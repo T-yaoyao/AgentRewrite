@@ -1,0 +1,392 @@
+{
+    "SUBQUERY_OPTIMIZATION": {
+        "description": "子查询优化：此类规则主要涉及将子查询（IN/EXISTS/Scalar）改写为更高效的 Join 结构，或处理 CTE 和相关子查询。",
+        "rules": {
+            "FILTER_SUB_QUERY_TO_CORRELATE": "在子查询数据量较小且去重成本低的前提下，将WHERE子查询（IN/EXISTS）改写为JOIN + DISTINCT。",
+            "FILTER_CORRELATE": "把外连接/相关子查询上的Filter尽量下推到子查询内部或输入端。",
+            "JOIN_SUB_QUERY_TO_CORRELATE": "当子查询目标表较小或结果集基数较低时，将连接条件中的标量/IN/EXISTS子查询改写为JOIN + DISTINCT形式。",
+            "JOIN_TO_CORRELATE": "在合适场景下，把JOIN结构改写为Correlate/相关子查询形式。",
+            "PROJECT_SUB_QUERY_TO_CORRELATE": "把SELECT列中的标量/集合子查询改写为JOIN + 聚合/集合构造。",
+            "PROJECT_CORRELATE_TRANSPOSE": "在Correlate/相关子查询前后重排投影，以减少传递列或简化结构。",
+            "STRATEGY_CTE_DECOMPOSITION": "将子查询或过滤逻辑提取为标准CTE (WITH ... AS ...)，旨在简化SQL的嵌套层级。"
+        },
+        "examples": [
+            {
+                "id": "FILTER_SUB_QUERY_TO_CORRELATE",
+                "original_query": "SELECT * FROM t1 WHERE id IN (SELECT id FROM t2)",
+                "rewritten_query": "SELECT t1.* FROM t1 JOIN (SELECT DISTINCT id FROM t2) AS sub_t2 ON t1.id = sub_t2.id",
+                "rule_description": "将IN/EXISTS子查询改写为JOIN + DISTINCT；利用Hash Join替代低效的Nested Loop。"
+            },
+            {
+                "id": "FILTER_CORRELATE",
+                "original_query": "SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t1.id = t2.id AND t1.id > 5)",
+                "rewritten_query": "SELECT * FROM t1 WHERE t1.id > 5 AND EXISTS (SELECT 1 FROM t2 WHERE t1.id = t2.id)",
+                "rule_description": "将过滤条件下推至相关子查询内部；尽早剔除无效数据。"
+            },
+            {
+                "id": "PROJECT_SUB_QUERY_TO_CORRELATE",
+                "original_query": "SELECT t1.id, (SELECT MAX(val) FROM t2 WHERE t2.id = t1.id) AS max_val FROM t1",
+                "rewritten_query": "SELECT t1.id, t2.max_val FROM t1 LEFT JOIN LATERAL (SELECT MAX(val) AS max_val FROM t2 WHERE t2.id = t1.id) AS t2 ON TRUE",
+                "rule_description": "将SELECT中的标量/集合子查询改写为JOIN + 聚合/集合构造。"
+            },
+            {
+                "id": "STRATEGY_CTE_DECOMPOSITION",
+                "original_query": "SELECT * FROM lineitem l JOIN part p ON l.pid = p.pid WHERE p.type = 'RARE'",
+                "rewritten_query": "WITH p_filtered AS (SELECT pid FROM part WHERE type = 'RARE') SELECT * FROM lineitem l JOIN p_filtered p ON l.pid = p.pid",
+                "rule_description": "将子查询提取为公用表表达式(CTE)；降低SQL嵌套层级以提升可读性和复用性。"
+            }
+        ]
+    },
+    "JOIN_OPTIMIZATION": {
+        "description": "连接优化：此类规则涉及JOIN的顺序调整、类型转换、剪枝（移除无效JOIN）以及条件推导。",
+        "rules": {
+            "AGGREGATE_JOIN_JOIN_REMOVE": "在多表LEFT JOIN + GROUP BY结构中，删除对结果无影响的冗余JOIN。",
+            "AGGREGATE_JOIN_REMOVE": "在单层JOIN + GROUP BY结构中，如果右表列没被聚合实质使用，就去掉该JOIN。",
+            "AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN": "将包含多个DISTINCT聚合的查询拆成多个子聚合，再用JOIN合并结果。",
+            "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": "将只依赖单边表的聚合提前到JOIN之前执行，再在JOIN后做必要的汇总。",
+            "FILTER_INTO_JOIN": "将只依赖某一侧表的WHERE条件推入JOIN的ON或该表的子查询中。",
+            "SORT_JOIN_TRANSPOSE": "当排序只依赖某一侧表列时，把Sort移到该表scan之后、JOIN之前。",
+            "JOIN_SUB_QUERY_TO_CORRELATE": "当子查询目标表较小或结果集基数较低时，将连接条件中的标量/IN/EXISTS子查询改写为JOIN + DISTINCT形式。",
+            "JOIN_CONDITION_PUSH": "把可以提前的连接条件推向输入表或JOIN的ON子句以减少中间结果。",
+            "JOIN_PUSH_TRANSITIVE_PREDICATES": "利用传递性（如A.x=B.x且B.x=1推出A.x=1）向左右两侧推条件。",
+            "JOIN_ADD_REDUNDANT_SEMI_JOIN": "在某些场景前置一个半连接，以先过滤一侧后再做真正JOIN。",
+            "JOIN_EXTRACT_FILTER": "把内连接变为笛卡尔积+过滤形式，便于优化器统一处理Filter。",
+            "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER": "当两边都是子查询/投影时，把它们的投影上提到JOIN之上（兼容外连接）。",
+            "JOIN_PROJECT_LEFT_TRANSPOSE_INCLUDE_OUTER": "只左边是投影时，上提重排以减少不必要的列。",
+            "JOIN_PROJECT_RIGHT_TRANSPOSE_INCLUDE_OUTER": "只右边是投影时，上提重排以减少不必要的列。",
+            "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": "从JOIN条件中推导出某些列IS NOT NULL的约束，加入过滤。",
+            "JOIN_PUSH_EXPRESSIONS": "把只依赖单边表的JOIN表达式提前为该表的计算列。",
+            "JOIN_LEFT_UNION_TRANSPOSE": "当左输入是UNION ALL时，把JOIN分发到每个分支，再用UNION合并。",
+            "JOIN_RIGHT_UNION_TRANSPOSE": "当右输入是UNION ALL时，把JOIN分发到每个分支，再用UNION合并。",
+            "SEMI_JOIN_FILTER_TRANSPOSE": "把和半连接相关的过滤条件在JOIN和其输入间来回重排以更有效过滤。",
+            "SEMI_JOIN_PROJECT_TRANSPOSE": "在半连接前后移动投影，去掉对后续无用的列。",
+            "SEMI_JOIN_JOIN_TRANSPOSE": "在多表JOIN树中，调整半连接和普通JOIN的相对顺序，优先执行选择性更强的过滤。",
+            "PROJECT_JOIN_JOIN_REMOVE": "在有JOIN + PROJECT的场景中移除对结果无贡献的中间JOIN。",
+            "PROJECT_JOIN_REMOVE": "如果LEFT/RIGHT JOIN的一侧列在最终SELECT中不用且不影响语义，就移除该JOIN。",
+            "PROJECT_JOIN_TRANSPOSE": "把投影上提到JOIN之上或下推到左右输入中，只保留后续需要的列。",
+            "JOIN_REDUCE_EXPRESSIONS": "简化JOIN条件里的常量表达式和冗余计算。",
+            "JOIN_TO_CORRELATE": "在合适场景下，把JOIN结构改写为Correlate/相关子查询形式。"
+        },
+        "examples": [
+            {
+                "id": "FILTER_INTO_JOIN",
+                "original_query": "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.val > 100",
+                "rewritten_query": "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id AND t1.val > 100",
+                "rule_description": "将只依赖某一侧表的WHERE条件推入JOIN的ON或该表的子查询中。"
+            },
+            {
+                "id": "JOIN_CONDITION_PUSH",
+                "original_query": "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id AND t1.val > 10",
+                "rewritten_query": "SELECT * FROM (SELECT * FROM t1 WHERE val > 10) AS s JOIN t2 ON s.id = t2.id",
+                "rule_description": "把可以提前的连接条件推向输入表或JOIN的ON子句以减少中间结果。"
+            },
+            {
+                "id": "JOIN_PUSH_TRANSITIVE_PREDICATES",
+                "original_query": "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.id = 5",
+                "rewritten_query": "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.id = 5 AND t2.id = 5",
+                "rule_description": "利用传递性（如A.x=B.x且B.x=1推出A.x=1）向左右两侧推条件。"
+            },
+            {
+                "id": "JOIN_LEFT_UNION_TRANSPOSE",
+                "original_query": "SELECT * FROM (SELECT * FROM t1_a UNION ALL SELECT * FROM t1_b) AS t1u JOIN t2 ON t1u.id = t2.id",
+                "rewritten_query": "SELECT * FROM t1_a JOIN t2 ON t1_a.id = t2.id UNION ALL SELECT * FROM t1_b JOIN t2 ON t1_b.id = t2.id",
+                "rule_description": "当左输入是UNION ALL时，把JOIN分发到每个分支，再用UNION合并。"
+            },
+            {
+                "id": "AGGREGATE_JOIN_REMOVE",
+                "original_query": "SELECT t1.x, COUNT(*) FROM t1 JOIN t2 ON t1.id = t2.id GROUP BY t1.x",
+                "rewritten_query": "SELECT t1.x, COUNT(*) FROM t1 GROUP BY t1.x",
+                "rule_description": "在单层JOIN + GROUP BY结构中，如果右表列没被聚合实质使用，就去掉该JOIN。"
+            },
+            {
+                "id": "PROJECT_JOIN_REMOVE",
+                "original_query": "SELECT t1.id FROM t1 LEFT JOIN t2 ON t1.id = t2.id",
+                "rewritten_query": "SELECT t1.id FROM t1",
+                "rule_description": "如果LEFT/RIGHT JOIN的一侧列在最终SELECT中不用且不影响语义，就移除该JOIN。"
+            },
+            {
+                "id": "SEMI_JOIN_FILTER_TRANSPOSE",
+                "original_query": "SELECT * FROM t1 WHERE id IN (SELECT id FROM t2) AND status = 'ACTIVE'",
+                "rewritten_query": "SELECT * FROM (SELECT * FROM t1 WHERE status = 'ACTIVE') AS t1_filtered WHERE id IN (SELECT id FROM t2)",
+                "rule_description": "把和半连接相关的过滤条件在JOIN和其输入间来回重排以更有效过滤。"
+            }
+        ]
+    },
+    "PREDICATE_OPTIMIZATION": {
+        "description": "谓词优化：此类规则涉及WHERE/HAVING条件的下推、合并、简化以及CASE WHEN等表达式转为过滤条件。",
+        "rules": {
+            "AGGREGATE_CASE_TO_FILTER": "把SUM(CASE WHEN ... THEN x END)改写为SUM(x) FILTER (WHERE ...)。",
+            "AGGREGATE_FILTER_TRANSPOSE": "把WHERE/HAVING过滤条件尽量下推到聚合前，减少参与聚合的数据量。",
+            "FILTER_AGGREGATE_TRANSPOSE": "把只依赖分组键的过滤条件从聚合后移到聚合前，减少聚合输入数据。",
+            "FILTER_CORRELATE": "把外连接/相关子查询上的Filter尽量下推到子查询内部或输入端。",
+            "FILTER_EXPAND_IS_NOT_DISTINCT_FROM": "把IS NOT DISTINCT FROM这类空值敏感比较展开成等价的普通布尔表达式。",
+            "FILTER_INTO_JOIN": "将只依赖某一侧表的WHERE条件推入JOIN的ON或该表的子查询中。",
+            "FILTER_MERGE": "把多层连续的WHERE合并成一层WHERE，或合并多个Filter节点。",
+            "FILTER_PROJECT_TRANSPOSE": "在SELECT计算列之后再过滤时，尽量把过滤移到原始列上，并前置到投影之前。",
+            "FILTER_REDUCE_EXPRESSIONS": "简化WHERE里的常量或恒真/恒假条件（比如1=1、1=0）。",
+            "FILTER_SET_OP_TRANSPOSE": "把WHERE条件从外层UNION/INTERSECT/EXCEPT后移到各个输入子查询中。",
+            "FILTER_TABLE_FUNCTION_TRANSPOSE": "过滤TABLE FUNCTION结果时，尽可能把条件提前到函数输入上。",
+            "FILTER_VALUES_MERGE": "对VALUES生成的常量行集过滤时，直接在VALUES里删掉不满足条件的行。",
+            "JOIN_CONDITION_PUSH": "把可以提前的连接条件推向输入表或JOIN的ON子句以减少中间结果。",
+            "JOIN_PUSH_TRANSITIVE_PREDICATES": "利用传递性向左右两侧推条件。",
+            "JOIN_EXTRACT_FILTER": "把内连接变为笛卡尔积+过滤形式。",
+            "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": "从JOIN条件中推导出某些列IS NOT NULL的约束，加入过滤。",
+            "SEMI_JOIN_FILTER_TRANSPOSE": "把和半连接相关的过滤条件在JOIN和其输入间来回重排以更有效过滤。",
+            "PROJECT_FILTER_VALUES_MERGE": "把对VALUES的投影+过滤合并成一个新的精简VALUES子句。",
+            "PROJECT_FILTER_TRANSPOSE": "与Filter组合时，在不改变语义下调整两者顺序以便更好下推。"
+        },
+        "examples": [
+            {
+                "id": "AGGREGATE_CASE_TO_FILTER",
+                "original_query": "SELECT SUM(CASE WHEN deptno = 10 THEN salary ELSE 0 END) FROM emp",
+                "rewritten_query": "SELECT SUM(salary) FILTER (WHERE deptno = 10) FROM emp",
+                "rule_description": "把SUM(CASE WHEN ... THEN x END)改写为SUM(x) FILTER (WHERE ...)。"
+            },
+            {
+                "id": "FILTER_MERGE",
+                "original_query": "SELECT * FROM (SELECT * FROM t WHERE a = 1) AS s WHERE b = 2",
+                "rewritten_query": "SELECT * FROM t WHERE a = 1 AND b = 2",
+                "rule_description": "把多层连续的WHERE合并成一层WHERE，或合并多个Filter节点。"
+            },
+            {
+                "id": "FILTER_REDUCE_EXPRESSIONS",
+                "original_query": "SELECT * FROM t WHERE 1 = 1 AND id > 5",
+                "rewritten_query": "SELECT * FROM t WHERE id > 5",
+                "rule_description": "简化WHERE里的常量或恒真/恒假条件（比如1=1、1=0）。"
+            },
+            {
+                "id": "FILTER_EXPAND_IS_NOT_DISTINCT_FROM",
+                "original_query": "SELECT * FROM t1 WHERE x IS NOT DISTINCT FROM y",
+                "rewritten_query": "SELECT * FROM t1 WHERE (x = y) OR (x IS NULL AND y IS NULL)",
+                "rule_description": "把IS NOT DISTINCT FROM这类空值敏感比较展开成等价的普通布尔表达式。"
+            },
+            {
+                "id": "FILTER_SET_OP_TRANSPOSE",
+                "original_query": "SELECT * FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2) AS u WHERE id > 10",
+                "rewritten_query": "SELECT * FROM t1 WHERE id > 10 UNION ALL SELECT * FROM t2 WHERE id > 10",
+                "rule_description": "把WHERE条件从外层UNION/INTERSECT/EXCEPT后移到各个输入子查询中。"
+            }
+        ]
+    },
+    "CONSTANT_OPTIMIZATION": {
+        "description": "常量优化：此类规则涉及常量折叠、表达式简化（1=1）、VALUES子句的预计算以及常量列的处理。",
+        "rules": {
+            "AGGREGATE_ANY_PULL_UP_CONSTANTS": "把GROUP BY里的常量分离出去，改为先按非常量列分组，再在外层补常量列。",
+            "AGGREGATE_VALUES": "对固定的VALUES子句做聚合时，直接在常量上算出结果而不真的扫描表。",
+            "WINDOW_REDUCE_EXPRESSIONS": "简化窗口函数里的常量表达式或冗余计算。",
+            "FILTER_REDUCE_EXPRESSIONS": "简化WHERE里的常量或恒真/恒假条件。",
+            "FILTER_VALUES_MERGE": "对VALUES生成的常量行集过滤时，直接在VALUES里删掉不满足条件的行。",
+            "SORT_REMOVE_CONSTANT_KEYS": "去掉排序键中恒定的列，若所有排序键都恒定则删除整个排序。",
+            "JOIN_REDUCE_EXPRESSIONS": "简化JOIN条件里的常量表达式和冗余计算。",
+            "PROJECT_REDUCE_EXPRESSIONS": "简化SELECT列中的常量计算、冗余表达式和无用CAST。",
+            "PROJECT_VALUES_MERGE": "把投影的列计算直接作用到VALUES里的字面量上，得到新的VALUES。",
+            "PROJECT_FILTER_VALUES_MERGE": "把对VALUES的投影+过滤合并成一个新的精简VALUES子句。",
+            "UNION_PULL_UP_CONSTANTS": "把各分支SELECT中相同常量列上提到外层，内分支只保留变化的部分。"
+        },
+        "examples": [
+            {
+                "id": "AGGREGATE_ANY_PULL_UP_CONSTANTS",
+                "original_query": "SELECT 'Department', deptno, COUNT(*) FROM emp GROUP BY deptno, 'Department'",
+                "rewritten_query": "SELECT 'Department', deptno, COUNT(*) FROM emp GROUP BY deptno",
+                "rule_description": "把GROUP BY里的常量分离出去，改为先按非常量列分组，再在外层补常量列。"
+            },
+            {
+                "id": "AGGREGATE_VALUES",
+                "original_query": "SELECT SUM(x) FROM (VALUES (1), (2), (3)) AS t(x)",
+                "rewritten_query": "SELECT 6",
+                "rule_description": "对固定的VALUES子句做聚合时，直接在常量上算出结果而不真的扫描表。"
+            },
+            {
+                "id": "PROJECT_REDUCE_EXPRESSIONS",
+                "original_query": "SELECT a + 0, CAST(b AS INTEGER) FROM t",
+                "rewritten_query": "SELECT a, b FROM t",
+                "rule_description": "简化SELECT列中的常量计算、冗余表达式和无用CAST。"
+            },
+            {
+                "id": "FILTER_REDUCE_EXPRESSIONS",
+                "original_query": "SELECT * FROM t WHERE 1 = 1 AND id > 5",
+                "rewritten_query": "SELECT * FROM t WHERE id > 5",
+                "rule_description": "简化WHERE里的常量或恒真/恒假条件（比如1=1、1=0）。"
+            },
+            {
+                "id": "SORT_REMOVE_CONSTANT_KEYS",
+                "original_query": "SELECT * FROM t ORDER BY 'constant', id",
+                "rewritten_query": "SELECT * FROM t ORDER BY id",
+                "rule_description": "去掉排序键中恒定的列，若所有排序键都恒定则删除整个排序。"
+            },
+            {
+                "id": "UNION_PULL_UP_CONSTANTS",
+                "original_query": "SELECT 'A', id FROM t1 UNION ALL SELECT 'A', id FROM t2",
+                "rewritten_query": "SELECT 'A', id FROM (SELECT id FROM t1 UNION ALL SELECT id FROM t2) AS s",
+                "rule_description": "把各分支SELECT中相同常量列上提到外层，内分支只保留变化的部分。"
+            }
+        ]
+    },
+    "AGGREGATE_OPTIMIZATION": {
+        "description": "聚合优化：此类规则涉及GROUP BY、Window Function的合并、消除、下推以及去重逻辑。",
+        "rules": {
+            "AGGREGATE_ANY_PULL_UP_CONSTANTS": "把GROUP BY里的常量分离出去。",
+            "AGGREGATE_CASE_TO_FILTER": "把SUM(CASE WHEN ... THEN x END)改写为SUM(x) FILTER。",
+            "AGGREGATE_MERGE": "合并嵌套的两个GROUP BY聚合为一个更简单的聚合。",
+            "AGGREGATE_PROJECT_MERGE": "把紧挨着聚合的纯投影合并进聚合或去掉多余的SELECT。",
+            "AGGREGATE_REMOVE": "如果GROUP BY不做真正聚合，或者输入本身已经DISTINCT，则去掉不必要的GROUP BY。",
+            "AGGREGATE_VALUES": "对固定的VALUES子句做聚合时，直接在常量上算出结果。",
+            "AGGREGATE_EXPAND_DISTINCT_AGGREGATES": "把同一列上的多个DISTINCT聚合重写为更易实现的一组GROUP BY/聚合组合。",
+            "AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN": "将包含多个DISTINCT聚合的查询拆成多个子聚合，再用JOIN合并结果。",
+            "AGGREGATE_FILTER_TRANSPOSE": "把WHERE/HAVING过滤条件尽量下推到聚合前。",
+            "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": "将只依赖单边表的聚合提前到JOIN之前执行。",
+            "AGGREGATE_REDUCE_FUNCTIONS": "把AVG等聚合改写成SUM/COUNT组合。",
+            "AGGREGATE_UNION_TRANSPOSE": "把聚合下推到UNION ALL的每个分支。",
+            "AGGREGATE_UNION_AGGREGATE_FIRST": "把UNION ALL + GROUP BY的去重场景改写为UNION。",
+            "AGGREGATE_UNION_AGGREGATE_SECOND": "在一侧已有GROUP BY的UNION ALL + GROUP BY场景下，整体改写为UNION。",
+            "PROJECT_AGGREGATE_MERGE": "把仅仅转发列名/别名的投影和聚合合并，减少多余SELECT层。",
+            "WINDOW_REDUCE_EXPRESSIONS": "简化窗口函数里的常量表达式或冗余计算。",
+            "FILTER_AGGREGATE_TRANSPOSE": "把只依赖分组键的过滤条件从聚合后移到聚合前。",
+            "PROJECT_TO_LOGICAL_PROJECT_AND_WINDOW": "把既含普通表达式又含窗口函数的SELECT拆成普通列+外层窗口两层。",
+            "PROJECT_WINDOW_TRANSPOSE": "在窗口函数前后重排投影，以减小参与窗口计算的数据列数。"
+        },
+        "examples": [
+            {
+                "id": "AGGREGATE_MERGE",
+                "original_query": "SELECT SUM(sum_sal) FROM (SELECT deptno, SUM(salary) AS sum_sal FROM emp GROUP BY deptno)",
+                "rewritten_query": "SELECT SUM(salary) FROM emp",
+                "rule_description": "合并嵌套的两个GROUP BY聚合为一个更简单的聚合。"
+            },
+            {
+                "id": "AGGREGATE_REMOVE",
+                "original_query": "SELECT empno FROM emp GROUP BY empno",
+                "rewritten_query": "SELECT empno FROM emp",
+                "rule_description": "如果GROUP BY不做真正聚合，或者输入本身已经DISTINCT，则去掉不必要的GROUP BY。"
+            },
+            {
+                "id": "AGGREGATE_FILTER_TRANSPOSE",
+                "original_query": "SELECT deptno, SUM(salary) FROM emp GROUP BY deptno HAVING deptno > 10",
+                "rewritten_query": "SELECT deptno, SUM(salary) FROM (SELECT * FROM emp WHERE deptno > 10) AS s GROUP BY deptno",
+                "rule_description": "把WHERE/HAVING过滤条件尽量下推到聚合前，减少参与聚合的数据量。"
+            },
+            {
+                "id": "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+                "original_query": "SELECT t1.id, SUM(t2.amount) FROM t1 JOIN t2 ON t1.id = t2.t1_id GROUP BY t1.id",
+                "rewritten_query": "SELECT t1.id, t2_agg.sum_amt FROM t1 JOIN (SELECT t1_id, SUM(amount) AS sum_amt FROM t2 GROUP BY t1_id) AS t2_agg ON t1.id = t2_agg.t1_id",
+                "rule_description": "将只依赖单边表的聚合提前到JOIN之前执行，再在JOIN后做必要的汇总。"
+            },
+            {
+                "id": "AGGREGATE_REDUCE_FUNCTIONS",
+                "original_query": "SELECT AVG(salary) FROM emp",
+                "rewritten_query": "SELECT SUM(salary) / COUNT(salary) FROM emp",
+                "rule_description": "把AVG等聚合改写成SUM/COUNT组合，便于统一实现和优化。"
+            },
+            {
+                "id": "AGGREGATE_EXPAND_DISTINCT_AGGREGATES",
+                "original_query": "SELECT COUNT(DISTINCT deptno), SUM(DISTINCT salary) FROM emp",
+                "rewritten_query": "SELECT COUNT(CASE WHEN grp = 1 THEN deptno END) AS cnt_distinct_deptno, SUM(CASE WHEN grp = 2 THEN salary END) AS sum_distinct_salary FROM (SELECT deptno, NULL::numeric AS salary, 1 AS grp FROM emp GROUP BY deptno UNION ALL SELECT NULL AS deptno, salary, 2 AS grp FROM emp GROUP BY salary) AS g",
+                "rule_description": "把同一列上的多个DISTINCT聚合重写为更易实现的一组GROUP BY/聚合组合。"
+            },
+            {
+                "id": "WINDOW_REDUCE_EXPRESSIONS",
+                "original_query": "SELECT SUM(CAST(1 AS INTEGER)) OVER (PARTITION BY deptno) FROM emp",
+                "rewritten_query": "SELECT SUM(1) OVER (PARTITION BY deptno) FROM emp",
+                "rule_description": "简化窗口函数里的常量表达式或冗余计算（比如去掉不必要的CAST/常量算术）。"
+            }
+        ]
+    },
+    "PROJECTION_OPTIMIZATION": {
+        "description": "投影优化：此类规则主要涉及SELECT列的优化，包括投影操作合并、表达式简化、列裁剪以及与集合操作的投影重排。",
+        "rules": {
+            "PROJECT_MERGE": "合并连续的两层SELECT（投影），减少多余中间层。",
+            "PROJECT_REMOVE": "当外层SELECT只是简单转发列（或纯重命名）时，直接删除这一层。",
+            "PROJECT_SET_OP_TRANSPOSE": "在UNION/INTERSECT/EXCEPT前后重排投影，尽量只对源数据做一次统一的列选择。"
+        },
+        "examples": [
+            {
+                "id": "PROJECT_MERGE",
+                "original_query": "SELECT a FROM (SELECT a, b FROM t) AS s",
+                "rewritten_query": "SELECT a FROM t",
+                "rule_description": "合并连续的两层SELECT（投影），减少多余中间层。"
+            },
+            {
+                "id": "PROJECT_REMOVE",
+                "original_query": "SELECT * FROM (SELECT id, name FROM t) AS s",
+                "rewritten_query": "SELECT id, name FROM t",
+                "rule_description": "当外层SELECT只是简单转发列（或纯重命名）时，直接删除这一层。"
+            },
+            {
+                "id": "PROJECT_SET_OP_TRANSPOSE",
+                "original_query": "SELECT a + 1 FROM (SELECT a FROM t1 UNION SELECT a FROM t2) AS u",
+                "rewritten_query": "SELECT a + 1 FROM t1 UNION SELECT a + 1 FROM t2",
+                "rule_description": "在UNION/INTERSECT/EXCEPT前后重排投影，尽量只对源数据做一次统一的列选择。"
+            }
+        ]
+    },
+    "SORT_OPTIMIZATION": {
+        "description": "排序优化：此类规则主要涉及ORDER BY操作的优化，包括排序移除、下推到合适位置、常量键处理以及与集合操作的排序重排。",
+        "rules": {
+            "SORT_REMOVE": "删除多余的排序，例如外层与内层排序键相同。",
+            "SORT_REMOVE_CONSTANT_KEYS": "去掉排序键中恒定的列。",
+            "SORT_JOIN_TRANSPOSE": "当排序只依赖某一侧表列时，把Sort移到该表scan之后。",
+            "SORT_PROJECT_TRANSPOSE": "把只依赖原始列的Sort尽量移到投影之前。",
+            "SORT_UNION_TRANSPOSE": "把Sort+LIMIT部分下推到UNION ALL的每个分支。",
+            "SORT_UNION_TRANSPOSE_MATCH_NULL_FETCH": "在UNION+FETCH/OFFSET场景下，下推排序同时严格保证NULL语义。"
+        },
+        "examples": [
+            {
+                "id": "SORT_REMOVE",
+                "original_query": "SELECT * FROM (SELECT * FROM t ORDER BY id) AS s ORDER BY id",
+                "rewritten_query": "SELECT * FROM t ORDER BY id",
+                "rule_description": "删除多余的排序，例如外层与内层排序键相同且没有LIMIT/OFFSET语义差异。"
+            },
+            {
+                "id": "SORT_JOIN_TRANSPOSE",
+                "original_query": "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.col",
+                "rewritten_query": "SELECT * FROM (SELECT * FROM t1 ORDER BY col) AS s JOIN t2 ON s.id = t2.id",
+                "rule_description": "当排序只依赖某一侧表列时，把Sort移到该表scan之后、JOIN之前。"
+            },
+            {
+                "id": "SORT_UNION_TRANSPOSE",
+                "original_query": "SELECT * FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2) AS u ORDER BY id LIMIT 10",
+                "rewritten_query": "SELECT * FROM (SELECT * FROM t1 ORDER BY id LIMIT 10 UNION ALL SELECT * FROM t2 ORDER BY id LIMIT 10) AS s ORDER BY id LIMIT 10",
+                "rule_description": "把Sort+LIMIT部分下推到UNION ALL的每个分支，再在外层整体排序+LIMIT。"
+            }
+        ]
+    },
+    "SET_OPERATION_OPTIMIZATION": {
+        "description": "集合优化：此类规则主要涉及UNION、INTERSECT、EXCEPT等集合操作的优化，包括分支剪枝、常量上提、去重策略调整以及与聚合操作的集合重排。",
+        "rules": {
+            "AGGREGATE_UNION_TRANSPOSE": "把聚合下推到UNION ALL的每个分支。",
+            "AGGREGATE_UNION_AGGREGATE_FIRST": "把UNION ALL + GROUP BY的去重场景改写为UNION。",
+            "AGGREGATE_UNION_AGGREGATE_SECOND": "在一侧已有GROUP BY的UNION ALL + GROUP BY场景下，整体改写为UNION。",
+            "JOIN_LEFT_UNION_TRANSPOSE": "当左输入是UNION ALL时，把JOIN分发到每个分支。",
+            "JOIN_RIGHT_UNION_TRANSPOSE": "当右输入是UNION ALL时，把JOIN分发到每个分支。",
+            "UNION_REMOVE": "删除冗余的UNION ALL分支，如恒为空的分支。",
+            "UNION_PULL_UP_CONSTANTS": "把各分支SELECT中相同常量列上提到外层。",
+            "UNION_TO_DISTINCT": "把UNION（去重）改写为UNION ALL再在外层做DISTINCT。",
+            "INTERSECT_TO_DISTINCT": "把INTERSECT改写为INTERSECT ALL+外层去重或等价的DISTINCT结构。"
+        },
+        "examples": [
+            {
+                "id": "UNION_REMOVE",
+                "original_query": "SELECT * FROM t1 UNION ALL SELECT * FROM t1 WHERE 1 = 0",
+                "rewritten_query": "SELECT * FROM t1",
+                "rule_description": "删除冗余的UNION ALL分支，如恒为空的分支。"
+            },
+            {
+                "id": "UNION_PULL_UP_CONSTANTS",
+                "original_query": "SELECT 'A', id FROM t1 UNION ALL SELECT 'A', id FROM t2",
+                "rewritten_query": "SELECT 'A', id FROM (SELECT id FROM t1 UNION ALL SELECT id FROM t2) AS s",
+                "rule_description": "把各分支SELECT中相同常量列上提到外层，内分支只保留变化的部分。"
+            },
+            {
+                "id": "UNION_TO_DISTINCT",
+                "original_query": "SELECT id FROM t1 UNION SELECT id FROM t2",
+                "rewritten_query": "SELECT DISTINCT id FROM (SELECT id FROM t1 UNION ALL SELECT id FROM t2) AS s",
+                "rule_description": "把UNION（去重）改写为UNION ALL再在外层做DISTINCT。"
+            },
+            {
+                "id": "AGGREGATE_UNION_TRANSPOSE",
+                "original_query": "SELECT deptno, COUNT(*) FROM (SELECT deptno FROM emp_us UNION ALL SELECT deptno FROM emp_cn) AS u GROUP BY deptno",
+                "rewritten_query": "SELECT deptno, SUM(cnt) FROM (SELECT deptno, COUNT(*) AS cnt FROM emp_us GROUP BY deptno UNION ALL SELECT deptno, COUNT(*) AS cnt FROM emp_cn GROUP BY deptno) AS s GROUP BY deptno",
+                "rule_description": "把聚合下推到UNION ALL的每个分支，再在外层做一次汇总，减少中间数据量。"
+            }
+        ]
+    }
+}

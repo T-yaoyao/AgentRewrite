@@ -75,29 +75,25 @@ class ReasoningAgent(Agent):
     async def analyze_sql(self, sql: str, data_statistics, explain_info : str) -> dict:
 
         prompt = textwrap.dedent(f"""
-        <Mission>
-        You are an experienced DBA, and your mission is to perform high-quality query rewriting for the user.
-        1. Identify potential bottlenecks in the SQL query and propose optimization strategies. For each strategy, assign a rewrite score and determine the most efficient way to optimize the SQL.
-            - Note: Consider creating CTEs when queries have complex WHERE/JOIN conditions or involve redundant subquery calculations, as CTEs can improve readability and performance. 
-                    Avoid overusing CTEs if the query is simple or CTEs do not reduce redundancy, as unnecessary CTEs may add overhead.
-        2. Rewrite the SQL query if necessary, ensuring the following standards are met for query rewriting:
-            - Executability
-            - Equivalence
-            - Efficiency
-            - Readability
+        <任务目标>
+       你是一名经验丰富的 DBA，核心任务是为用户完成高质量的 SQL 查询重写工作。                    
+        1.基于统计信息和执行计划分析结果，对 SQL 进行性能诊断，并给出有针对性的重写优化方向。
+        针对每一项优化策略，需评定重写评分，同时确定该 SQL 的最优优化方案。
+        注意：当查询语句包含复杂的WHERE/JOIN条件，或存在重复子查询计算时，可考虑使用公共表表达式（CTE） ——CTE 能够提升查询的可读性与执行性能。若查询语句本身结构简单，或使用 CTE 无法减少冗余计算，则应避免过度使用 CTE，多余的 CTE 可能会增加系统开销。
+        2. 如果必要，重写 SQL 查询，确保满足以下标准：
+            - 可执行性
+            - 等价性
+            - 效率（执行效率与计算效率）
+            - 可读性
 
-        IMPORTANT:            
-        If you find the SQL query is already well-optimized or too simple to require any changes, 
-        you can simply mention the final version of the SQL query, conclude that it doesn't need further optimization, and include the word "TERMINATE" at the end of your response.
-                                 
-                                 
-        <sql>
+        重要提示若经评估，目标 SQL 查询语句已处于充分优化状态，或结构过于简单无需调整，则直接给出该 SQL 的最终版本，同时判定其 “无需进一步优化”，并在回复末尾标注关键词 TERMINATE。                      
+        <sql语句>
         {sql}
 
-        <data_statistics>
+        <统计信息>
         {data_statistics}
 
-        <explain_info>
+        <执行计划分析结果>
         {explain_info}
         """)
         
@@ -118,31 +114,31 @@ class ReasoningAgent(Agent):
 
         prompt = textwrap.dedent(f"""
         <Mission>
-        You are an experienced DBA, and your mission is to perform high-quality query rewriting for the user.
-        1. Identify potential bottlenecks in the SQL query and propose optimization strategies. For each strategy, assign a rewrite score and determine the most efficient way to optimize the SQL.
-            - Note: Consider creating CTEs when queries have complex WHERE/JOIN conditions or involve redundant subquery calculations, as CTEs can improve readability and performance. 
-                    Avoid overusing CTEs if the query is simple or CTEs do not reduce redundancy, as unnecessary CTEs may add overhead.
-        2. Rewrite the SQL query if necessary, ensuring the following standards are met for query rewriting:
-            - Executability
-            - Equivalence
-            - Efficiency
-            - Readability
+        你是一名经验丰富的 DBA，核心任务是为用户完成高质量的 SQL 查询重写工作。                    
+        1.基于统计信息和执行计划分析结果，对 SQL 进行性能诊断，并给出有针对性的重写优化方向。
+        针对每一项优化策略，需评定重写评分，同时确定该 SQL 的最优优化方案。
+        注意：当查询语句包含复杂的WHERE/JOIN条件，或存在重复子查询计算时，可考虑使用公共表表达式（CTE） ——CTE 能够提升查询的可读性与执行性能。若查询语句本身结构简单，或使用 CTE 无法减少冗余计算，则应避免过度使用 CTE，多余的 CTE 可能会增加系统开销。
+        2. 如果必要，重写 SQL 查询，确保满足以下标准：
+            - 可执行性
+            - 等价性
+            - 效率（执行效率与计算效率）
+            - 可读性
 
-        3. Notably, you will be provided with the preivous rewrite report.
+
+        3. 特别说明：你会获取到此前的重写报告作为参考。
                                  
-        IMPORTANT:            
-        If you find the SQL query is already well-optimized or too simple to require any changes, you can conclude that it doesn't need further optimization and then include the word "TERMINATE" at the end of your response.
-                                 
-        <sql>
+        若经评估，目标 SQL 查询语句已处于充分优化状态，或结构过于简单无需调整，则直接判定其 “无需进一步优化”，并在回复末尾标注关键词 TERMINATE。
+
+        <sql语句>
         {sql}
 
-        <data_statistics>
+        <统计信息>
         {data_statistics}
 
-        <explain_info>
+        <执行计划分析结果>
         {explain_info}
 
-        <report>
+        <重写报告>
         {report}
 
         """)
@@ -173,31 +169,19 @@ class DecisionAgent(Agent):
     async def summarize_chain(self, chain: str, original_sql: str, data_statistics) -> dict:
         prompt = textwrap.dedent(f"""
         <Mission>
-        You are an experienced database administrator. Your mission is to
-        1. Summarize the rewrite suggestions and the newly rewritten SQL query based on the detailed SQL rewrite report from [chain].
-        Each suggestion should be grouped under one of the following categories:
-        - Predicate_simplification
-        - Subquery_optimization
-        - Query_optimization
-        - Join_optimization
-        - Constant_folding
-                                 
-        These messages should be output with "produced_sql" and "advice" in the format provided. The original SQL query will be provided in <original_sql>.
+        你是一名经验丰富的 DBA，核心任务是为用户完成高质量的 SQL 查询重写工作。
+        1. 总结重写建议和新的重写 SQL 查询，基于详细的 SQL 重写报告 [chain]。
+        每个建议应归入以下类别之一：
+        - 谓词简化
+        - 子查询优化
+        - 查询优化
+        - 连接优化
+        - 常量折叠
+       2. 随后检查 produced_sql，挖掘其潜在的优化空间，在保证结果等价性的前提下对其进行进一步优化（例如：将过滤条件提前至FROM子句的JOIN环节、在主查询中保留过滤条件以优化 CTE 结构、常量折叠、日期 / 数值计算优化、冗余谓词简化等）。
+        此阶段还可结合数据统计信息（data_statistics） 提升 SQL 执行效率，尤其是在考虑创建 CTE 的场景下。
+        注意：切勿盲目创建 CTE，尤其是当查询包含大量WHERE/JOIN条件，或冗余子查询计算较少时，更应避免滥用 CTE。                    
 
-        2. Then check the "produced_sql", try to find more potential rewritten improvement, try to futher improve it meanwhile keep equivalence ( like Early Filtering Conditions in FROM part as JOIN, make the CTE structure more efficient with maintaining the filter condition in main query, constant folding or calculate the date/num, redundant predicate siplification, etc.) 
-        
-        
-        In this stage, you can also consider the data_statistics to make the SQL more efficient. 
-        Especially if you want to create CTE. 
-                                 
-        Do not always consider creating CTEs, especially when there are numerous WHERE/JOIN conditions or when there are fewer redundant subquery calculations.
-        {data_statistics} 
-
-        These message can be outputed with "analysis" and "enhanced_sql" in [format]. If the SQL is well down or too easy to give a rewrite process, no need to optimize, just put [produced_sql] into [enhanced_sql] and [advice] into [analysis].
-        Note that do not contain annotation in the SQL, and try to avoid to make to many exchanges.
-                                 
-
-        3. please strictly follow the format provided below:
+        3. 请严格遵循以下格式：
         [format]
         </produced_sql>
         ```sql
@@ -211,12 +195,12 @@ class DecisionAgent(Agent):
                     "group": "",
                     "produced_suggestion": ""
                 }},
-                ... // if more suggestion is available
+                ... // 如果还有更多建议，则继续添加
         ]
         </advice>
                                  
         </analysis>
-        // The analysis of the rewritten SQL statement
+        // 重写 SQL 语句的分析
         </analysis>
         
         </enhanced_sql>
@@ -242,9 +226,9 @@ class DecisionAgent(Agent):
 
     async def check_equivalence(self, ori_sql: str, rewritten_sql: str, rewrite_advice) -> dict:
         prompt = textwrap.dedent(f"""
-        You are an experienced database administrator. 
-        1. Your mission is to check the equivalence of the original SQL and the improved SQL. If you think the improved SQL is not equivalent to the original SQL, please provide the corrected SQL.
-        2. And you have the rewritte idea process to be considered to make the SQL more efficient.         Note that do not contain annotation in the SQL, and try to avoid to make to many exchanges.
+        你是一名经验丰富的 DBA，核心任务是检查原始 SQL 和改进 SQL 的等价性。
+        1. 检查原始 SQL 和改进 SQL 的等价性。如果认为改进 SQL 不等价于原始 SQL，请提供修正后的 SQL。
+        2. 你还有重写思路过程需要考虑，以使 SQL 更高效。注意：不要在 SQL 中包含注释，并尽量避免进行过多的交换。
 
         <original_sql>:
         {ori_sql}
@@ -254,7 +238,7 @@ class DecisionAgent(Agent):
 
         <rewritten_idea_process>:
         {rewrite_advice}
-        3. please strictly follow the format provided below:
+        3. 请严格遵循以下格式：
         [format]
         </analysis>
 
@@ -265,7 +249,7 @@ class DecisionAgent(Agent):
         </equivalence>
         
         </corrected_sql>
-          // If not equivalent, insert the corrected SQL here; otherwise leave empty.
+          // 如果是false，则插入修正后的 SQL；否则留空。
         </corrected_sql>
         """)
         
@@ -277,23 +261,16 @@ class DecisionAgent(Agent):
     
     async def select_sql(self, original_sql:str, query_pairs:list) -> dict:
         prompt = textwrap.dedent(f"""
-        You are an experienced database administrator. 
-        You have been provided with multiple SQL statements that are equivalent to the original SQL query, and each ehanced SQL statement has its own rewrite process.
-        Your mission is to select the most effective enhanced SQL statement. 
-        
-        The SQL statements are provided below:
-        <original_sql>:
-        {original_sql}
-        <enhanced_sql_pairs>:
-        {query_pairs}
-        
-        Please strictly follow the format provided below:
+        你是一名经验丰富的 DBA，核心任务是选择最有效的改进 SQL 语句。
+        1. 你已获得多个等价于原始 SQL 查询的 SQL 语句，每个改进 SQL 语句都有其自己的重写过程。
+        2. 你的任务是选择最有效的改进 SQL 语句。
+        3. 请严格遵循以下格式：
         [format]
         </analysis>
-            // Fill in the analysis of the selected SQL statement.
+            // 填充选定 SQL 语句的分析。
         </analysis>
         </selected_id>
-            // Fill in the selected id you think is the best one.
+            // 填充你认为最好的选定 ID。
         </selected_id>
         """)
         
@@ -311,32 +288,33 @@ class DecisionAgent(Agent):
             equivalence_failure_info = """
         
         **IMPORTANT CONTEXT**: 
-        All parallel workers failed equivalence checks and had to fall back to the original SQL. 
-        This means the rewritten queries were not equivalent to the original, not that the original query was already optimal.
-        The system attempted SQL optimization but the rewritten versions failed equivalence validation.
-        Consider this as a failed optimization attempt rather than an indication that no optimization is needed.
+        所有并行工作器都失败了等价性检查，不得不回退到原始 SQL。 
+        这意味着重写后的查询不等价于原始查询，而不是原始查询已经是最优的。
+        系统尝试了 SQL 优化，但重写版本失败了等价性验证。
+        考虑这种情况作为失败优化尝试，而不是表明不需要优化。
         """
 
         prompt = textwrap.dedent(f"""
-        You are responsible for evaluating whether SQL optimization is up to standard.Please decide whether to terminate the optimization process based on the information below:
-        Do you want to terminate the process?
+        你负责评估 SQL 优化是否符合标准。请根据以下信息决定是否终止优化过程：
+        你想终止优化过程吗？
 
-        * Note: Execution times for <original_sql> and <enhanced_sql> come from the database optimizer and may be imprecise. Base your decision on a detailed analysis.
-        * Objectively assess whether the enhanced SQL satisfies the key indicators of a successful rewrite.
+        * 注意：<original_sql> 和 <enhanced_sql> 的执行时间来自数据库优化器，可能不精确。基于详细分析做出决定。
+        注意：<original_sql> 和 <enhanced_sql> 的执行时间来自数据库优化器，可能不精确。基于详细分析做出决定。
+        * 客观评估改进 SQL 是否满足成功重写的指标。
 
-        TERMINATION CONDITIONS:
+        终止条件：
         [True]:
-            1. enhanced_sql execution time < ori_sql execution time, and enhanced_sql executes without errors.
-            2. enhanced_sql execution time ≥ ori_sql execution time due to cardinality estimation inaccuracies, but you still consider the rewrite an improvement.
+            1. enhanced_sql 执行时间 < ori_sql 执行时间 and enhanced_sql执行没有报错.
+            2. enhanced_sql 执行时间 ≥ ori_sql 执行时间，由于基数估计不准确，但你仍可将此次重写视为一种优化。
 
         [False]:
-            enhanced_sql execution time ≥ ori_sql execution time, or enhanced_sql fails to execute without errors.
+            enhanced_sql 执行时间 ≥ ori_sql 执行时间，或 enhanced_sql 执行失败。
             {equivalence_failure_info}
             
-        Return your answer strictly in this JSON format:
+        请严格遵循以下 JSON 格式返回你的答案：
         {{
             "terminate": True/False,
-            "reason": ""  // Provide your rationale here.
+            "reason": ""  // 提供你的理由。
         }}
 
         <original_sql>:
@@ -373,7 +351,7 @@ class DecisionAgent(Agent):
         pattern = r'</selected_id>\s*(.*?)\s*</selected_id>'
         match = re.search(pattern, text, re.DOTALL)
         if match:
-            return json.loads(match.group(1).strip())
+            return match.group(1).strip()  # 直接返回字符串，不需要JSON解析
         return ""
     
 
@@ -462,23 +440,24 @@ class DecisionAgent(Agent):
             for opt in optimizations
         ]
         prompt = textwrap.dedent(f"""
-        You are an experienced database administrator. Your mission is to merge the RAG optimizations from expert knowledge into the original optimization suggestions and return the final rewrite suggestions.
-        Carefully consider the validity of both the original optimization suggestions and the RAG optimizations, and return the result in the format below.
-
-        The original SQL statement:
+        你是一名经验丰富的 DBA，核心任务是合并专家知识中的 RAG 优化建议和原始优化建议，并返回最终的重写建议。
+        仔细考虑原始优化建议和 RAG 优化建议的有效性，并返回以下格式的 JSON：
+        审慎评估原始优化建议与检索增强生成（RAG）优化方案的有效性，并按以下格式返回结果。
+ 
+        原始 SQL 语句：
         {base_sql}
 
-        Original optimization suggestions:
+        原始优化建议：
         {optimizations_str}
 
-        RAG optimizations from expert knowledge:
+        RAG 优化建议：
         {rag_optimizations}
 
-        You must return the JSON in the following format:
+        请严格遵循以下 JSON 格式返回你的答案：
         {{
             {{
                 "group": "",
-                "produced_suggestion": ""  // merged suggestions
+                "produced_suggestion": ""  // 合并建议
             }}
         }}
         """)
@@ -517,31 +496,31 @@ class AssistantAgent(Agent):
     async def _correct_sql(self, original_sql: str, rewritten_sql: str, error: str) -> str:
         """Correct SQL syntax errors"""
         prompt = textwrap.dedent(f"""
-            You are an expert in SQL syntax and excel at correcting SQL syntax errors.
-            Please fix the following SQL statement, using the error message provided.
+        你是一名经验丰富的 DBA，核心任务是修正 SQL 语法错误。
+        1. 修正以下 SQL 语句，使用提供的错误消息。
 
-            * Note: If the SQL contains double quotes, preserve them exactly as they appear.
+            * 注意：如果 SQL 包含双引号，请保留它们 exactly as they appear.
             <rewritten_sql>
             {rewritten_sql}
 
-            Error message:
+           错误消息:
             {error}
 
-            Below is the original form of the rewritten SQL for reference to the schema.
-            Only correct the syntax in <rewritten_sql>; do not align it with the original SQL,
-            and do NOT include any "EXPLAIN (FORMAT JSON)" clause!
+            下面是重写 SQL 的原始形式，用于参考模式。
+            只修正 <rewritten_sql> 中的语法；不要与原始 SQL 对齐，
+            且不要包含任何 "EXPLAIN (FORMAT JSON)" 子句！
 
             <original_sql>
             {original_sql}
 
-            Please follow the format below exactly:
+            请严格遵循以下格式：
             [format]
             </analysis>
 
             </analysis>
 
             </corrected_sql>
-            // Insert the corrected SQL here.
+            // 插入修正后的 SQL 语句。
             </corrected_sql>
             """)
 
@@ -571,35 +550,30 @@ class AssistantAgent(Agent):
     async def  generate_report(self, ori_explain_result: list, re_explain_result: list, imp_explain_result: list) -> str:
         prompt = textwrap.dedent(f"""
         <Mission>
-        You are a professional database administrator. Your mission is to generate a detailed report based on the original EXPLAIN analysis, the rewritten EXPLAIN analysis, 和 the enhanced EXPLAIN analysis.
-        You should consider and compare them with a report that contains these parts:
-        
-
-        1. Cost Efficiency:
-            - Overall cost change percentage  
-            - Cost change at the most expensive plan node  
-
-        2. Plan Characteristics:
-            - Scan type transitions (e.g., Seq Scan → Index Scan)  
-            - Join algorithm refinements (e.g., Hash Join → Merge Join)  
-            - Elimination of explicit sorting and reduction of intermediate result sets   
+        你是一名经验丰富的 DBA，核心任务是生成详细的报告，基于原始 EXPLAIN 分析、重写 EXPLAIN 分析和增强 EXPLAIN 分析。
+        你应该考虑并比较它们与包含这些部分的报告：
+        1. 成本效率：
+            - 总体成本变化百分比  
+            - 最昂贵计划节点成本变化  
+        2. 计划特征：
+            - 扫描类型转换 (例如：Seq Scan → Index Scan)  
+            - 连接算法改进 (例如：Hash Join → Merge Join)  
+            - 显式排序消除和中间结果集减少   
+        3. 资源利用：
+            - 内存使用 (Hash/Buffer 节点变化)
+            - 工作线程数调整
+        4. 其他改进：
                                  
-        3. Resource Utilization:
-            - Memory usage (changes in Hash/Buffer nodes)
-            - Worker count adjustment
-        
-        4. Other Improvements:
+        注意：在你的报告中，不需要复制 EXPLAIN 结果，只需进行 NLP 分析和比较。
                                  
-
-        Note that in your report, there is no need to copy the EXPLAIN result one more, just analyze and compare them in NLP.
-                                 
-        Your answer should follow the format below:
+        请严格遵循以下格式：
+        [format]
         </analysis>
             ...
         </analysis>
                                  
         </report>
-            ... // Do not need to remention the EXPLAIN result
+            ... // 不需要重复提及 EXPLAIN 结果
         </report>
                                                       
         <ori_explain_result>

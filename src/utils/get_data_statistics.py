@@ -4,7 +4,16 @@ import json
 import re
 from pathlib import Path
 
-# Setup project paths
+# Setup project paths - 需要在导入其他模块之前设置
+# 获取当前文件的目录
+current_file = Path(__file__).resolve()
+# 获取项目根目录（从 src/utils 向上两级）
+project_root = current_file.parent.parent.parent
+# 将项目根目录添加到 Python 路径
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+# 现在可以导入项目模块
 from src.utils.path_config import setup_python_path
 setup_python_path()
 
@@ -128,15 +137,28 @@ def update_data_distribution_file(db_name, statistics):
         return False
 
 
-def get_data_statistics():
+def get_data_statistics(db_name: str = None):
     """
     Main function: Collect database statistics and update distribution file
+
+    Args:
+        db_name: Optional database name. If None, uses DB_NAME from environment or DBMS instance.
 
     Returns:
         str: JSON formatted statistics
     """
+    # Create DBMS instance
+    dbms = DBMS()
+    
+    # If db_name is provided, override the db_name in DBMS instance
+    if db_name:
+        dbms.db_name = db_name
+        print(f"📌 Using specified database: {db_name}")
+    else:
+        print(f"📌 Using database from environment: {dbms.db_name}")
+    
     # Collect statistics from the database
-    db_name, statistics = collect_database_statistics()
+    db_name, statistics = collect_database_statistics(dbms)
     
     if not statistics:
         print("⚠️  No statistics collected")
@@ -160,8 +182,53 @@ def get_data_statistics():
 
 
 if __name__ == "__main__":
-    data_statistics = get_data_statistics()
-    print(f"\n🎯 Final JSON Output:")
-    print(data_statistics)
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Collect database statistics and update data_distribution.py',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 更新当前环境变量指定的数据库
+  python src/utils/get_data_statistics.py
+  
+  # 更新指定数据库
+  python src/utils/get_data_statistics.py --db calcite
+  python src/utils/get_data_statistics.py --db dsb
+  python src/utils/get_data_statistics.py --db tpch
+  
+  # 更新多个数据库
+  python src/utils/get_data_statistics.py --db calcite --db dsb
+        """
+    )
+    
+    parser.add_argument(
+        '--db',
+        '--database',
+        dest='db_names',
+        action='append',
+        help='Database name(s) to update. Can be specified multiple times. If not specified, uses DB_NAME from environment.'
+    )
+    
+    args = parser.parse_args()
+    
+    if args.db_names:
+        # Update multiple databases
+        for db_name in args.db_names:
+            print("\n" + "="*80)
+            print(f"🔄 Updating statistics for database: {db_name}")
+            print("="*80)
+            try:
+                data_statistics = get_data_statistics(db_name)
+                print(f"\n✅ Successfully updated {db_name}")
+            except Exception as e:
+                print(f"\n❌ Failed to update {db_name}: {e}")
+                import traceback
+                traceback.print_exc()
+    else:
+        # Update current database from environment
+        data_statistics = get_data_statistics()
+        print(f"\n🎯 Final JSON Output:")
+        print(data_statistics)
 
 

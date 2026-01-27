@@ -158,14 +158,34 @@ class DBMS:
             print(f"Error executing statement: {e}")
             raise
 
-# tool_1
+# tool_1 - Intelligent Plan Analyzer
 async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
-    print("DBMS_EXPLAIN_Tool starts...")
+    """
+    Intelligent execution plan analyzer that uses PlanAnalyzer to provide structured analysis.
+    
+    Returns:
+        str: JSON-formatted string containing structured analysis:
+        {
+            "bottlenecks": [...],
+            "cost_analysis": {...},
+            "text_report": "..."
+        }
+    """
+    print("🔍 Intelligent Plan Analyzer starts...")
+
+    # Import PlanAnalyzer
+    try:
+        from src.Rewrite_Middleware.plan_analyzer import PlanAnalyzer
+    except ImportError as e:
+        print(f"Warning: Failed to import PlanAnalyzer: {e}")
+        print("Falling back to basic EXPLAIN...")
+        # Fallback to basic behavior
+        return await _basic_explain_tool(dbms, input_sql)
 
     # Split SQL script into individual statements by semicolon
     statements = [stmt.strip() for stmt in input_sql.split(';') if stmt.strip()]
     
-    query_plans = []
+    all_analyses = []
     
     try:
         # Iterate through each statement
@@ -173,25 +193,173 @@ async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
             # If it's a CREATE VIEW, execute it first
             if stmt.upper().startswith("CREATE VIEW"):
                 dbms.execute_statement(stmt)
+                continue
 
-            # If it's a SELECT or other statement that needs EXPLAIN, get its execution plan
-            if not stmt.upper().startswith("CREATE VIEW") and not stmt.upper().startswith("DROP VIEW"):
+            # If it's a DROP VIEW, execute it first
+            if stmt.upper().startswith("DROP VIEW"):
+                dbms.execute_statement(stmt)
+                continue
+
+            # For SELECT and other statements that need EXPLAIN
+            try:
+                # Get JSON-formatted execution plan
+                success, explain_result = dbms.execute_explain(stmt)
+                
+                if not success:
+                    all_analyses.append({
+                        "statement": stmt[:100] + "..." if len(stmt) > 100 else stmt,
+                        "error": str(explain_result),
+                        "bottlenecks": [],
+                        "cost_analysis": {}
+                    })
+                    continue
+
+                # Convert explain_result to JSON string for PlanAnalyzer
+                if isinstance(explain_result, list):
+                    explain_json_str = json.dumps(explain_result, ensure_ascii=False, indent=2)
+                elif isinstance(explain_result, dict):
+                    # Ensure it's in the format PlanAnalyzer expects
+                    if 'Plan' in explain_result:
+                        explain_json_str = json.dumps([explain_result], ensure_ascii=False, indent=2)
+                    else:
+                        explain_json_str = json.dumps([{'Plan': explain_result}], ensure_ascii=False, indent=2)
+                else:
+                    explain_json_str = json.dumps(explain_result, ensure_ascii=False, indent=2)
+
+                # Use PlanAnalyzer to analyze the execution plan
+                try:
+                    # Get database name from DBMS instance
+                    db_name = dbms.db_name if hasattr(dbms, 'db_name') else None
+                    analyzer = PlanAnalyzer(explain_json_str=explain_json_str, db_name=db_name)
+                    
+                    # Get structured bottlenecks
+                    bottlenecks = analyzer.get_top_bottlenecks(top_n=10, min_percentage=5)
+                    
+                    # Calculate cost analysis
+                    cost_analysis = _calculate_cost_analysis(analyzer, bottlenecks)
+                    
+                    # Format bottlenecks for output
+                    formatted_bottlenecks = _format_bottlenecks(bottlenecks)
+                    
+                    # Generate text report for backward compatibility
+                    text_report = analyzer.format_analysis_report(top_n=10, min_percentage=5)
+                    
+                    analysis_result = {
+                        "bottlenecks": formatted_bottlenecks,
+                        "cost_analysis": cost_analysis,
+                        "text_report": text_report  # For backward compatibility with existing code
+                    }
+                    
+                    all_analyses.append(analysis_result)
+                    
+                except Exception as e:
+                    print(f"Warning: PlanAnalyzer failed for statement: {e}")
+                    # Fallback: return basic analysis
+                    all_analyses.append({
+                        "statement": stmt[:100] + "..." if len(stmt) > 100 else stmt,
+                        "error": f"PlanAnalyzer error: {str(e)}",
+                        "raw_plan": explain_json_str[:500] if len(explain_json_str) > 500 else explain_json_str,
+                        "bottlenecks": [],
+                        "cost_analysis": {}
+                    })
+                    
+            except Exception as e:
+                print(f"Error processing statement: {e}")
+                all_analyses.append({
+                    "statement": stmt[:100] + "..." if len(stmt) > 100 else stmt,
+                    "error": str(e),
+                    "bottlenecks": [],
+                    "cost_analysis": {}
+                })
+    
+    except Exception as e:
+        print(f"Error in Intelligent Plan Analyzer: {e}")
+        import traceback
+        traceback.print_exc()
+        return json.dumps({
+            "error": str(e),
+            "bottlenecks": [],
+            "cost_analysis": {}
+        }, ensure_ascii=False, indent=2)
+    
+    # If only one analysis, return it directly; otherwise return list
+    if len(all_analyses) == 1:
+        result = all_analyses[0]
+    else:
+        result = {
+            "statements_count": len(all_analyses),
+            "analyses": all_analyses
+        }
+    
+    print("✅ Intelligent Plan Analyzer completed")
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _calculate_cost_analysis(analyzer: 'PlanAnalyzer', bottlenecks: List[Dict]) -> Dict:
+    """Calculate comprehensive cost analysis metrics"""
+    cost_analysis = {
+        "total_cost": analyzer.root_total_cost,
+        "max_tree_cost": analyzer.max_tree_cost,
+        "has_limit": analyzer.has_limit,
+        "limit_child_cost": analyzer.limit_child_cost if analyzer.has_limit else None,
+        "bottleneck_count": len(bottlenecks),
+        "total_bottleneck_cost": sum(b.get('self_cost', 0) for b in bottlenecks),
+        "bottleneck_cost_percentage": 0.0
+    }
+    
+    # Calculate bottleneck cost percentage
+    denominator = max(analyzer.root_total_cost, analyzer.max_tree_cost)
+    if analyzer.has_limit and analyzer.limit_child_cost > 0:
+        denominator = max(analyzer.limit_child_cost, analyzer.max_tree_cost)
+    
+    if denominator > 0:
+        cost_analysis["bottleneck_cost_percentage"] = (
+            cost_analysis["total_bottleneck_cost"] / denominator * 100
+        )
+    
+    return cost_analysis
+
+
+def _format_bottlenecks(bottlenecks: List[Dict]) -> List[Dict]:
+    """Format bottlenecks for structured output"""
+    formatted = []
+    for bn in bottlenecks:
+        formatted.append({
+            "node_type": bn.get('node_type', 'Unknown'),
+            "entity": bn.get('entity', 'N/A'),
+            "self_cost": round(bn.get('self_cost', 0), 2),
+            "total_cost": round(bn.get('total_cost', 0), 2),
+            "startup_cost": round(bn.get('startup_cost', 0), 2),
+            "cost_percentage": round(bn.get('display_pct', 0), 2),
+            "is_blocker": bn.get('is_blocker', False),
+            "context": bn.get('context', '')
+        })
+    return formatted
+
+
+async def _basic_explain_tool(dbms: DBMS, input_sql: str) -> str:
+    """Fallback basic EXPLAIN tool for backward compatibility"""
+    print("Using basic EXPLAIN tool (fallback)...")
+    
+    statements = [stmt.strip() for stmt in input_sql.split(';') if stmt.strip()]
+    query_plans = []
+    
+    try:
+        for stmt in statements:
+            if stmt.upper().startswith("CREATE VIEW"):
+                dbms.execute_statement(stmt)
+            elif stmt.upper().startswith("DROP VIEW"):
+                dbms.execute_statement(stmt)
+            else:
                 result = dbms.get_pure_plan(stmt)
                 if isinstance(result, list):
                     query_plans.extend([item['QUERY PLAN'] for item in result])
                 else:
                     query_plans.append(f"Error: {result}")
-
-            # If it's a DROP VIEW, execute it first
-            if stmt.upper().startswith("DROP VIEW"):
-                dbms.execute_statement(stmt)
-    
     except Exception as e:
         print(f"Error processing statements: {e}")
     
-    print(query_plans)
-    print("DBMS_EXPLAIN_Tool ends...")
-    return query_plans
+    return json.dumps(query_plans, ensure_ascii=False, indent=2)
 
 
 # tool_2
