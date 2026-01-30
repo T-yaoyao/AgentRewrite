@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import threading
+import json
 
 # Setup project paths
 from src.utils.path_config import setup_python_path
@@ -8,19 +9,19 @@ setup_python_path()
 
 from src.Rewrite_Middleware.middleware import DBMS_EXPLAIN_Tool, DBMS_Syntax_Tool, Knowledge_Base_Tool, Equivalence_Check_Tool, DBMS
 from src.Rewrite_Middleware.Agent_Memory_Buffer.memory_buffer import AgentMemoryBuffer, OutputCollector, create_memory_buffer
-from src.Query_Rewriter.agent_definition import ReasoningAgent, AssistantAgent, DecisionAgent
+from src.Query_Rewriter.agent_definition import ReasoningAgent, AssistantAgent, DecisionAgent, RewriteAgent, get_rules_by_groups, get_rule_examples
 from src.utils.agent_template import MessageContent, Message, MemoryWindow, MessageQueue
 
 
 class QueryRewriter:
     """SQL Rewrite Finite State Machine"""
-    def __init__(self, message_queue: MessageQueue, dbms: DBMS, data_statistics, schema_file, MAX_ITERATION_LOOP=3):
-        self.current_state = "REASONING"
+    def __init__(self, message_queue: MessageQueue, dbms: DBMS, data_statistics, schema_file, MAX_ITERATION_LOOP=2):
+        self.current_state = "INITIAL_CHECK"
         self.memory = create_memory_buffer(data_statistics, schema_file)
 
         self.dbms = dbms
         self.iteration = 0
-        self.MAX_ITERATION_LOOP = MAX_ITERATION_LOOP    
+        self.MAX_ITERATION_LOOP = MAX_ITERATION_LOOP
         self.terminal_output = None
         self.output_collector = OutputCollector()
 
@@ -28,10 +29,19 @@ class QueryRewriter:
         self.reasoning_agent = ReasoningAgent(message_queue)
         self.assistant_agent = AssistantAgent(message_queue)
         self.decision_agent = DecisionAgent(message_queue)
+        self.rewrite_agent = RewriteAgent(message_queue)
 
         # Set up observation relationships
         self.decision_agent.watch(["ReasoningAgent","ExplainAgent"])
         self.assistant_agent.watch(["SummaryAgent","ExplainAgent"])
+
+        # Multi-round optimization variables
+        self.optimization_round = 1
+        self.can_optimize = None
+        self.optimization_advice = []
+        self.rule_library = {}
+        self.current_rewrite_result = None
+        self.previous_feedback = None
 
         # Parallel processing related
         self.parallel_threads = 2
@@ -126,13 +136,21 @@ class QueryRewriter:
         # Use memory buffer's clearing method
         self.memory.clear_volatile_memory()
 
-        # Reset FSM state
-        self.current_state = "REASONING"
+        # Reset FSM state to initial state for new query processing
+        self.current_state = "INITIAL_CHECK"
         self.iteration = 0
         self.parallel_reasoning_results = []
         self.parallel_verification_results = []
         self._stop_event.clear()
-        
+
+        # Reset multi-round optimization variables
+        self.optimization_round = 1
+        self.can_optimize = None
+        self.optimization_advice = []
+        self.rule_library = {}
+        self.current_rewrite_result = None
+        self.previous_feedback = None
+
         print(f"🧹 Memory cleared. Buffer status: {self.memory}")
     
     async def clear_log(self):
@@ -144,22 +162,265 @@ class QueryRewriter:
 
         while self.current_state != "TERMINATED":
 
-            if self.current_state == "REASONING":
-                await self.state_reasoning_parallel()
+            if self.current_state == "INITIAL_CHECK":
+                await self.state_initial_check()
 
-            elif self.current_state == "VERIFICATION":
-                await self.state_verification_parallel()
+            elif self.current_state == "RULE_SELECTION":
+                await self.state_rule_selection()
 
-            elif self.current_state == "DECISION":
-                await self.state_decision()
+            elif self.current_state == "REWRITE":
+                await self.state_rewrite()
+
+            elif self.current_state == "EVALUATION":
+                await self.state_evaluation()
+
             await asyncio.sleep(0.1)  # Prevent event loop blocking
 
         terminal_output = self.output_collector.stop_collecting()
         # Store the output in FSM's attributes
         self.terminal_output = terminal_output
-        
-        return self.enhanced_sql
-    
+
+        return self.format_final_output()
+
+    async def state_initial_check(self):
+        """Initial optimization feasibility check"""
+        print("🔍 开始初始优化可行性检查...")
+
+        try:
+            async with self.llm_semaphore:
+                explain_info = await DBMS_EXPLAIN_Tool(self.dbms, self.initial_sql)
+
+            async with self.llm_semaphore:
+                check_result = await self.decision_agent.initial_optimization_check(
+                    self.initial_sql, self.data_statistics, explain_info
+                )
+
+            self.can_optimize = check_result.get("can_optimize", False)
+            self.optimization_advice = check_result.get("advice", [])
+
+            if self.can_optimize:
+                print("✅ SQL可以优化，进入规则选择阶段")
+                self.current_state = "RULE_SELECTION"
+            else:
+                print("❌ SQL无需优化，终止流程")
+                self.current_state = "TERMINATED"
+
+        except Exception as e:
+            print(f"初始检查失败: {e}")
+            self.can_optimize = False
+            self.current_state = "TERMINATED"
+
+    async def state_rule_selection(self):
+        """Rule selection based on optimization advice"""
+        print(f"🎯 第{self.optimization_round}轮规则选择...")
+
+        try:
+            # Extract groups from advice
+            groups = []
+            advice_text = ""
+            for advice_item in self.optimization_advice:
+                group = advice_item.get("group", "")
+                suggestion = advice_item.get("produced_suggestion", "")
+                if group:
+                    groups.append(group)
+                advice_text += f"- {group}: {suggestion}\n"
+
+            # Get rules for these groups
+            self.rule_library = get_rules_by_groups(groups)
+
+            # Select rule sequence
+            async with self.llm_semaphore:
+                rule_sequence = await self.reasoning_agent.select_rule_sequence(
+                    self.initial_sql,
+                    self.optimization_advice,
+                    self.rule_library,
+                    self.data_statistics,
+                    "",  # explain_info will be empty for now
+                    self.optimization_round,
+                    self.previous_feedback
+                )
+
+            self.selected_rules = rule_sequence
+            print(f"✅ 选择了 {len(rule_sequence.get('applied_rules', []))} 个规则")
+            self.current_state = "REWRITE"
+
+        except Exception as e:
+            print(f"规则选择失败: {e}")
+            self.current_state = "TERMINATED"
+
+    async def state_rewrite(self):
+        """Execute SQL rewriting"""
+        print("🔧 开始SQL重写...")
+
+        try:
+            # Get rule examples
+            applied_rules = self.selected_rules.get("applied_rules", [])
+            rule_examples = get_rule_examples(applied_rules)
+
+            # Execute rewriting
+            async with self.llm_semaphore:
+                rewrite_result = await self.rewrite_agent.rewrite_with_rule_sequence(
+                    self.initial_sql,
+                    self.selected_rules,
+                    rule_examples,
+                    json.dumps(self.optimization_advice, ensure_ascii=False),
+                    self.data_statistics
+                )
+
+            self.current_rewrite_result = rewrite_result
+
+            # Syntax check
+            rewritten_sql = rewrite_result.get("rewritten_sql", self.initial_sql)
+            syntax_check = await DBMS_Syntax_Tool(self.dbms, rewritten_sql)
+
+            if not syntax_check.get("valid", True):
+                print("⚠️ 语法检查失败，开始迭代修正...")
+                error_info = syntax_check.get("error", "Unknown error")
+
+                async with self.llm_semaphore:
+                    corrected_sql = await self.rewrite_agent.iterative_rewrite(
+                        self.initial_sql, error_info, rewrite_result
+                    )
+
+                if corrected_sql:
+                    rewrite_result["rewritten_sql"] = corrected_sql
+                    self.current_rewrite_result = rewrite_result
+                    print("✅ 语法修正完成")
+                else:
+                    print("❌ 语法修正失败")
+
+            self.current_state = "EVALUATION"
+
+        except Exception as e:
+            print(f"重写失败: {e}")
+            self.current_state = "TERMINATED"
+
+    async def state_evaluation(self):
+        """Evaluate optimization results"""
+        print("📊 开始评估优化结果...")
+
+        try:
+            # Get costs for both SQLs
+            original_cost_result = await DBMS_EXPLAIN_Tool(self.dbms, self.initial_sql)
+            rewritten_sql = self.current_rewrite_result.get("rewritten_sql", self.initial_sql)
+            rewritten_cost_result = await DBMS_EXPLAIN_Tool(self.dbms, rewritten_sql)
+
+            # Extract costs (simplified extraction)
+            original_cost = self._extract_cost_from_explain(original_cost_result)
+            rewritten_cost = self._extract_cost_from_explain(rewritten_cost_result)
+
+            # Store final costs for output
+            self.final_original_costs = original_cost
+            self.final_rewritten_costs = rewritten_cost
+
+            # Prepare evaluation info
+            evaluation_info = {
+                "original_costs": original_cost,
+                "rewritten_costs": rewritten_cost,
+                "original_explain_info": json.dumps(original_cost_result, ensure_ascii=False),
+                "rewritten_explain_info": json.dumps(rewritten_cost_result, ensure_ascii=False),
+                "groups": self.selected_rules.get("groups", ""),
+                "applied_rules": self.selected_rules.get("applied_rules", []),
+                "original_sql": self.initial_sql,
+                "rewritten_sql": rewritten_sql,
+                "reason": self.previous_feedback.get("reason", "") if self.previous_feedback else ""
+            }
+
+            # Evaluate
+            async with self.llm_semaphore:
+                evaluation_result = await self.decision_agent.evaluate_with_costs(
+                    evaluation_info, self.optimization_round
+                )
+
+            terminate = evaluation_result.get("terminate", True)
+            should_rollback = evaluation_result.get("是否回退SQL", False)
+
+            if terminate:
+                print("✅ 优化完成，终止流程")
+                self.current_state = "TERMINATED"
+            elif self.optimization_round < self.MAX_ITERATION_LOOP:
+                print(f"🔄 第{self.optimization_round}轮优化未通过，准备下一轮...")
+                self.optimization_round += 1
+
+                # Update feedback for next round
+                self.previous_feedback = {
+                    "reason": evaluation_result.get("reason", ""),
+                    "problematic_rules": evaluation_result.get("可能造成这个结果的规则", [])
+                }
+
+                # Rollback SQL if needed
+                if should_rollback:
+                    print("🔙 回退到原始SQL")
+                    self.current_rewrite_result["rewritten_sql"] = self.initial_sql
+
+                self.current_state = "RULE_SELECTION"
+            else:
+                print("❌ 已达到最大优化轮数，终止流程")
+                self.current_state = "TERMINATED"
+
+        except Exception as e:
+            print(f"评估失败: {e}")
+            self.current_state = "TERMINATED"
+
+    def _extract_cost_from_explain(self, explain_result):
+        """Extract total cost from explain result"""
+        try:
+            # If explain_result is a string (JSON), parse it first
+            if isinstance(explain_result, str):
+                try:
+                    explain_result = json.loads(explain_result)
+                except json.JSONDecodeError:
+                    return 0
+
+            if isinstance(explain_result, dict):
+                # Try different possible structures
+                if "total_cost" in explain_result:
+                    return explain_result["total_cost"]
+                elif "Plan" in explain_result and "Total Cost" in explain_result["Plan"]:
+                    return explain_result["Plan"]["Total Cost"]
+                elif "cost_analysis" in explain_result:
+                    return explain_result["cost_analysis"].get("total_cost", 0)
+            elif isinstance(explain_result, list) and len(explain_result) > 0:
+                plan = explain_result[0]
+                if "Plan" in plan and "Total Cost" in plan["Plan"]:
+                    return plan["Plan"]["Total Cost"]
+        except:
+            pass
+        return 0
+
+    def format_final_output(self):
+        """Format final output according to requirements"""
+        if not self.can_optimize:
+            # Cannot optimize case - first round decision
+            return {
+                "tpch": [{
+                    "rewritten_query": self.initial_sql,
+                    "original_costs": 0,
+                    "rewrite_costs": 0,
+                    "costs_reduction_rate": 0,
+                    "rewrite_rules": None
+                }]
+            }
+
+        # Can optimize case
+        final_sql = self.current_rewrite_result.get("rewritten_sql", self.initial_sql) if self.current_rewrite_result else self.initial_sql
+        applied_rules = self.selected_rules.get("applied_rules", []) if self.selected_rules else []
+
+        # Get final costs (these should be stored during evaluation)
+        original_costs = getattr(self, 'final_original_costs', 0)
+        rewritten_costs = getattr(self, 'final_rewritten_costs', 0)
+        costs_reduction_rate = ((original_costs - rewritten_costs) / original_costs * 100) if original_costs > 0 else 0
+
+        return {
+            "tpch": [{
+                "rewritten_query": final_sql,
+                "original_costs": original_costs,
+                "rewrite_costs": rewritten_costs,
+                "costs_reduction_rate": round(costs_reduction_rate, 2),
+                "rewrite_rules": applied_rules if applied_rules else None
+            }]
+        }
+
     async def parallel_reasoning_worker(self, worker_id: int):
         """Parell reasoning worker"""
         try:

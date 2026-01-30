@@ -171,7 +171,7 @@ async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
             "text_report": "..."
         }
     """
-    print("🔍 Intelligent Plan Analyzer starts...")
+    print("🔍 计划分析器开始分析...")
 
     # Import PlanAnalyzer
     try:
@@ -273,7 +273,7 @@ async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
                 })
     
     except Exception as e:
-        print(f"Error in Intelligent Plan Analyzer: {e}")
+        print(f"计划分析器分析失败: {e}")
         import traceback
         traceback.print_exc()
         return json.dumps({
@@ -291,7 +291,7 @@ async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
             "analyses": all_analyses
         }
     
-    print("✅ Intelligent Plan Analyzer completed")
+    print("✅ 计划分析器完成分析")
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 

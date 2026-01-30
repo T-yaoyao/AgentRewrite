@@ -25,6 +25,7 @@ from src.Rewrite_Middleware.middleware import DBMS
 from src.utils.agent_template import MessageContent, Message, MemoryWindow, MessageQueue
 from src.Query_Rewriter.finite_state_machine import QueryRewriter
 from src.Hint_Recommender.injection import Hint_Recommender   
+from src.utils.llm_client import GPT
 
 def parse_arguments():
     """Parse parameters from command line or use default values"""
@@ -125,24 +126,34 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
     with open(args.input_path, "r", encoding='utf-8') as f:
         data = json.load(f)
     
-    # make sure the input data is a list
-    actual_batch_size = 1 if args.save_rewriter_logs else args.rewriter_batch_size
-    if args.save_rewriter_logs and args.rewriter_batch_size != 1:
-        print(f"⚠️  Forcing batch size to 1 due to log saving requirement (was {args.rewriter_batch_size})")
-    
     count = 0
-    batch = 0
-    result = []
-    temp_dir = directories['rewriter_temp']
-    
-    print(f"📊 Processing {len(data)} queries with batch size {actual_batch_size}")
-    print(f"📁 Temp directory: {temp_dir}")
-    print(f"📝 Save logs: {'Yes' if args.save_rewriter_logs else 'No'}")
-    print()  
+    all_results = []  # Store all results in memory
 
-    with tqdm(total=len(data), 
-              desc="🔄 Query Rewriter Progress", 
-              position=0, 
+    # Load existing results if file exists (append mode)
+    temp_dir = directories['rewriter_temp']
+    final_output_file = directories['output'] / "rewritten_queries.json"
+    if final_output_file.exists():
+        try:
+            with open(final_output_file, "r", encoding='utf-8') as f:
+                existing_results = json.load(f)
+                if isinstance(existing_results, list):
+                    all_results = existing_results
+                    count = len(all_results)
+                    print(f"📂 Loaded {count} existing results from {final_output_file}")
+        except (json.JSONDecodeError, FileNotFoundError):
+            print("⚠️ Could not load existing results, starting fresh")
+            all_results = []
+
+    print(f"📊 Processing {len(data)} queries (writing results individually)")
+    print(f"📁 Output file: {final_output_file}")
+    print(f"📝 Save logs: {'Yes' if args.save_rewriter_logs else 'No'}")
+    print(f"📈 Starting from query #{count + 1}")
+    print()
+
+    with tqdm(total=len(data),
+              initial=count,
+              desc="🔄 Processing Queries",
+              position=0,
               leave=True,
               dynamic_ncols=True,
               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
@@ -152,69 +163,91 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
             pbar.set_description(f"🔄 Processing Query {count + 1}/{len(data)} (ID: {item.get('id', 'N/A')})")
             
             initial_sql = item["query"]
-            
+
+            # Reset rewriter state for new query
             rewriter.initial_sql = initial_sql
+            rewriter.current_state = "INITIAL_CHECK"  # Ensure correct initial state
             start_time = time.time()
 
-            rewritten_sql = await rewriter.run()
-            
-            end_time = time.time()
-            rewrite_time = end_time - start_time
-            
+            # Record LLM cost before this query
+            usage_before = GPT.get_global_usage()
+            cost_before = usage_before.get("total_cost_rmb", 0.0)
+
+            try:
+                rewritten_sql = await rewriter.run()
+                end_time = time.time()
+                rewrite_time = end_time - start_time
+                success = True
+            except Exception as e:
+                print(f"❌ Error processing query {item.get('id', 'N/A')}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+
+                # Create a fallback result for failed queries
+                rewritten_sql = {
+                    "tpch": [{
+                        "rewritten_query": initial_sql,  # fallback to original
+                        "original_costs": 0,
+                        "rewrite_costs": 0,
+                        "costs_reduction_rate": 0,
+                        "rewrite_rules": []
+                    }]
+                }
+                end_time = time.time()
+                rewrite_time = end_time - start_time
+                success = False
+
+            # LLM cost consumed by this query (all agents)
+            usage_after = GPT.get_global_usage()
+            cost_after = usage_after.get("total_cost_rmb", 0.0)
+            query_llm_cost = max(0.0, cost_after - cost_before)
+            query_llm_cost = round(query_llm_cost, 6)
+
             tmp = {
                 "id": item["id"],
                 "original_query": item["query"],
                 "rewritten_query": rewritten_sql,
                 "time_cost": rewrite_time,
-                "rewrite_suggestion": rewriter.optimization_advice
+                "llm_costs": query_llm_cost,
+                "rewrite_suggestion": rewriter.optimization_advice if success else "Error occurred during processing"
             }
-            result.append(tmp)
+            all_results.append(tmp)
             count += 1
-            
+
+            # Write all results to the final output file
+            with open(final_output_file, "w", encoding='utf-8') as f:
+                json.dump(all_results, f, indent=4, ensure_ascii=False)
+
+            # If saving logs, write individual log files
+            if args.save_rewriter_logs:
+                log_file_path = temp_dir / f"query_{item['id']}.txt"
+                with open(log_file_path, "w", encoding='utf-8') as f:
+                    f.write(f"Query ID: {item['id']}\n")
+                    f.write("="*50 + "\n\n")
+                    f.write(f"Original: {tmp['original_query']}\n")
+                    f.write(f"Rewritten: {tmp['rewritten_query']}\n")
+                    f.write(f"Time Cost: {tmp['time_cost']:.2f}s\n")
+                    f.write(f"Suggestion: {tmp['rewrite_suggestion']}\n")
+                    f.write(rewriter.terminal_output or "")
+                    f.write("\n" + "-"*40 + "\n\n")
+
             pbar.update(1)
             pbar.set_postfix({
                 'Time': f'{rewrite_time:.2f}s',
-                'Batch': batch + 1 if count % actual_batch_size == 0 else batch
+                'Status': 'Success' if success else 'Error',
+                'Total': count
             })
-            
+
             await rewriter.clear()
-            
-            # save results in batches
-            if count % actual_batch_size == 0 or count == len(data):
-                batch += 1
-                
-                # save batch results to temporary directory
-                json_file_path = temp_dir / f"batch_{batch}.json"
-                with open(json_file_path, "w", encoding='utf-8') as f:
-                    json.dump(result, f, indent=4, ensure_ascii=False)
-                
-                # if saving logs, write to txt file
-                if args.save_rewriter_logs:
-                    txt_file_path = temp_dir / f"batch_{batch}.txt"
-                    with open(txt_file_path, "w", encoding='utf-8') as f:
-                        f.write(f"Batch {batch} - Query Rewriter Logs\n")
-                        f.write("="*50 + "\n\n")
-                        for r in result:
-                            f.write(f"Query ID: {r['id']}\n")
-                            f.write(f"Original: {r['original_query']}\n")
-                            f.write(f"Rewritten: {r['rewritten_query']}\n")
-                            f.write(f"Time Cost: {r['time_cost']:.2f}s\n")
-                            f.write(f"Suggestion: {r['rewrite_suggestion']}\n")
-                            f.write(rewriter.terminal_output)
-                            f.write("\n" + "-"*40 + "\n\n")
-                
-                await rewriter.clear_log()
-                result = []  # clear result for next batch
-        
+            await rewriter.clear_log()
+
         # update progress bar when done
         pbar.set_description("🔄 Query Rewriter Completed")
-        pbar.set_postfix({'Status': 'Merging files...'})
-    
-    print(f"\n✅ Query Rewriter completed! Processed {count} queries in {batch} batches")
-    
-    # merge all batch files into output directory
-    final_file = merge_batch_files(temp_dir, directories['output'], "rewritten_queries.json")
-    return final_file
+        pbar.set_postfix({'Status': f'Processed {count} queries'})
+
+    print(f"\n✅ Query Rewriter completed! Processed {count} queries")
+    print(f"📁 Final output: {final_output_file}")
+    return final_output_file
 
 async def run_hint_recommender(args, directories, dbms, rewriter_output_file):
     """run query hint recommender"""
@@ -350,21 +383,22 @@ async def main():
         rewriter_output_file = await run_query_rewriter(args, directories, dbms, data_statistics, schema_file)
     
     # run Hint Recommender
-    if not args.enable_rewriter:
-        # if rewriter is not enabled, check if rewriter output file exists
-        existing_file = directories['output'] / "rewritten_queries.json"
-        if existing_file.exists():
-            rewriter_output_file = existing_file
-            print(f"📖 Using existing rewriter output: {existing_file}")
-        else:
-            print("❌ No existing rewriter output found. Cannot run recommender without rewriter data.")
+    if args.enable_recommender:
+        if not args.enable_rewriter:
+            # if rewriter is not enabled, check if rewriter output file exists
+            existing_file = directories['output'] / "rewritten_queries.json"
+            if existing_file.exists():
+                rewriter_output_file = existing_file
+                print(f"📖 Using existing rewriter output: {existing_file}")
+            else:
+                print("❌ No existing rewriter output found. Cannot run recommender without rewriter data.")
+                return
+
+        if not rewriter_output_file:
+            print("❌ No rewriter output available for recommender.")
             return
-    
-    if not rewriter_output_file:
-        print("❌ No rewriter output available for recommender.")
-        return
-        
-    recommender_output_file = await run_hint_recommender(args, directories, dbms, rewriter_output_file)
+
+        recommender_output_file = await run_hint_recommender(args, directories, dbms, rewriter_output_file)
 
     ###########################################################
     # summary and output

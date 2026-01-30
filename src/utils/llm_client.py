@@ -19,23 +19,41 @@ import tiktoken
 
 
 class GPT:
+    """
+    Lightweight LLM client with optional DeepSeek-thinking support and
+    simple token/cost accounting.
+    """
+
+    # Global accumulators across all GPT instances (for the whole process)
+    _global_input_tokens = 0
+    _global_output_tokens = 0
+    _global_cost_rmb = 0.0
+
     def __init__(self, api_key, model, base_url):
         """
         Initialize the GPT client.
-        
+
         Args:
             api_key (str): Your OpenAI API key
-            model (str): The GPT model to use (e.g., 'gpt-4o', 'gpt-3.5-turbo')
+            model (str): The GPT model to use (e.g., 'gpt-4o', 'gpt-3.5-turbo', 'deepseek-v3.2')
             base_url (str): The base URL for the OpenAI API
         """
-        self.api_key = api_key  
-        self.model = model
+        self.api_key = api_key
+        self.model = model or ""
         self.base_url = base_url
+
+        # Per-instance accumulators
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cost_rmb = 0.0
+
+        # Check if this is a DeepSeek thinking model
+        self.is_deepseek_thinking = "deepseek" in self.model.lower() and ("v3" in self.model or "thinking" in self.model)
 
         # Initialize synchronous client
         self.client = OpenAI(
-            api_key= self.api_key,
-            base_url = self.base_url
+            api_key=self.api_key,
+            base_url=self.base_url
         )
 
         # Initialize asynchronous client
@@ -44,15 +62,81 @@ class GPT:
             base_url=self.base_url
         )
 
+    def _count_tokens(self, text: str) -> int:
+        """
+        Rough token count using a generic tokenizer.
+        This is an approximation but good enough for cost estimation.
+        """
+        if not text:
+            return 0
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        except Exception:
+            # Fallback heuristic: 1 token ≈ 2 characters
+            return max(1, len(text) // 2)
+
+    def _estimate_cost_rmb(self, input_tokens: int, output_tokens: int) -> float:
+        """
+        Estimate RMB cost based on model pricing.
+
+        For deepseek-v3.2 (from screenshot):
+            - Input:  0.002 RMB / 1K tokens
+            - Output: 0.003 RMB / 1K tokens
+
+        For other models, we currently return 0 (can be extended later).
+        """
+        model_lower = self.model.lower()
+        if "deepseek-v3.2" in model_lower or ("deepseek" in model_lower and "v3" in model_lower):
+            in_price = 0.002  # RMB per 1K tokens
+            out_price = 0.003
+        else:
+            # Unknown pricing → don't charge
+            in_price = 0.0
+            out_price = 0.0
+
+        return (input_tokens / 1000.0) * in_price + (output_tokens / 1000.0) * out_price
+
+    def _update_usage(self, prompt: str, response: str):
+        """
+        Update per-instance and global token/cost statistics.
+        """
+        in_tokens = self._count_tokens(prompt)
+        out_tokens = self._count_tokens(response)
+        cost = self._estimate_cost_rmb(in_tokens, out_tokens)
+
+        # Update instance-level stats
+        self.input_tokens += in_tokens
+        self.output_tokens += out_tokens
+        self.cost_rmb += cost
+
+        # Update global stats
+        GPT._global_input_tokens += in_tokens
+        GPT._global_output_tokens += out_tokens
+        GPT._global_cost_rmb += cost
+
+    @classmethod
+    def get_global_usage(cls):
+        """
+        Get aggregated usage across all GPT instances.
+        Returns:
+            dict: {input_tokens, output_tokens, total_cost_rmb}
+        """
+        return {
+            "input_tokens": cls._global_input_tokens,
+            "output_tokens": cls._global_output_tokens,
+            "total_cost_rmb": cls._global_cost_rmb,
+        }
+
     def get_LLM_response(self, prompt, system_message=None, json_format=False) -> str:
         """
         Get a streaming response from GPT.
-        
+
         Args:
             prompt (str): The user prompt to send to GPT
             system_message (str, optional): System message to set context. Defaults to None.
             json_format (bool, optional): Whether to request JSON formatted response. Defaults to False.
-            
+
         Returns:
             str: The complete response from GPT
         """
@@ -61,7 +145,12 @@ class GPT:
         if system_message:
             messages.append({"role": "system", "content": system_message})
         messages.append({"role": "user", "content": prompt})
-        
+
+        # Prepare extra parameters for DeepSeek thinking models
+        extra_params = {}
+        if self.is_deepseek_thinking:
+            extra_params["extra_body"] = {"enable_thinking": True}
+
         if json_format:
             # Request JSON formatted response
             completion = self.client.chat.completions.create(
@@ -69,45 +158,60 @@ class GPT:
                 model=self.model,
                 response_format={"type": "json_object"},
                 messages=messages,
-                stream=True
+                stream=True,
+                **extra_params
             )
-            full_response = ""
-            for chunk in completion:
-                if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
-                    chunk_text = chunk.choices[0].delta.content
-                    print(chunk_text, end="", flush=True)
-                    full_response += chunk_text
-            print()
+
+            if self.is_deepseek_thinking:
+                full_response = self._process_deepseek_streaming_response(completion)
+            else:
+                full_response = ""
+                for chunk in completion:
+                    if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                        chunk_text = chunk.choices[0].delta.content
+                        print(chunk_text, end="", flush=True)
+                        full_response += chunk_text
+                print()
+
+            # Update cost statistics
+            self._update_usage(prompt, full_response)
             return full_response
-            
+
         else:
             # Request regular text response
             completion = self.client.chat.completions.create(
                 temperature=0.0,
                 model=self.model,
                 messages=messages,
-                stream=True
+                stream=True,
+                **extra_params
             )
 
-            # Process streaming response
-            full_response = ""
-            for chunk in completion:
-                if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
-                    chunk_text = chunk.choices[0].delta.content
-                    print(chunk_text, end="", flush=True)
-                    full_response += chunk_text
-            print() # New line after response
+            if self.is_deepseek_thinking:
+                full_response = self._process_deepseek_streaming_response(completion)
+            else:
+                # Process streaming response
+                full_response = ""
+                for chunk in completion:
+                    if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                        chunk_text = chunk.choices[0].delta.content
+                        print(chunk_text, end="", flush=True)
+                        full_response += chunk_text
+                print()  # New line after response
+
+            # Update cost statistics
+            self._update_usage(prompt, full_response)
             return full_response
     
     async def get_LLM_response_async(self, prompt, system_message=None, json_format=False) -> str:
             """
             Get an asynchronous streaming response from GPT.
-            
+
             Args:
                 prompt (str): The user prompt to send to GPT
                 system_message (str, optional): System message to set context. Defaults to None.
                 json_format (bool, optional): Whether to request JSON formatted response. Defaults to False.
-                
+
             Returns:
                 str: The complete response from GPT
             """
@@ -116,7 +220,12 @@ class GPT:
             if system_message:
                 messages.append({"role": "system", "content": system_message})
             messages.append({"role": "user", "content": prompt})
-            
+
+            # Prepare extra parameters for DeepSeek thinking models
+            extra_params = {}
+            if self.is_deepseek_thinking:
+                extra_params["extra_body"] = {"enable_thinking": True}
+
             if json_format:
                 # Request JSON formatted response
                 completion = await self.async_client.chat.completions.create(
@@ -124,15 +233,23 @@ class GPT:
                     model=self.model,
                     response_format={"type": "json_object"},
                     messages=messages,
-                    stream=True
+                    stream=True,
+                    **extra_params
                 )
-                full_response = ""
-                async for chunk in completion:
-                    if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
-                        chunk_text = chunk.choices[0].delta.content
-                        print(chunk_text, end="", flush=True)
-                        full_response += chunk_text
-                print()
+
+                if self.is_deepseek_thinking:
+                    full_response = await self._process_deepseek_streaming_response_async(completion)
+                else:
+                    full_response = ""
+                    async for chunk in completion:
+                        if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                            chunk_text = chunk.choices[0].delta.content
+                            print(chunk_text, end="", flush=True)
+                            full_response += chunk_text
+                    print()
+
+                # Update cost statistics
+                self._update_usage(prompt, full_response)
                 return full_response
             else:
                 # Request regular text response
@@ -140,21 +257,93 @@ class GPT:
                     temperature=0.0,
                     model=self.model,
                     messages=messages,
-                    stream=True
+                    stream=True,
+                    **extra_params
                 )
 
-                # Process streaming response asynchronously
-                full_response = ""
-                async for chunk in completion:
-                    if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
-                        chunk_text = chunk.choices[0].delta.content
-                        print(chunk_text, end="", flush=True)
-                        full_response += chunk_text
-                print() # New line after response
-                return full_response
-    
+                if self.is_deepseek_thinking:
+                    full_response = await self._process_deepseek_streaming_response_async(completion)
+                else:
+                    # Process streaming response asynchronously
+                    full_response = ""
+                    async for chunk in completion:
+                        if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                            chunk_text = chunk.choices[0].delta.content
+                            print(chunk_text, end="", flush=True)
+                            full_response += chunk_text
+                    print()  # New line after response
 
-    
+                # Update cost statistics
+                self._update_usage(prompt, full_response)
+                return full_response
+
+    def _process_deepseek_streaming_response(self, completion) -> str:
+        """
+        Process DeepSeek streaming response with thinking content.
+
+        Args:
+            completion: The streaming completion object
+
+        Returns:
+            str: The complete response content (without thinking)
+        """
+        full_response = ""
+        is_answering = False
+
+        for chunk in completion:
+            delta = chunk.choices[0].delta
+
+            # Handle reasoning content (thinking process)
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content is not None:
+                if not is_answering:
+                    # Only print thinking content before the actual answer starts
+                    print(delta.reasoning_content, end="", flush=True)
+
+            # Handle actual content
+            if hasattr(delta, "content") and delta.content:
+                if not is_answering:
+                    print("\n" + "=" * 20 + "完整回复" + "=" * 20)
+                    is_answering = True
+                print(delta.content, end="", flush=True)
+                full_response += delta.content
+
+        print()  # New line after response
+        return full_response
+
+    async def _process_deepseek_streaming_response_async(self, completion) -> str:
+        """
+        Process DeepSeek streaming response asynchronously with thinking content.
+
+        Args:
+            completion: The async streaming completion object
+
+        Returns:
+            str: The complete response content (without thinking)
+        """
+        full_response = ""
+        is_answering = False
+
+        async for chunk in completion:
+            delta = chunk.choices[0].delta
+
+            # Handle reasoning content (thinking process)
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content is not None:
+                if not is_answering:
+                    # Only print thinking content before the actual answer starts
+                    print(delta.reasoning_content, end="", flush=True)
+
+            # Handle actual content
+            if hasattr(delta, "content") and delta.content:
+                if not is_answering:
+                    print("\n" + "=" * 20 + "完整回复" + "=" * 20)
+                    is_answering = True
+                print(delta.content, end="", flush=True)
+                full_response += delta.content
+
+        print()  # New line after response
+        return full_response
+
+
     # def calc_token(self, in_text, out_text="") -> int:
     #     """
     #     Calculate the number of tokens for given text using the model's tokenizer.
