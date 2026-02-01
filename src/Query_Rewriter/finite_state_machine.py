@@ -9,7 +9,7 @@ setup_python_path()
 
 from src.Rewrite_Middleware.middleware import DBMS_EXPLAIN_Tool, DBMS_Syntax_Tool, Knowledge_Base_Tool, Equivalence_Check_Tool, DBMS
 from src.Rewrite_Middleware.Agent_Memory_Buffer.memory_buffer import AgentMemoryBuffer, OutputCollector, create_memory_buffer
-from src.Query_Rewriter.agent_definition import ReasoningAgent, AssistantAgent, DecisionAgent, RewriteAgent, get_rules_by_groups, get_rule_examples
+from src.Query_Rewriter.agent_definition import ReasoningAgent, DecisionAgent, RewriteAgent, get_rules_by_groups, get_rule_examples
 from src.utils.agent_template import MessageContent, Message, MemoryWindow, MessageQueue
 
 
@@ -27,13 +27,11 @@ class QueryRewriter:
 
         # Initialize each agent
         self.reasoning_agent = ReasoningAgent(message_queue)
-        self.assistant_agent = AssistantAgent(message_queue)
         self.decision_agent = DecisionAgent(message_queue)
         self.rewrite_agent = RewriteAgent(message_queue)
 
         # Set up observation relationships
         self.decision_agent.watch(["ReasoningAgent","ExplainAgent"])
-        self.assistant_agent.watch(["SummaryAgent","ExplainAgent"])
 
         # Multi-round optimization variables
         self.optimization_round = 1
@@ -80,12 +78,12 @@ class QueryRewriter:
         self.memory.produced_sql = value
     
     @property
-    def enhanced_sql(self):
-        return self.memory.enhanced_sql
+    def rewritten_sql(self):
+        return self.memory.rewritten_sql
     
-    @enhanced_sql.setter
-    def enhanced_sql(self, value):
-        self.memory.enhanced_sql = value
+    @rewritten_sql.setter
+    def rewritten_sql(self, value):
+        self.memory.rewritten_sql = value
     
     @property
     def re_explain_result(self):
@@ -264,7 +262,8 @@ class QueryRewriter:
                     self.selected_rules,
                     rule_examples,
                     json.dumps(self.optimization_advice, ensure_ascii=False),
-                    self.data_statistics
+                    self.data_statistics,
+                    self.schema_file
                 )
 
             self.current_rewrite_result = rewrite_result
@@ -447,18 +446,18 @@ class QueryRewriter:
                 )
             
             produced_sql = self.decision_agent.extract_sql_candidate_content(summary)
-            enhanced_sql = self.decision_agent.extract_enhanced_sql_content(summary)
+            rewritten_sql = self.decision_agent.extract_rewritten_sql_content(summary)
             optimization_advice = self.decision_agent.extract_advice_content(summary)
 
             # Check if there is any actual optimization content
-            if enhanced_sql and enhanced_sql.strip() and enhanced_sql != self.initial_sql:
+            if rewritten_sql and rewritten_sql.strip() and rewritten_sql != self.initial_sql:
                 # If there is valid optimized SQL, use it
                 print(f"Worker {worker_id}: Found optimized SQL")
                 return {
                     "worker_id": worker_id,
                     "status": "success",
                     "produced_sql": produced_sql,
-                    "enhanced_sql": enhanced_sql,
+                    "rewritten_sql": rewritten_sql,
                     "optimization_advice": optimization_advice
                 }
             elif "TERMINATE" in reasoning_result:
@@ -468,7 +467,7 @@ class QueryRewriter:
                     "worker_id": worker_id,
                     "status": "early_stop",
                     "produced_sql": self.initial_sql,
-                    "enhanced_sql": self.initial_sql,
+                    "rewritten_sql": self.initial_sql,
                     "optimization_advice": "No need to optimize"
                 }
             else:
@@ -478,7 +477,7 @@ class QueryRewriter:
                     "worker_id": worker_id,
                     "status": "success",
                     "produced_sql": produced_sql or self.initial_sql,
-                    "enhanced_sql": enhanced_sql or self.initial_sql,
+                    "rewritten_sql": rewritten_sql or self.initial_sql,
                     "optimization_advice": optimization_advice or "No specific advice"
                 }
             
@@ -523,7 +522,7 @@ class QueryRewriter:
         if not self.parallel_reasoning_results:
             print("## All the parallel reasoning workers failed. Use the original SQL.##")
             self.produced_sql = self.initial_sql
-            self.enhanced_sql = self.initial_sql
+            self.rewritten_sql = self.initial_sql
             self.optimization_advice = "No need to optimize"
             self.current_state = "TERMINATED"
         else:
@@ -536,7 +535,7 @@ class QueryRewriter:
     async def parallel_verification_worker(self, reasoning_result: dict):
         """verification worker"""
         worker_id = reasoning_result["worker_id"]
-        enhanced_sql = reasoning_result["enhanced_sql"]
+        rewritten_sql = reasoning_result["rewritten_sql"]
         produced_sql = reasoning_result["produced_sql"]
         optimization_advice = reasoning_result["optimization_advice"]
         
@@ -545,7 +544,7 @@ class QueryRewriter:
             
             # Syntax Check
             async with self.db_semaphore:
-                syntax_check = await DBMS_Syntax_Tool(self.dbms, enhanced_sql)
+                syntax_check = await DBMS_Syntax_Tool(self.dbms, rewritten_sql)
             MAX_CORRECT_TIMES = 0
             MAX_CORRECT_FLAG = False
             
@@ -562,8 +561,8 @@ class QueryRewriter:
                     print(f"Worker {worker_id}: ################ Start correct the error ################")
                     print(f"Worker {worker_id}: Current error to fix: {current_error}")
                     async with self.llm_semaphore:
-                        checked_sql = await self.assistant_agent._correct_sql(
-                            self.initial_sql, enhanced_sql, current_error  # Always modify the initial version, but use the current error
+                        checked_sql = await self.rewrite_agent.correct_sql(
+                            self.initial_sql, rewritten_sql, current_error  # Always modify the initial version, but use the current error
                         )
                     async with self.db_semaphore:
                         check_result = await DBMS_Syntax_Tool(self.dbms, checked_sql)
@@ -573,7 +572,7 @@ class QueryRewriter:
                         CHECK_FLAG = True
                         MAX_CORRECT_FLAG = True
                         print(f"-- Worker {worker_id}: ✓ THE GRAMMAR CHECK HAS BEEN PASSED.--")
-                        enhanced_sql = checked_sql
+                        rewritten_sql = checked_sql
                     else:
                         # Update the error information to the current attempted error for reference in the next correction
                         current_error = check_result["error"]
@@ -596,7 +595,7 @@ class QueryRewriter:
             print(f"-- Worker {worker_id}: Perform SQL equivalence check--")
             
             result = await Equivalence_Check_Tool(
-                self.initial_sql, enhanced_sql, self.schema_file, timeout=10
+                self.initial_sql, rewritten_sql, self.schema_file, timeout=10
             )
             
             if result is not None and "EQ" in result:
@@ -605,7 +604,7 @@ class QueryRewriter:
             else:
                 print(f"-- Worker {worker_id}: X Not verified by the optimizer, calling LLM to rewrite process--")
                 CHECK_EQUIV_FLAG = False
-                tmp_checked_sql = enhanced_sql
+                tmp_checked_sql = rewritten_sql
                 
                 while CHECK_EQUIV_FLAG == False and MAX_EQUIV_TIMES < 3:
                     if self._stop_event.is_set():
@@ -622,7 +621,7 @@ class QueryRewriter:
                     if "true" in CHCKED_FLAG or "True" in CHCKED_FLAG:
                         CHECK_EQUIV_FLAG = True
                         MAX_EQUIV_FLAG = True
-                        enhanced_sql = tmp_checked_sql
+                        rewritten_sql = tmp_checked_sql
                         print(f"-- Worker {worker_id}: ✓ Optimize SQL to be equivalent to the original SQL--")
                     else:
                         print(f"-- Worker {worker_id}: X Optimize SQL not be equivalent to the original SQL (try {MAX_EQUIV_TIMES}/3)--")
@@ -633,7 +632,7 @@ class QueryRewriter:
                 
                 if MAX_EQUIV_FLAG == False:
                     print(f"-- Worker {worker_id}: X The equivalence check failed. The maximum number of attempts has been reached. Using the original SQL.--")
-                    enhanced_sql = self.initial_sql
+                    rewritten_sql = self.initial_sql
                     self.optimization_advice = "No need to optimize"
             
             print(f"-- Worker {worker_id}: Verification completed")
@@ -641,7 +640,7 @@ class QueryRewriter:
                 "worker_id": worker_id,
                 "status": "success",
                 "produced_sql": produced_sql,
-                "enhanced_sql": enhanced_sql,
+                "rewritten_sql": rewritten_sql,
                 "optimization_advice": optimization_advice,
                 "equivalence_passed": MAX_EQUIV_FLAG
             }
@@ -677,7 +676,7 @@ class QueryRewriter:
                 "worker_id": early_stop["worker_id"],
                 "status": "success",
                 "produced_sql": early_stop["produced_sql"],
-                "enhanced_sql": early_stop["enhanced_sql"],
+                "rewritten_sql": early_stop["rewritten_sql"],
                 "optimization_advice": early_stop["optimization_advice"]
             })
 
@@ -711,7 +710,7 @@ class QueryRewriter:
             # All verification attempts failed, terminate using the original SQL
             print("## All the parallel verification workers failed. Using the original SQL.##")
             self.produced_sql = self.initial_sql
-            self.enhanced_sql = self.initial_sql
+            self.rewritten_sql = self.initial_sql
             self.optimization_advice = "No need to optimize"
             self.current_state = "TERMINATED"
 
@@ -734,7 +733,7 @@ class QueryRewriter:
             for result in self.parallel_verification_results:
                 query_pairs.append({
                     "id": result["worker_id"],
-                    "enhanced_sql": result["enhanced_sql"],
+                    "rewritten_sql": result["rewritten_sql"],
                 })
             
             async with self.llm_semaphore:
@@ -756,10 +755,10 @@ class QueryRewriter:
 
         # Set the selected result
         self.produced_sql = selected_result["produced_sql"]
-        self.enhanced_sql = selected_result["enhanced_sql"]
+        self.rewritten_sql = selected_result["rewritten_sql"]
         self.optimization_advice = selected_result["optimization_advice"]
 
-        print(f"## Selected Rewritten SQL: {self.enhanced_sql} ##")
+        print(f"## Selected Rewritten SQL: {self.rewritten_sql} ##")
         print(f"## Rewrite Proposals: {self.optimization_advice} ##")
 
 
@@ -768,18 +767,16 @@ class QueryRewriter:
         async with self.db_semaphore:
             # Execute the two explain tasks in parallel
             ori_explain_task = asyncio.create_task(DBMS_EXPLAIN_Tool(self.dbms, self.initial_sql))
-            enhanced_explain_task = asyncio.create_task(DBMS_EXPLAIN_Tool(self.dbms, self.enhanced_sql))
+            enhanced_explain_task = asyncio.create_task(DBMS_EXPLAIN_Tool(self.dbms, self.rewritten_sql))
             
             ori_explain_result, enhanced_explain_result = await asyncio.gather(
                 ori_explain_task, enhanced_explain_task
             )
-        async with self.llm_semaphore:
-            report = await self.assistant_agent.generate_report(
-                ori_explain_result, enhanced_explain_result, enhanced_explain_result
-            )
-        
-        analysis_report = self.assistant_agent.extract_analysis_content(report)
-        self.report = analysis_report
+        # Store explain results as report (simplified - no detailed report generation needed)
+        self.report = {
+            "original_explain": ori_explain_result,
+            "rewritten_explain": enhanced_explain_result
+        }
         print(f"## Report generation completed ##")
 
         # Step 2: Make a decision
@@ -792,7 +789,7 @@ class QueryRewriter:
         async with self.llm_semaphore:
             decision = await self.decision_agent.evaluate(
                 self.initial_sql,
-                self.enhanced_sql,
+                self.rewritten_sql,
                 self.report,
                 worker_equivalence_flags
             )
@@ -806,16 +803,16 @@ class QueryRewriter:
                 print(f"## The decision was not approved. Further optimization is required (iteration: {self.iteration}/{self.MAX_ITERATION_LOOP}) ##")
                 
                 print("## Start a new round of complete iteration ## ")
-                rag_knowledge = await Knowledge_Base_Tool(self.enhanced_sql, self.optimization_advice)
+                rag_knowledge = await Knowledge_Base_Tool(self.rewritten_sql, self.optimization_advice)
                 async with self.llm_semaphore:
                     self.optimization_advice = await self.decision_agent.merge_advice(
-                        self.enhanced_sql, 
+                        self.rewritten_sql, 
                         self.optimization_advice,
                         rag_knowledge
                     )
                 input_report = {
                     "decision": decision,
-                    "pre_rewrite_sql": self.enhanced_sql,
+                    "pre_rewrite_sql": self.rewritten_sql,
                     "corrected_guide_knowledge": rag_knowledge,
                 }
                 self.guide_info = input_report
@@ -827,7 +824,7 @@ class QueryRewriter:
                 self.current_state = "REASONING"
         else:
             print(f"## Reach the maximum number of iterations ({self.MAX_ITERATION_LOOP}),print Terminate optimization ##")
-            self.enhanced_sql = self.initial_sql
+            self.rewritten_sql = self.initial_sql
             self.current_state = "TERMINATED"
             self.optimization_advice = "No need to optimize"
 

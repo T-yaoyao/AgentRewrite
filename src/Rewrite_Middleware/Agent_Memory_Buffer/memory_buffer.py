@@ -16,7 +16,7 @@ class AgentMemoryBuffer:
         # Rewriting process results
         self.optimization_advice = None
         self.produced_sql = None
-        self.enhanced_sql = None
+        self.rewritten_sql = None
 
         # Execution plan related
         self.ori_explain_result = None
@@ -36,7 +36,7 @@ class AgentMemoryBuffer:
         self.initial_sql = None
         self.optimization_advice = None
         self.produced_sql = None
-        self.enhanced_sql = None
+        self.rewritten_sql = None
         self.ori_explain_result = None
         self.re_explain_result = None
         self.imp_explain_result = None
@@ -47,7 +47,7 @@ class AgentMemoryBuffer:
         """Get current status for debugging"""
         status = {}
         for attr in ['initial_sql', 'data_statistics', 'schema_file', 
-                    'optimization_advice', 'produced_sql', 'enhanced_sql',
+                    'optimization_advice', 'produced_sql', 'rewritten_sql',
                     'ori_explain_result', 're_explain_result', 'imp_explain_result',
                     'report', 'guide_info']:
             value = getattr(self, attr)

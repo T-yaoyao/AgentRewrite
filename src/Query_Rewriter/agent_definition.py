@@ -386,11 +386,11 @@ class DecisionAgent(Agent):
         // 重写 SQL 语句的分析
         </analysis>
         
-        </enhanced_sql>
+        </rewritten_sql>
         ```sql
                                  
         ```
-        </enhanced_sql>
+        </rewritten_sql>
                                  
 
         [chain]
@@ -464,7 +464,7 @@ class DecisionAgent(Agent):
         return response
 
     
-    async def evaluate(self, ori_sql: str, enhanced_sql: str, report: str, worker_equivalence_flags: List[bool] = None) -> dict:
+    async def evaluate(self, ori_sql: str, rewritten_sql: str, report: str, worker_equivalence_flags: List[bool] = None) -> dict:
         # Check if all workers failed equivalence check
         equivalence_failure_info = ""
         if worker_equivalence_flags is not None and all(not flag for flag in worker_equivalence_flags):
@@ -481,17 +481,17 @@ class DecisionAgent(Agent):
         你负责评估 SQL 优化是否符合标准。请根据以下信息决定是否终止优化过程：
         你想终止优化过程吗？
 
-        * 注意：<original_sql> 和 <enhanced_sql> 的执行时间来自数据库优化器，可能不精确。基于详细分析做出决定。
-        注意：<original_sql> 和 <enhanced_sql> 的执行时间来自数据库优化器，可能不精确。基于详细分析做出决定。
+        * 注意：<original_sql> 和 <rewritten_sql> 的执行时间来自数据库优化器，可能不精确。基于详细分析做出决定。
+        注意：<original_sql> 和 <rewritten_sql> 的执行时间来自数据库优化器，可能不精确。基于详细分析做出决定。
         * 客观评估改进 SQL 是否满足成功重写的指标。
 
         终止条件：
         [True]:
-            1. enhanced_sql 执行时间 < ori_sql 执行时间 and enhanced_sql执行没有报错.
-            2. enhanced_sql 执行时间 ≥ ori_sql 执行时间，由于基数估计不准确，但你仍可将此次重写视为一种优化。
+            1. rewritten_sql 执行时间 < ori_sql 执行时间 and rewritten_sql执行没有报错.
+            2. rewritten_sql 执行时间 ≥ ori_sql 执行时间，由于基数估计不准确，但你仍可将此次重写视为一种优化。
 
         [False]:
-            enhanced_sql 执行时间 ≥ ori_sql 执行时间，或 enhanced_sql 执行失败。
+            rewritten_sql 执行时间 ≥ ori_sql 执行时间，或 rewritten_sql 执行失败。
             {equivalence_failure_info}
             
         请严格遵循以下 JSON 格式返回你的答案：
@@ -503,8 +503,8 @@ class DecisionAgent(Agent):
         <original_sql>:
         {ori_sql}
 
-        <enhanced_sql>:
-        {enhanced_sql}
+        <rewritten_sql>:
+        {rewritten_sql}
 
         <report>:
         {report}
@@ -547,13 +547,11 @@ class DecisionAgent(Agent):
 
         终止条件：
         [True]:
-            1. enhanced_sql costs < ori_sql costs (优化成功，直接终止)
-            2. enhanced_sql costs ≥ ori_sql costs (成本不变或增加，认为当前SQL在重写层面已经无法进行优化，直接终止并回退SQL到原始SQL)
+            1. rewritten_sql costs < ori_sql costs (优化成功，直接终止)
+            2. rewritten_sql costs ≥ ori_sql costs (成本不变或增加，并且你认为当前SQL在重写层面已经无法进行优化，直接终止并回退SQL到原始SQL)
 
         [False]:
-            只有在极特殊情况下，如果执行计划明确显示还有明显优化空间，才继续下一轮优化。
-
-        **重要**：对于成本不变或增加的情况，默认应该终止优化，因为这表明重写没有带来性能改善。
+            只有在极特殊情况下，如果SQL和执行计划明确显示还有明显优化空间，才继续下一轮优化。
 
         {f"上一轮评估失败原因: {reason}" if reason else ""}
 
@@ -650,18 +648,18 @@ class DecisionAgent(Agent):
         print(f"Warning: Could not extract SQL candidate from response")
         return ""
 
-    def extract_enhanced_sql_content(self, text: str) -> str:
+    def extract_rewritten_sql_content(self, text: str) -> str:
         """
-        Extract content between </enhanced_sql> and </enhanced_sql> tags.
+        Extract content between </rewritten_sql> and </rewritten_sql> tags.
         """
         # First, try to match the format with ```sql
-        pattern1 = r'</enhanced_sql>\s*```sql\s*(.*?)\s*```\s*</enhanced_sql>'
+        pattern1 = r'</rewritten_sql>\s*```sql\s*(.*?)\s*```\s*</rewritten_sql>'
         match1 = re.search(pattern1, text, re.DOTALL)
         if match1:
             return match1.group(1).strip()
 
         # Try to match the format without ```
-        pattern2 = r'</enhanced_sql>\s*(.*?)\s*</enhanced_sql>'
+        pattern2 = r'</rewritten_sql>\s*(.*?)\s*</rewritten_sql>'
         match2 = re.search(pattern2, text, re.DOTALL)
         if match2:
             sql_content = match2.group(1).strip()
@@ -669,7 +667,7 @@ class DecisionAgent(Agent):
             sql_content = re.sub(r'\s*```$', '', sql_content)
             return sql_content.strip()
         
-        print(f"Warning: Could not extract enhanced SQL from response")
+        print(f"Warning: Could not extract rewritten SQL from response")
         return ""
     
     def extract_equivalence_content(self, text: str) -> str:
@@ -747,123 +745,6 @@ class DecisionAgent(Agent):
         return [msg.content.text for msg in messages if msg.content and msg.content.text]
 
 
-class AssistantAgent(Agent):
-    """Execution Plan Analysis Agent"""
-    def __init__(self, mq: MessageQueue):
-        super().__init__("AssistantAgent", mq, gpt = GPT(
-    api_key=os.getenv("ASSISTANT_MODEL_API_KEY"),
-    model=os.getenv("ASSISTANT_MODEL"),
-    base_url=os.getenv("ASSISTANT_MODEL_URL")
-))
-    
-    def extract_corrected_sql_content(self, text: str) -> str:
-        """
-        Extract content between </corrected_sql>```sql and ```</corrected_sql> tags.
-        """
-        pattern = r'</corrected_sql>\s*```sql\s*(.*?)\s*```\s*</corrected_sql>'
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return ""
-    
-    async def _correct_sql(self, original_sql: str, rewritten_sql: str, error: str) -> str:
-        """Correct SQL syntax errors"""
-        prompt = textwrap.dedent(f"""
-        你是一名经验丰富的 DBA，核心任务是修正 SQL 语法错误。
-        1. 修正以下 SQL 语句，使用提供的错误消息。
-
-            * 注意：如果 SQL 包含双引号，请保留它们 exactly as they appear.
-            <rewritten_sql>
-            {rewritten_sql}
-
-           错误消息:
-            {error}
-
-            下面是重写 SQL 的原始形式，用于参考模式。
-            只修正 <rewritten_sql> 中的语法；不要与原始 SQL 对齐，
-            且不要包含任何 "EXPLAIN (FORMAT JSON)" 子句！
-
-            <original_sql>
-            {original_sql}
-
-            请严格遵循以下格式：
-            [format]
-            </analysis>
-
-            </analysis>
-
-            </corrected_sql>
-            // 插入修正后的 SQL 语句。
-            </corrected_sql>
-            """)
-
-        
-        response = await self.llm.get_LLM_response_async(
-            prompt=prompt
-        )
-        
-        corrected_sql = self.extract_corrected_sql_content(response)
-        return corrected_sql
-    
-    def extract_analysis_content(self, text: str) -> str:
-        """
-        Extract content between </analysis> and </analysis> tags.
-        """
-        print(text)
-        if text is None:
-            print("Error: text is None")
-            return None
-        pattern = r'</analysis>\s*(.*?)\s*</analysis>'
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            return match.group(1).strip()#  match.group(1).strip()
-        return ""
-
-    
-    async def  generate_report(self, ori_explain_result: list, re_explain_result: list, imp_explain_result: list) -> str:
-        prompt = textwrap.dedent(f"""
-        <Mission>
-        你是一名经验丰富的 DBA，核心任务是生成详细的报告，基于原始 EXPLAIN 分析、重写 EXPLAIN 分析和增强 EXPLAIN 分析。
-        你应该考虑并比较它们与包含这些部分的报告：
-        1. 成本效率：
-            - 总体成本变化百分比  
-            - 最昂贵计划节点成本变化  
-        2. 计划特征：
-            - 扫描类型转换 (例如：Seq Scan → Index Scan)  
-            - 连接算法改进 (例如：Hash Join → Merge Join)  
-            - 显式排序消除和中间结果集减少   
-        3. 资源利用：
-            - 内存使用 (Hash/Buffer 节点变化)
-            - 工作线程数调整
-        4. 其他改进：
-                                 
-        注意：在你的报告中，不需要复制 EXPLAIN 结果，只需进行 NLP 分析和比较。
-                                 
-        请严格遵循以下格式：
-        [format]
-        </analysis>
-            ...
-        </analysis>
-                                 
-        </report>
-            ... // 不需要重复提及 EXPLAIN 结果
-        </report>
-                                                      
-        <ori_explain_result>
-        {ori_explain_result}
-
-        <re_explain_result>
-        {re_explain_result}
-
-        <imp_explain_result>
-        {imp_explain_result}
-
-        """)
-        return await self.llm.get_LLM_response_async(
-            prompt=prompt
-        )
-
-
 # Utility functions for rule management
 def load_rule_knowledge_base() -> dict:
     """Load rule knowledge base from Rule_Examples.json"""
@@ -928,8 +809,8 @@ class RewriteAgent(Agent):
         ))
         self.watch(["DecisionAgent", "ReasoningAgent"])
 
-    async def rewrite_with_rule_sequence(self, sql: str, rule_sequence: dict, rule_examples: dict, optimization_direction: str, data_statistics: str) -> dict:
-        """Execute SQL rewriting based on selected rule sequence"""
+    async def rewrite_with_rule_sequence(self, sql: str, rule_sequence: dict, rule_examples: dict, optimization_direction: str, data_statistics: str, schema_file: str = None) -> dict:
+        """Execute SQL rewriting based on selected rule sequence with semantic equivalence check"""
         applied_rules = rule_sequence.get("applied_rules", [])
         groups = rule_sequence.get("groups", "")
 
@@ -958,22 +839,29 @@ class RewriteAgent(Agent):
            - 严格按照applied_rules中的规则顺序依次应用
            - 每个规则应用后都要确保SQL的正确性
            - 参考rule_examples中的示例进行重写
-           - 保持查询语义的等价性
+           - **必须保持查询语义的等价性**：重写后的SQL必须与原始SQL在语义上完全等价
            - 生成可执行的SQL
 
-        3. 输出格式：
+        3. 语义等价性检查：
+           - 重写后的SQL必须返回与原始SQL相同的结果集
+           - 列名、数据类型、排序顺序等必须保持一致
+           - 聚合函数、窗口函数、子查询等必须保持相同的语义
+
+        4. 输出格式：
         <rewrite>
         {{
             "groups": "{groups}",
             "applied_rules": {json.dumps(applied_rules)},
             "original_sql": "{sql}",
-            "rewritten_sql": "重写后的完整SQL"
+            "rewritten_sql": "重写后的完整SQL",
+            "semantic_check": "语义等价性说明"
         }}
         </rewrite>
 
-        4. 重写要求：
+        5. 重写要求：
            - 生成语义等价且语法正确的SQL
            - 确保重写后的SQL能够正确执行
+           - 在semantic_check中说明如何保证语义等价性
 
         <original_sql>
         {sql}
@@ -1032,7 +920,7 @@ class RewriteAgent(Agent):
         2. 修正要求：
            - 分析错误原因
            - 修正SQL语法错误
-           - 保持查询语义正确性
+           - 保持查询语义正确性（必须与原始SQL语义等价）
            - 生成可执行的SQL
 
         3. 输出要求：
@@ -1052,6 +940,67 @@ class RewriteAgent(Agent):
         response = await self.get_answer(prompt=prompt, silent=True)
         # Extract SQL from response
         return self._extract_sql_from_response_robust(response)
+    
+    async def correct_sql(self, original_sql: str, rewritten_sql: str, error: str) -> str:
+        """Correct SQL syntax errors while maintaining semantic equivalence"""
+        prompt = textwrap.dedent(f"""
+        你是一名经验丰富的 DBA，核心任务是修正 SQL 语法错误，同时保持语义等价性。
+        1. 修正以下 SQL 语句，使用提供的错误消息。
+
+            * 注意：如果 SQL 包含双引号，请保留它们 exactly as they appear.
+            <rewritten_sql>
+            {rewritten_sql}
+
+           错误消息:
+            {error}
+
+            下面是重写 SQL 的原始形式，用于参考模式。
+            只修正 <rewritten_sql> 中的语法；不要与原始 SQL 对齐，
+            且不要包含任何 "EXPLAIN (FORMAT JSON)" 子句！
+            **重要**：修正后的SQL必须与原始SQL在语义上等价。
+
+            <original_sql>
+            {original_sql}
+
+            请严格遵循以下格式：
+            [format]
+            </analysis>
+            分析错误原因和修正方案
+            </analysis>
+
+            </corrected_sql>
+            ```sql
+            插入修正后的 SQL 语句。
+            ```
+            </corrected_sql>
+            """)
+
+        response = await self.llm.get_LLM_response_async(prompt=prompt)
+        corrected_sql = self.extract_corrected_sql_content(response)
+        return corrected_sql
+    
+    def extract_corrected_sql_content(self, text: str) -> str:
+        """
+        Extract content between </corrected_sql> and </corrected_sql> tags.
+        """
+        # First, try to match the format with ```sql
+        pattern1 = r'</corrected_sql>\s*```sql\s*(.*?)\s*```\s*</corrected_sql>'
+        match1 = re.search(pattern1, text, re.DOTALL)
+        if match1:
+            return match1.group(1).strip()
+
+        # If no match is found, try to match the plain text format without ```
+        pattern2 = r'</corrected_sql>\s*(.*?)\s*</corrected_sql>'
+        match2 = re.search(pattern2, text, re.DOTALL)
+        if match2:
+            sql_content = match2.group(1).strip()
+            # Remove any ```sql markers
+            sql_content = re.sub(r'^```sql\s*', '', sql_content)
+            sql_content = re.sub(r'\s*```$', '', sql_content)
+            return sql_content.strip()
+        
+        print(f"Warning: Could not extract corrected SQL from response: {text[:200]}...")
+        return ""
 
     def _extract_sql_from_response_robust(self, text: str) -> str:
         """Robust SQL extraction from LLM response"""
