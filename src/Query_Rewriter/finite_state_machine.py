@@ -11,6 +11,7 @@ from src.Rewrite_Middleware.middleware import DBMS_EXPLAIN_Tool, DBMS_Syntax_Too
 from src.Rewrite_Middleware.Agent_Memory_Buffer.memory_buffer import AgentMemoryBuffer, OutputCollector, create_memory_buffer
 from src.Query_Rewriter.agent_definition import ReasoningAgent, DecisionAgent, RewriteAgent, get_rules_by_groups, get_rule_examples
 from src.utils.agent_template import MessageContent, Message, MemoryWindow, MessageQueue
+from src.Query_Rewriter.global_memory import GlobalMemoryManager
 
 
 class QueryRewriter:
@@ -48,6 +49,13 @@ class QueryRewriter:
         self._stop_event = threading.Event()
         self.llm_semaphore = asyncio.Semaphore(3)  # Control LLM concurrency
         self.db_semaphore = asyncio.Semaphore(5)   # Control database concurrency
+        
+        # Global memory/knowledge base
+        self.global_memory = GlobalMemoryManager()
+        
+        # Knowledge retrieval results (few-shot examples only, no fast track)
+        self.few_shot_examples = []
+        self.retrieved_record_id = None  # For updating frequency
 
     @property
     def data_statistics(self):
@@ -148,7 +156,11 @@ class QueryRewriter:
         self.rule_library = {}
         self.current_rewrite_result = None
         self.previous_feedback = None
-
+        
+        # Reset knowledge retrieval state (no fast track, only few-shot examples)
+        self.few_shot_examples = []
+        self.retrieved_record_id = None
+        
         print(f"🧹 Memory cleared. Buffer status: {self.memory}")
     
     async def clear_log(self):
@@ -181,16 +193,80 @@ class QueryRewriter:
         return self.format_final_output()
 
     async def state_initial_check(self):
-        """Initial optimization feasibility check"""
+        """Initial optimization feasibility check with knowledge retrieval"""
         print("🔍 开始初始优化可行性检查...")
 
         try:
+            # Step 1: Knowledge retrieval (One-Pass Retrieval)
+            print("📚 检索历史优化经验...")
+            retrieval_results = self.global_memory.retrieve(self.initial_sql, top_k=3)
+            
+            # Define thresholds for few-shot examples
+            # MIN_SIMILARITY_THRESHOLD: Minimum similarity to use as context
+            # Similarity < 0.8 usually indicates low relevance and may mislead the model
+            MIN_SIMILARITY_THRESHOLD = 0.80  # Minimum threshold for using as few-shot examples
+            HIGH_SIMILARITY_THRESHOLD = 0.90  # High similarity threshold (for logging)
+            
+            # Reset knowledge retrieval state
+            self.few_shot_examples = []
+            self.retrieved_record_id = None
+            
+            # Step 2: Filter retrieval results by similarity threshold
+            # Only use results above threshold as few-shot examples
+            if not retrieval_results:
+                # Case: No matches - cold start
+                print("🧊 无相关历史经验，完全从头推理")
+                self.few_shot_examples = []
+            else:
+                # Filter results by similarity threshold
+                filtered_results = [
+                    result for result in retrieval_results 
+                    if result.get('score', 0) >= MIN_SIMILARITY_THRESHOLD
+                ]
+                
+                if filtered_results:
+                    # Sort by cost reduction rate (descending) to prioritize best optimizations
+                    # If multiple results have same similarity, prefer the one with higher cost reduction
+                    filtered_results.sort(
+                        key=lambda x: (
+                            x.get('cost_reduction_rate', 0),  # Primary: cost reduction rate (higher is better)
+                            x.get('score', 0)  # Secondary: similarity score (higher is better)
+                        ),
+                        reverse=True
+                    )
+                    
+                    # Use top 3 results (sorted by cost reduction rate) as few-shot examples
+                    self.few_shot_examples = filtered_results[:3]
+                    best_result = filtered_results[0]
+                    best_score = best_result.get('score', 0)
+                    best_reduction = best_result.get('cost_reduction_rate', 0) * 100
+                    
+                    # Log based on similarity level
+                    if best_score >= HIGH_SIMILARITY_THRESHOLD:
+                        print(f"✅ 发现高度相似的历史案例 (相似度: {best_score:.4f}, 成本降低: {best_reduction:.2f}%)，作为参考上下文")
+                    else:
+                        print(f"🤔 发现相似案例 (相似度: {best_score:.4f}, 成本降低: {best_reduction:.2f}%)，作为参考上下文")
+                    
+                    # Update frequency for the best match (highest cost reduction)
+                    if best_result.get('id'):
+                        self.global_memory.update_hit_frequency(best_result['id'])
+                else:
+                    # All results below threshold - don't use as context
+                    best_score = retrieval_results[0].get('score', 0) if retrieval_results else 0
+                    print(f"🧊 历史案例相似度较低 (相似度: {best_score:.4f} < {MIN_SIMILARITY_THRESHOLD})，不使用作为上下文，完全从头推理")
+                    self.few_shot_examples = []
+            
+            # Step 3: Normal optimization feasibility check (always proceed)
             async with self.llm_semaphore:
                 explain_info = await DBMS_EXPLAIN_Tool(self.dbms, self.initial_sql)
 
+            # Extract and store original cost (needed even if cannot optimize)
+            original_cost = self._extract_cost_from_explain(explain_info)
+            self.final_original_costs = original_cost
+
             async with self.llm_semaphore:
                 check_result = await self.decision_agent.initial_optimization_check(
-                    self.initial_sql, self.data_statistics, explain_info
+                    self.initial_sql, self.data_statistics, explain_info, self.few_shot_examples
                 )
 
             self.can_optimize = check_result.get("can_optimize", False)
@@ -201,10 +277,14 @@ class QueryRewriter:
                 self.current_state = "RULE_SELECTION"
             else:
                 print("❌ SQL无需优化，终止流程")
+                # If cannot optimize, rewritten cost equals original cost
+                self.final_rewritten_costs = original_cost
                 self.current_state = "TERMINATED"
 
         except Exception as e:
             print(f"初始检查失败: {e}")
+            import traceback
+            traceback.print_exc()
             self.can_optimize = False
             self.current_state = "TERMINATED"
 
@@ -226,7 +306,7 @@ class QueryRewriter:
             # Get rules for these groups
             self.rule_library = get_rules_by_groups(groups)
 
-            # Select rule sequence
+            # Select rule sequence with few-shot examples
             async with self.llm_semaphore:
                 rule_sequence = await self.reasoning_agent.select_rule_sequence(
                     self.initial_sql,
@@ -235,7 +315,8 @@ class QueryRewriter:
                     self.data_statistics,
                     "",  # explain_info will be empty for now
                     self.optimization_round,
-                    self.previous_feedback
+                    self.previous_feedback,
+                    self.few_shot_examples
                 )
 
             self.selected_rules = rule_sequence
@@ -251,15 +332,16 @@ class QueryRewriter:
         print("🔧 开始SQL重写...")
 
         try:
-            # Get rule examples
+            # Normal rule selection path (no fast track)
             applied_rules = self.selected_rules.get("applied_rules", [])
             rule_examples = get_rule_examples(applied_rules)
+            rule_sequence = self.selected_rules
 
             # Execute rewriting
             async with self.llm_semaphore:
                 rewrite_result = await self.rewrite_agent.rewrite_with_rule_sequence(
                     self.initial_sql,
-                    self.selected_rules,
+                    rule_sequence,
                     rule_examples,
                     json.dumps(self.optimization_advice, ensure_ascii=False),
                     self.data_statistics,
@@ -268,25 +350,85 @@ class QueryRewriter:
 
             self.current_rewrite_result = rewrite_result
 
-            # Syntax check
+            # Check if there was a parse error
+            parse_error = rewrite_result.get("parse_error", False)
             rewritten_sql = rewrite_result.get("rewritten_sql", self.initial_sql)
-            syntax_check = await DBMS_Syntax_Tool(self.dbms, rewritten_sql)
-
-            if not syntax_check.get("valid", True):
-                print("⚠️ 语法检查失败，开始迭代修正...")
-                error_info = syntax_check.get("error", "Unknown error")
-
+            
+            # If parse error occurred and we got the original SQL (meaning extraction failed)
+            if parse_error and rewritten_sql == self.initial_sql:
+                print("⚠️ 重写结果解析错误且无法提取SQL，尝试使用iterative_rewrite修复...")
+                error_info = rewrite_result.get("error_info", "JSON解析错误，无法提取重写SQL")
+                print(f"   错误信息: {error_info}")
+                
                 async with self.llm_semaphore:
                     corrected_sql = await self.rewrite_agent.iterative_rewrite(
                         self.initial_sql, error_info, rewrite_result
                     )
-
+                
                 if corrected_sql:
                     rewrite_result["rewritten_sql"] = corrected_sql
-                    self.current_rewrite_result = rewrite_result
-                    print("✅ 语法修正完成")
+                    rewritten_sql = corrected_sql
+                    print("✅ 通过iterative_rewrite成功生成SQL")
                 else:
-                    print("❌ 语法修正失败")
+                    print("❌ iterative_rewrite未能生成SQL，使用原始SQL继续流程")
+            
+            # Syntax check
+            syntax_check = await DBMS_Syntax_Tool(self.dbms, rewritten_sql)
+
+            # DBMS_Syntax_Tool returns {"flag": True/False, "error": ...}
+            # Check both "flag" and "valid" for compatibility
+            is_valid = syntax_check.get("flag", syntax_check.get("valid", True))
+            
+            if not is_valid:
+                print("⚠️ 语法检查失败，开始迭代修正...")
+                MAX_FIX_ATTEMPTS = 3
+                current_sql = rewritten_sql
+                fix_attempt = 0
+                fix_success = False
+                
+                while fix_attempt < MAX_FIX_ATTEMPTS and not fix_success:
+                    fix_attempt += 1
+                    print(f"🔄 第 {fix_attempt}/{MAX_FIX_ATTEMPTS} 次修复尝试...")
+                    
+                    # Get current error info
+                    current_syntax_check = await DBMS_Syntax_Tool(self.dbms, current_sql)
+                    error_info = current_syntax_check.get("error", "Unknown error")
+                    print(f"   错误信息: {error_info}")
+                    
+                    # Prepare previous rewrite info with current SQL
+                    previous_rewrite_info = rewrite_result.copy()
+                    previous_rewrite_info["rewritten_sql"] = current_sql
+                    previous_rewrite_info["error_info"] = error_info
+                    
+                    async with self.llm_semaphore:
+                        corrected_sql = await self.rewrite_agent.iterative_rewrite(
+                            self.initial_sql, error_info, previous_rewrite_info
+                        )
+                    
+                    if corrected_sql:
+                        # Verify corrected SQL syntax
+                        print("🔍 验证修正后的SQL语法...")
+                        corrected_syntax_check = await DBMS_Syntax_Tool(self.dbms, corrected_sql)
+                        corrected_is_valid = corrected_syntax_check.get("flag", corrected_syntax_check.get("valid", True))
+                        
+                        if corrected_is_valid:
+                            rewrite_result["rewritten_sql"] = corrected_sql
+                            self.current_rewrite_result = rewrite_result
+                            print("✅ 语法修正完成")
+                            fix_success = True
+                        else:
+                            print(f"❌ 修正后的SQL仍有语法错误: {corrected_syntax_check.get('error', 'Unknown error')}")
+                            current_sql = corrected_sql  # Use corrected SQL for next attempt
+                    else:
+                        print("❌ 语法修正失败，无法生成修正后的SQL")
+                        break  # Exit loop if can't generate SQL
+                
+                if not fix_success:
+                    print(f"⚠️ 经过 {fix_attempt} 次修复尝试后仍无法修复，使用原始SQL继续流程")
+                    rewrite_result["rewritten_sql"] = self.initial_sql
+                    self.current_rewrite_result = rewrite_result
+            else:
+                print("✅ 语法检查通过")
 
             self.current_state = "EVALUATION"
 
@@ -312,14 +454,18 @@ class QueryRewriter:
             self.final_original_costs = original_cost
             self.final_rewritten_costs = rewritten_cost
 
+            # Get rule sequence (from selected rules)
+            groups = self.selected_rules.get("groups", "") if self.selected_rules else ""
+            applied_rules = self.selected_rules.get("applied_rules", []) if self.selected_rules else []
+
             # Prepare evaluation info
             evaluation_info = {
                 "original_costs": original_cost,
                 "rewritten_costs": rewritten_cost,
                 "original_explain_info": json.dumps(original_cost_result, ensure_ascii=False),
                 "rewritten_explain_info": json.dumps(rewritten_cost_result, ensure_ascii=False),
-                "groups": self.selected_rules.get("groups", ""),
-                "applied_rules": self.selected_rules.get("applied_rules", []),
+                "groups": groups,
+                "applied_rules": applied_rules,
                 "original_sql": self.initial_sql,
                 "rewritten_sql": rewritten_sql,
                 "reason": self.previous_feedback.get("reason", "") if self.previous_feedback else ""
@@ -336,6 +482,49 @@ class QueryRewriter:
 
             if terminate:
                 print("✅ 优化完成，终止流程")
+                if should_rollback:
+                    print("⚠️ 回退到原始SQL")
+                    self.rewritten_sql = self.initial_sql
+                    # Update rewrite result to reflect rollback
+                    if self.current_rewrite_result:
+                        self.current_rewrite_result["rewritten_sql"] = self.initial_sql
+                    # Clear selected rules since we're rolling back
+                    self.selected_rules = None
+                    # Clear optimization advice since we're rolling back
+                    self.optimization_advice = []
+                    # Set rewritten cost to original cost (rollback means no improvement)
+                    self.final_rewritten_costs = original_cost
+                else:
+                    # Store successful optimization to knowledge base
+                    if rewritten_cost < original_cost:
+                        print(f"📊 准备存储优化案例: 原始成本={original_cost:.2f}, 重写成本={rewritten_cost:.2f}, 降低率={((original_cost-rewritten_cost)/original_cost*100):.2f}%")
+                        try:
+                            # Get rule sequence (from selected rules)
+                            groups = self.selected_rules.get("groups", "") if self.selected_rules else ""
+                            applied_rules = self.selected_rules.get("applied_rules", []) if self.selected_rules else []
+                            
+                            if not applied_rules:
+                                print(f"⚠️ 警告：规则序列为空，可能影响存储质量")
+                            
+                            record_id = self.global_memory.store_successful_optimization(
+                                original_sql=self.initial_sql,
+                                rewritten_sql=rewritten_sql,
+                                rule_sequence=applied_rules,
+                                groups=groups,
+                                original_cost=original_cost,
+                                rewritten_cost=rewritten_cost
+                            )
+                            if record_id:
+                                print(f"💾 已存储成功优化案例到知识库 (ID: {record_id})")
+                            else:
+                                print(f"⚠️ 存储返回None，可能被过滤（检查日志了解原因）")
+                        except Exception as e:
+                            print(f"⚠️ 存储知识库失败: {e}")
+                            import traceback
+                            traceback.print_exc()
+                    else:
+                        print(f"⚠️ 跳过存储：重写成本 ({rewritten_cost:.2f}) >= 原始成本 ({original_cost:.2f})")
+                
                 self.current_state = "TERMINATED"
             elif self.optimization_round < self.MAX_ITERATION_LOOP:
                 print(f"🔄 第{self.optimization_round}轮优化未通过，准备下一轮...")
@@ -355,6 +544,17 @@ class QueryRewriter:
                 self.current_state = "RULE_SELECTION"
             else:
                 print("❌ 已达到最大优化轮数，终止流程")
+                # Handle rollback decision even when max rounds reached
+                if should_rollback:
+                    print("⚠️ 回退到原始SQL")
+                    if self.current_rewrite_result:
+                        self.current_rewrite_result["rewritten_sql"] = self.initial_sql
+                    # Clear selected rules since we're rolling back
+                    self.selected_rules = None
+                    # Set rewritten cost to original cost (rollback means no improvement)
+                    self.final_rewritten_costs = original_cost
+                else:
+                    print(f"✅ 保留当前重写SQL（未回退）")
                 self.current_state = "TERMINATED"
 
         except Exception as e:
@@ -389,13 +589,18 @@ class QueryRewriter:
 
     def format_final_output(self):
         """Format final output according to requirements"""
+        # Get final costs (these should be stored during evaluation or initial check)
+        original_costs = getattr(self, 'final_original_costs', 0)
+        rewritten_costs = getattr(self, 'final_rewritten_costs', 0)
+        
         if not self.can_optimize:
             # Cannot optimize case - first round decision
+            # Use actual original cost (already extracted in state_initial_check)
             return {
                 "tpch": [{
                     "rewritten_query": self.initial_sql,
-                    "original_costs": 0,
-                    "rewrite_costs": 0,
+                    "original_costs": original_costs,
+                    "rewrite_costs": original_costs,  # If cannot optimize, rewritten = original
                     "costs_reduction_rate": 0,
                     "rewrite_rules": None
                 }]
@@ -403,12 +608,23 @@ class QueryRewriter:
 
         # Can optimize case
         final_sql = self.current_rewrite_result.get("rewritten_sql", self.initial_sql) if self.current_rewrite_result else self.initial_sql
-        applied_rules = self.selected_rules.get("applied_rules", []) if self.selected_rules else []
-
-        # Get final costs (these should be stored during evaluation)
-        original_costs = getattr(self, 'final_original_costs', 0)
-        rewritten_costs = getattr(self, 'final_rewritten_costs', 0)
-        costs_reduction_rate = ((original_costs - rewritten_costs) / original_costs * 100) if original_costs > 0 else 0
+        
+        # Check if this is a rollback case (final_sql equals original_sql after optimization attempt)
+        is_rollback = (final_sql == self.initial_sql)
+        
+        # Get applied rules (from selected rules)
+        # If rolled back, selected_rules should be None (set in state_evaluation)
+        applied_rules = None
+        if self.selected_rules and not is_rollback:
+            applied_rules = self.selected_rules.get("applied_rules", [])
+            applied_rules = applied_rules if applied_rules else None
+        
+        # If rolled back, ensure costs reflect rollback (rewritten = original)
+        if is_rollback:
+            rewritten_costs = original_costs
+            costs_reduction_rate = 0
+        else:
+            costs_reduction_rate = ((original_costs - rewritten_costs) / original_costs * 100) if original_costs > 0 else 0
 
         return {
             "tpch": [{
@@ -416,7 +632,7 @@ class QueryRewriter:
                 "original_costs": original_costs,
                 "rewrite_costs": rewritten_costs,
                 "costs_reduction_rate": round(costs_reduction_rate, 2),
-                "rewrite_rules": applied_rules if applied_rules else None
+                "rewrite_rules": applied_rules
             }]
         }
 

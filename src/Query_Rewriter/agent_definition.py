@@ -77,15 +77,8 @@ class ReasoningAgent(Agent):
         prompt = textwrap.dedent(f"""
         <任务目标>
        你是一名经验丰富的 DBA，核心任务是为用户完成高质量的 SQL 查询重写工作。                    
-        1.基于统计信息和执行计划分析结果，对 SQL 进行性能诊断，并给出有针对性的重写优化方向。
+        基于统计信息和执行计划分析结果，对 SQL 进行性能诊断，并给出有针对性的重写优化方向。
         针对每一项优化策略，需评定重写评分，同时确定该 SQL 的最优优化方案。
-        注意：当查询语句包含复杂的WHERE/JOIN条件，或存在重复子查询计算时，可考虑使用公共表表达式（CTE） ——CTE 能够提升查询的可读性与执行性能。若查询语句本身结构简单，或使用 CTE 无法减少冗余计算，则应避免过度使用 CTE，多余的 CTE 可能会增加系统开销。
-        2. 如果必要，重写 SQL 查询，确保满足以下标准：
-            - 可执行性
-            - 等价性
-            - 效率（执行效率与计算效率）
-            - 可读性
-
         重要提示若经评估，目标 SQL 查询语句已处于充分优化状态，或结构过于简单无需调整，则直接给出该 SQL 的最终版本，同时判定其 “无需进一步优化”，并在回复末尾标注关键词 TERMINATE。                      
         <sql语句>
         {sql}
@@ -115,17 +108,10 @@ class ReasoningAgent(Agent):
         prompt = textwrap.dedent(f"""
         <Mission>
         你是一名经验丰富的 DBA，核心任务是为用户完成高质量的 SQL 查询重写工作。                    
-        1.基于统计信息和执行计划分析结果，对 SQL 进行性能诊断，并给出有针对性的重写优化方向。
+        基于统计信息和执行计划分析结果，对 SQL 进行性能诊断，并给出有针对性的重写优化方向。
         针对每一项优化策略，需评定重写评分，同时确定该 SQL 的最优优化方案。
-        注意：当查询语句包含复杂的WHERE/JOIN条件，或存在重复子查询计算时，可考虑使用公共表表达式（CTE） ——CTE 能够提升查询的可读性与执行性能。若查询语句本身结构简单，或使用 CTE 无法减少冗余计算，则应避免过度使用 CTE，多余的 CTE 可能会增加系统开销。
-        2. 如果必要，重写 SQL 查询，确保满足以下标准：
-            - 可执行性
-            - 等价性
-            - 效率（执行效率与计算效率）
-            - 可读性
 
-
-        3. 特别说明：你会获取到此前的重写报告作为参考。
+        特别说明：你会获取到此前的重写报告作为参考。
                                  
         若经评估，目标 SQL 查询语句已处于充分优化状态，或结构过于简单无需调整，则直接判定其 “无需进一步优化”，并在回复末尾标注关键词 TERMINATE。
 
@@ -154,7 +140,7 @@ class ReasoningAgent(Agent):
 
         return thought_chain
 
-    async def select_rule_sequence(self, sql: str, decision_advice: list, rule_library: dict, data_statistics: str, explain_info: str, iteration_round: int = 1, previous_feedback: dict = None) -> dict:
+    async def select_rule_sequence(self, sql: str, decision_advice: list, rule_library: dict, data_statistics: str, explain_info: str, iteration_round: int = 1, previous_feedback: dict = None, few_shot_examples: list = None) -> dict:
         """Select appropriate rule sequence based on DecisionAgent's advice"""
         advice_text = json.dumps(decision_advice, ensure_ascii=False, indent=2)
 
@@ -179,6 +165,21 @@ class ReasoningAgent(Agent):
             {json.dumps(previous_feedback, ensure_ascii=False, indent=2)}
             请基于上一轮的经验和失败原因重新选择规则序列，避免重复同样的错误。
             """
+        
+        # Build few-shot examples context
+        few_shot_context = ""
+        if few_shot_examples and len(few_shot_examples) > 0:
+            few_shot_context = "\n\n<相似历史案例>\n"
+            few_shot_context += "以下是历史上相似SQL的优化案例，供参考（你可以参考这些案例的思路，但需要根据当前SQL的具体情况选择规则）：\n\n"
+            for i, example in enumerate(few_shot_examples[:3], 1):
+                few_shot_context += f"案例{i}:\n"
+                few_shot_context += f"- 相似度: {example.get('score', 0):.4f}\n"
+                few_shot_context += f"- SQL指纹: {example.get('sql_fingerprint', '')[:150]}...\n"
+                few_shot_context += f"- 应用的规则序列: {example.get('rule_sequence', [])}\n"
+                few_shot_context += f"- 优化组别: {example.get('groups', '')}\n"
+                few_shot_context += f"- 优化效果: 成本降低 {example.get('cost_reduction_rate', 0) * 100:.2f}%\n"
+                few_shot_context += f"- 命中次数: {example.get('frequency', 0)}\n\n"
+            few_shot_context += "</相似历史案例>\n"
 
         prompt = textwrap.dedent(f"""
         <Mission>
@@ -193,6 +194,7 @@ class ReasoningAgent(Agent):
            - 逐一考虑规则库中的规则，判断其是否适用
            - 挑选能够解决问题的规则
            - 按照规则依赖关系进行排序
+           {few_shot_context}
         3. 输出格式：
         <rule_sequence>
         {{
@@ -263,8 +265,23 @@ class DecisionAgent(Agent):
 ))
         self.watch(["ReasoningAgent", "ExplainAgent"])
 
-    async def initial_optimization_check(self, sql: str, data_statistics: str, explain_info: str) -> dict:
+    async def initial_optimization_check(self, sql: str, data_statistics: str, explain_info: str, few_shot_examples: list = None) -> dict:
         """Initial check to determine if SQL can be optimized through rewriting"""
+        
+        # Build few-shot examples context
+        few_shot_context = ""
+        if few_shot_examples and len(few_shot_examples) > 0:
+            few_shot_context = "\n\n<相似历史案例>\n"
+            few_shot_context += "以下是历史上相似SQL的优化案例，供参考：\n\n"
+            for i, example in enumerate(few_shot_examples[:3], 1):
+                few_shot_context += f"案例{i}:\n"
+                few_shot_context += f"- 相似度: {example.get('score', 0):.4f}\n"
+                few_shot_context += f"- SQL指纹: {example.get('sql_fingerprint', '')[:100]}...\n"
+                few_shot_context += f"- 应用的规则序列: {example.get('rule_sequence', [])}\n"
+                few_shot_context += f"- 优化效果: 成本降低 {example.get('cost_reduction_rate', 0) * 100:.2f}%\n"
+                few_shot_context += f"- 命中次数: {example.get('frequency', 0)}\n\n"
+            few_shot_context += "</相似历史案例>\n"
+        
         prompt = textwrap.dedent(f"""
         <Mission>
         你是一名经验丰富的 DBA，你的任务是判断给定的 SQL 查询是否可以通过查询重写优化来提升执行性能。
@@ -273,6 +290,7 @@ class DecisionAgent(Agent):
            - <sql语句>: 原始SQL查询
            - <统计信息>: 数据库表统计信息
            - <执行计划分析结果>: 智能执行计划分析器生成的分析结果
+           {few_shot_context}
 
         2. 基于执行计划分析中的高代价算子信息，判断SQL是否可以通过以下优化方式提升性能：
            - 子查询优化：子查询转换为JOIN、相关子查询优化、CTE分解等
@@ -481,17 +499,17 @@ class DecisionAgent(Agent):
         你负责评估 SQL 优化是否符合标准。请根据以下信息决定是否终止优化过程：
         你想终止优化过程吗？
 
-        * 注意：<original_sql> 和 <rewritten_sql> 的执行时间来自数据库优化器，可能不精确。基于详细分析做出决定。
-        注意：<original_sql> 和 <rewritten_sql> 的执行时间来自数据库优化器，可能不精确。基于详细分析做出决定。
-        * 客观评估改进 SQL 是否满足成功重写的指标。
+        注意：<original_sql> 和 <rewritten_sql> 的costs来自数据库优化器，可能不精确。基于详细分析做出决定。
+       
 
         终止条件：
         [True]:
-            1. rewritten_sql 执行时间 < ori_sql 执行时间 and rewritten_sql执行没有报错.
-            2. rewritten_sql 执行时间 ≥ ori_sql 执行时间，由于基数估计不准确，但你仍可将此次重写视为一种优化。
+           1. rewritten_sql costs < ori_sql costs (优化成功，直接终止)
+            2. rewritten_sql costs 略微大于ori_sql costs，代价没有增加的很夸张，但重写后SQL的执行计划更优，直接终止并保留重写SQL。 
+            3. rewritten_sql costs ≥ ori_sql costs (明显重写SQL没有原始SQL执行效果好，并且你认为当前SQL在重写层面已经无法进行优化，直接终止并回退SQL到原始SQL)
 
         [False]:
-            rewritten_sql 执行时间 ≥ ori_sql 执行时间，或 rewritten_sql 执行失败。
+            如果你认为是规则选择的不对，或者SQL和执行计划明确显示还有明显优化空间，继续下一轮优化。
             {equivalence_failure_info}
             
         请严格遵循以下 JSON 格式返回你的答案：
@@ -544,14 +562,15 @@ class DecisionAgent(Agent):
         - 成本减少: {cost_reduction} ({cost_reduction_percent:.2f}%)
         - 优化类别: {groups}
         - 应用的规则: {', '.join(applied_rules)}
-
+         * 注意：<original_sql> 和 <rewritten_sql> 的costs来自数据库优化器，可能不精确。基于详细分析做出决定。*  
         终止条件：
         [True]:
             1. rewritten_sql costs < ori_sql costs (优化成功，直接终止)
-            2. rewritten_sql costs ≥ ori_sql costs (成本不变或增加，并且你认为当前SQL在重写层面已经无法进行优化，直接终止并回退SQL到原始SQL)
+            2. rewritten_sql costs 略微大于ori_sql costs，代价没有增加的很夸张，但重写后SQL的执行计划更优，直接终止并保留重写SQL。 
+            3. rewritten_sql costs ≥ ori_sql costs (明显重写SQL没有原始SQL执行效果好，并且你认为当前SQL在重写层面已经无法进行优化，直接终止并回退SQL到原始SQL)
 
         [False]:
-            只有在极特殊情况下，如果SQL和执行计划明确显示还有明显优化空间，才继续下一轮优化。
+            如果你认为是规则选择的不对，或者SQL和执行计划明确显示还有明显优化空间，继续下一轮优化。
 
         {f"上一轮评估失败原因: {reason}" if reason else ""}
 
@@ -891,41 +910,79 @@ class RewriteAgent(Agent):
                     result = json.loads(json_match.group())
                     return result
 
+            # If JSON parsing failed, try to extract SQL from response
+            print("⚠️ 无法解析JSON格式，尝试从响应中提取SQL...")
+            extracted_sql = self._extract_sql_from_response_robust(thought_chain)
+            if extracted_sql:
+                print(f"✅ 成功从响应中提取SQL")
+                return {
+                    "groups": groups,
+                    "applied_rules": applied_rules,
+                    "original_sql": sql,
+                    "rewritten_sql": extracted_sql,
+                    "parse_error": True  # Flag to indicate parsing error
+                }
+            
             return {
                 "groups": groups,
                 "applied_rules": applied_rules,
                 "original_sql": sql,
-                "rewritten_sql": sql  # fallback to original
+                "rewritten_sql": sql,  # fallback to original
+                "parse_error": True
             }
         except json.JSONDecodeError as e:
             print(f"重写结果解析错误: {e}")
+            # Try to extract SQL from response even when JSON parsing fails
+            print("⚠️ 尝试从响应中提取SQL...")
+            extracted_sql = self._extract_sql_from_response_robust(thought_chain)
+            if extracted_sql:
+                print(f"✅ 成功从响应中提取SQL")
+                return {
+                    "groups": groups,
+                    "applied_rules": applied_rules,
+                    "original_sql": sql,
+                    "rewritten_sql": extracted_sql,
+                    "parse_error": True,
+                    "error_info": f"JSON解析错误: {str(e)}"
+                }
+            
             return {
                 "groups": groups,
                 "applied_rules": applied_rules,
                 "original_sql": sql,
-                "rewritten_sql": sql
+                "rewritten_sql": sql,
+                "parse_error": True,
+                "error_info": f"JSON解析错误: {str(e)}"
             }
 
     async def iterative_rewrite(self, sql: str, error_info: str, previous_rewrite: dict) -> str:
         """Iteratively rewrite SQL based on error feedback"""
+        # Extract previous SQL and error history if available
+        previous_sql = previous_rewrite.get("rewritten_sql", "")
+        previous_error = previous_rewrite.get("error_info", "")
+        
         prompt = textwrap.dedent(f"""
         <Mission>
         你是一名经验丰富的 DBA，你的任务是基于语法错误信息修正重写后的SQL。
 
+        **重要**：请仔细阅读并分析 <error_info> 中的错误信息，这是数据库返回的具体语法错误，必须针对这个错误进行修正。
+
         1. 输入信息：
-           - <original_sql>: 原始SQL
-           - <error_info>: 语法检查错误信息
-           - <previous_rewrite>: 上次重写结果
+           - <original_sql>: 原始SQL（用于保持语义等价性）
+           - <error_info>: **当前语法检查错误信息**（这是你需要修复的具体错误）
+           - <previous_rewrite>: 上次重写结果（包含之前尝试的SQL和可能的错误信息）
 
         2. 修正要求：
-           - 分析错误原因
-           - 修正SQL语法错误
-           - 保持查询语义正确性（必须与原始SQL语义等价）
-           - 生成可执行的SQL
+           - **仔细分析 <error_info> 中的错误信息**，这是数据库返回的具体语法错误位置和原因
+           - 如果 <previous_rewrite> 中包含之前的错误信息，参考它们避免重复同样的错误
+           - 修正SQL语法错误，确保修正后的SQL能够通过语法检查
+           - **必须保持查询语义正确性**：修正后的SQL必须与原始SQL在语义上完全等价
+           - 生成可执行的、语法正确的SQL
 
         3. 输出要求：
            - 直接输出修正后的完整SQL
            - 不要包含任何解释或额外格式
+           - 确保SQL语法完全正确
 
         <original_sql>
         {sql}
@@ -937,7 +994,7 @@ class RewriteAgent(Agent):
         {json.dumps(previous_rewrite, ensure_ascii=False, indent=2)}
         """)
 
-        response = await self.get_answer(prompt=prompt, silent=True)
+        response = await self.llm.get_LLM_response_async(prompt=prompt)
         # Extract SQL from response
         return self._extract_sql_from_response_robust(response)
     

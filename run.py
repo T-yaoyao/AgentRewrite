@@ -21,7 +21,7 @@ load_project_env()
 from tqdm import tqdm
 from src.utils.data_distribution import get_statistics_list, get_available_databases
 from src.utils.get_data_statistics import get_data_statistics
-from src.Rewrite_Middleware.middleware import DBMS
+from src.Rewrite_Middleware.middleware import DBMS, DBMS_Syntax_Tool
 from src.utils.agent_template import MessageContent, Message, MemoryWindow, MessageQueue
 from src.Query_Rewriter.finite_state_machine import QueryRewriter
 from src.Hint_Recommender.injection import Hint_Recommender   
@@ -148,7 +148,7 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
     print(f"📁 Output file: {final_output_file}")
     print(f"📝 Save logs: {'Yes' if args.save_rewriter_logs else 'No'}")
     print(f"📈 Starting from query #{count + 1}")
-    print()
+    print()  
 
     with tqdm(total=len(data),
               initial=count,
@@ -196,6 +196,69 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
                 end_time = time.time()
                 rewrite_time = end_time - start_time
                 success = False
+
+            # 在评估完成后、写入 JSON 之前，对“最终版本”的重写 SQL 再做一次语法验证
+            if success:
+                final_sql = None
+
+                # 从 rewriter.run() 的结果结构中提取最终重写 SQL
+                if isinstance(rewritten_sql, dict):
+                    tpch_list = rewritten_sql.get("tpch")
+                    if isinstance(tpch_list, list) and tpch_list:
+                        first_entry = tpch_list[0]
+                        if isinstance(first_entry, dict):
+                            final_sql = first_entry.get("rewritten_query")
+
+                # 仅当最终 SQL 存在且确实与原始 SQL 不同时才进行额外校验
+                if final_sql and isinstance(final_sql, str) and final_sql.strip() and final_sql.strip() != initial_sql.strip():
+                    try:
+                        print("🧪 对最终重写 SQL 进行语法二次校验...")
+                        syntax_check = await DBMS_Syntax_Tool(dbms, final_sql)
+                        is_valid = syntax_check.get("flag", syntax_check.get("valid", True))
+
+                        if not is_valid:
+                            error_info = syntax_check.get("error", "Unknown error")
+                            print("⚠️ 最终 SQL 语法检查失败，尝试交给 RewriteAgent 进行修复")
+                            print(f"   错误信息: {error_info}")
+
+                            previous_rewrite = rewriter.current_rewrite_result or {
+                                "original_sql": initial_sql,
+                                "rewritten_sql": final_sql,
+                            }
+
+                            # 调用 RewriteAgent 的迭代修复能力
+                            async with rewriter.llm_semaphore:
+                                corrected_sql = await rewriter.rewrite_agent.iterative_rewrite(
+                                    initial_sql, error_info, previous_rewrite
+                                )
+
+                            if corrected_sql and isinstance(corrected_sql, str) and corrected_sql.strip():
+                                print("🔍 验证修复后的最终 SQL 语法...")
+                                corrected_syntax = await DBMS_Syntax_Tool(dbms, corrected_sql)
+                                corrected_is_valid = corrected_syntax.get(
+                                    "flag", corrected_syntax.get("valid", True)
+                                )
+
+                                if corrected_is_valid:
+                                    # 更新最终输出中的 SQL 文本（仅更新字符串，不改动成本等其他字段）
+                                    try:
+                                        if isinstance(rewritten_sql, dict):
+                                            tpch_list = rewritten_sql.get("tpch")
+                                            if isinstance(tpch_list, list) and tpch_list:
+                                                first_entry = tpch_list[0]
+                                                if isinstance(first_entry, dict):
+                                                    first_entry["rewritten_query"] = corrected_sql
+                                    except Exception as update_err:
+                                        print(f"⚠️ 更新最终重写 SQL 时发生错误: {update_err}")
+                                    else:
+                                        print("✅ 最终 SQL 语法修复成功，已更新写入 JSON 的内容")
+                                else:
+                                    print("❌ 修复后的最终 SQL 仍存在语法问题，将保留原评估版本写入 JSON")
+                            else:
+                                print("❌ RewriteAgent 未能生成有效的修复 SQL，将保留原评估版本写入 JSON")
+                    except Exception as final_check_err:
+                        # 二次校验或修复过程本身出错时，不影响主流程，只记录日志
+                        print(f"⚠️ 最终 SQL 语法二次校验/修复过程中发生异常: {final_check_err}")
 
             # LLM cost consumed by this query (all agents)
             usage_after = GPT.get_global_usage()

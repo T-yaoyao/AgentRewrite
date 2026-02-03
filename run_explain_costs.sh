@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # Script to run the EXPLAIN costs extraction
-# Make sure to modify the database configuration in the Python script first
+# Usage: ./run_explain_costs.sh [--input INPUT_FILE] [--output OUTPUT_FILE] [--database DB_NAME]
+# Example: ./run_explain_costs.sh --input experiments_results/tpch/QUITE_tpch_63queries.json
+# Example: ./run_explain_costs.sh --input experiments_results/dsb/QUITE_dsb_156queries.json --database dsb
 
 echo "Running EXPLAIN costs extraction..."
 
@@ -18,7 +20,7 @@ if [ $? -ne 0 ]; then
     pip3 install psycopg2-binary
 fi
 
-# Run the extraction script
-python3 explain_costs_extractor.py
+# Run the extraction script with all arguments passed through
+python3 explain_costs_extractor.py "$@"
 
-echo "Extraction completed. Check query_costs_comparison.csv for results."
+echo "Extraction completed. Check the output CSV file for results."

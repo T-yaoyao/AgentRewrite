@@ -6,6 +6,7 @@
 - [Quick Start](#quick-start)
 - [Experimental Results](#experimental-results)
 - [Rewrite Beyond Rules Discussion](#rewrite-beyond-rules-discussion)
+- [Data Analysis Scripts](#data-analysis-scripts)
 - [Code Structure](#code-structure)
 
 <!-- - [Citation](#citation) -->
