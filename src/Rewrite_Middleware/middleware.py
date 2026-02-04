@@ -164,12 +164,8 @@ async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
     Intelligent execution plan analyzer that uses PlanAnalyzer to provide structured analysis.
     
     Returns:
-        str: JSON-formatted string containing structured analysis:
-        {
-            "bottlenecks": [...],
-            "cost_analysis": {...},
-            "text_report": "..."
-        }
+        str: Direct text report from PlanAnalyzer (not JSON formatted)
+        Contains detailed execution plan analysis for LLM consumption
     """
     print("🔍 计划分析器开始分析...")
 
@@ -244,55 +240,37 @@ async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
                     # Generate text report for backward compatibility
                     text_report = analyzer.format_analysis_report(top_n=10, min_percentage=5)
                     
-                    analysis_result = {
-                        "bottlenecks": formatted_bottlenecks,
-                        "cost_analysis": cost_analysis,
-                        "text_report": text_report  # For backward compatibility with existing code
-                    }
-                    
-                    all_analyses.append(analysis_result)
+                    # Directly use text_report as the analysis result (not wrapped in JSON)
+                    all_analyses.append(text_report)
                     
                 except Exception as e:
                     print(f"Warning: PlanAnalyzer failed for statement: {e}")
-                    # Fallback: return basic analysis
-                    all_analyses.append({
-                        "statement": stmt[:100] + "..." if len(stmt) > 100 else stmt,
-                        "error": f"PlanAnalyzer error: {str(e)}",
-                        "raw_plan": explain_json_str[:500] if len(explain_json_str) > 500 else explain_json_str,
-                        "bottlenecks": [],
-                        "cost_analysis": {}
-                    })
+                    # Fallback: return error message as string
+                    error_msg = f"执行计划分析失败: {str(e)}\n原始执行计划: {explain_json_str[:500] if len(explain_json_str) > 500 else explain_json_str}"
+                    all_analyses.append(error_msg)
                     
             except Exception as e:
                 print(f"Error processing statement: {e}")
-                all_analyses.append({
-                    "statement": stmt[:100] + "..." if len(stmt) > 100 else stmt,
-                    "error": str(e),
-                    "bottlenecks": [],
-                    "cost_analysis": {}
-                })
+                error_msg = f"语句处理失败: {str(e)}"
+                all_analyses.append(error_msg)
     
     except Exception as e:
         print(f"计划分析器分析失败: {e}")
         import traceback
         traceback.print_exc()
-        return json.dumps({
-            "error": str(e),
-            "bottlenecks": [],
-            "cost_analysis": {}
-        }, ensure_ascii=False, indent=2)
+        return f"执行计划分析器完全失败: {str(e)}"
     
-    # If only one analysis, return it directly; otherwise return list
+    # If only one analysis, return it directly; otherwise combine all analyses
     if len(all_analyses) == 1:
         result = all_analyses[0]
     else:
-        result = {
-            "statements_count": len(all_analyses),
-            "analyses": all_analyses
-        }
+        # Combine multiple analyses into a single text report
+        result = f"多语句分析结果 (共{len(all_analyses)}个语句):\n\n"
+        for i, analysis in enumerate(all_analyses, 1):
+            result += f"=== 语句 {i} ===\n{analysis}\n\n"
     
     print("✅ 计划分析器完成分析")
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
 
 
 def _calculate_cost_analysis(analyzer: 'PlanAnalyzer', bottlenecks: List[Dict]) -> Dict:

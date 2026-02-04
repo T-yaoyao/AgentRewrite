@@ -11,25 +11,30 @@ from pathlib import Path
 
 # Fix SQLite version issue for ChromaDB
 # ChromaDB requires sqlite3 >= 3.35.0, but system may have older version
+# IMPORTANT: This must happen BEFORE importing chromadb
 try:
     import pysqlite3
     import sys
-    # Replace the default sqlite3 module with pysqlite3
+    # Replace the default sqlite3 module with pysqlite3 BEFORE any other imports
     sys.modules['sqlite3'] = pysqlite3
-except ImportError:
-    # pysqlite3 not available, use system sqlite3 (may fail if version < 3.35.0)
-    pass
+    print("✅ Replaced system sqlite3 with pysqlite3-binary for ChromaDB compatibility")
+except ImportError as e:
+    print(f"⚠️ pysqlite3-binary not available: {e}")
+    print("💡 Install with: pip install pysqlite3-binary")
 
 try:
     import chromadb
     from chromadb.config import Settings
     CHROMADB_AVAILABLE = True
+    print("✅ ChromaDB imported successfully")
 except (ImportError, RuntimeError) as e:
     CHROMADB_AVAILABLE = False
     if isinstance(e, RuntimeError) and "sqlite3" in str(e):
-        print("Warning: SQLite version too old for ChromaDB. Install pysqlite3-binary: pip install pysqlite3-binary")
+        print("⚠️ SQLite version too old for ChromaDB even with pysqlite3 replacement")
+        print("💡 This may be due to import order - pysqlite3 needs to be imported before chromadb")
     else:
-        print("Warning: chromadb not available, falling back to in-memory storage")
+        print(f"⚠️ ChromaDB import failed: {e}")
+        print("💡 Falling back to in-memory storage")
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -86,11 +91,43 @@ class VectorStore:
         self.embedding_model = None
         if SENTENCE_TRANSFORMERS_AVAILABLE:
             try:
-                # Use a lightweight model for SQL embeddings
-                self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-                print("✅ Loaded sentence-transformers model for embeddings")
+                # Set local cache directory for models
+                # Create models cache directory in project root
+                cache_dir = Path(__file__).parent.parent.parent.parent / "models_cache"
+                cache_dir.mkdir(exist_ok=True)
+
+                # Set Hugging Face cache directory and mirror
+                os.environ['HF_HOME'] = str(cache_dir / "huggingface")
+                os.environ['TRANSFORMERS_CACHE'] = str(cache_dir / "transformers")
+                os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+                os.environ['HF_HUB_CACHE'] = str(cache_dir / "huggingface" / "hub")
+
+                # Use a lightweight model for SQL embeddings with local cache
+                # Try different model name formats
+                model_names = [
+                    'sentence-transformers/all-MiniLM-L6-v2',
+                    'all-MiniLM-L6-v2'
+                ]
+
+                for model_name in model_names:
+                    try:
+                        self.embedding_model = SentenceTransformer(
+                            model_name,
+                            cache_folder=str(cache_dir / "sentence_transformers")
+                        )
+                        print(f"✅ Loaded sentence-transformers model '{model_name}' for embeddings (cached in {cache_dir})")
+                        print("🔗 Using Hugging Face mirror: https://hf-mirror.com")
+                        break  # Success, exit the loop
+                    except Exception as e:
+                        print(f"⚠️ Failed to load model '{model_name}': {e}")
+                        continue
+
+                if self.embedding_model is None:
+                    print("❌ Failed to load any embedding model")
+                    print("💡 The system will continue without embeddings (reduced functionality)")
             except Exception as e:
-                print(f"⚠️ Failed to load embedding model: {e}")
+                print(f"⚠️ Failed to initialize embedding model: {e}")
+                print("💡 The system will continue without embeddings (reduced functionality)")
         
         # Initialize ChromaDB
         self.collection = None

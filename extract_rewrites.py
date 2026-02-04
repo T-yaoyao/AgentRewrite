@@ -91,37 +91,29 @@ def extract_rewrite_sql(data: List[Dict[str, Any]], output_path: Path) -> None:
     """
     提取“被实际重写”的 SQL，写入 rewrite_sql.csv：
 
-    支持两种 JSON 结构：
-    1) 旧结构（来自 rewritten_queries.json）：
-       - item["rewritten_query"]["tpch"][0]["rewritten_query"]
-       - item["rewritten_query"]["tpch"][0]["rewrite_rules"] 非空
-    2) 实验结果结构（QUITE_tpch_63queries.json）：
-       - item["rewritten_query"] 为字符串
-       - original_query 与 rewritten_query 不一致即认为“有重写”
+    规则：只要重写 SQL 存在，且与原始 SQL 文本不一致，就认为是“被重写”的 SQL，
+    不再依赖 rewrite_rules 字段。
     """
-    rows = []
+    rows: List[Dict[str, str]] = []
 
     def clean_sql(sql: str) -> str:
         """
         清理 SQL：
         - 删除单行注释和多行注释
         - 去掉多余换行和空格，压成一行
+        - 末尾没有分号则补上分号
         """
         if not sql:
             return ""
-        # 删除单行注释 --
         sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
-        # 删除多行注释 /* ... */
         sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
-        # 压缩空白为一行
         sql = " ".join(sql.replace("\n", " ").split())
-        # 如果末尾没有分号，则补上分号
         if sql and not sql.rstrip().endswith(";"):
             sql = sql.rstrip() + ";"
         return sql
 
     for item in data:
-        # 跳过非字典项（例如统计信息列表等）
+        # 跳过非字典项
         if not isinstance(item, dict):
             continue
 
@@ -137,24 +129,35 @@ def extract_rewrite_sql(data: List[Dict[str, Any]], output_path: Path) -> None:
 
         # 情况 1：旧结构，rewritten_query 是一个包含 tpch 列表的 dict
         if isinstance(rewritten_field, dict):
-            tpch_list = rewritten_field.get("tpch") or []
-            if not tpch_list:
-                continue
-            first = tpch_list[0] or {}
-            if not isinstance(first, dict):
-                continue
-            rewritten_sql = first.get("rewritten_query", "") or ""
-            rules = first.get("rewrite_rules", None)
+            tpch_data = rewritten_field.get("tpch")
 
-            # 有规则应用（非 None 且非空列表）
-            if rules and rewritten_sql:
-                flat_sql = clean_sql(rewritten_sql)
-                rows.append({"id": _id, "rewritten_query": flat_sql})
+            # tpch 为列表（正常情况）
+            if isinstance(tpch_data, list) and tpch_data:
+                try:
+                    first = tpch_data[0]
+                    if not isinstance(first, dict):
+                        continue
+                    rewritten_sql = first.get("rewritten_query", "") or ""
+                    if rewritten_sql and original_sql.strip() != rewritten_sql.strip():
+                        flat_sql = clean_sql(rewritten_sql)
+                        rows.append({"id": _id, "rewritten_query": flat_sql})
+                except (IndexError, KeyError, TypeError):
+                    continue
+
+            # tpch 为单个对象
+            elif isinstance(tpch_data, dict):
+                rewritten_sql = tpch_data.get("rewritten_query", "") or ""
+                if rewritten_sql and original_sql.strip() != rewritten_sql.strip():
+                    flat_sql = clean_sql(rewritten_sql)
+                    rows.append({"id": _id, "rewritten_query": flat_sql})
+
+            # 其他情况：tpch 字段不存在或为空，跳过
+            else:
+                continue
 
         # 情况 2：实验结果结构，rewritten_query 为字符串
         elif isinstance(rewritten_field, str):
             rewritten_sql = rewritten_field
-            # 与原始 SQL 不同则认为是“被重写”的 SQL
             if rewritten_sql and original_sql.strip() != rewritten_sql.strip():
                 flat_sql = clean_sql(rewritten_sql)
                 rows.append({"id": _id, "rewritten_query": flat_sql})

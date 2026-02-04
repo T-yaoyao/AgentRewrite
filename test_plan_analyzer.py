@@ -92,25 +92,13 @@ def print_text_report(text_report: str):
         print("  " + "-" * 76)
 
 
-def format_output(result_json: str, verbose: bool = False):
+def format_output(result_str: str, verbose: bool = False):
     """格式化输出分析结果"""
-    try:
-        result = json.loads(result_json)
-    except json.JSONDecodeError as e:
-        print(f"❌ JSON 解析失败: {e}")
-        print(f"原始输出:\n{result_json[:500]}")
-        return
-    
-    # 处理多语句结果
-    if "statements_count" in result:
-        print_section(f"多语句分析结果 (共 {result['statements_count']} 条语句)")
-        for i, analysis in enumerate(result.get('analyses', []), 1):
-            print_section(f"语句 {i}", "-")
-            format_single_analysis(analysis, verbose)
-        return
-    
-    # 处理单语句结果
-    format_single_analysis(result, verbose)
+    # Since DBMS_EXPLAIN_Tool now returns text directly, just print it
+    print("📊 执行计划分析结果:")
+    print("=" * 60)
+    print(result_str)
+    print("=" * 60)
 
 
 def format_single_analysis(analysis: dict, verbose: bool = False):

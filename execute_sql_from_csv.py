@@ -14,19 +14,19 @@ from src.utils.postgres_connector import PostgresConnector
 
 def create_connector() -> PostgresConnector:
     """
-    创建 PostgreSQL 连接器，优先使用环境变量，其次使用默认值。
-    环境变量：
-      - DB_HOST
-      - DB_PORT
-      - DB_NAME
-      - DB_USER
-      - DB_PASSWORD
+    创建 PostgreSQL 连接器，使用默认配置。
+    默认配置：
+      - host: 172.17.0.3
+      - port: 5432
+      - database: dsb
+      - user: postgres
+      - password: 123456
     """
-    host = os.getenv("DB_HOST", "localhost")
-    port = int(os.getenv("DB_PORT", "5432"))
-    database = os.getenv("DB_NAME", "dsb")
-    user = os.getenv("DB_USER", "postgres")
-    password = os.getenv("DB_PASSWORD", "123456")
+    host = "172.17.0.3"
+    port = 5432
+    database = "calcite"
+    user = "postgres"
+    password = "123456"
 
     return PostgresConnector(
         host=host,
@@ -165,7 +165,18 @@ def process_csv(
     对每条 SQL 执行 5 次，去掉最高和最低的时间，剩余 3 次取平均，
     输出到新的 CSV（id, execution_time_s）。
     """
-    conn = connector._get_connection()
+    # 获取数据库连接，增加友好的错误提示，避免直接抛出 psycopg2 超时异常
+    try:
+        conn = connector._get_connection()
+    except psycopg2.OperationalError as e:
+        print("❌ 无法连接到 PostgreSQL 数据库（连接超时或不可达）")
+        print(f"   连接配置: host={connector.host}, port={connector.port}, db={connector.database}, user={connector.user}")
+        print(f"   详细错误: {e}")
+        print("💡 请检查：")
+        print("   1) 数据库服务是否已启动并监听对应地址和端口")
+        print("   2) Docker 容器 / 远程主机 IP 是否正确（当前使用 172.17.0.3）")
+        print("   3) 防火墙或网络策略是否阻止了连接")
+        sys.exit(1)
 
     with input_csv.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)

@@ -199,7 +199,7 @@ class TestRewriteMiddleware(unittest.TestCase):
             
             # Basic assertions
             self.assertIsNotNone(result)
-            self.assertIsInstance(result, list)
+            self.assertIsInstance(result, str)  # Now returns string directly
             
             print("✅ Test PASSED!")
             print(f"📋 Query plans generated: {len(result)} items")

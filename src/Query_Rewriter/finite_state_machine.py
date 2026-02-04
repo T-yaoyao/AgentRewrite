@@ -51,7 +51,13 @@ class QueryRewriter:
         self.db_semaphore = asyncio.Semaphore(5)   # Control database concurrency
         
         # Global memory/knowledge base
-        self.global_memory = GlobalMemoryManager()
+        try:
+            self.global_memory = GlobalMemoryManager()
+            print("✅ Global memory manager initialized")
+        except Exception as e:
+            print(f"⚠️ Failed to initialize global memory manager: {e}")
+            print("💡 System will continue without knowledge base (reduced functionality)")
+            self.global_memory = None
         
         # Knowledge retrieval results (few-shot examples only, no fast track)
         self.few_shot_examples = []
@@ -199,7 +205,11 @@ class QueryRewriter:
         try:
             # Step 1: Knowledge retrieval (One-Pass Retrieval)
             print("📚 检索历史优化经验...")
-            retrieval_results = self.global_memory.retrieve(self.initial_sql, top_k=3)
+            if self.global_memory is not None:
+                retrieval_results = self.global_memory.retrieve(self.initial_sql, top_k=3)
+            else:
+                print("⚠️ Knowledge base unavailable, skipping retrieval")
+                retrieval_results = []
             
             # Define thresholds for few-shot examples
             # MIN_SIMILARITY_THRESHOLD: Minimum similarity to use as context
@@ -249,7 +259,8 @@ class QueryRewriter:
                     
                     # Update frequency for the best match (highest cost reduction)
                     if best_result.get('id'):
-                        self.global_memory.update_hit_frequency(best_result['id'])
+                        if self.global_memory is not None:
+                            self.global_memory.update_hit_frequency(best_result['id'])
                 else:
                     # All results below threshold - don't use as context
                     best_score = retrieval_results[0].get('score', 0) if retrieval_results else 0
@@ -506,7 +517,8 @@ class QueryRewriter:
                             if not applied_rules:
                                 print(f"⚠️ 警告：规则序列为空，可能影响存储质量")
                             
-                            record_id = self.global_memory.store_successful_optimization(
+                            if self.global_memory is not None:
+                                record_id = self.global_memory.store_successful_optimization(
                                 original_sql=self.initial_sql,
                                 rewritten_sql=rewritten_sql,
                                 rule_sequence=applied_rules,
@@ -514,10 +526,12 @@ class QueryRewriter:
                                 original_cost=original_cost,
                                 rewritten_cost=rewritten_cost
                             )
-                            if record_id:
-                                print(f"💾 已存储成功优化案例到知识库 (ID: {record_id})")
+                                if record_id:
+                                    print(f"💾 已存储成功优化案例到知识库 (ID: {record_id})")
+                                else:
+                                    print(f"⚠️ 存储返回None，可能被过滤（检查日志了解原因）")
                             else:
-                                print(f"⚠️ 存储返回None，可能被过滤（检查日志了解原因）")
+                                print("⚠️ Knowledge base unavailable, skipping storage")
                         except Exception as e:
                             print(f"⚠️ 存储知识库失败: {e}")
                             import traceback
@@ -544,17 +558,32 @@ class QueryRewriter:
                 self.current_state = "RULE_SELECTION"
             else:
                 print("❌ 已达到最大优化轮数，终止流程")
-                # Handle rollback decision even when max rounds reached
-                if should_rollback:
-                    print("⚠️ 回退到原始SQL")
+
+                # Check if rewritten cost exceeds original cost by more than 20%
+                cost_increase_ratio = ((rewritten_cost - original_cost) / original_cost * 100) if original_cost > 0 else 0
+                force_rollback = cost_increase_ratio > 20.0
+
+                if force_rollback:
+                    print(f"🔄 强制回退：重写代价({rewritten_cost:.2f})超过原始代价({original_cost:.2f}) {cost_increase_ratio:.2f}% > 20%，强制回退到原始SQL")
                     if self.current_rewrite_result:
                         self.current_rewrite_result["rewritten_sql"] = self.initial_sql
                     # Clear selected rules since we're rolling back
                     self.selected_rules = None
+                    self.optimization_advice = []
                     # Set rewritten cost to original cost (rollback means no improvement)
                     self.final_rewritten_costs = original_cost
                 else:
-                    print(f"✅ 保留当前重写SQL（未回退）")
+                    # Handle rollback decision even when max rounds reached
+                    if should_rollback:
+                        print("⚠️ 回退到原始SQL")
+                        if self.current_rewrite_result:
+                            self.current_rewrite_result["rewritten_sql"] = self.initial_sql
+                        # Clear selected rules since we're rolling back
+                        self.selected_rules = None
+                        # Set rewritten cost to original cost (rollback means no improvement)
+                        self.final_rewritten_costs = original_cost
+                    else:
+                        print(f"✅ 保留当前重写SQL（未回退）")
                 self.current_state = "TERMINATED"
 
         except Exception as e:
@@ -562,10 +591,18 @@ class QueryRewriter:
             self.current_state = "TERMINATED"
 
     def _extract_cost_from_explain(self, explain_result):
-        """Extract total cost from explain result"""
+        """Extract total cost from explain result (now supports both JSON and text formats)"""
         try:
-            # If explain_result is a string (JSON), parse it first
+            # If explain_result is a string, try to extract cost from text first
             if isinstance(explain_result, str):
+                # Try to extract cost from text report format like "执行计划总代价: 123.45"
+                import re
+                cost_match = re.search(r'执行计划总代价:\s*([0-9,]+\.?[0-9]*)', explain_result)
+                if cost_match:
+                    cost_str = cost_match.group(1).replace(',', '')
+                    return float(cost_str)
+
+                # If no text match, try parsing as JSON (backward compatibility)
                 try:
                     explain_result = json.loads(explain_result)
                 except json.JSONDecodeError:

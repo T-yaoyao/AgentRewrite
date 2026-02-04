@@ -903,16 +903,24 @@ class RewriteAgent(Agent):
         try:
             # Extract rewrite result
             rewrite_match = re.search(r'<rewrite>(.*?)</rewrite>', thought_chain, re.DOTALL)
+            rewrite_text = None
             if rewrite_match:
                 rewrite_text = rewrite_match.group(1).strip()
                 json_match = re.search(r'\{.*\}', rewrite_text, re.DOTALL)
                 if json_match:
-                    result = json.loads(json_match.group())
-                    return result
+                    try:
+                        result = json.loads(json_match.group())
+                        return result
+                    except json.JSONDecodeError as e:
+                        print(f"JSON解析错误: {e}")
 
             # If JSON parsing failed, try to extract SQL from response
             print("⚠️ 无法解析JSON格式，尝试从响应中提取SQL...")
-            extracted_sql = self._extract_sql_from_response_robust(thought_chain)
+            # First try to extract from rewrite_text if available
+            if rewrite_text:
+                extracted_sql = self._extract_sql_from_response_robust(rewrite_text)
+            else:
+                extracted_sql = self._extract_sql_from_response_robust(thought_chain)
             if extracted_sql:
                 print(f"✅ 成功从响应中提取SQL")
                 return {
@@ -922,7 +930,7 @@ class RewriteAgent(Agent):
                     "rewritten_sql": extracted_sql,
                     "parse_error": True  # Flag to indicate parsing error
                 }
-            
+
             return {
                 "groups": groups,
                 "applied_rules": applied_rules,
@@ -1061,6 +1069,22 @@ class RewriteAgent(Agent):
 
     def _extract_sql_from_response_robust(self, text: str) -> str:
         """Robust SQL extraction from LLM response"""
+        # First, try to extract from JSON "rewritten_sql" field
+        rewritten_sql_pattern = r'"rewritten_sql"\s*:\s*"([^"]*(?:\\.[^"]*)*)"'
+        rewritten_match = re.search(rewritten_sql_pattern, text, re.DOTALL)
+        if rewritten_match:
+            sql_content = rewritten_match.group(1)
+            try:
+                # Use json.loads to properly unescape the JSON string
+                sql_content = json.loads(f'"{sql_content}"')
+                if sql_content.strip():
+                    return sql_content.strip()
+            except json.JSONDecodeError:
+                # Fallback: basic unescaping
+                sql_content = sql_content.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t')
+                if sql_content.strip():
+                    return sql_content.strip()
+
         # Try to find SQL between ```sql and ```
         pattern1 = r'```sql\s*(.*?)\s*```'
         match1 = re.search(pattern1, text, re.DOTALL | re.IGNORECASE)
@@ -1076,7 +1100,13 @@ class RewriteAgent(Agent):
             sql_content = re.sub(r'\s*```$', '', sql_content)
             return sql_content.strip()
 
-        # Last resort: look for SELECT keyword
+        # Last resort: look for WITH (CTE) or SELECT keyword
+        # First try to match complete WITH statement
+        with_match = re.search(r'(WITH.*?);', text, re.DOTALL | re.IGNORECASE)
+        if with_match:
+            return with_match.group(1).strip() + ";"
+
+        # Fallback to SELECT keyword
         select_match = re.search(r'(SELECT.*?);', text, re.DOTALL | re.IGNORECASE)
         if select_match:
             return select_match.group(1).strip() + ";"
