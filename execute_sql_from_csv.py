@@ -22,9 +22,9 @@ def create_connector() -> PostgresConnector:
       - user: postgres
       - password: 123456
     """
-    host = "172.17.0.3"
+    host = "127.0.0.1"
     port = 5432
-    database = "calcite"
+    database = "tpch"
     user = "postgres"
     password = "123456"
 
