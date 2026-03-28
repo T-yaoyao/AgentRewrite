@@ -5,13 +5,15 @@ class AgentMemoryBuffer:
     Simplified memory buffer for storing key information during the SQL rewriting process
     """
     
-    def __init__(self, data_statistics: str = None, schema_file: str = None):
+    def __init__(self, data_statistics: str = None, schema_file: str = None, schema_content: str = None):
         """Initialize memory buffer"""
 
         # Query related information
         self.initial_sql = None
         self.data_statistics = data_statistics
         self.schema_file = schema_file
+        # 与当前 SQL 相关的 DDL 子集（LangGraph 等在首跳过滤后写入）
+        self.schema_content = schema_content
 
         # Rewriting process results
         self.optimization_advice = None
@@ -30,10 +32,11 @@ class AgentMemoryBuffer:
     def clear_volatile_memory(self):
         """
         Clear volatile memory content while retaining stable configuration information
-        Retain: data_statistics, schema_file
+        Retain: data_statistics, schema_file, schema_content
         Clear: All other content
         """
         self.initial_sql = None
+        self.schema_content = None
         self.optimization_advice = None
         self.produced_sql = None
         self.rewritten_sql = None
@@ -46,7 +49,7 @@ class AgentMemoryBuffer:
     def get_status(self):
         """Get current status for debugging"""
         status = {}
-        for attr in ['initial_sql', 'data_statistics', 'schema_file', 
+        for attr in ['initial_sql', 'data_statistics', 'schema_file', 'schema_content',
                     'optimization_advice', 'produced_sql', 'rewritten_sql',
                     'ori_explain_result', 're_explain_result', 'imp_explain_result',
                     'report', 'guide_info']:
@@ -83,11 +86,13 @@ class OutputCollector:
         self.original_stdout.flush()
 
 
-def create_memory_buffer(data_statistics: str = None, schema_file: str = None) -> AgentMemoryBuffer:
+def create_memory_buffer(
+    data_statistics: str = None, schema_file: str = None, schema_content: str = None
+) -> AgentMemoryBuffer:
     """
     Simple factory function to create a memory buffer
     """
-    return AgentMemoryBuffer(data_statistics, schema_file)
+    return AgentMemoryBuffer(data_statistics, schema_file, schema_content)
 
 
 

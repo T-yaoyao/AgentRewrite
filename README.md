@@ -155,35 +155,25 @@ Here is a detailed guideline: [guideline](src/Rewrite_Middleware/Structured_Know
 
 #### 3.1 Using Automation Scripts (Recommended)
 
-We provide three convenient scripts for different scenarios. 
+We provide scripts for running the query rewriter. 
 
 **Note:** You should enter the following `.sh` files to check the **Input Path**, **Output Path** and the **Schema Path**.
 
-**Option 1: Complete Pipeline (Rewriter + Recommender)**
+**Option 1: Rewriter with default script settings**
 ```bash
 # Check the .sh file configurations
 
-# Run the complete pipeline (can be executed from any location within QUITE)
+# Run the rewriter pipeline (can be executed from any location within QUITE)
 chmod +x ./scripts/run_quite.sh
 bash ./scripts/run_quite.sh
 ```
 
-**Option 2: Query Rewriting Only**
+**Option 2: Query rewriting only (alternate script)**
 ```bash
 # Check the .sh file configurations
 
-# Run only the query rewriter (can be executed from any location within QUITE)
 chmod +x ./scripts/run_quite_only_query_rewrite.sh
 bash ./scripts/run_quite_only_query_rewrite.sh
-```
-
-**Option 3: Hint Recommendation Only**
-```bash
-# Check the .sh file configurations
-
-# Run only the hint recommender (can be executed from any location within QUITE)
-chmod +x ./scripts/run_quite_only_hint_injection.sh
-bash ./scripts/run_quite_only_hint_injection.sh
 ```
 
 #### 3.2 Direct Python Execution
@@ -191,35 +181,19 @@ bash ./scripts/run_quite_only_hint_injection.sh
 You can also run the system directly with custom parameters:
 
 ```bash
-# Basic usage with both modules
+# Query rewriting
 python run.py \
     --input_path dataset/queries/tpch_test.json \
     --output_dir output/my_results \
     --schema_file dataset/schemas/tpch_schemas.sql \
-    --enable_rewriter \
-    --enable_recommender
-
-# Query rewriting only
-python run.py \
-    --input_path dataset/queries/tpch_test.json \
-    --output_dir output/rewrite_only \
-    --schema_file dataset/schemas/tpch_schemas.sql \
     --enable_rewriter
 
-# Hint recommendation only
-python run.py \
-    --input_path dataset/queries/tpch_test.json \
-    --output_dir output/hints_only \
-    --schema_file dataset/schemas/tpch_schemas.sql \
-    --enable_recommender
-
-# With detailed logging
+# With detailed rewriter logs
 python run.py \
     --input_path dataset/queries/tpch_test.json \
     --output_dir output/with_logs \
     --schema_file dataset/schemas/tpch_schemas.sql \
     --enable_rewriter \
-    --enable_recommender \
     --save_rewriter_logs
 ```
 
@@ -231,10 +205,8 @@ python run.py \
 | `--output_dir` | Output directory for results | `/root/QUITE/output` |
 | `--schema_file` | Path to the database schema file | Required |
 | `--enable_rewriter` | Enable query rewriter module | False |
-| `--enable_recommender` | Enable hint recommender module | False |
 | `--save_rewriter_logs` | Save detailed rewriter logs to txt files | False |
 | `--rewriter_batch_size` | Batch size for rewriter | 3 (forced to 1 if saving logs) |
-| `--recommender_batch_size` | Batch size for recommender | 3 |
 | `--max_iterations` | Maximum iteration loops for query rewriting | 2 |
 
 #### 3.4 Monitor the Process
@@ -246,49 +218,25 @@ The system will display real-time progress with tqdm progress bars:
 📂 Input: /root/QUITE/dataset/queries/tpch_test.json
 📁 Output: /root/QUITE/output/test
 🔄 Rewriter: Enabled
-💡 Recommender: Enabled
 📝 Rewriter logs: Enabled (batch size forced to 1)
 
 📁 Directory structure created:
    rewriter_temp: /root/QUITE/output/test/rewriter_temp
-   recommender_temp: /root/QUITE/output/test/recommender_temp
-   output: /root/QUITE/ofutput/test
+   output: /root/QUITE/output/test
 
 ============================================================
 🔄 Starting Query Rewriter
 ============================================================
-📊 Processing 10 queries with batch size 1
-📁 Temp directory: /root/QUITE/output/test/rewriter_temp
-📝 Save logs: Yes
-
-🔄 Processing Query 1/10 (ID: query_1): 100%|██████████| 10/10 [02:34<00:00, 15.4s/query]
-
-✅ Query Rewriter completed! Processed 10 queries in 10 batches
-✅ Merged 10 batch files into /root/QUITE/output/test/rewritten_queries.json
-📊 Total queries processed: 10
-
-============================================================
-💡 Starting Hint Recommender
-============================================================
-📖 Loading data from /root/QUITE/output/test/rewritten_queries.json
-📊 Processing 10 queries with batch size 3
-
-💡 Processing Hint 1/10 (ID: query_1): 100%|██████████| 10/10 [01:45<00:00, 10.5s/hint]
-
-✅ Hint Recommender completed! Processed 10 queries in 4 batches
-✅ Merged 4 batch files into /root/QUITE/output/test/recommended_hints.json
-📊 Total queries processed: 10
+...
 
 ============================================================
 🎉 QUITE System Completed!
 ============================================================
 📝 Query Rewriter Output: /root/QUITE/output/test/rewritten_queries.json
-💡 Hint Recommender Output: /root/QUITE/output/test/recommended_hints.json
 📁 Output Directory: /root/QUITE/output/test
 
 📊 Final output files:
-   rewritten_queries.json: 3,396 bytes
-   recommended_hints.json: 3,936 bytes
+   rewritten_queries.json: ...
 
 ✨ Processing completed successfully!
 ```
@@ -301,18 +249,10 @@ Results are organized in a hierarchical directory structure with temporary and f
 
 ```
 output/
-├── rewriter_temp/                   # Temporary rewriter batch files
-│   ├── batch_1.json                # Query rewriting batch 1
-│   ├── batch_1.txt                 # Detailed logs batch 1 (if --save_rewriter_logs)
-│   ├── batch_2.json                # Query rewriting batch 2  
-│   ├── batch_2.txt                 # Detailed logs batch 2 (if --save_rewriter_logs)
-│   └── ...
-├── recommender_temp/                # Temporary recommender batch files
-│   ├── batch_1.json                # Hint recommendation batch 1
-│   ├── batch_2.json                # Hint recommendation batch 2
-│   └── ...
-├── rewritten_queries.json          # Final merged rewriter output
-└── recommended_hints.json          # Final merged recommender output
+├── rewriter_temp/                   # Temporary rewriter logs (if --save_rewriter_logs)
+│   └── query_<id>.txt
+├── rewritten_queries.json          # Rewriter output
+└── ...
 ```
 
 ### Step 5: Performance Evaluation
@@ -429,14 +369,13 @@ In the course of rewriting with QUITE, we discovered a range of strategies previ
 #### 📋 Automation Scripts
 - **`scripts/`**: Execution scripts for different scenarios
   - `setup_env.sh`: Common environment setup script (auto-detects project root)
-  - `run_quite.sh`: Complete pipeline with both rewriter and recommender
-  - `run_quite_only_query_rewrite.sh`: Query rewriting only
-  - `run_quite_only_hint_injection.sh`: Hint recommendation only
+  - `run_quite.sh`: Run query rewriter with default paths
+  - `run_quite_only_query_rewrite.sh`: Query rewriting only (alternate defaults)
   - `evaluation.sh`: Evaluate the rewrite result in real DBMS 
 
 #### 🔧 LLM Agent-based Query Rewriter
 - **`src/Query_Rewriter/`**: Main query rewriting engine
-  - `finite_state_machine.py`: Finite state machine orchestrating the complete rewrite workflow
+  - `langgraph_rewriter.py`: LangGraph orchestration for the rewrite workflow
   - `agent_definition.py`: Definitions for Reasoning, Assistant, and Decision agents
 
 #### 🛠️ Rewrite Middleware
@@ -445,10 +384,6 @@ In the course of rewriting with QUITE, we discovered a range of strategies previ
   - `Agent_Memory_Buffer/`: Advanced memory management for agent context
   - `Structured_Knowledge_Base/`: Knowledge retrieval and management system
   - `Agent_Memory_Buffer`: Memory management to prevent context overflow and hallucinations
-
-#### 💡 Query Hint Recommender
-- **`src/Hint_Recommender/`**: Optimization hint generation system
-  - `injection.py`: Main hint injection and recommendation engine
 
 #### 🔧 Utilities
 - **`src/utils/`**: Shared utilities and base classes
@@ -485,13 +420,12 @@ QUITE/
 │       ├── DSB/                     # DSB query examples
 │       └── Calcite/                 # Calcite query examples
 ├── scripts/
-│   ├── run_quite.sh                 # Complete pipeline execution 
+│   ├── run_quite.sh                 # Run rewriter with default paths
 │   ├── run_quite_only_query_rewrite.sh    # Query rewriting only
-│   ├── run_quite_only_hint_injection.sh   # Hint recommendation only
 │   └── performance_evaluation.sh   # Evaluate rewrite results in real 
 ├── src/
 │   ├── Query_Rewriter/
-│   │   ├── finite_state_machine.py  # Main FSM orchestrating rewrite 
+│   │   ├── langgraph_rewriter.py    # LangGraph orchestrating rewrite
 │   │   ├── agent_definition.py      # LLM agent role definitions
 │   │   └── memory_buffer.py         # Agent memory management system
 │   ├── Rewrite_Middleware/
@@ -507,10 +441,6 @@ QUITE/
 pipeline
 │   │       └── scripts/
 │   │           └── test.py          # Knowledge base testing utilities
-│   ├── Hint_Recommender/
-│   │   ├── injection.py             # Main hint injection and recommendation engine
-│   │   ├── gpt.py                   # GPT client for hint generation
-│   │   └── tools.py                 # Utility tools for hint processing
 │   └── utils/
 │       ├── agent_template.py        # Base agent template classes
 │       ├── llm_client.py           # LLM client interface

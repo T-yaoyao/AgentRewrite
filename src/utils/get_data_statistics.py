@@ -20,6 +20,56 @@ setup_python_path()
 from src.Rewrite_Middleware.middleware import DBMS
 from src.utils.data_distribution import DATABASE_STATISTICS
 
+
+def get_index_info(dbms_instance):
+    """
+    PostgreSQL public schema indexes via pg_indexes.
+    Returns: [{"table": str, "index_name": str, "definition": str}, ...]
+    """
+    if dbms_instance is None:
+        return []
+    out = []
+    try:
+        dbms_instance.connect()
+        dbms_instance.cursor.execute(
+            """
+            SELECT tablename, indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+            ORDER BY tablename, indexname
+            """
+        )
+        for row in dbms_instance.cursor.fetchall():
+            r = row if isinstance(row, (list, tuple)) else (
+                row.get("tablename"),
+                row.get("indexname"),
+                row.get("indexdef"),
+            )
+            out.append({"table": r[0], "index_name": r[1], "definition": r[2] or ""})
+    except Exception as e:
+        print(f"⚠️ 获取索引信息失败: {e}")
+        out = []
+    return out
+
+
+def format_index_info_for_prompt(index_list):
+    """Human-readable index block for agent prompts."""
+    if not index_list:
+        return "当前库未查询到索引信息。"
+    lines = []
+    cur = None
+    for item in index_list:
+        t = item.get("table", "")
+        if t != cur:
+            cur = t
+            lines.append(f"表名: {t}")
+        lines.append(f"  索引名: {item.get('index_name', '')}")
+        d = item.get("definition", "")
+        if d:
+            lines.append(f"  定义: {d}")
+    return "\n".join(lines)
+
+
 def collect_database_statistics(dbms_instance=None):
     """
     Collect statistics from the database

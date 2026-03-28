@@ -44,6 +44,26 @@ except ImportError:
     print("Warning: sentence-transformers not available, using simple hash-based similarity")
 
 
+def _find_hf_hub_snapshot(hub_models_root: Path, model_id: str) -> Optional[Path]:
+    """
+    Locate a complete local snapshot under HuggingFace hub cache layout:
+    hub_models_root / models--org--name / snapshots / <revision> /
+    """
+    folder = "models--" + model_id.replace("/", "--")
+    snapshots = hub_models_root / folder / "snapshots"
+    if not snapshots.is_dir():
+        return None
+    weight_files = ("model.safetensors", "pytorch_model.bin", "model.bin")
+    candidates = [p for p in snapshots.iterdir() if p.is_dir()]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for rev in candidates:
+        if not (rev / "config.json").exists():
+            continue
+        if any((rev / w).exists() for w in weight_files):
+            return rev
+    return None
+
+
 class VectorStore:
     """Vector database manager for SQL optimization knowledge"""
     
@@ -95,32 +115,85 @@ class VectorStore:
                 # Create models cache directory in project root
                 cache_dir = Path(__file__).parent.parent.parent.parent / "models_cache"
                 cache_dir.mkdir(exist_ok=True)
+                st_cache = cache_dir / "sentence_transformers"
 
-                # Set Hugging Face cache directory and mirror
-                os.environ['HF_HOME'] = str(cache_dir / "huggingface")
-                os.environ['TRANSFORMERS_CACHE'] = str(cache_dir / "transformers")
-                os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-                os.environ['HF_HUB_CACHE'] = str(cache_dir / "huggingface" / "hub")
+                # Hugging Face dirs (do not override if user already set in .env / shell)
+                os.environ.setdefault("HF_HOME", str(cache_dir / "huggingface"))
+                os.environ.setdefault("TRANSFORMERS_CACHE", str(cache_dir / "transformers"))
+                os.environ.setdefault("HF_HUB_CACHE", str(cache_dir / "huggingface" / "hub"))
+                # 国内或网络受限时可设 HF_ENDPOINT=https://hf-mirror.com；未设置时默认镜像，避免直连 huggingface.co
+                os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-                # Use a lightweight model for SQL embeddings with local cache
-                # Try different model name formats
-                model_names = [
-                    'sentence-transformers/all-MiniLM-L6-v2',
-                    'all-MiniLM-L6-v2'
-                ]
+                default_model_id = "sentence-transformers/all-MiniLM-L6-v2"
+                model_id = os.getenv("ST_EMBEDDING_MODEL_ID", default_model_id).strip() or default_model_id
 
-                for model_name in model_names:
+                # 1) 显式本地路径（目录内需含 config.json 与权重）
+                explicit_local = os.getenv("ST_EMBEDDING_MODEL_PATH", "").strip()
+                local_snap: Optional[Path] = None
+                if explicit_local:
+                    p = Path(explicit_local).expanduser().resolve()
+                    if p.is_dir() and (p / "config.json").exists():
+                        local_snap = p
+
+                # 2) sentence-transformers 默认 cache_folder 下的已下载 snapshot（免联网）
+                if local_snap is None:
+                    local_snap = _find_hf_hub_snapshot(st_cache, model_id)
+
+                if local_snap is not None:
+                    snap_s = str(local_snap.resolve())
+                    # 避免部分版本在本地路径下仍向 huggingface.co 发 HEAD（连接被重置）
+                    prev_off = os.environ.get("HF_HUB_OFFLINE")
+                    os.environ["HF_HUB_OFFLINE"] = "1"
                     try:
-                        self.embedding_model = SentenceTransformer(
-                            model_name,
-                            cache_folder=str(cache_dir / "sentence_transformers")
+                        try:
+                            self.embedding_model = SentenceTransformer(
+                                snap_s,
+                                cache_folder=str(st_cache),
+                                local_files_only=True,
+                            )
+                        except TypeError:
+                            # 旧版 sentence-transformers 无 local_files_only，仅靠 HF_HUB_OFFLINE 禁网
+                            self.embedding_model = SentenceTransformer(
+                                snap_s,
+                                cache_folder=str(st_cache),
+                            )
+                        print(
+                            f"✅ Loaded sentence-transformers from local snapshot (no Hub download): {snap_s}"
                         )
-                        print(f"✅ Loaded sentence-transformers model '{model_name}' for embeddings (cached in {cache_dir})")
-                        print("🔗 Using Hugging Face mirror: https://hf-mirror.com")
-                        break  # Success, exit the loop
                     except Exception as e:
-                        print(f"⚠️ Failed to load model '{model_name}': {e}")
-                        continue
+                        print(f"⚠️ Local snapshot load failed ({local_snap}): {e}")
+                    finally:
+                        if prev_off is None:
+                            os.environ.pop("HF_HUB_OFFLINE", None)
+                        else:
+                            os.environ["HF_HUB_OFFLINE"] = prev_off
+
+                # 3) 回退：按模型名从 Hub 拉取（需网络）
+                if self.embedding_model is None:
+                    if os.getenv("HF_HUB_OFFLINE", "").strip().lower() in ("1", "true", "yes"):
+                        print(
+                            "❌ HF_HUB_OFFLINE 已开启且无可用本地 embedding 模型，跳过下载。"
+                            " 请设置 ST_EMBEDDING_MODEL_PATH 或先在有网络环境完成下载。"
+                        )
+                    else:
+                        model_names = [model_id, "all-MiniLM-L6-v2"]
+                        for name in model_names:
+                            try:
+                                self.embedding_model = SentenceTransformer(
+                                    name,
+                                    cache_folder=str(st_cache),
+                                )
+                                print(
+                                    f"✅ Loaded sentence-transformers model '{name}' "
+                                    f"(cached under {st_cache})"
+                                )
+                                ep = os.environ.get("HF_ENDPOINT", "")
+                                if ep:
+                                    print(f"🔗 HF_ENDPOINT={ep}")
+                                break
+                            except Exception as e:
+                                print(f"⚠️ Failed to load model '{name}': {e}")
+                                continue
 
                 if self.embedding_model is None:
                     print("❌ Failed to load any embedding model")

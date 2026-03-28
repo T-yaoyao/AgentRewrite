@@ -1,21 +1,19 @@
 
-from openai import OpenAI, AsyncOpenAI
 import json
 import os
 import re
 import textwrap
 import sys
-import json
-import textwrap
-from typing import List, Dict, Set, Optional, Union
+from typing import Dict, Optional
 
 # Setup project paths
 from src.utils.path_config import setup_python_path, load_project_env
 setup_python_path()
 load_project_env()
 
-from src.utils.agent_template import MessageContent, Message, MemoryWindow, MessageQueue,  Agent
+from src.utils.agent_template import MessageQueue, Agent
 from src.utils.llm_client import GPT
+from src.utils.llm_json_utils import parse_llm_json, parse_llm_json_with_default
 
 class ReasoningAgent(Agent):
     """MDP-based Reasoning Agent"""
@@ -26,121 +24,7 @@ class ReasoningAgent(Agent):
         base_url=os.getenv("REASONING_MODEL_URL")
         ))
 
-        self.api_key = os.getenv("REASONING_MODEL_API_KEY")  # Get the API key from the environment variable
-        self.model = os.getenv("REASONING_MODEL")
-        self.base_url = os.getenv("REASONING_MODEL_URL")
-        self.async_client = AsyncOpenAI(
-            base_url=self.base_url,
-            api_key=self.api_key
-        )
-        self.client = OpenAI(
-            base_url=self.base_url,
-            api_key=self.api_key
-        )
-
-
-    async def get_answer(self, prompt):
-        reasoning_content = ""  # 
-        is_answering = False   # 
-        messages= []
-
-        # messages.append({"role": "system", "content": "Initiate your response with '<think>\\n' at the beginning of every output."})
-        messages.append(({"role": "user", "content": prompt}))
-
-        completion = await self.async_client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=True,
-            temperature=0.0
-        )
-
-        async for chunk in completion:
-            if not chunk.choices:
-                if hasattr(chunk, 'usage') and chunk.usage:
-                    print("\nUsage:")
-                    print(chunk.usage)
-            else:
-                delta = chunk.choices[0].delta
-                if hasattr(delta, 'reasoning_content') and delta.reasoning_content is not None:
-                    print(delta.reasoning_content, end='', flush=True)
-                    reasoning_content += delta.reasoning_content
-                else:
-                    if delta.content != "" and is_answering is False:
-                        is_answering = True
-                        break
-
-        return reasoning_content
-        
-        
-    async def analyze_sql(self, sql: str, data_statistics, explain_info : str) -> dict:
-
-        prompt = textwrap.dedent(f"""
-        <任务目标>
-       你是一名经验丰富的 DBA，核心任务是为用户完成高质量的 SQL 查询重写工作。                    
-        基于统计信息和执行计划分析结果，对 SQL 进行性能诊断，并给出有针对性的重写优化方向。
-        针对每一项优化策略，需评定重写评分，同时确定该 SQL 的最优优化方案。
-        重要提示若经评估，目标 SQL 查询语句已处于充分优化状态，或结构过于简单无需调整，则直接给出该 SQL 的最终版本，同时判定其 “无需进一步优化”，并在回复末尾标注关键词 TERMINATE。                      
-        <sql语句>
-        {sql}
-
-        <统计信息>
-        {data_statistics}
-
-        <执行计划分析结果>
-        {explain_info}
-        """)
-        
-        thought_chain = await self.get_answer(
-            prompt=prompt,
-        )
-        self.send_message(
-            MessageContent(text=thought_chain),
-            role="ReasoiningAgent",
-            receiver="SummaryAgent"
-        )
-
-        return thought_chain
-
-    
-
-    async def analyze_sql_report(self, sql: str, data_statistics, report: dict, explain_info: str) -> dict: 
-
-        prompt = textwrap.dedent(f"""
-        <Mission>
-        你是一名经验丰富的 DBA，核心任务是为用户完成高质量的 SQL 查询重写工作。                    
-        基于统计信息和执行计划分析结果，对 SQL 进行性能诊断，并给出有针对性的重写优化方向。
-        针对每一项优化策略，需评定重写评分，同时确定该 SQL 的最优优化方案。
-
-        特别说明：你会获取到此前的重写报告作为参考。
-                                 
-        若经评估，目标 SQL 查询语句已处于充分优化状态，或结构过于简单无需调整，则直接判定其 “无需进一步优化”，并在回复末尾标注关键词 TERMINATE。
-
-        <sql语句>
-        {sql}
-
-        <统计信息>
-        {data_statistics}
-
-        <执行计划分析结果>
-        {explain_info}
-
-        <重写报告>
-        {report}
-
-        """)
-        
-        thought_chain = await self.get_answer(
-            prompt=prompt,
-        )
-        self.send_message(
-            MessageContent(text=thought_chain),
-            role="ReasoiningAgent",
-            receiver="SummaryAgent"
-        )
-
-        return thought_chain
-
-    async def select_rule_sequence(self, sql: str, decision_advice: list, rule_library: dict, data_statistics: str, explain_info: str, iteration_round: int = 1, previous_feedback: dict = None, few_shot_examples: list = None) -> dict:
+    async def select_rule_sequence(self, sql: str, decision_advice: list, rule_library: dict, data_statistics: str, explain_info: str, iteration_round: int = 1, previous_feedback: dict = None, few_shot_examples: list = None, index_info: str = "") -> dict:
         """Select appropriate rule sequence based on DecisionAgent's advice"""
         advice_text = json.dumps(decision_advice, ensure_ascii=False, indent=2)
 
@@ -195,17 +79,6 @@ class ReasoningAgent(Agent):
            - 挑选能够解决问题的规则
            - 按照规则依赖关系进行排序
            {few_shot_context}
-        3. 输出格式：
-        <rule_sequence>
-        {{
-            "groups": "{groups_text}",
-            "applied_rules": []
-        }}
-        </rule_sequence>
-
-        注意：applied_rules数组中的规则ID必须是从上述<rule_library>中提供的实际规则ID，不要编造不存在的规则ID！
-
-
 
         {previous_feedback_text}
 
@@ -221,38 +94,32 @@ class ReasoningAgent(Agent):
         <统计信息>
         {data_statistics}
 
+        <索引信息>
+        {index_info}
+
         <执行计划分析结果>
         {explain_info}
+
+        3. 输出格式（**最后必须严格按此输出**）：
+        <rule_sequence>
+        {{
+            "groups": "{groups_text}",
+            "applied_rules": []
+        }}
+        </rule_sequence>
+
+        注意：applied_rules 中的规则 ID 必须来自上述 <rule_library>，禁止编造。
         """)
 
         thought_chain = await self.llm.get_LLM_response_async(prompt=prompt)
 
-        try:
-            # Extract rule_sequence from response
-            sequence_match = re.search(r'<rule_sequence>(.*?)</rule_sequence>', thought_chain, re.DOTALL)
-            if sequence_match:
-                sequence_text = sequence_match.group(1).strip()
-                json_match = re.search(r'\{.*\}', sequence_text, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group())
-                    return result
-
-            # Fallback: try to extract JSON directly
-            json_match = re.search(r'\{.*\}', thought_chain, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-                return result
-
-            return {
-                "groups": groups_text,
-                "applied_rules": []
-            }
-        except json.JSONDecodeError as e:
-            print(f"规则序列解析错误: {e}")
-            return {
-                "groups": groups_text,
-                "applied_rules": []
-            }
+        default = {"groups": groups_text, "applied_rules": []}
+        sequence_match = re.search(r"<rule_sequence>(.*?)</rule_sequence>", thought_chain, re.DOTALL)
+        inner = sequence_match.group(1).strip() if sequence_match else thought_chain
+        parsed, _ = parse_llm_json(inner, default)
+        if parsed and isinstance(parsed.get("applied_rules"), list):
+            return parsed
+        return default
 
 
 class DecisionAgent(Agent):
@@ -265,7 +132,7 @@ class DecisionAgent(Agent):
 ))
         self.watch(["ReasoningAgent", "ExplainAgent"])
 
-    async def initial_optimization_check(self, sql: str, data_statistics: str, explain_info: str, few_shot_examples: list = None) -> dict:
+    async def initial_optimization_check(self, sql: str, data_statistics: str, explain_info: str, few_shot_examples: list = None, index_info: str = "") -> dict:
         """Initial check to determine if SQL can be optimized through rewriting"""
         
         # Build few-shot examples context
@@ -284,11 +151,12 @@ class DecisionAgent(Agent):
         
         prompt = textwrap.dedent(f"""
         <Mission>
-        你是一名经验丰富的 DBA，你的任务是判断给定的 SQL 查询是否可以通过查询重写优化来提升执行性能。
+        你是一名经验丰富的 SQL查询重写优化专家，你的任务是判断给定的 SQL 查询是否可以通过查询重写优化来提升执行性能。
 
         1. 分析输入信息：
            - <sql语句>: 原始SQL查询
            - <统计信息>: 数据库表统计信息
+           - <索引信息>: 表索引（索引名与定义）
            - <执行计划分析结果>: 智能执行计划分析器生成的分析结果
            {few_shot_context}
 
@@ -310,8 +178,8 @@ class DecisionAgent(Agent):
 
            [False] - 不需要优化：
            - SQL已经是最优结构，执行计划合理
-           - SQL过于简单，无优化空间
            - 执行计划显示已经是最佳执行方式
+           - SQL已经不能单纯通过查询重写优化来提升性能，需要结合索引或物理优化方式来提升性能
 
         4. 如果可以优化，请提供有针对性的优化方向建议，按照以下格式输出：
         <advice>
@@ -337,202 +205,27 @@ class DecisionAgent(Agent):
         <统计信息>
         {data_statistics}
 
+        <索引信息>
+        {index_info}
+
         <执行计划分析结果>
         {explain_info}
         """)
 
         thought_chain = await self.llm.get_LLM_response_async(prompt=prompt)
 
-        try:
-            # Extract JSON from response
-            json_match = re.search(r'\{.*\}', thought_chain, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-                return result
-            else:
-                # Fallback parsing
-                return {
-                    "can_optimize": False,
-                    "reason": "无法解析LLM响应，默认认为无需优化",
-                    "advice": []
-                }
-        except json.JSONDecodeError as e:
-            print(f"JSON解析错误: {e}")
-            return {
-                "can_optimize": False,
-                "reason": f"JSON解析失败: {str(e)}",
-                "advice": []
-            }
-
-    async def summarize_chain(self, chain: str, original_sql: str, data_statistics) -> dict:
-        prompt = textwrap.dedent(f"""
-        <Mission>
-        你是一名经验丰富的 DBA，核心任务是为用户完成高质量的 SQL 查询重写工作。
-        1. 总结重写建议和新的重写 SQL 查询，基于详细的 SQL 重写报告 [chain]。
-        每个建议应归入以下类别之一：
-        - 子查询优化
-        - 连接优化
-        - 谓词简化
-        - 常量折叠
-        - 聚合优化
-        - 投影优化
-        - 排序优化
-        - 集合优化
-       2. 随后检查 produced_sql，挖掘其潜在的优化空间，在保证结果等价性的前提下对其进行进一步优化（例如：将过滤条件提前至FROM子句的JOIN环节、在主查询中保留过滤条件以优化 CTE 结构、常量折叠、日期 / 数值计算优化、冗余谓词简化等）。
-        此阶段还可结合数据统计信息（data_statistics） 提升 SQL 执行效率，尤其是在考虑创建 CTE 的场景下。
-        注意：切勿盲目创建 CTE，尤其是当查询包含大量WHERE/JOIN条件，或冗余子查询计算较少时，更应避免滥用 CTE。                    
-
-        3. 请严格遵循以下格式：
-        [format]
-        </produced_sql>
-        ```sql
-                                 
-        ```
-        </produced_sql>
-        
-        </advice>
-        [
-                {{
-                    "group": "",
-                    "produced_suggestion": ""
-                }},
-                ... // 如果还有更多建议，则继续添加
-        ]
-        </advice>
-                                 
-        </analysis>
-        // 重写 SQL 语句的分析
-        </analysis>
-        
-        </rewritten_sql>
-        ```sql
-                                 
-        ```
-        </rewritten_sql>
-                                 
-
-        [chain]
-            {chain} 
-
-        [oringal_sql]
-            {original_sql}
-        """)
-        
-        response = await self.llm.get_LLM_response_async(
-            prompt=prompt,
-            json_format= False
-        )
-        return response 
-    
-
-    async def check_equivalence(self, ori_sql: str, rewritten_sql: str, rewrite_advice) -> dict:
-        prompt = textwrap.dedent(f"""
-        你是一名经验丰富的 DBA，核心任务是检查原始 SQL 和改进 SQL 的等价性。
-        1. 检查原始 SQL 和改进 SQL 的等价性。如果认为改进 SQL 不等价于原始 SQL，请提供修正后的 SQL。
-        2. 你还有重写思路过程需要考虑，以使 SQL 更高效。注意：不要在 SQL 中包含注释，并尽量避免进行过多的交换。
-
-        <original_sql>:
-        {ori_sql}
-
-        <rewritten_sql>:
-        {rewritten_sql}
-
-        <rewritten_idea_process>:
-        {rewrite_advice}
-        3. 请严格遵循以下格式：
-        [format]
-        </analysis>
-
-        </analysis>
-        
-        </equivalence>
-            // True/False
-        </equivalence>
-        
-        </corrected_sql>
-          // 如果是false，则插入修正后的 SQL；否则留空。
-        </corrected_sql>
-        """)
-        
-        response = await self.llm.get_LLM_response_async(
-            prompt=prompt,
-            json_format=False
-        )
-        return response
-    
-    async def select_sql(self, original_sql:str, query_pairs:list) -> dict:
-        prompt = textwrap.dedent(f"""
-        你是一名经验丰富的 DBA，核心任务是选择最有效的改进 SQL 语句。
-        1. 你已获得多个等价于原始 SQL 查询的 SQL 语句，每个改进 SQL 语句都有其自己的重写过程。
-        2. 你的任务是选择最有效的改进 SQL 语句。
-        3. 请严格遵循以下格式：
-        [format]
-        </analysis>
-            // 填充选定 SQL 语句的分析。
-        </analysis>
-        </selected_id>
-            // 填充你认为最好的选定 ID。
-        </selected_id>
-        """)
-        
-        response = await self.llm.get_LLM_response_async(
-            prompt=prompt,
-            json_format=False
-        )
-        return response
-
-    
-    async def evaluate(self, ori_sql: str, rewritten_sql: str, report: str, worker_equivalence_flags: List[bool] = None) -> dict:
-        # Check if all workers failed equivalence check
-        equivalence_failure_info = ""
-        if worker_equivalence_flags is not None and all(not flag for flag in worker_equivalence_flags):
-            equivalence_failure_info = """
-        
-        **IMPORTANT CONTEXT**: 
-        所有并行工作器都失败了等价性检查，不得不回退到原始 SQL。 
-        这意味着重写后的查询不等价于原始查询，而不是原始查询已经是最优的。
-        系统尝试了 SQL 优化，但重写版本失败了等价性验证。
-        考虑这种情况作为失败优化尝试，而不是表明不需要优化。
-        """
-
-        prompt = textwrap.dedent(f"""
-        你负责评估 SQL 优化是否符合标准。请根据以下信息决定是否终止优化过程：
-        你想终止优化过程吗？
-
-        注意：<original_sql> 和 <rewritten_sql> 的costs来自数据库优化器，可能不精确。基于详细分析做出决定。
-       
-
-        终止条件：
-        [True]:
-           1. rewritten_sql costs < ori_sql costs (优化成功，直接终止)
-            2. rewritten_sql costs 略微大于ori_sql costs，代价没有增加的很夸张，但重写后SQL的执行计划更优，直接终止并保留重写SQL。 
-            3. rewritten_sql costs ≥ ori_sql costs (明显重写SQL没有原始SQL执行效果好，并且你认为当前SQL在重写层面已经无法进行优化，直接终止并回退SQL到原始SQL)
-
-        [False]:
-            如果你认为是规则选择的不对，或者SQL和执行计划明确显示还有明显优化空间，继续下一轮优化。
-            {equivalence_failure_info}
-            
-        请严格遵循以下 JSON 格式返回你的答案：
-        {{
-            "terminate": True/False,
-            "reason": ""  // 提供你的理由。
-        }}
-
-        <original_sql>:
-        {ori_sql}
-
-        <rewritten_sql>:
-        {rewritten_sql}
-
-        <report>:
-        {report}
-        """)
-        
-        response = await self.llm.get_LLM_response_async(
-            prompt=prompt,
-            json_format=False
-        )
-        return response
+        default_result = {
+            "can_optimize": False,
+            "reason": "无法解析LLM响应，默认认为无需优化",
+            "advice": [],
+        }
+        parsed, _ = parse_llm_json(thought_chain, default_result)
+        if not parsed:
+            return default_result
+        parsed.setdefault("can_optimize", False)
+        parsed.setdefault("advice", [])
+        parsed.setdefault("reason", "")
+        return parsed
 
     async def evaluate_with_costs(self, optimization_info: dict, iteration_round: int = 1) -> dict:
         """Evaluate optimization results with cost analysis for multi-round optimization"""
@@ -564,13 +257,15 @@ class DecisionAgent(Agent):
         - 应用的规则: {', '.join(applied_rules)}
          * 注意：<original_sql> 和 <rewritten_sql> 的costs来自数据库优化器，可能不精确。基于详细分析做出决定。*  
         终止条件：
-        [True]:
-            1. rewritten_sql costs < ori_sql costs (优化成功，直接终止)
-            2. rewritten_sql costs 略微大于ori_sql costs，代价没有增加的很夸张，但重写后SQL的执行计划更优，直接终止并保留重写SQL。 
-            3. rewritten_sql costs ≥ ori_sql costs (明显重写SQL没有原始SQL执行效果好，并且你认为当前SQL在重写层面已经无法进行优化，直接终止并回退SQL到原始SQL)
+        [True]（terminate 为 true）：
+            1. rewritten_sql costs 明显低于 ori_sql costs（优化成功，直接终止；通常「是否保留重写SQL」为 true）
+            2. rewritten_sql costs 略微大于 ori_sql costs，代价没有增加得很夸张，但重写后 SQL 的执行计划更优，直接终止；「是否保留重写SQL」为 true。
+            3. rewritten_sql costs ≥ ori_sql costs，明显不如原始 SQL，且你认为在重写层面已无法继续优化时，可终止；若最终应采用原始 SQL，则「是否保留重写SQL」为 false（系统将回退到原始 SQL）。
 
-        [False]:
-            如果你认为是规则选择的不对，或者SQL和执行计划明确显示还有明显优化空间，继续下一轮优化。
+        [False]（terminate 为 false）：
+            若规则选择不当，或 SQL 与执行计划仍显示有明显优化空间，继续下一轮优化。
+
+        「是否保留重写SQL」：true 表示当前重写更优，保留当前重写 SQL；false 表示不保留、回退到原始 SQL。
 
         {f"上一轮评估失败原因: {reason}" if reason else ""}
 
@@ -578,8 +273,7 @@ class DecisionAgent(Agent):
         {{
             "terminate": true/false,
             "reason": "评估理由的详细说明",
-            "应用的规则": ["RULE_ID1", "RULE_ID2"],
-            "是否回退SQL": true/false
+            "是否保留重写SQL": true/false
         }}
 
         <原始SQL成本信息>
@@ -602,166 +296,21 @@ class DecisionAgent(Agent):
             json_format=True
         )
 
-        try:
-            # Extract JSON from response
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-                return result
-            else:
-                return {
-                    "terminate": True,
-                    "reason": "无法解析响应，默认终止优化",
-                    "应用的规则": [],
-                    "是否回退SQL": False
-                }
-        except json.JSONDecodeError as e:
-            print(f"评估结果解析错误: {e}")
-            return {
-                "terminate": True,
-                "reason": f"JSON解析失败: {str(e)}",
-                "应用的规则": [],
-                "是否回退SQL": False
-            }
-
-    def extract_advice_content(self, text: str) -> str:
-        """
-        Extract content between </advice> and </advice> tags.
-        """
-        pattern = r'</advice>\s*(.*?)\s*</advice>'
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            return json.loads(match.group(1).strip())
-        return ""
-    
-    def extract_selected_id_content(self, text: str) -> str:
-        """
-        Extract content between </selected_id> and </selected_id> tags.
-        """
-        pattern = r'</selected_id>\s*(.*?)\s*</selected_id>'
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            return match.group(1).strip()  # 直接返回字符串，不需要JSON解析
-        return ""
-    
-
-    def extract_sql_candidate_content(self, text: str) -> str:
-        """
-        Extract content between </sql_candidate> and </sql_candidate> tags.
-        """
-        # First, try to match the format with ```sql
-        pattern1 = r'</sql_candidate>\s*```sql\s*(.*?)\s*```\s*</sql_candidate>'
-        match1 = re.search(pattern1, text, re.DOTALL)
-        if match1:
-            return match1.group(1).strip()
-
-        # Try to match the format without ```
-        pattern2 = r'</sql_candidate>\s*(.*?)\s*</sql_candidate>'
-        match2 = re.search(pattern2, text, re.DOTALL)
-        if match2:
-            sql_content = match2.group(1).strip()
-            sql_content = re.sub(r'^```sql\s*', '', sql_content)
-            sql_content = re.sub(r'\s*```$', '', sql_content)
-            return sql_content.strip()
-        
-        print(f"Warning: Could not extract SQL candidate from response")
-        return ""
-
-    def extract_rewritten_sql_content(self, text: str) -> str:
-        """
-        Extract content between </rewritten_sql> and </rewritten_sql> tags.
-        """
-        # First, try to match the format with ```sql
-        pattern1 = r'</rewritten_sql>\s*```sql\s*(.*?)\s*```\s*</rewritten_sql>'
-        match1 = re.search(pattern1, text, re.DOTALL)
-        if match1:
-            return match1.group(1).strip()
-
-        # Try to match the format without ```
-        pattern2 = r'</rewritten_sql>\s*(.*?)\s*</rewritten_sql>'
-        match2 = re.search(pattern2, text, re.DOTALL)
-        if match2:
-            sql_content = match2.group(1).strip()
-            sql_content = re.sub(r'^```sql\s*', '', sql_content)
-            sql_content = re.sub(r'\s*```$', '', sql_content)
-            return sql_content.strip()
-        
-        print(f"Warning: Could not extract rewritten SQL from response")
-        return ""
-    
-    def extract_equivalence_content(self, text: str) -> str:
-        """
-        Extract content between </equivalence> and </equivalence> tags.
-        """
-        pattern = r'</equivalence>\s*(.*?)\s*</equivalence>'
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return ""
-    
-    def extract_corrected_sql_content(self, text: str) -> str:
-        """
-        Extract content between </corrected_sql> and </corrected_sql> tags.
-        Support multiple formats: code blocks with ```sql and plain text without.
-        """
-        # First, try to match the format with ```sql
-        pattern1 = r'</corrected_sql>\s*```sql\s*(.*?)\s*```\s*</corrected_sql>'
-        match1 = re.search(pattern1, text, re.DOTALL)
-        if match1:
-            return match1.group(1).strip()
-
-        # If no match is found, try to match the plain text format without ```
-        pattern2 = r'</corrected_sql>\s*(.*?)\s*</corrected_sql>'
-        match2 = re.search(pattern2, text, re.DOTALL)
-        if match2:
-            sql_content = match2.group(1).strip()
-            # Remove any ```sql markers
-            sql_content = re.sub(r'^```sql\s*', '', sql_content)
-            sql_content = re.sub(r'\s*```$', '', sql_content)
-            return sql_content.strip()
-        
-        print(f"Warning: Could not extract corrected SQL from response: {text[:200]}...")
-        return ""
-
-    async def merge_advice(self, base_sql: str, optimizations: List[str], rag_optimizations: List[str]) -> str:
-        """Merge optimization suggestions into SQL"""
-        optimizations_str = [
-            json.dumps(opt) if isinstance(opt, dict) else str(opt)
-            for opt in optimizations
-        ]
-        prompt = textwrap.dedent(f"""
-        你是一名经验丰富的 DBA，核心任务是合并专家知识中的 RAG 优化建议和原始优化建议，并返回最终的重写建议。
-        仔细考虑原始优化建议和 RAG 优化建议的有效性，并返回以下格式的 JSON：
-        审慎评估原始优化建议与检索增强生成（RAG）优化方案的有效性，并按以下格式返回结果。
- 
-        原始 SQL 语句：
-        {base_sql}
-
-        原始优化建议：
-        {optimizations_str}
-
-        RAG 优化建议：
-        {rag_optimizations}
-
-        请严格遵循以下 JSON 格式返回你的答案：
-        {{
-            {{
-                "group": "",
-                "produced_suggestion": ""  // 合并建议
-            }}
-        }}
-        """)
-        response = await self.llm.get_LLM_response_async(
-            prompt=prompt,
-            json_format=False
-        )
-        # return self._extract_sql(response)
-        return response
-    
-    def retrieve_reasoning_chain(self) -> str:
-        """Retrieve reasoning chain from message queue"""
-        messages = self.retrieve_memories(k=1)
-        return [msg.content.text for msg in messages if msg.content and msg.content.text]
+        fallback = {
+            "terminate": True,
+            "reason": "无法解析响应，默认终止优化",
+            "应用的规则": applied_rules,
+            "是否保留重写SQL": True,
+        }
+        result = parse_llm_json_with_default(response, fallback)
+        if not isinstance(result, dict):
+            return fallback
+        result.setdefault("terminate", True)
+        result.setdefault("reason", "")
+        result.setdefault("应用的规则", applied_rules)
+        result.setdefault("是否保留重写SQL", True)
+        result["应用的规则"] = applied_rules
+        return result
 
 
 # Utility functions for rule management
@@ -800,20 +349,24 @@ def get_rules_by_groups(groups: list) -> dict:
 
     return result
 
-def get_rule_examples(rule_ids: list) -> dict:
-    """Get examples for specific rules"""
-    rule_kb = load_rule_knowledge_base()
-    result = {}
+RULE_EXAMPLES_MAX_PER_RULE = 2
 
-    # Search through all categories for the rules
-    for category, category_data in rule_kb.items():
-        examples = category_data.get("examples", [])
-        for example in examples:
+
+def get_rule_examples(rule_ids: list, max_per_rule: int = RULE_EXAMPLES_MAX_PER_RULE) -> dict:
+    """按规则 ID 拉取示例；每个规则最多 max_per_rule 条（默认 TOP2），减少重写提示长度。"""
+    rule_kb = load_rule_knowledge_base()
+    result: Dict[str, list] = {}
+    want = set(rule_ids)
+
+    for category_data in rule_kb.values():
+        for example in category_data.get("examples", []):
             rule_id = example.get("id")
-            if rule_id in rule_ids:
-                if rule_id not in result:
-                    result[rule_id] = []
-                result[rule_id].append(example)
+            if rule_id not in want:
+                continue
+            bucket = result.setdefault(rule_id, [])
+            if len(bucket) >= max_per_rule:
+                continue
+            bucket.append(example)
 
     return result
 
@@ -828,7 +381,16 @@ class RewriteAgent(Agent):
         ))
         self.watch(["DecisionAgent", "ReasoningAgent"])
 
-    async def rewrite_with_rule_sequence(self, sql: str, rule_sequence: dict, rule_examples: dict, optimization_direction: str, data_statistics: str, schema_file: str = None) -> dict:
+    async def rewrite_with_rule_sequence(
+        self,
+        sql: str,
+        rule_sequence: dict,
+        rule_examples: dict,
+        optimization_direction: str,
+        data_statistics: str,
+        schema_content: Optional[str] = None,
+        index_info: str = "",
+    ) -> dict:
         """Execute SQL rewriting based on selected rule sequence with semantic equivalence check"""
         applied_rules = rule_sequence.get("applied_rules", [])
         groups = rule_sequence.get("groups", "")
@@ -843,6 +405,27 @@ class RewriteAgent(Agent):
                     examples_text += f"重写查询: {example.get('rewritten_query', '')}\n"
                     examples_text += f"规则描述: {example.get('rule_description', '')}\n\n"
 
+        sch = (schema_content or "").strip()
+        schema_section = (
+            f"""
+        <SQL Schema（与当前查询相关的表结构）>
+        {sch}
+        </SQL Schema>
+"""
+            if sch
+            else ""
+        )
+        idx = (index_info or "").strip()
+        idx_section = (
+            f"""
+        <索引信息>
+        {idx}
+        </索引信息>
+"""
+            if idx
+            else ""
+        )
+
         prompt = textwrap.dedent(f"""
         <Mission>
         你是一名经验丰富的 DBA，你的任务是按照指定的规则序列对SQL进行重写。
@@ -853,6 +436,8 @@ class RewriteAgent(Agent):
            - <rule_examples>: 相关规则的重写示例
            - <optimization_direction>: 优化方向
            - <统计信息>: 数据库表统计信息
+           - （若下方提供）<SQL Schema>: 与当前查询相关的表 DDL
+           - （若下方提供）<索引信息>: 表索引信息
 
         2. 重写要求：
            - 严格按照applied_rules中的规则顺序依次应用
@@ -865,22 +450,6 @@ class RewriteAgent(Agent):
            - 重写后的SQL必须返回与原始SQL相同的结果集
            - 列名、数据类型、排序顺序等必须保持一致
            - 聚合函数、窗口函数、子查询等必须保持相同的语义
-
-        4. 输出格式：
-        <rewrite>
-        {{
-            "groups": "{groups}",
-            "applied_rules": {json.dumps(applied_rules)},
-            "original_sql": "{sql}",
-            "rewritten_sql": "重写后的完整SQL",
-            "semantic_check": "语义等价性说明"
-        }}
-        </rewrite>
-
-        5. 重写要求：
-           - 生成语义等价且语法正确的SQL
-           - 确保重写后的SQL能够正确执行
-           - 在semantic_check中说明如何保证语义等价性
 
         <original_sql>
         {sql}
@@ -896,30 +465,37 @@ class RewriteAgent(Agent):
 
         <统计信息>
         {data_statistics}
+{schema_section}{idx_section}
+        4. 输出格式（**最后必须严格按此输出**，rewritten_sql 为单行可执行 SQL，JSON 内用 \\n 转义换行）：
+        <rewrite>
+        {{
+            "groups": "{groups}",
+            "applied_rules": {json.dumps(applied_rules)},
+            "original_sql": "",
+            "rewritten_sql": "重写后的完整SQL",
+            "semantic_check": "语义等价性说明"
+        }}
+        </rewrite>
+        说明：original_sql 字段请填与上方 <original_sql> 相同的字符串（注意 JSON 转义）。
         """)
 
         thought_chain = await self.llm.get_LLM_response_async(prompt=prompt)
 
         try:
-            # Extract rewrite result
-            rewrite_match = re.search(r'<rewrite>(.*?)</rewrite>', thought_chain, re.DOTALL)
-            rewrite_text = None
-            if rewrite_match:
-                rewrite_text = rewrite_match.group(1).strip()
-                json_match = re.search(r'\{.*\}', rewrite_text, re.DOTALL)
-                if json_match:
-                    try:
-                        result = json.loads(json_match.group())
-                        return result
-                    except json.JSONDecodeError as e:
-                        print(f"JSON解析错误: {e}")
+            rewrite_match = re.search(r"<rewrite>(.*?)</rewrite>", thought_chain, re.DOTALL)
+            inner = rewrite_match.group(1).strip() if rewrite_match else thought_chain
+            parsed, _ = parse_llm_json(inner, {})
+            if parsed and parsed.get("rewritten_sql"):
+                parsed.setdefault("groups", groups)
+                parsed.setdefault("applied_rules", applied_rules)
+                parsed.setdefault("semantic_check", "")
+                parsed["original_sql"] = sql
+                return parsed
 
             # If JSON parsing failed, try to extract SQL from response
             print("⚠️ 无法解析JSON格式，尝试从响应中提取SQL...")
-            # First try to extract from rewrite_text if available
-            if rewrite_text:
-                extracted_sql = self._extract_sql_from_response_robust(rewrite_text)
-            else:
+            extracted_sql = self._extract_sql_from_response_robust(inner)
+            if not extracted_sql:
                 extracted_sql = self._extract_sql_from_response_robust(thought_chain)
             if extracted_sql:
                 print(f"✅ 成功从响应中提取SQL")
@@ -963,12 +539,64 @@ class RewriteAgent(Agent):
                 "error_info": f"JSON解析错误: {str(e)}"
             }
 
-    async def iterative_rewrite(self, sql: str, error_info: str, previous_rewrite: dict) -> str:
+    async def semantic_fix(
+        self,
+        original_sql: str,
+        rewritten_sql: str,
+        applied_rules: list,
+        differences: list,
+    ) -> str:
+        """在保留优化结构前提下最小修复语义，使与原始 SQL 结果集等价。"""
+        diff_text = json.dumps(differences, ensure_ascii=False, indent=2) if differences else "[]"
+        rules_text = json.dumps(applied_rules, ensure_ascii=False) if applied_rules else "[]"
+        prompt = textwrap.dedent(f"""
+        <Mission>
+        你是 DBA。当前重写 SQL 经语义检查判定与原始 SQL 不等价。
+        你的任务是：**仅修复 differences 指出的差异相关片段**，而不是对整条 SQL 重新改写。
+        请在**尽量保留现有优化结构**（JOIN/CTE/子查询形态）的前提下，对「当前重写 SQL」做**最小修改**，使其与原始 SQL **结果集语义等价**。
+
+        <original_sql>
+        {original_sql}
+
+        <当前重写 SQL>
+        {rewritten_sql}
+
+        <应用规则 ID>
+        {rules_text}
+
+        <语义差异点 differences>
+        {diff_text}
+
+        修复约束（必须遵守）：
+        1. 只允许改动 differences 直接涉及的片段（相关谓词、JOIN 条件、聚合列、子查询条件等）。
+        2. 不要重排与 differences 无关的 JOIN/CTE 结构，不要整体重写 SQL。
+        3. 保留当前重写 SQL 中已生效的优化（除非该优化正是导致不等价的根因）。
+        4. 若 differences 为空或信息不足，返回原 rewritten_sql，不要臆造新重写。
+        5. 输出必须是**可执行完整 SQL**，且与原始 SQL 结果集等价。
+
+        输出要求：**只输出一个 JSON 对象**（不要 markdown），格式：
+        {{"fixed_sql": "修复后的完整 SQL 单行或合理换行", "note": "一句话说明如何修复"}}
+        """)
+        resp = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        data = parse_llm_json_with_default(resp, {})
+        fixed = data.get("fixed_sql") or data.get("rewritten_sql") or ""
+        return fixed.strip() if isinstance(fixed, str) else ""
+
+    async def iterative_rewrite(
+        self,
+        sql: str,
+        error_info: str,
+        previous_rewrite: dict,
+        data_statistics: Optional[str] = None,
+        index_info: Optional[str] = None,
+    ) -> str:
         """Iteratively rewrite SQL based on error feedback"""
         # Extract previous SQL and error history if available
         previous_sql = previous_rewrite.get("rewritten_sql", "")
         previous_error = previous_rewrite.get("error_info", "")
-        
+        stats_block = f"\n        <统计信息>\n        {data_statistics}\n" if data_statistics else ""
+        idx_block = f"\n        <索引信息>\n        {index_info}\n" if index_info else ""
+
         prompt = textwrap.dedent(f"""
         <Mission>
         你是一名经验丰富的 DBA，你的任务是基于语法错误信息修正重写后的SQL。
@@ -979,6 +607,7 @@ class RewriteAgent(Agent):
            - <original_sql>: 原始SQL（用于保持语义等价性）
            - <error_info>: **当前语法检查错误信息**（这是你需要修复的具体错误）
            - <previous_rewrite>: 上次重写结果（包含之前尝试的SQL和可能的错误信息）
+        {stats_block}{idx_block}
 
         2. 修正要求：
            - **仔细分析 <error_info> 中的错误信息**，这是数据库返回的具体语法错误位置和原因
@@ -1114,4 +743,120 @@ class RewriteAgent(Agent):
         print(f"Warning: Could not extract rewritten SQL from response")
         return ""
 
+
+class SemanticCheckAgent(Agent):
+    """语义等价检查：结构化 JSON 输出，供 LangGraph 管线使用。"""
+
+    def __init__(self, mq: MessageQueue):
+        api_key = os.getenv("SEMANTIC_CHECK_MODEL_API_KEY") or os.getenv("REWRITE_MODEL_API_KEY")
+        model = os.getenv("SEMANTIC_CHECK_MODEL") or os.getenv("REWRITE_MODEL")
+        base_url = os.getenv("SEMANTIC_CHECK_MODEL_URL") or os.getenv("REWRITE_MODEL_URL")
+        super().__init__(
+            "SemanticCheckAgent",
+            mq,
+            gpt=GPT(api_key=api_key, model=model, base_url=base_url),
+        )
+
+    def _parse_equivalence_response(self, response: str) -> dict:
+        default = {
+            "equivalent": False,
+            "message": "解析失败",
+            "differences": [{"type": "解析", "description": "无法解析 LLM 输出", "location": "N/A"}],
+        }
+        if not response or not str(response).strip():
+            return default
+        data = parse_llm_json_with_default(str(response), default)
+        eq = data.get("equivalent", False)
+        diffs = data.get("differences") or []
+        if not isinstance(diffs, list):
+            diffs = []
+        if not diffs:
+            eq = True
+        return {
+            "equivalent": bool(eq),
+            "message": data.get("message", ""),
+            "differences": diffs,
+        }
+
+    async def check_equivalence(
+        self,
+        original_sql: str,
+        rewritten_sql: str,
+        rewrite_rules: list,
+        semantic_check: Optional[str] = None,
+        schema_content: Optional[str] = None,
+        index_info: Optional[str] = None,
+    ) -> dict:
+        rules_text = ", ".join(rewrite_rules) if rewrite_rules else "无"
+        sem_text = ""
+        if semantic_check is not None:
+            s = str(semantic_check).strip()
+            if s:
+                sem_text = s
+        # 仅承载重写代理原文，Instructions 统一写在下方唯一的主 prompt 里，避免「两套说明」重复。
+        sem_ctx = (
+            textwrap.dedent(f"""
+
+            <重写代理的 semantic_check说明>
+            {sem_text}
+            </重写代理的 semantic_check说明>
+            """)
+            if sem_text
+            else "\n（未提供重写代理的 semantic_check。）\n"
+        )
+        schema_ctx = (
+            textwrap.dedent(f"""
+
+            <SQL Schema（表结构及约束，判断等价时必用）>
+            {schema_content.strip()}
+            </SQL Schema>
+            """)
+            if schema_content and schema_content.strip()
+            else "\n（未提供 Schema：仅基于 SQL 文本推理，对不确定处从宽。）\n"
+        )
+        index_ctx = (
+            textwrap.dedent(f"""
+
+            <索引信息（库中索引定义，可选参考）>
+            {str(index_info).strip()}
+            </索引信息>
+            """)
+            if index_info and str(index_info).strip()
+            else ""
+        )
+        prompt = textwrap.dedent(f"""
+        你是 SQL 语义审计专家。等价含义：**同一库状态、同一参数下，两查询结果集相同（行集合与列语义一致；允许列名/顺序在逻辑上等价时的合理差异，但若会改变行数或聚合语义则不等价）**。
+
+        输入优先级：
+        1. **原始 SQL** 与 **当前重写 SQL** 的实际语义（谓词、JOIN、GROUP BY、DISTINCT、子查询相关性、NULL 处理等）。
+        2. **SQL Schema**：主键、唯一约束、函数依赖、可据此认可的等价变形（例如已知 PK 下 GROUP BY 的化简）。
+        3. **索引信息**（若提供）：通常不改变关系层面的结果集语义；PRIMARY KEY/UNIQUE 类索引可辅助推断唯一性，与 Schema 一并用于等价推理。**不得以「有无非唯一索引」代替 SQL 逻辑判断是否等价**。
+        4. **重写代理的 semantic_check**（若上方 XML 块中有内容）：必须逐条对照 1–3 与两条 SQL 核验；主张成立且可推出结果集等价则倾向 equivalent=true；与事实矛盾、遗漏关键差异或过度推断则 equivalent=false，并在 differences 中写依据。**不得盲信**。
+        5. **应用规则**：仅作改写意图参考；最终以 1–3 及对第 4 条的核验为准。
+
+        通用原则：
+        - 疑罪从无：仅当**能明确指出**会导致结果集不一致的差异时判 equivalent=false。
+        - Schema 中有明确定义时，采纳与约束一致的等价推理（如主键列 A 下，GROUP BY A 与 GROUP BY A,B 且 B 函数依赖于 A）。
+        - 无 semantic_check 内容时，不得编造代理意图；有则以上述第 4 条为主轴审计。
+
+        <原始 SQL>
+        {original_sql}
+
+        <当前重写 SQL>
+        {rewritten_sql}
+        {schema_ctx}{index_ctx}
+        {sem_ctx}
+        <应用规则>
+        {rules_text}
+
+        **只输出一个 JSON**（不要其它文字）：
+        {{
+            "equivalent": true 或 false,
+            "message": "一句话（若核验了 semantic_check，需体现是否采纳其主张）",
+            "differences": [{{"type": "类型", "description": "一句话", "location": "位置"}}]
+        }}
+        equivalent 为 true 时 differences 必须为 []。
+        """)
+        response = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        return self._parse_equivalence_response(response)
 
