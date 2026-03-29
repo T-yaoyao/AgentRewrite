@@ -29,7 +29,6 @@ from openai import OpenAI
 # from dotenv import load_dotenv
 import json
 import os
-import json
 from tqdm import tqdm
 import textwrap
 from datetime import datetime
@@ -46,6 +45,25 @@ sys.path.append('../../../')
 from utils.llm_client import GPT
 
 PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", Path(__file__).resolve().parents[4]))
+_SRC = PROJECT_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+from utils.llm_json_utils import parse_llm_json
+
+
+def _parse_llm_json_obj(raw):
+    """Parse LLM text with fence/repair fallbacks; returns dict or None."""
+    if raw is None:
+        return None
+    text = raw if isinstance(raw, str) else str(raw)
+    parsed, _ = parse_llm_json(text, default=None)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_useful_flag(v):
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    return bool(v)
 LOAD_PATH = PROJECT_ROOT / "config_file" / ".env"
 load_dotenv(dotenv_path=LOAD_PATH)      
 llm = GPT(
@@ -169,16 +187,11 @@ class cleaner():
             - [Join]: Join reordering, join method selection, join elimination, or subquery-to-join conversions.
             - [Others]: Other optimizations like subquery unnesting, view merging, query flattening, or aggregation pushdown.
             If the document doesn't fit any category or is not useful, fill null instead.
-        3. Return the answer strictly according to the <json format>.
+        3. Respond with **exactly one JSON object** (no markdown). Keys: "useful" (boolean), "group" (string or null).
+           Example: {{"useful": true, "group": "Join"}}
         
         <doc>
         {json.dumps(data, indent=2, ensure_ascii=False)}
-        
-        <json format>
-        {{
-            {{useful}} :  {{flag}} // True or False
-            {{group}} : {{name}}  //Fill the group name of the document, if not useful, fill null.
-        }}
         """)
         return prompt
     
@@ -220,16 +233,10 @@ class cleaner():
             - [Join]: Join reordering, join method selection, join elimination, or subquery-to-join conversions.
             - [Others]: Other optimizations like subquery unnesting, view merging, query flattening, or aggregation pushdown.
             If the document doesn't fit any category or is not useful, fill null instead.
-        3. Return the answer strictly according to the <json format>.
+        3. Respond with **exactly one JSON object** (no markdown). Keys: "useful" (boolean), "group" (string or null).
         
         <doc>
         {data}
-        
-        <json format>
-        {{
-            {{useful}} :  {{flag}} // True or False
-            {{group}} : {{name}}  //Fill the group name of the document, if not useful, fill null.
-        }}
         """)
         return prompt
     
@@ -267,21 +274,15 @@ class cleaner():
         1. Read this document for query rewrite accrording to the <doc> and the doc's type in <tag>.
         2. Summarize the Question desciption based related to the tag. If the question desciption contains the query example, pick it.
         3. Summarize the Answer based related to the tag. If the answer contains the query example, pick it. If there are multiple answers, please summarize all of them.
-        4. return the answer strickly according to the <json format>.
+        4. Respond with **exactly one JSON object** (no markdown). Keys:
+           Question_description (string), Question_query_example (string or null),
+           Answer_summary (string), Answer_query_example (string or null).
         
         <doc>
         {data}
         
         <tag>
         {tag}
-        
-        <json format>
-        {{
-            {{Question_description}} :  {{description}} // The question description related to the tag.
-            {{Question_query_example}} : {{example}}  // The question query example,if not exists, fill None.
-            {{Answer_summary}} : {{summary}}  // The answer summary related to the tag.
-            {{Answer_query_example}} : {{example}}  // The answer query example, if not exists, fill None.
-        }}
         """)
         return prompt
         
@@ -324,32 +325,12 @@ class cleaner():
                     try:
                         print(f"🤖 Analyzing {doc_type} item: {item.get('method', 'Unknown')}...")
                         res = self.llm.get_LLM_response(prompt, json_format=True)
-                        
-                        # Handle string response that may contain JSON
-                        if isinstance(res, str):
-                            # Extract JSON from the response if needed
-                            try:
-                                import re
-                                json_match = re.search(r'```json\s*(\{.*?\})\s*```', res, re.DOTALL)
-                                if json_match:
-                                    json_str = json_match.group(1)
-                                    res = json.loads(json_str)
-                                else:
-                                    # Try to find JSON without code blocks
-                                    json_match = re.search(r'(\{[^}]*"useful"[^}]*\})', res, re.DOTALL)
-                                    if json_match:
-                                        json_str = json_match.group(1)
-                                        res = json.loads(json_str)
-                                    else:
-                                        print(f"❌ No JSON found in response")
-                                        continue
-                            except json.JSONDecodeError as e:
-                                print(f"❌ Failed to parse JSON: {e}")
-                                continue
-                        
-                        # Process the single entry response
-                        useflag = res.get('useful', False)
-                        group = res.get('group', None)
+                        parsed = _parse_llm_json_obj(res)
+                        if not parsed:
+                            print(f"❌ No valid JSON object in response")
+                            continue
+                        useflag = _normalize_useful_flag(parsed.get("useful", False))
+                        group = parsed.get("group", None)
                         
                         if useflag == True:
                             # Handle useful documents even if group is null
@@ -598,33 +579,13 @@ class cleaner():
                         pbar.set_description(f"🤖 GPT Analysis: {filename[:25]}...")
                         prompt = self.con_prompt1(data)
                         res = self.llm.get_LLM_response(prompt, json_format=True)
-                        
-                        # Handle string response that may contain JSON
-                        if isinstance(res, str):
-                            # Extract JSON from the response if needed
-                            try:
-                                import re
-                                json_match = re.search(r'```json\s*(\{.*?\})\s*```', res, re.DOTALL)
-                                if json_match:
-                                    json_str = json_match.group(1)
-                                    res = json.loads(json_str)
-                                else:
-                                    # Try to find JSON without code blocks
-                                    json_match = re.search(r'(\{[^}]*"useful"[^}]*\})', res, re.DOTALL)
-                                    if json_match:
-                                        json_str = json_match.group(1)
-                                        res = json.loads(json_str)
-                                    else:
-                                        tqdm.write(f"❌ {filename}: No JSON found in response")
-                                        successful_files += 1  # Count as processed even if failed
-                                        continue
-                            except json.JSONDecodeError as e:
-                                tqdm.write(f"❌ {filename}: Failed to parse JSON: {e}")
-                                successful_files += 1  # Count as processed even if failed
-                                continue
-                        
-                        useflag = res.get('useful', False)
-                        group = res.get('group', None)
+                        parsed = _parse_llm_json_obj(res)
+                        if not parsed:
+                            tqdm.write(f"❌ {filename}: No valid JSON in response")
+                            successful_files += 1
+                            continue
+                        useflag = _normalize_useful_flag(parsed.get("useful", False))
+                        group = parsed.get("group", None)
                         
                         if useflag == True:
                             if group is None:
@@ -638,34 +599,15 @@ class cleaner():
                                 # Stage 2: Extract detailed information
                                 prompt = self.con_prompt2(data, group)
                                 res = self.llm.get_LLM_response(prompt, json_format=True)
-                                
-                                # Handle string response that may contain JSON
-                                if isinstance(res, str):
-                                    # Extract JSON from the response if needed
-                                    try:
-                                        import re
-                                        json_match = re.search(r'```json\s*(\{.*?\})\s*```', res, re.DOTALL)
-                                        if json_match:
-                                            json_str = json_match.group(1)
-                                            res = json.loads(json_str)
-                                        else:
-                                            # Try to find JSON without code blocks
-                                            json_match = re.search(r'(\{[^}]*"Question_description"[^}]*\})', res, re.DOTALL)
-                                            if json_match:
-                                                json_str = json_match.group(1)
-                                                res = json.loads(json_str)
-                                            else:
-                                                tqdm.write(f"❌ {filename}: No JSON found in stage 2 response")
-                                                continue
-                                    except json.JSONDecodeError as e:
-                                        tqdm.write(f"❌ {filename}: Failed to parse stage 2 JSON: {e}")
-                                        continue
-                                
-                                # Extract structured information
-                                question_description = res.get('Question_description', 'N/A')
-                                question_query_example = res.get('Question_query_example', None)
-                                answer_summary = res.get('Answer_summary', 'N/A')
-                                answer_query_example = res.get('Answer_query_example', None)
+                                parsed2 = _parse_llm_json_obj(res)
+                                if not parsed2:
+                                    tqdm.write(f"❌ {filename}: No valid JSON in stage 2 response")
+                                    continue
+
+                                question_description = parsed2.get('Question_description', 'N/A')
+                                question_query_example = parsed2.get('Question_query_example', None)
+                                answer_summary = parsed2.get('Answer_summary', 'N/A')
+                                answer_query_example = parsed2.get('Answer_query_example', None)
                                 
                                 # Structure the extracted data
                                 stackoverflow_entry = {

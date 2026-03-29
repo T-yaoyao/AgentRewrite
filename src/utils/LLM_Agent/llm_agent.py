@@ -19,6 +19,7 @@ setup_python_path()
 load_project_env()
 
 from src.utils.llm_client import GPT
+from src.utils.llm_json_utils import parse_llm_json_with_default
 from src.utils.data_distribution import get_statistics_list, get_available_databases
 from src.utils.get_data_statistics import get_data_statistics
 from src.Rewrite_Middleware.middleware import DBMS
@@ -43,20 +44,15 @@ def con_prompt1(data, data_statistics):
         - Efficiency: 
             - Execution Efficiency: The rewritten query should execute more efficiently than the original query.
             - Computational Efficiency: The overhead of the rewriting process should be justified by the time savings during query execution.
-    5. Return the answer according to the <json format>.
-    6. Do not output any content outside the <json format> block.
-    
+    5. Output **only one JSON object** (no markdown). Keys: rewritten_query (string), useful (boolean).
+
     <doc>
     {data}
 
     <data_statistics>
     {data_statistics}
     
-    <json format>
-    {{
-        "rewritten_query": "",  
-        "useful": {str(flag).lower()}     
-    }}
+    Example shape: {{"rewritten_query": "...", "useful": true}}
     """)
     return prompt
 
@@ -91,17 +87,12 @@ def con_prompt2(history):
         - Efficiency: 
             - Execution Efficiency: The rewritten query should execute more efficiently than the original query.
             - Computational Efficiency: The overhead of the rewriting process should be justified by the time savings during query execution.
-    5. Return the answer according to the <json format>.
-    6. Do not output any content outside the <json format> block.
+    5. Output **only one JSON object** (no markdown). Keys: rewritten_query (string), useful (boolean).
 
     <doc>
     {formatted_history}
 
-    <json format>
-    {{
-        "rewritten_query": "",
-        "useful": {str(flag).lower()}
-    }}
+    Example shape: {{"rewritten_query": "...", "useful": true}}
     """)
     
     return prompt
@@ -150,21 +141,19 @@ if __name__ == '__main__':
     with open(input_path, 'r', encoding='utf-8') as f:
         input_queries = json.load(f)
    
+    json_default = {"rewritten_query": "", "useful": False}
     for i in tqdm(range(len(input_queries)), desc="Processing queries"):
         prompt = con_prompt1(input_queries[i], data_statistics)
         res = gpt.get_LLM_response(prompt, json_format=True)
-        
-        # Handle case where response is a string instead of dict
-        if isinstance(res, str):
-            try:
-                res = json.loads(res)
-            except json.JSONDecodeError as e:
-                print(f"Error parsing JSON response: {e}")
-                print(f"Raw response: {res}")
-                # Skip this query if we can't parse the response
-                continue
+        res = parse_llm_json_with_default(
+            res if isinstance(res, str) else str(res), json_default
+        )
+        u = res.get("useful", False)
+        if isinstance(u, str):
+            res["useful"] = u.strip().lower() in ("true", "1", "yes")
+        else:
+            res["useful"] = bool(u)
 
-        
         if res.get('useful', False):  # if the response is useful
             sql_query = input_queries[i].get('query', '')
             rewritten_sql_query = res.get('rewritten_query', '')
@@ -191,17 +180,16 @@ if __name__ == '__main__':
                     while iteration < 3:
                         prompt = con_prompt2(history)
                         response = gpt.get_LLM_response(prompt, json_format=True)
-                        
-                        # Handle case where response is a string instead of dict
-                        if isinstance(response, str):
-                            try:
-                                response = json.loads(response)
-                            except json.JSONDecodeError as e:
-                                print(f"Error parsing JSON response in iteration {iteration}: {e}")
-                                print(f"Raw response: {response}")
-                                iteration += 1
-                                continue
-                        
+                        response = parse_llm_json_with_default(
+                            response if isinstance(response, str) else str(response),
+                            json_default,
+                        )
+                        u = response.get("useful", False)
+                        if isinstance(u, str):
+                            response["useful"] = u.strip().lower() in ("true", "1", "yes")
+                        else:
+                            response["useful"] = bool(u)
+
                         if response.get('useful', False):
                             rewritten_sql_query = response.get('rewritten_query', '')
                             

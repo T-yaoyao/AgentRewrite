@@ -1,6 +1,7 @@
 """
 LangGraph 编排的查询重写管线：
-节点为 initial_check → rule_selection → rewrite → syntax_check → semantic_check → evaluation。
+initial_check → rule_selection → rewrite → syntax_check → semantic_check → evaluation
+→（有条件）uct_learning → END。UCT 学习更新使用纯数学公式（基于代价降低率）。
 """
 from __future__ import annotations
 
@@ -8,6 +9,8 @@ import asyncio
 import json
 import re
 from typing import Any, Dict, List, Optional, TypedDict
+
+import numpy as np
 
 from langgraph.graph import END, StateGraph
 
@@ -35,6 +38,7 @@ from src.Query_Rewriter.schema_context import (
     build_filtered_schema_content,
     filter_data_statistics_for_sql,
 )
+from src.Query_Rewriter.rule_bandit import get_rule_bandit
 from src.utils.agent_template import MessageQueue
 
 
@@ -80,6 +84,9 @@ class RewriteState(TypedDict, total=False):
 
     few_shot_examples: List
     retrieved_record_id: Optional[str]
+
+    # 评估节点写入，供 uct_learning 节点做数学更新；须显式声明否则 LangGraph 可能丢弃
+    _uct_update_info: Optional[Dict[str, Any]]
 
     final_original_costs: float
     final_rewritten_costs: float
@@ -136,6 +143,10 @@ class LangGraphQueryRewriter:
         except Exception as e:
             print(f"⚠️ Global memory unavailable: {e}")
             self.global_memory = None
+        
+        # Initialize UCT bandit components
+        self.bandit = get_rule_bandit()
+        print("✅ UCT Bandit initialized (math reward mode)")
 
         self.graph = self._build_graph()
 
@@ -158,20 +169,24 @@ class LangGraphQueryRewriter:
         g.add_edge("rewrite", "syntax_check")
         g.add_edge("syntax_check", "semantic_check")
         g.add_edge("semantic_check", "evaluation")
+        g.add_node("uct_learning", self._uct_learning_node)
         g.add_conditional_edges(
             "evaluation",
             self._route_after_eval,
-            {"again": "rule_selection", "end": END},
+            {"again": "rule_selection", "uct": "uct_learning", "end": END},
         )
+        g.add_edge("uct_learning", END)
         return g.compile()
 
     def _route_after_initial(self, state: RewriteState) -> str:
         return "continue" if state.get("can_optimize") else "end"
 
     def _route_after_eval(self, state: RewriteState) -> str:
-        if state.get("should_terminate", True):
-            return "end"
-        return "again"
+        if not state.get("should_terminate", True):
+            return "again"
+        if state.get("_uct_update_info"):
+            return "uct"
+        return "end"
 
     def _trace(self, state: RewriteState, node: str, payload: Dict[str, Any]) -> List[Dict]:
         tr = list(state.get("agent_trace") or [])
@@ -201,6 +216,74 @@ class LangGraphQueryRewriter:
             pass
         return 0.0
 
+    def _uct_update_payload(
+        self,
+        sel: Dict[str, Any],
+        applied: List[str],
+        init_sql: str,
+        rw: str,
+        o_exp: Any,
+        r_exp: Any,
+        oc: float,
+        rc: float,
+    ) -> Dict[str, Any]:
+        return {
+            "applied_rules": applied,
+            "context_vector": sel.get("_context_vector"),
+            "original_cost": oc,
+            "rewritten_cost": rc,
+            "original_sql": init_sql,
+            "rewritten_sql": rw,
+            "original_explain": o_exp,
+            "rewritten_explain": r_exp,
+        }
+
+    async def _apply_uct_bandit_update(self, state: RewriteState) -> None:
+        """消费 evaluation 写入的 _uct_update_info，完成纯数学 LinUCB 更新。"""
+        initial_sql = state["initial_sql"]
+        uct_info = state.get("_uct_update_info")
+        if not uct_info or not uct_info.get("applied_rules"):
+            return
+        uct_info = dict(uct_info)
+        if not uct_info.get("context_vector"):
+            expl = state.get("initial_explain_info") or ""
+            adv_groups: List[str] = []
+            for a in state.get("optimization_advice") or []:
+                g = a.get("group")
+                if g:
+                    adv_groups.append(g)
+            ctx = self.bandit.extract_context(initial_sql, expl, adv_groups)
+            uct_info["context_vector"] = ctx.tolist()
+        try:
+            context = np.array(uct_info["context_vector"], dtype=np.float32)
+            oc = uct_info["original_cost"]
+            rc = uct_info["rewritten_cost"]
+            applied = uct_info["applied_rules"]
+            sequence_reward = self.bandit.compute_sequence_reward(oc, rc)
+            print(
+                f"\n🎲 UCT Math Update: {len(applied)} rules, "
+                f"reward={sequence_reward:+.4f} (oc={oc:.4f}, rc={rc:.4f})"
+            )
+            rule_rewards = self.bandit.update_with_sequence_reward(
+                applied,
+                context,
+                sequence_reward,
+            )
+            print("✅ UCT Update Complete:")
+            for rule_id, reward in rule_rewards.items():
+                stats = self.bandit.get_rule_stats(rule_id)
+                if stats:
+                    print(
+                        f"   → {rule_id}: reward={reward:+.3f}, "
+                        f"count={stats['count']}, avg={stats['avg_reward']:+.3f}"
+                    )
+        except Exception as be:
+            print(f"⚠️ UCT Bandit update failed: {be}")
+
+    async def _uct_learning_node(self, state: RewriteState) -> Dict[str, Any]:
+        await self._apply_uct_bandit_update(state)
+        return {}
+
     async def _initial_check_node(self, state: RewriteState) -> Dict[str, Any]:
         print("🔍 开始初始优化可行性检查...")
         trace = list(state.get("agent_trace") or [])
@@ -224,7 +307,7 @@ class LangGraphQueryRewriter:
                     print(
                         f"🧊 历史案例相似度较低，不使用 few-shot"
                     )
-            async with self.llm_semaphore:
+            async with self.db_semaphore:
                 explain_info = await DBMS_EXPLAIN_Tool(self.dbms, state["initial_sql"])
             oc = self._extract_cost_from_explain(explain_info)
             stats = _stats_str(state["data_statistics"])
@@ -281,7 +364,7 @@ class LangGraphQueryRewriter:
 
     async def _rule_selection_node(self, state: RewriteState) -> Dict[str, Any]:
         rnd = state.get("current_round", 1)
-        print(f"🎯 第{rnd}轮规则选择...")
+        print(f"🎯 第{rnd}轮规则选择 (UCT-guided)...")
         trace = list(state.get("agent_trace") or [])
         try:
             groups: List[str] = []
@@ -294,18 +377,35 @@ class LangGraphQueryRewriter:
             idx = state.get("index_info") or self.index_info
             explain_info = state.get("initial_explain_info", "")
             if not explain_info:
-                async with self.llm_semaphore:
+                async with self.db_semaphore:
                     explain = await DBMS_EXPLAIN_Tool(self.dbms, state["initial_sql"])
                 explain_info = (
                     json.dumps(explain, ensure_ascii=False)
                     if not isinstance(explain, str)
                     else explain
                 )
+            
+            # ====== UCT Bandit: Score and sort rules ======
+            context = self.bandit.extract_context(state["initial_sql"], explain_info, groups)
+            scored_rules = self.bandit.score_rules(lib, context)
+            
+            # Build UCT-scored rule library for LLM
+            uct_scored_lib = {}
+            for group, rule_id, score, desc in scored_rules:
+                if group not in uct_scored_lib:
+                    uct_scored_lib[group] = {}
+                uct_scored_lib[group][rule_id] = (desc, score)
+            
+            print(f"📊 UCT scored {len(scored_rules)} rules")
+            top_3 = scored_rules[:3]
+            for g, rid, score, _ in top_3:
+                print(f"   → {rid}: UCT={score:.3f}")
+            
             async with self.llm_semaphore:
                 seq = await self.reasoning_agent.select_rule_sequence(
                     state["initial_sql"],
                     state["optimization_advice"],
-                    lib,
+                    uct_scored_lib,  # Pass UCT-scored library
                     stats,
                     explain_info,
                     rnd,
@@ -313,6 +413,10 @@ class LangGraphQueryRewriter:
                     state.get("few_shot_examples") or [],
                     index_info=idx,
                 )
+            
+            # Store context for later bandit update
+            seq["_context_vector"] = context.tolist()
+            
             trace.append({"node": "rule_selection", "output": seq})
             print(f"✅ 选择了 {len(seq.get('applied_rules', []))} 个规则")
             return {"selected_rules": seq, "agent_trace": trace}
@@ -508,9 +612,11 @@ class LangGraphQueryRewriter:
         applied = sel.get("applied_rules", [])
 
         try:
-            async with self.llm_semaphore:
-                o_exp = await DBMS_EXPLAIN_Tool(self.dbms, init_sql)
-                r_exp = await DBMS_EXPLAIN_Tool(self.dbms, rw)
+            async def _exp(sql: str):
+                async with self.db_semaphore:
+                    return await DBMS_EXPLAIN_Tool(self.dbms, sql)
+
+            o_exp, r_exp = await asyncio.gather(_exp(init_sql), _exp(rw))
             oc = self._extract_cost_from_explain(o_exp)
             rc = self._extract_cost_from_explain(r_exp)
             info = {
@@ -562,18 +668,24 @@ class LangGraphQueryRewriter:
                     rr = dict(rr)
                     rr["rewritten_sql"] = init_sql
                     out["current_rewrite_result"] = rr
-                elif rc < oc and self.global_memory:
-                    try:
-                        self.global_memory.store_successful_optimization(
-                            original_sql=init_sql,
-                            rewritten_sql=out["rewritten_sql"],
-                            rule_sequence=applied,
-                            groups=groups,
-                            original_cost=oc,
-                            rewritten_cost=rc,
-                        )
-                    except Exception as ex:
-                        print(f"⚠️ 知识库存储失败: {ex}")
+                elif rc < oc:
+                    # Store to global memory
+                    if self.global_memory:
+                        try:
+                            self.global_memory.store_successful_optimization(
+                                original_sql=init_sql,
+                                rewritten_sql=out["rewritten_sql"],
+                                rule_sequence=applied,
+                                groups=groups,
+                                original_cost=oc,
+                                rewritten_cost=rc,
+                            )
+                        except Exception as ex:
+                            print(f"⚠️ 知识库存储失败: {ex}")
+                    
+                    out["_uct_update_info"] = self._uct_update_payload(
+                        sel, applied, init_sql, rw, o_exp, r_exp, oc, rc
+                    )
                 return out
 
             nxt = rnd + 1
@@ -583,6 +695,22 @@ class LangGraphQueryRewriter:
                 if ratio > self.COST_ROLLBACK_PCT:
                     out["rewritten_sql"] = init_sql
                     out["final_rewritten_costs"] = oc
+                elif rc < oc and applied:
+                    if self.global_memory:
+                        try:
+                            self.global_memory.store_successful_optimization(
+                                original_sql=init_sql,
+                                rewritten_sql=rw,
+                                rule_sequence=applied,
+                                groups=groups,
+                                original_cost=oc,
+                                rewritten_cost=rc,
+                            )
+                        except Exception as ex:
+                            print(f"⚠️ 知识库存储失败: {ex}")
+                    out["_uct_update_info"] = self._uct_update_payload(
+                        sel, applied, init_sql, rw, o_exp, r_exp, oc, rc
+                    )
                 return out
 
             out["should_terminate"] = False

@@ -25,19 +25,44 @@ class ReasoningAgent(Agent):
         ))
 
     async def select_rule_sequence(self, sql: str, decision_advice: list, rule_library: dict, data_statistics: str, explain_info: str, iteration_round: int = 1, previous_feedback: dict = None, few_shot_examples: list = None, index_info: str = "") -> dict:
-        """Select appropriate rule sequence based on DecisionAgent's advice"""
+        """Select appropriate rule sequence based on DecisionAgent's advice with UCT scores"""
         advice_text = json.dumps(decision_advice, ensure_ascii=False, indent=2)
 
-        # Build rule library text
+        # Build rule library text with UCT scores
         rule_text = ""
         all_groups = []
         all_rules = []
+        
+        # Check if rule_library contains UCT scores (tuple format) or plain descriptions
+        has_uct_scores = False
+        for group, rules in rule_library.items():
+            if rules:
+                first_val = next(iter(rules.values()))
+                if isinstance(first_val, tuple):
+                    has_uct_scores = True
+                break
+        
         for group, rules in rule_library.items():
             all_groups.append(group)
             rule_text += f"### {group}\n"
-            for rule_id, rule_desc in rules.items():
+            
+            # Sort rules by UCT score if available (descending)
+            sorted_rules = []
+            for rule_id, rule_data in rules.items():
+                if has_uct_scores and isinstance(rule_data, tuple):
+                    desc, score = rule_data
+                    sorted_rules.append((rule_id, desc, score))
+                else:
+                    sorted_rules.append((rule_id, rule_data, 1.0))  # Default score 1.0
+            
+            sorted_rules.sort(key=lambda x: x[2], reverse=True)
+            
+            for rule_id, desc, score in sorted_rules:
                 all_rules.append(rule_id)
-                rule_text += f"- {rule_id}: {rule_desc}\n"
+                if has_uct_scores:
+                    rule_text += f"- {rule_id} [UCT分数: {score:.3f}]: {desc}\n"
+                else:
+                    rule_text += f"- {rule_id}: {desc}\n"
 
         groups_text = ", ".join(all_groups)
 
@@ -65,6 +90,15 @@ class ReasoningAgent(Agent):
                 few_shot_context += f"- 命中次数: {example.get('frequency', 0)}\n\n"
             few_shot_context += "</相似历史案例>\n"
 
+        uct_guidance = """
+        【UCT分数说明】
+        规则后面的 [UCT分数: x.xxx] 表示该规则在历史上的表现评分：
+        - 高分规则（>0.7）：历史成功率较高，通常更可靠
+        - 中分规则（0.4-0.7）：有一定成功案例，需结合SQL结构判断
+        - 低分规则（<0.4）：历史表现一般或为较少尝试的新规则
+        可以优先选择 UCT 分数高的规则，但需要结合当前SQL的具体结构做最终判断，不要盲目选择。
+        """ if has_uct_scores else ""
+        
         prompt = textwrap.dedent(f"""
         <Mission>
         你是一名经验丰富的 DBA，你的任务是基于决策Agent提供的优化方向，从规则库中挑选合适的优化规则序列。
@@ -81,6 +115,8 @@ class ReasoningAgent(Agent):
            {few_shot_context}
 
         {previous_feedback_text}
+        
+        {uct_guidance}
 
         <sql语句>
         {sql}
@@ -100,25 +136,24 @@ class ReasoningAgent(Agent):
         <执行计划分析结果>
         {explain_info}
 
-        3. 输出格式（**最后必须严格按此输出**）：
-        <rule_sequence>
-        {{
-            "groups": "{groups_text}",
-            "applied_rules": []
-        }}
-        </rule_sequence>
+        3. 输出要求：**只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）。字段：
+        - groups: 字符串，必须与「当前优化方向」一致："{groups_text}"
+        - applied_rules: 字符串数组，按应用顺序列出规则 ID；必须来自 <rule_library>，禁止编造；若无适用规则则为 []
 
-        注意：applied_rules 中的规则 ID 必须来自上述 <rule_library>，禁止编造。
+        示例：{{"groups": "{groups_text}", "applied_rules": ["RULE_ID_1"]}}
         """)
 
-        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt)
+        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
 
         default = {"groups": groups_text, "applied_rules": []}
-        sequence_match = re.search(r"<rule_sequence>(.*?)</rule_sequence>", thought_chain, re.DOTALL)
-        inner = sequence_match.group(1).strip() if sequence_match else thought_chain
-        parsed, _ = parse_llm_json(inner, default)
+        parsed, _ = parse_llm_json(thought_chain, default)
         if parsed and isinstance(parsed.get("applied_rules"), list):
             return parsed
+        sequence_match = re.search(r"<rule_sequence>(.*?)</rule_sequence>", thought_chain, re.DOTALL)
+        inner = sequence_match.group(1).strip() if sequence_match else thought_chain
+        parsed2, _ = parse_llm_json(inner, default)
+        if parsed2 and isinstance(parsed2.get("applied_rules"), list):
+            return parsed2
         return default
 
 
@@ -181,23 +216,11 @@ class DecisionAgent(Agent):
            - 执行计划显示已经是最佳执行方式
            - SQL已经不能单纯通过查询重写优化来提升性能，需要结合索引或物理优化方式来提升性能
 
-        4. 如果可以优化，请提供有针对性的优化方向建议，按照以下格式输出：
-        <advice>
-        [
-            {{
-                "group": "子查询优化",  // 从8个类别中选择：子查询优化、连接优化、谓词简化、常量折叠、聚合优化、投影优化、排序优化、集合优化
-                "produced_suggestion": "具体的优化建议描述"
-            }},
-            // ... 如果还有更多建议，则继续添加
-        ]
-        </advice>
+        4. 如果可以优化，在 advice 中给出建议数组；否则 advice 为 []。advice 每项含 group（八类之一）与 produced_suggestion（字符串）。
+           八类：子查询优化、连接优化、谓词简化、常量折叠、聚合优化、投影优化、排序优化、集合优化。
 
-        5. 请严格遵循以下 JSON 格式返回：
-        {{
-            "can_optimize": true/false,
-            "reason": "判断理由的详细说明",
-            "advice": []  // 如果can_optimize为true，则填充优化建议；否则为空数组
-        }}
+        5. **只输出一个 JSON 对象**（不要 markdown、不要注释）。字段：
+           can_optimize（布尔）、reason（字符串）、advice（数组，元素为 {{"group","produced_suggestion"}}）。
 
         <sql语句>
         {sql}
@@ -212,7 +235,7 @@ class DecisionAgent(Agent):
         {explain_info}
         """)
 
-        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt)
+        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
 
         default_result = {
             "can_optimize": False,
@@ -269,12 +292,7 @@ class DecisionAgent(Agent):
 
         {f"上一轮评估失败原因: {reason}" if reason else ""}
 
-        请严格遵循以下 JSON 格式返回你的答案：
-        {{
-            "terminate": true/false,
-            "reason": "评估理由的详细说明",
-            "是否保留重写SQL": true/false
-        }}
+        **只输出一个 JSON 对象**（不要 markdown）。字段：terminate（布尔）、reason（字符串）、是否保留重写SQL（布尔）。
 
         <原始SQL成本信息>
         成本: {original_costs}
@@ -466,22 +484,25 @@ class RewriteAgent(Agent):
         <统计信息>
         {data_statistics}
 {schema_section}{idx_section}
-        4. 输出格式（**最后必须严格按此输出**，rewritten_sql 为单行可执行 SQL，JSON 内用 \\n 转义换行）：
-        <rewrite>
-        {{
-            "groups": "{groups}",
-            "applied_rules": {json.dumps(applied_rules)},
-            "original_sql": "",
-            "rewritten_sql": "重写后的完整SQL",
-            "semantic_check": "语义等价性说明"
-        }}
-        </rewrite>
-        说明：original_sql 字段请填与上方 <original_sql> 相同的字符串（注意 JSON 转义）。
+        4. **只输出一个 JSON 对象**（不要 <rewrite> 标签、不要 markdown）。字段：
+           - groups: 字符串 "{groups}"
+           - applied_rules: 数组，与当前序列一致：{json.dumps(applied_rules, ensure_ascii=False)}
+           - original_sql: 字符串，与上方 <original_sql> 全文相同（注意 JSON 字符串转义）
+           - rewritten_sql: 重写后的完整可执行 SQL（字符串内换行用 \\n）
+           - semantic_check: 语义等价性说明字符串
         """)
 
-        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt)
+        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
 
         try:
+            parsed, _ = parse_llm_json(thought_chain, {})
+            if parsed and parsed.get("rewritten_sql"):
+                parsed.setdefault("groups", groups)
+                parsed.setdefault("applied_rules", applied_rules)
+                parsed.setdefault("semantic_check", "")
+                parsed["original_sql"] = sql
+                return parsed
+
             rewrite_match = re.search(r"<rewrite>(.*?)</rewrite>", thought_chain, re.DOTALL)
             inner = rewrite_match.group(1).strip() if rewrite_match else thought_chain
             parsed, _ = parse_llm_json(inner, {})
@@ -748,9 +769,9 @@ class SemanticCheckAgent(Agent):
     """语义等价检查：结构化 JSON 输出，供 LangGraph 管线使用。"""
 
     def __init__(self, mq: MessageQueue):
-        api_key = os.getenv("SEMANTIC_CHECK_MODEL_API_KEY") or os.getenv("REWRITE_MODEL_API_KEY")
-        model = os.getenv("SEMANTIC_CHECK_MODEL") or os.getenv("REWRITE_MODEL")
-        base_url = os.getenv("SEMANTIC_CHECK_MODEL_URL") or os.getenv("REWRITE_MODEL_URL")
+        api_key = os.getenv("SEMANTIC_CHECK_MODEL_API_KEY") 
+        model = os.getenv("SEMANTIC_CHECK_MODEL")
+        base_url = os.getenv("SEMANTIC_CHECK_MODEL_URL")
         super().__init__(
             "SemanticCheckAgent",
             mq,
@@ -825,13 +846,13 @@ class SemanticCheckAgent(Agent):
             else ""
         )
         prompt = textwrap.dedent(f"""
-        你是 SQL 语义审计专家。等价含义：**同一库状态、同一参数下，两查询结果集相同（行集合与列语义一致；允许列名/顺序在逻辑上等价时的合理差异，但若会改变行数或聚合语义则不等价）**。
+        你是 SQL 语义审计专家，你要分析判断原始SQL和重写SQL是否等价。等价含义：**同一库状态、同一参数下，两查询结果集相同（行集合与列语义一致；允许列名/顺序在逻辑上等价时的合理差异，但若会改变行数或聚合语义则不等价）**。
 
         输入优先级：
         1. **原始 SQL** 与 **当前重写 SQL** 的实际语义（谓词、JOIN、GROUP BY、DISTINCT、子查询相关性、NULL 处理等）。
         2. **SQL Schema**：主键、唯一约束、函数依赖、可据此认可的等价变形（例如已知 PK 下 GROUP BY 的化简）。
         3. **索引信息**（若提供）：通常不改变关系层面的结果集语义；PRIMARY KEY/UNIQUE 类索引可辅助推断唯一性，与 Schema 一并用于等价推理。**不得以「有无非唯一索引」代替 SQL 逻辑判断是否等价**。
-        4. **重写代理的 semantic_check**（若上方 XML 块中有内容）：必须逐条对照 1–3 与两条 SQL 核验；主张成立且可推出结果集等价则倾向 equivalent=true；与事实矛盾、遗漏关键差异或过度推断则 equivalent=false，并在 differences 中写依据。**不得盲信**。
+        4. **重写代理的 semantic_check**（若上方 XML 块中有内容）：必须逐条对照 1–3 与两条 SQL 核验；对于semantic_check中的每条内容进行分析，只有你认为全部正确时并可推出结果集等价则倾向 equivalent=true；与事实矛盾、遗漏关键差异或过度推断则 equivalent=false，并在 differences 中写出具体差异。
         5. **应用规则**：仅作改写意图参考；最终以 1–3 及对第 4 条的核验为准。
 
         通用原则：
@@ -852,7 +873,7 @@ class SemanticCheckAgent(Agent):
         **只输出一个 JSON**（不要其它文字）：
         {{
             "equivalent": true 或 false,
-            "message": "一句话（若核验了 semantic_check，需体现是否采纳其主张）",
+            "message": "一句话（若核验了 semantic_check说法是正确的，则需体现是否采纳其主张）",
             "differences": [{{"type": "类型", "description": "一句话", "location": "位置"}}]
         }}
         equivalent 为 true 时 differences 必须为 []。

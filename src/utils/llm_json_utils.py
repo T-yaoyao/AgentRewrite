@@ -13,10 +13,61 @@ except ImportError:
     _json_repair = None
 
 
+def merge_json_string_plus_concat(raw: str) -> str:
+    """
+    Collapse illegal JSON like "a" +\\n "b" into one string literal "ab".
+    Some models emit JavaScript-style concatenation inside JSON values.
+    """
+    if not raw or "+" not in raw:
+        return raw
+    result: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        if raw[i] != '"':
+            result.append(raw[i])
+            i += 1
+            continue
+        pieces: list[str] = []
+        j = i
+        while j < n and raw[j] == '"':
+            j += 1
+            chunk: list[str] = []
+            while j < n:
+                if raw[j] == "\\":
+                    if j + 1 < n:
+                        chunk.append(raw[j : j + 2])
+                        j += 2
+                    else:
+                        chunk.append(raw[j])
+                        j += 1
+                    continue
+                if raw[j] == '"':
+                    j += 1
+                    break
+                chunk.append(raw[j])
+                j += 1
+            pieces.append("".join(chunk))
+            while j < n and raw[j] in " \t\n\r":
+                j += 1
+            if j < n and raw[j] == "+":
+                j += 1
+                while j < n and raw[j] in " \t\n\r":
+                    j += 1
+                if j < n and raw[j] == '"':
+                    continue
+            break
+        merged = "".join(pieces)
+        result.append(json.dumps(merged))
+        i = j
+    return "".join(result)
+
+
 def repair_json_string(raw: str) -> str:
     """Try to fix common LLM JSON issues (trailing commas, unclosed brackets)."""
     if not raw or not raw.strip():
         return raw
+    raw = merge_json_string_plus_concat(raw)
     if _json_repair is not None:
         try:
             return _json_repair(raw)
