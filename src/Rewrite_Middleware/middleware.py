@@ -20,6 +20,37 @@ from src.Rewrite_Middleware.Structured_Knowledge_Base.knowledge_base import Stru
 from typing import List, Dict, Any   
 
 
+def _normalize_sql_text(sql_text: Any) -> str:
+    """
+    Normalize SQL text before sending to DB:
+    - Handle accidentally JSON-escaped SQL (e.g., "\\n", "\\t")
+    - Strip surrounding quotes when SQL is wrapped as a JSON string
+    """
+    if sql_text is None:
+        return ""
+    s = str(sql_text).strip()
+    if not s:
+        return s
+
+    # If SQL is wrapped as a JSON string literal, decode once.
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        try:
+            decoded = json.loads(s)
+            if isinstance(decoded, str):
+                s = decoded
+        except Exception:
+            pass
+
+    # Replace common escaped control sequences that break SQL parsing.
+    s = (
+        s.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+    )
+    return s.strip()
+
+
 class DBMS:
     def __init__(self,json_file_path = None):
         
@@ -168,6 +199,7 @@ async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
         Contains detailed execution plan analysis for LLM consumption
     """
     print("🔍 计划分析器开始分析...")
+    input_sql = _normalize_sql_text(input_sql)
 
     # Import PlanAnalyzer
     try:
@@ -396,6 +428,7 @@ async def Knowledge_Base_Tool(input_sql: str, origin_suggestion_list: str) -> st
 # tool_3
 async def DBMS_Syntax_Tool(dbms: DBMS, test_sql: str) -> Dict[str, Any]:
     print("DBMS_syntax_Tool starts...")
+    test_sql = _normalize_sql_text(test_sql)
 
     dbms.connect()
 

@@ -60,7 +60,12 @@ class RuleBandit:
     Reward allocation is computed from observed cost reduction (pure math).
     """
     
-    def __init__(self, storage_path: Optional[str] = None, context_dim: int = DEFAULT_CONTEXT_DIM, alpha: float = 1.0):
+    def __init__(
+        self,
+        storage_path: Optional[str] = None,
+        context_dim: int = DEFAULT_CONTEXT_DIM,
+        alpha: float = 1.0,
+    ):
         """
         Initialize RuleBandit
         
@@ -301,6 +306,19 @@ class RuleBandit:
 
         return features.astype(np.float32)
     
+    def _predict_reward(self, rule_id: str, context: np.ndarray) -> Tuple[float, np.ndarray]:
+        stats = self._get_or_init_rule(rule_id)
+        A = self._A_to_numpy(stats)
+        b = self._b_to_numpy(stats)
+        try:
+            A_inv = np.linalg.inv(A)
+            theta = A_inv @ b
+        except np.linalg.LinAlgError:
+            A_inv = np.linalg.pinv(A)
+            theta = A_inv @ b
+        predicted_reward = float(theta @ context)
+        return predicted_reward, A_inv
+
     def calculate_ucb_score(self, rule_id: str, context: np.ndarray) -> float:
         """
         Calculate UCB (Upper Confidence Bound) score using LinUCB formula.
@@ -322,21 +340,8 @@ class RuleBandit:
             UCB score (higher = better candidate for selection)
         """
         stats = self._get_or_init_rule(rule_id)
-
-        A = self._A_to_numpy(stats)
-        b = self._b_to_numpy(stats)
         count = stats["count"]
-        
-        # Compute θ = A^(-1) · b
-        try:
-            A_inv = np.linalg.inv(A)
-            theta = A_inv @ b
-        except np.linalg.LinAlgError:
-            A_inv = np.linalg.pinv(A)
-            theta = A_inv @ b
-        
-        # Predicted reward (exploitation term)
-        predicted_reward = theta @ context
+        predicted_reward, A_inv = self._predict_reward(rule_id, context)
         
         # Uncertainty bonus (exploration term)
         uncertainty = np.sqrt(context @ A_inv @ context)
@@ -346,9 +351,12 @@ class RuleBandit:
         exploration_bonus += 0.1 / (1 + count)
         
         return float(predicted_reward + exploration_bonus)
-    
-    def score_rules(self, rule_library: Dict[str, Dict[str, str]], 
-                   context: np.ndarray) -> List[Tuple[str, str, float, str]]:
+
+    def score_rules(
+        self,
+        rule_library: Dict[str, Dict[str, str]],
+        context: np.ndarray,
+    ) -> List[Tuple[str, str, float, str]]:
         """
         Calculate UCB scores for all rules in the library.
         
@@ -360,7 +368,6 @@ class RuleBandit:
             List of (group, rule_id, ucb_score, description) sorted by score descending
         """
         scored_rules = []
-        
         for group, rules in rule_library.items():
             for rule_id, rule_desc in rules.items():
                 score = self.calculate_ucb_score(rule_id, context)
@@ -418,20 +425,24 @@ class RuleBandit:
         rule_sequence: List[str],
         context: np.ndarray,
         sequence_reward: float,
+        rule_weights: Optional[Dict[str, float]] = None,
         position_decay: float = 0.90,
     ) -> Dict[str, float]:
         """
         Update statistics from sequence-level reward without any LLM.
 
         The full sequence gets a scalar reward from cost reduction.
-        That reward is distributed to each rule using geometric position weights:
-            w_i = position_decay ** i
-            r_i = sequence_reward * w_i / sum_j w_j
+        Reward distribution strategy:
+        1) If rule_weights provided, use normalized positive weights for matching rules.
+        2) Otherwise, use geometric position weights:
+           w_i = position_decay ** i
+           r_i = sequence_reward * w_i / sum_j w_j
 
         Args:
             rule_sequence: Ordered applied rule IDs.
             context: Context vector used for LinUCB update.
             sequence_reward: Sequence-level reward in [-1, 1].
+            rule_weights: Optional per-rule positive weights from LLM effect scores.
             position_decay: Later rules get smaller weights when < 1.
 
         Returns:
@@ -443,7 +454,17 @@ class RuleBandit:
             position_decay = 1.0
 
         n = len(rule_sequence)
-        weights = np.array([position_decay ** i for i in range(n)], dtype=np.float64)
+        if isinstance(rule_weights, dict) and rule_weights:
+            raw = np.array(
+                [max(0.0, float(rule_weights.get(rid, 0.0))) for rid in rule_sequence],
+                dtype=np.float64,
+            )
+            if float(raw.sum()) > 0:
+                weights = raw
+            else:
+                weights = np.array([position_decay ** i for i in range(n)], dtype=np.float64)
+        else:
+            weights = np.array([position_decay ** i for i in range(n)], dtype=np.float64)
         weight_sum = float(weights.sum()) if float(weights.sum()) > 0 else 1.0
 
         allocated: Dict[str, float] = {}

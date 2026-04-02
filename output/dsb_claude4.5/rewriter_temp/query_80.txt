@@ -1,0 +1,160 @@
+Query ID: 80
+==================================================
+
+Original: with my_customers as (  select distinct c_customer_sk         , c_current_addr_sk  from         ( select cs_sold_date_sk sold_date_sk,                  cs_bill_customer_sk customer_sk,                  cs_item_sk item_sk,                  cs_wholesale_cost wholesale_cost           from   catalog_sales           union all           select ws_sold_date_sk sold_date_sk,                  ws_bill_customer_sk customer_sk,                  ws_item_sk item_sk,                  ws_wholesale_cost wholesale_cost           from   web_sales          ) cs_or_ws_sales,          item,          date_dim,          customer  where   sold_date_sk = d_date_sk          and item_sk = i_item_sk          and i_category = 'Sports'          and i_class = 'camping'          and c_customer_sk = cs_or_ws_sales.customer_sk          and d_moy = 6          and d_year = 2001          and wholesale_cost BETWEEN 18 AND 48          and c_birth_year BETWEEN 1932 AND 1945  )  , my_revenue as (  select c_customer_sk,         sum(ss_ext_sales_price) as revenue  from   my_customers,         store_sales,         customer_address,         store,         date_dim  where  c_current_addr_sk = ca_address_sk         and ca_county = s_county         and ca_state = s_state         and ss_sold_date_sk = d_date_sk         and c_customer_sk = ss_customer_sk         and ss_wholesale_cost BETWEEN 18 AND 48         and s_state in ('IA','MD','MO'                     ,'MS','NE','NY'                     ,'OK','TN','TX'                     ,'VA')         and d_month_seq between (select distinct d_month_seq+1                                  from   date_dim where d_year = 2001 and d_moy = 6)                            and  (select distinct d_month_seq+3                                  from   date_dim where d_year = 2001 and d_moy = 6)  group by c_customer_sk  )  , segments as  (select cast((revenue/50) as int) as segment   from   my_revenue  )   select  segment, count(*) as num_customers, segment*50 as segment_base  from segments  group by segment  order by segment, num_customers  limit 100;
+Rewritten: WITH base_month AS (
+    SELECT DISTINCT d_month_seq
+    FROM date_dim
+    WHERE d_year = 2001 AND d_moy = 6
+),
+my_customers AS (
+    SELECT DISTINCT c_customer_sk, c_current_addr_sk
+    FROM (
+        SELECT cs_sold_date_sk AS sold_date_sk,
+               cs_bill_customer_sk AS customer_sk,
+               cs_item_sk AS item_sk,
+               cs_wholesale_cost AS wholesale_cost
+        FROM catalog_sales
+        WHERE cs_wholesale_cost BETWEEN 18 AND 48
+        UNION ALL
+        SELECT ws_sold_date_sk AS sold_date_sk,
+               ws_bill_customer_sk AS customer_sk,
+               ws_item_sk AS item_sk,
+               ws_wholesale_cost AS wholesale_cost
+        FROM web_sales
+        WHERE ws_wholesale_cost BETWEEN 18 AND 48
+    ) cs_or_ws_sales,
+    item,
+    date_dim,
+    customer
+    WHERE sold_date_sk = d_date_sk
+        AND item_sk = i_item_sk
+        AND i_category = 'Sports'
+        AND i_class = 'camping'
+        AND c_customer_sk = cs_or_ws_sales.customer_sk
+        AND d_moy = 6
+        AND d_year = 2001
+        AND c_birth_year BETWEEN 1932 AND 1945
+),
+my_revenue AS (
+    SELECT c_customer_sk,
+           SUM(ss_ext_sales_price) AS revenue
+    FROM my_customers
+    JOIN store_sales ON my_customers.c_customer_sk = store_sales.ss_customer_sk
+        AND store_sales.ss_wholesale_cost BETWEEN 18 AND 48
+    JOIN customer_address ON my_customers.c_current_addr_sk = customer_address.ca_address_sk
+    JOIN store ON customer_address.ca_county = store.s_county
+        AND customer_address.ca_state = store.s_state
+        AND store.s_state IN ('IA','MD','MO','MS','NE','NY','OK','TN','TX','VA')
+    JOIN date_dim ON store_sales.ss_sold_date_sk = date_dim.d_date_sk
+        AND date_dim.d_month_seq BETWEEN (SELECT d_month_seq+1 FROM base_month) 
+                                 AND (SELECT d_month_seq+3 FROM base_month)
+    GROUP BY c_customer_sk
+),
+segments AS (
+    SELECT CAST((revenue/50) AS INT) AS segment
+    FROM my_revenue
+)
+SELECT segment, COUNT(*) AS num_customers, segment*50 AS segment_base
+FROM segments
+GROUP BY segment
+ORDER BY segment, num_customers
+LIMIT 100;
+Time Cost: 262.69s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将my_revenue中的两个标量子查询 (select distinct d_month_seq+1 from date_dim where d_year=2001 and d_moy=6) 和 (select distinct d_month_seq+3 from date_dim where d_moy=6 and d_year=2001) 提取为独立CTE预先计算，避免在主查询执行过程中重复扫描date_dim表。例如新增CTE：base_month AS (SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year=2001 AND d_moy=6)，然后在my_revenue的WHERE条件中改写为 d_month_seq BETWEEN (SELECT d_month_seq+1 FROM base_month) AND (SELECT d_month_seq+3 FROM base_month)。'}, {'group': '谓词简化', 'produced_suggestion': '对store_sales的全表扫描（代价占比78.5%），在不增加索引的前提下，可将ss_wholesale_cost BETWEEN 18 AND 48的过滤条件尽早下推，并确认该条件与my_customers中的wholesale_cost BETWEEN 18 AND 48是否可以通过JOIN条件合并，避免对store_sales的大范围扫描后才过滤。同时检查是否可将d_month_seq范围条件与ss_sold_date_sk的过滤提前计算出具体date_sk集合，用IN列表替代JOIN以减少扫描行数。'}, {'group': '聚合优化', 'produced_suggestion': 'my_customers CTE中使用了SELECT DISTINCT来去重，可以评估是否改写为GROUP BY c_customer_sk, c_current_addr_sk，某些优化器对GROUP BY的处理比DISTINCT更高效。同时segments CTE仅做简单的cast计算，可以将其内联到最终SELECT中，减少CTE物化开销：直接写为 SELECT cast((revenue/50) as int) as segment, count(*) as num_customers, cast((revenue/50) as int)*50 as segment_base FROM my_revenue GROUP BY cast((revenue/50) as int) ORDER BY segment, num_customers LIMIT 100。'}, {'group': '投影优化', 'produced_suggestion': 'my_customers CTE中的UNION ALL子查询选取了wholesale_cost列，但该列仅用于过滤（wholesale_cost BETWEEN 18 AND 48），过滤完成后在外层查询中不再需要。建议将wholesale_cost的过滤条件下推到UNION ALL内部各分支中（catalog_sales和web_sales分支分别加上 cs_wholesale_cost BETWEEN 18 AND 48 和 ws_wholesale_cost BETWEEN 18 AND 48），并在外层投影中去掉wholesale_cost列，减少UNION ALL传输的数据量。'}, {'group': '连接优化', 'produced_suggestion': 'my_revenue中store_sales与my_customers通过c_customer_sk关联，而my_customers结果集经过多条件过滤后规模较小，建议确认执行计划中是否使用了Hash Join并以my_customers为build侧。若优化器选择了Nested Loop驱动store_sales，可通过调整JOIN顺序提示或改写方式，确保以较小的my_customers结果集作为内层探测，减少对store_sales的重复扫描次数。'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示store_sales全表扫描代价占比78.5%，是主要瓶颈。此外，my_revenue CTE中存在两个相关标量子查询（select distinct d_month_seq+1/+3 from date_dim where d_year=2001 and d_moy=6），每次执行都会重复扫描date_dim，可以提取为独立CTE或预计算常量，避免重复执行。同时UNION ALL结果上的DISTINCT操作以及多层CTE嵌套也存在优化空间。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将my_revenue中的两个标量子查询 (select distinct d_month_seq+1 from date_dim where d_year=2001 and d_moy=6) 和 (select distinct d_month_seq+3 from date_dim where d_moy=6 and d_year=2001) 提取为独立CTE预先计算，避免在主查询执行过程中重复扫描date_dim表。例如新增CTE：base_month AS (SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year=2001 AND d_moy=6)，然后在my_revenue的WHERE条件中改写为 d_month_seq BETWEEN (SELECT d_month_seq+1 FROM base_month) AND (SELECT d_month_seq+3 FROM base_month)。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "对store_sales的全表扫描（代价占比78.5%），在不增加索引的前提下，可将ss_wholesale_cost BETWEEN 18 AND 48的过滤条件尽早下推，并确认该条件与my_customers中的wholesale_cost BETWEEN 18 AND 48是否可以通过JOIN条件合并，避免对store_sales的大范围扫描后才过滤。同时检查是否可将d_month_seq范围条件与ss_sold_date_sk的过滤提前计算出具体date_sk集合，用IN列表替代JOIN以减少扫描行数。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "my_customers CTE中使用了SELECT DISTINCT来去重，可以评估是否改写为GROUP BY c_customer_sk, c_current_addr_sk，某些优化器对GROUP BY的处理比DISTINCT更高效。同时segments CTE仅做简单的cast计算，可以将其内联到最终SELECT中，减少CTE物化开销：直接写为 SELECT cast((revenue/50) as int) as segment, count(*) as num_customers, cast((revenue/50) as int)*50 as segment_base FROM my_revenue GROUP BY cast((revenue/50) as int) ORDER BY segment, num_customers LIMIT 100。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "my_customers CTE中的UNION ALL子查询选取了wholesale_cost列，但该列仅用于过滤（wholesale_cost BETWEEN 18 AND 48），过滤完成后在外层查询中不再需要。建议将wholesale_cost的过滤条件下推到UNION ALL内部各分支中（catalog_sales和web_sales分支分别加上 cs_wholesale_cost BETWEEN 18 AND 48 和 ws_wholesale_cost BETWEEN 18 AND 48），并在外层投影中去掉wholesale_cost列，减少UNION ALL传输的数据量。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "my_revenue中store_sales与my_customers通过c_customer_sk关联，而my_customers结果集经过多条件过滤后规模较小，建议确认执行计划中是否使用了Hash Join并以my_customers为build侧。若优化器选择了Nested Loop驱动store_sales，可通过调整JOIN顺序提示或改写方式，确保以较小的my_customers结果集作为内层探测，减少对store_sales的重复扫描次数。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 74 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.214
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "聚合优化, 子查询优化, 谓词简化, 连接优化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_SET_OP_TRANSPOSE",
+    "FILTER_INTO_JOIN"
+  ],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.3,
+    "FILTER_SET_OP_TRANSPOSE": 0.3,
+    "FILTER_INTO_JOIN": 0.4
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "FILTER_SET_OP_TRANSPOSE": 0.8,
+    "FILTER_INTO_JOIN": 0.9
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+{
+  "groups": "聚合优化, 子查询优化, 谓词简化, 连接优化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_SET_OP_TRANSPOSE",
+    "FILTER_INTO_JOIN"
+  ],
+  "original_sql": "with my_customers as (  select distinct c_customer_sk         , c_current_addr_sk  from         ( select cs_sold_date_sk sold_date_sk,                  cs_bill_customer_sk customer_sk,                  cs_item_sk item_sk,                  cs_wholesale_cost wholesale_cost           from   catalog_sales           union all           select ws_sold_date_sk sold_date_sk,                  ws_bill_customer_sk customer_sk,                  ws_item_sk item_sk,                  ws_wholesale_cost wholesale_cost           from   web_sales          ) cs_or_ws_sales,          item,          date_dim,          customer  where   sold_date_sk = d_date_sk          and item_sk = i_item_sk          and i_category = 'Sports'          and i_class = 'camping'          and c_customer_sk = cs_or_ws_sales.customer_sk          and d_moy = 6          and d_year = 2001          and wholesale_cost BETWEEN 18 AND 48          and c_birth_year BETWEEN 1932 AND 1945  )  , my_revenue as (  select c_customer_sk,         sum(ss_ext_sales_price) as revenue  from   my_customers,         store_sales,         customer_address,         store,         date_dim  where  c_current_addr_sk = ca_address_sk         and ca_county = s_county         and ca_state = s_state         and ss_sold_date_sk = d_date_sk         and c_customer_sk = ss_customer_sk         and ss_wholesale_cost BETWEEN 18 AND 48         and s_state in ('IA','MD','MO'                     ,'MS','NE','NY'                     ,'OK','TN','TX'                     ,'VA')         and d_month_seq between (select distinct d_month_seq+1                                  from   date_dim where d_year = 2001 and d_moy = 6)                            and  (select distinct d_month_seq+3                                  from   date_dim where d_year = 2001 and d_moy = 6)  group by c_customer_sk  )  , segments as  (select cast((revenue/50) as int) as segment   from   my_revenue  )   select  segment, count(*) as num_customers, segment*50 as segment_base  from segments  group by segment  order by segment, num_customers  limit 100;",
+  "rewritten_sql": "WITH base_month AS (\n    SELECT DISTINCT d_month_seq\n    FROM date_dim\n    WHERE d_year = 2001 AND d_moy = 6\n),\nmy_customers AS (\n    SELECT DISTINCT c_customer_sk, c_current_addr_sk\n    FROM (\n        SELECT cs_sold_date_sk AS sold_date_sk,\n               cs_bill_customer_sk AS customer_sk,\n               cs_item_sk AS item_sk,\n               cs_wholesale_cost AS wholesale_cost\n        FROM catalog_sales\n        WHERE cs_wholesale_cost BETWEEN 18 AND 48\n        UNION ALL\n        SELECT ws_sold_date_sk AS sold_date_sk,\n               ws_bill_customer_sk AS customer_sk,\n               ws_item_sk AS item_sk,\n               ws_wholesale_cost AS wholesale_cost\n        FROM web_sales\n        WHERE ws_wholesale_cost BETWEEN 18 AND 48\n    ) cs_or_ws_sales,\n    item,\n    date_dim,\n    customer\n    WHERE sold_date_sk = d_date_sk\n        AND item_sk = i_item_sk\n        AND i_category = 'Sports'\n        AND i_class = 'camping'\n        AND c_customer_sk = cs_or_ws_sales.customer_sk\n        AND d_moy = 6\n        AND d_year = 2001\n        AND c_birth_year BETWEEN 1932 AND 1945\n),\nmy_revenue AS (\n    SELECT c_customer_sk,\n           SUM(ss_ext_sales_price) AS revenue\n    FROM my_customers\n    JOIN store_sales ON my_customers.c_customer_sk = store_sales.ss_customer_sk\n        AND store_sales.ss_wholesale_cost BETWEEN 18 AND 48\n    JOIN customer_address ON my_customers.c_current_addr_sk = customer_address.ca_address_sk\n    JOIN store ON customer_address.ca_county = store.s_county\n        AND customer_address.ca_state = store.s_state\n        AND store.s_state IN ('IA','MD','MO','MS','NE','NY','OK','TN','TX','VA')\n    JOIN date_dim ON store_sales.ss_sold_date_sk = date_dim.d_date_sk\n        AND date_dim.d_month_seq BETWEEN (SELECT d_month_seq+1 FROM base_month) \n                                 AND (SELECT d_month_seq+3 FROM base_month)\n    GROUP BY c_customer_sk\n),\nsegments AS (\n    SELECT CAST((revenue/50) AS INT) AS segment\n    FROM my_revenue\n)\nSELECT segment, COUNT(*) AS num_customers, segment*50 AS segment_base\nFROM segments\nGROUP BY segment\nORDER BY segment, num_customers\nLIMIT 100;",
+  "semantic_check": "重写后的SQL在语义上等价于原始SQL，理由如下：\n1. 规则STRATEGY_CTE_DECOMPOSITION：将my_revenue中的两个标量子查询提取为base_month CTE，由于base_month计算的是相同的月份序列值，且使用DISTINCT确保唯一，因此计算结果与原始子查询相同。\n2. 规则FILTER_SET_OP_TRANSPOSE：将my_customers中UNION ALL后的wholesale_cost过滤条件下推到两个分支中，由于投影中不包含wholesale_cost列，且过滤条件在分支中执行，与原始外层过滤效果相同。\n3. 规则FILTER_INTO_JOIN：将my_revenue中单表依赖的过滤条件（ss_wholesale_cost, s_state, d_month_seq）从WHERE子句移动到对应JOIN的ON子句中，由于使用内连接，移动条件不影响最终结果集。\n所有列名、聚合计算、排序和分组均保持不变，结果集与原始SQL完全一致。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "经核验 semantic_check 中规则及其理由均正确，且两条 SQL 在逻辑谓词、连接条件、过滤条件、聚合及最终结果列上完全等价，采纳其主张。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+{
+  "terminate": true,
+  "reason": "重写SQL成本(1,523,050.38)明显高于原始SQL成本(881,838.51)，成本增加72.71%，且执行计划显示store_sales表的全表扫描仍为主要瓶颈，自身消耗未降低，且重写SQL新增了对catalog_sales表的全表扫描，代价更高。虽然重写SQL在逻辑结构上进行了部分子查询CTE分解和谓词下推，提升了SQL的逻辑清晰度，但性能代价明显恶化，且优化规则大多基于逻辑重写已充分尝试，考虑到物理优化如索引未应用且无明显执行计划改善空间，建议终止进一步优化。重写SQL成本劣于原始，且优化空间有限，应回退采用原始SQL。",
+  "是否保留重写SQL": false
+}
+
+----------------------------------------
+

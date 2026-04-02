@@ -4,7 +4,7 @@ import os
 import re
 import textwrap
 import sys
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 # Setup project paths
 from src.utils.path_config import setup_python_path, load_project_env
@@ -23,6 +23,69 @@ class ReasoningAgent(Agent):
         model=os.getenv("REASONING_MODEL"),
         base_url=os.getenv("REASONING_MODEL_URL")
         ))
+
+    @staticmethod
+    def _sanitize_rule_effect_scores(applied_rules, raw_scores) -> Dict[str, float]:
+        """
+        Keep only positive numeric scores for selected rules and normalize to sum=1.
+        """
+        if not isinstance(applied_rules, list) or not applied_rules:
+            return {}
+        if not isinstance(raw_scores, dict):
+            return {}
+
+        cleaned: Dict[str, float] = {}
+        for rid in applied_rules:
+            v = raw_scores.get(rid)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                fv = float(v)
+                if fv > 0:
+                    cleaned[rid] = fv
+            elif isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    continue
+                try:
+                    fv = float(s)
+                except ValueError:
+                    continue
+                if fv > 0:
+                    cleaned[rid] = fv
+
+        total = sum(cleaned.values())
+        if total <= 0:
+            return {}
+        return {rid: cleaned[rid] / total for rid in cleaned}
+
+    @staticmethod
+    def _sanitize_rule_effect_confidence(applied_rules, raw_confidence) -> Dict[str, float]:
+        """
+        Keep confidence values in [0, 1] for selected rules only.
+        """
+        if not isinstance(applied_rules, list) or not applied_rules:
+            return {}
+        if not isinstance(raw_confidence, dict):
+            return {}
+
+        cleaned: Dict[str, float] = {}
+        for rid in applied_rules:
+            v = raw_confidence.get(rid)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                cleaned[rid] = float(max(0.0, min(1.0, float(v))))
+            elif isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    continue
+                try:
+                    fv = float(s)
+                except ValueError:
+                    continue
+                cleaned[rid] = float(max(0.0, min(1.0, fv)))
+        return cleaned
 
     async def select_rule_sequence(self, sql: str, decision_advice: list, rule_library: dict, data_statistics: str, explain_info: str, iteration_round: int = 1, previous_feedback: dict = None, few_shot_examples: list = None, index_info: str = "") -> dict:
         """Select appropriate rule sequence based on DecisionAgent's advice with UCT scores"""
@@ -101,7 +164,7 @@ class ReasoningAgent(Agent):
         
         prompt = textwrap.dedent(f"""
         <Mission>
-        你是一名经验丰富的 DBA，你的任务是基于决策Agent提供的优化方向，从规则库中挑选合适的优化规则序列。
+        你是一名经验丰富的 DBA，你的任务是基于决策Agent提供的优化方向，从规则库中挑选合适的优化规则序列。你只负责选择规则，不进行任何重写操作。
 
         1. 规则选择原则：
            - 只能选择与当前SQL结构相符且能够优化该SQL的规则
@@ -139,20 +202,46 @@ class ReasoningAgent(Agent):
         3. 输出要求：**只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）。字段：
         - groups: 字符串，必须与「当前优化方向」一致："{groups_text}"
         - applied_rules: 字符串数组，按应用顺序列出规则 ID；必须来自 <rule_library>，禁止编造；若无适用规则则为 []
+        - rule_effect_scores: 对象，键为 applied_rules 中的 rule_id，值为该规则预估贡献分（正数）。建议总和约为 1；若无规则则 {{}}
+        - rule_effect_confidence: 对象，键为 applied_rules 中的 rule_id，值为该规则效果估计的置信度（0到1之间）
 
-        示例：{{"groups": "{groups_text}", "applied_rules": ["RULE_ID_1"]}}
+        示例：{{"groups": "{groups_text}", "applied_rules": ["RULE_ID_1"], "rule_effect_scores": {{"RULE_ID_1": 1.0}}, "rule_effect_confidence": {{"RULE_ID_1": 0.8}}}}
         """)
 
         thought_chain = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
 
-        default = {"groups": groups_text, "applied_rules": []}
+        default = {
+            "groups": groups_text,
+            "applied_rules": [],
+            "chosen_rule_prior": [],
+            "rule_effect_scores": {},
+            "rule_effect_confidence": {},
+        }
         parsed, _ = parse_llm_json(thought_chain, default)
         if parsed and isinstance(parsed.get("applied_rules"), list):
+            parsed["chosen_rule_prior"] = []
+            parsed["rule_effect_scores"] = self._sanitize_rule_effect_scores(
+                parsed.get("applied_rules", []),
+                parsed.get("rule_effect_scores", {}),
+            )
+            parsed["rule_effect_confidence"] = self._sanitize_rule_effect_confidence(
+                parsed.get("applied_rules", []),
+                parsed.get("rule_effect_confidence", {}),
+            )
             return parsed
         sequence_match = re.search(r"<rule_sequence>(.*?)</rule_sequence>", thought_chain, re.DOTALL)
         inner = sequence_match.group(1).strip() if sequence_match else thought_chain
         parsed2, _ = parse_llm_json(inner, default)
         if parsed2 and isinstance(parsed2.get("applied_rules"), list):
+            parsed2["chosen_rule_prior"] = []
+            parsed2["rule_effect_scores"] = self._sanitize_rule_effect_scores(
+                parsed2.get("applied_rules", []),
+                parsed2.get("rule_effect_scores", {}),
+            )
+            parsed2["rule_effect_confidence"] = self._sanitize_rule_effect_confidence(
+                parsed2.get("applied_rules", []),
+                parsed2.get("rule_effect_confidence", {}),
+            )
             return parsed2
         return default
 
@@ -258,9 +347,11 @@ class DecisionAgent(Agent):
         rewritten_explain_info = optimization_info.get("rewritten_explain_info", "")
         groups = optimization_info.get("groups", "")
         applied_rules = optimization_info.get("applied_rules", [])
+        optimization_advice = optimization_info.get("optimization_advice", [])
         original_sql = optimization_info.get("original_sql", "")
         rewritten_sql = optimization_info.get("rewritten_sql", "")
         reason = optimization_info.get("reason", "")
+        advice_text = json.dumps(optimization_advice, ensure_ascii=False, indent=2) if optimization_advice else "[]"
 
         # Calculate cost reduction
         cost_reduction = original_costs - rewritten_costs if original_costs > 0 else 0
@@ -268,7 +359,7 @@ class DecisionAgent(Agent):
 
         prompt = textwrap.dedent(f"""
         <Mission>
-        你负责评估 SQL 优化是否符合标准，决定是否终止优化过程或继续下一轮优化。
+        你负责评估 SQL 优化是否符合标准，决定是否终止优化过程或继续下一轮优化。必须是在逻辑上基于查询重写的优化，如果只能通过物理上如索引等进行优化就终止优化流程。
 
         当前是第{iteration_round}轮优化。
 
@@ -282,8 +373,9 @@ class DecisionAgent(Agent):
         终止条件：
         [True]（terminate 为 true）：
             1. rewritten_sql costs 明显低于 ori_sql costs（优化成功，直接终止；通常「是否保留重写SQL」为 true）
-            2. rewritten_sql costs 略微大于 ori_sql costs，代价没有增加得很夸张，但重写后 SQL 的执行计划更优，直接终止；「是否保留重写SQL」为 true。
-            3. rewritten_sql costs ≥ ori_sql costs，明显不如原始 SQL，且你认为在重写层面已无法继续优化时，可终止；若最终应采用原始 SQL，则「是否保留重写SQL」为 false（系统将回退到原始 SQL）。
+            2. rewritten_sql costs 稍微≥ ori_sql costs，代价没有明显超过原始代价，但重写后 SQL 在逻辑层面更优/更简洁（例如结构更清晰、冗余更少、可维护性更好）或执行计划更优，可保留重写SQL；「是否保留重写SQL」为 true。
+            3. rewritten_sql costs ≥ ori_sql costs，重写SQL在性能上明显恶化，不如原始 SQL，且你认为在重写层面已无法继续优化时，可终止；若最终应采用原始 SQL，则「是否保留重写SQL」为 false（系统将回退到原始 SQL）。
+            4. 若首轮后从执行计划可判断“主要瓶颈仍是同一大表全表扫描且成本不降”，可直接终止优化；此时若重写SQL在逻辑结构上更优/更简洁可保留（true），否则不保留（false）。
 
         [False]（terminate 为 false）：
             若规则选择不当，或 SQL 与执行计划仍显示有明显优化空间，继续下一轮优化。
@@ -304,6 +396,7 @@ class DecisionAgent(Agent):
 
         <优化信息>
         类别: {groups}
+        决策建议(advice): {advice_text}
         规则: {applied_rules}
         原始SQL: {original_sql}
         重写SQL: {rewritten_sql}
@@ -633,14 +726,18 @@ class RewriteAgent(Agent):
         2. 修正要求：
            - **仔细分析 <error_info> 中的错误信息**，这是数据库返回的具体语法错误位置和原因
            - 如果 <previous_rewrite> 中包含之前的错误信息，参考它们避免重复同样的错误
+           - 仅做“最小修复”：只修改触发错误的必要片段（如列引用、别名、GROUP BY项、函数参数）
+           - 尽量保留 current rewritten SQL 的优化结构（CTE 组织、JOIN 形态、聚合层次、谓词布局），不要整体改写
+           - 禁止无关改动：不要新增/删除非必要子查询、不要替换为原始 SQL，除非当前 SQL 无法通过最小修复挽救
            - 修正SQL语法错误，确保修正后的SQL能够通过语法检查
            - **必须保持查询语义正确性**：修正后的SQL必须与原始SQL在语义上完全等价
            - 生成可执行的、语法正确的SQL
 
         3. 输出要求：
-           - 直接输出修正后的完整SQL
-           - 不要包含任何解释或额外格式
-           - 确保SQL语法完全正确
+           - **只输出一个 JSON 对象**（不要 markdown / 不要额外文本）
+           - 必须包含字段 rewritten_sql，值为修正后的完整可执行 SQL
+           - 可选字段 note 用一句话说明修复点
+           - 示例：{{"rewritten_sql":"SELECT ...","note":"修复了别名不存在错误"}}
 
         <original_sql>
         {sql}
@@ -652,8 +749,12 @@ class RewriteAgent(Agent):
         {json.dumps(previous_rewrite, ensure_ascii=False, indent=2)}
         """)
 
-        response = await self.llm.get_LLM_response_async(prompt=prompt)
-        # Extract SQL from response
+        response = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        data = parse_llm_json_with_default(response, {})
+        rewritten_sql = data.get("rewritten_sql") if isinstance(data, dict) else ""
+        if isinstance(rewritten_sql, str) and rewritten_sql.strip():
+            return rewritten_sql.strip()
+        # Fallback for non-compliant model outputs.
         return self._extract_sql_from_response_robust(response)
     
     async def correct_sql(self, original_sql: str, rewritten_sql: str, error: str) -> str:
@@ -808,7 +909,26 @@ class SemanticCheckAgent(Agent):
         schema_content: Optional[str] = None,
         index_info: Optional[str] = None,
     ) -> dict:
-        rules_text = ", ".join(rewrite_rules) if rewrite_rules else "无"
+        # Build "规则ID + 规则描述" text for semantic audit context.
+        if rewrite_rules:
+            rule_kb = load_rule_knowledge_base()
+            rule_desc_map: Dict[str, str] = {}
+            if isinstance(rule_kb, dict):
+                for category_data in rule_kb.values():
+                    if not isinstance(category_data, dict):
+                        continue
+                    rules_block = category_data.get("rules", {})
+                    if isinstance(rules_block, dict):
+                        for rid, desc in rules_block.items():
+                            rule_desc_map[str(rid)] = str(desc)
+            rule_lines = []
+            for rid in rewrite_rules:
+                rid_s = str(rid)
+                desc = rule_desc_map.get(rid_s, "（规则描述缺失）")
+                rule_lines.append(f"- {rid_s}: {desc}")
+            rules_text = "\n".join(rule_lines)
+        else:
+            rules_text = "无"
         sem_text = ""
         if semantic_check is not None:
             s = str(semantic_check).strip()
@@ -853,11 +973,16 @@ class SemanticCheckAgent(Agent):
         2. **SQL Schema**：主键、唯一约束、函数依赖、可据此认可的等价变形（例如已知 PK 下 GROUP BY 的化简）。
         3. **索引信息**（若提供）：通常不改变关系层面的结果集语义；PRIMARY KEY/UNIQUE 类索引可辅助推断唯一性，与 Schema 一并用于等价推理。**不得以「有无非唯一索引」代替 SQL 逻辑判断是否等价**。
         4. **重写代理的 semantic_check**（若上方 XML 块中有内容）：必须逐条对照 1–3 与两条 SQL 核验；对于semantic_check中的每条内容进行分析，只有你认为全部正确时并可推出结果集等价则倾向 equivalent=true；与事实矛盾、遗漏关键差异或过度推断则 equivalent=false，并在 differences 中写出具体差异。
-        5. **应用规则**：仅作改写意图参考；最终以 1–3 及对第 4 条的核验为准。
+        5. **应用规则**：作为改写意图参考。
 
         通用原则：
         - 疑罪从无：仅当**能明确指出**会导致结果集不一致的差异时判 equivalent=false。
         - Schema 中有明确定义时，采纳与约束一致的等价推理（如主键列 A 下，GROUP BY A 与 GROUP BY A,B 且 B 函数依赖于 A）。
+        - 对同一张表、没有额外过滤/去重/DISTINCT 的情况下，先按任意维度 GROUP BY 再对每组 COUNT(col) 并在外层 SUM(count_col)，
+  与直接对整表 COUNT(col) 结果相同。
+        - 两层聚合折叠规则（强约束）：若原SQL形如「内层按 (K,U) 分组，外层按 K 分组」，且重写为「按 K 单层聚合」，并且每个外层聚合列都满足以下逐列等价之一：
+          MIN(MIN(v))->MIN(v)，MAX(MAX(v))->MAX(v)，SUM(SUM(v))->SUM(v)，SUM(COUNT(v))->COUNT(v)，则**必须判 equivalent=true**。
+        - 禁止误判：在满足上述强约束时，不能使用“计数对象不同”“中间分组行数不同”“内层多了 ename”作为不等价理由；这些只影响中间态，不影响最终结果。
         - 无 semantic_check 内容时，不得编造代理意图；有则以上述第 4 条为主轴审计。
 
         <原始 SQL>
@@ -867,7 +992,7 @@ class SemanticCheckAgent(Agent):
         {rewritten_sql}
         {schema_ctx}{index_ctx}
         {sem_ctx}
-        <应用规则>
+        <应用规则（规则ID + 规则描述）>
         {rules_text}
 
         **只输出一个 JSON**（不要其它文字）：

@@ -111,6 +111,7 @@ class LangGraphQueryRewriter:
     MAX_SEMANTIC_FIX = 3
     MAX_SYNTAX_AFTER_SEMANTIC = 3
     COST_ROLLBACK_PCT = 20.0
+    EFFECT_SCORE_LAMBDA_BASE = 0.5
 
     def __init__(
         self,
@@ -229,6 +230,9 @@ class LangGraphQueryRewriter:
     ) -> Dict[str, Any]:
         return {
             "applied_rules": applied,
+            "chosen_rule_prior": sel.get("chosen_rule_prior") or [],
+            "rule_effect_scores": sel.get("rule_effect_scores") or {},
+            "rule_effect_confidence": sel.get("rule_effect_confidence") or {},
             "context_vector": sel.get("_context_vector"),
             "original_cost": oc,
             "rewritten_cost": rc,
@@ -237,6 +241,55 @@ class LangGraphQueryRewriter:
             "original_explain": o_exp,
             "rewritten_explain": r_exp,
         }
+
+    @staticmethod
+    def _fallback_position_weights(applied: List[str], position_decay: float = 0.90) -> Dict[str, float]:
+        if not applied:
+            return {}
+        if position_decay <= 0:
+            position_decay = 1.0
+        ws = np.array([position_decay ** i for i in range(len(applied))], dtype=np.float64)
+        s = float(ws.sum()) if float(ws.sum()) > 0 else 1.0
+        return {rid: float(ws[i] / s) for i, rid in enumerate(applied)}
+
+    def _mix_llm_effect_with_confidence_gate(
+        self,
+        applied: List[str],
+        effect_scores: Dict[str, float],
+        effect_confidence: Dict[str, float],
+    ) -> Dict[str, float]:
+        """
+        Mixed weight per rule:
+            w_i = lambda_i * w_i_llm + (1-lambda_i) * w_i_fallback
+            lambda_i = lambda_base * confidence_i
+        """
+        if not applied:
+            return {}
+        fallback = self._fallback_position_weights(applied, position_decay=0.90)
+        if not effect_scores:
+            return fallback
+
+        llm = {}
+        llm_sum = 0.0
+        for rid in applied:
+            v = float(max(0.0, effect_scores.get(rid, 0.0)))
+            llm[rid] = v
+            llm_sum += v
+        if llm_sum <= 0:
+            return fallback
+        llm = {rid: (llm[rid] / llm_sum) for rid in applied}
+
+        mixed = {}
+        for rid in applied:
+            conf = float(effect_confidence.get(rid, 0.5))
+            conf = max(0.0, min(1.0, conf))
+            lambda_i = self.EFFECT_SCORE_LAMBDA_BASE * conf
+            mixed[rid] = lambda_i * llm[rid] + (1.0 - lambda_i) * fallback[rid]
+
+        total = sum(mixed.values())
+        if total <= 0:
+            return fallback
+        return {rid: (mixed[rid] / total) for rid in applied}
 
     async def _apply_uct_bandit_update(self, state: RewriteState) -> None:
         """消费 evaluation 写入的 _uct_update_info，完成纯数学 LinUCB 更新。"""
@@ -259,6 +312,34 @@ class LangGraphQueryRewriter:
             oc = uct_info["original_cost"]
             rc = uct_info["rewritten_cost"]
             applied = uct_info["applied_rules"]
+            chosen_prior_list = uct_info.get("chosen_rule_prior") or []
+            chosen_prior_map: Dict[str, float] = {}
+            for item in chosen_prior_list:
+                if not isinstance(item, dict):
+                    continue
+                rid = item.get("rule_id")
+                pr = item.get("prior")
+                if rid and isinstance(pr, (int, float)):
+                    chosen_prior_map[str(rid)] = float(pr)
+            raw_effect_scores = uct_info.get("rule_effect_scores") or {}
+            effect_scores: Dict[str, float] = {}
+            if isinstance(raw_effect_scores, dict):
+                for rid in applied:
+                    v = raw_effect_scores.get(rid)
+                    if isinstance(v, (int, float)) and float(v) > 0:
+                        effect_scores[rid] = float(v)
+            raw_effect_conf = uct_info.get("rule_effect_confidence") or {}
+            effect_conf: Dict[str, float] = {}
+            if isinstance(raw_effect_conf, dict):
+                for rid in applied:
+                    v = raw_effect_conf.get(rid)
+                    if isinstance(v, (int, float)):
+                        effect_conf[rid] = float(max(0.0, min(1.0, float(v))))
+            mixed_weights = self._mix_llm_effect_with_confidence_gate(
+                applied,
+                effect_scores,
+                effect_conf,
+            )
             sequence_reward = self.bandit.compute_sequence_reward(oc, rc)
             print(
                 f"\n🎲 UCT Math Update: {len(applied)} rules, "
@@ -268,13 +349,35 @@ class LangGraphQueryRewriter:
                 applied,
                 context,
                 sequence_reward,
+                rule_weights=mixed_weights,
             )
             print("✅ UCT Update Complete:")
             for rule_id, reward in rule_rewards.items():
                 stats = self.bandit.get_rule_stats(rule_id)
                 if stats:
+                    prior_str = (
+                        f"{chosen_prior_map[rule_id]:.3f}"
+                        if rule_id in chosen_prior_map
+                        else "N/A"
+                    )
+                    effect_str = (
+                        f"{effect_scores.get(rule_id, 0.0):.3f}"
+                        if effect_scores
+                        else "N/A"
+                    )
+                    conf_str = (
+                        f"{effect_conf.get(rule_id, 0.5):.2f}"
+                        if effect_conf
+                        else "N/A"
+                    )
+                    gate_lambda = (
+                        self.EFFECT_SCORE_LAMBDA_BASE * float(effect_conf.get(rule_id, 0.5))
+                        if effect_conf
+                        else 0.0
+                    )
                     print(
-                        f"   → {rule_id}: reward={reward:+.3f}, "
+                        f"   → {rule_id}: P(s,a)={prior_str}, effect={effect_str}, conf={conf_str}, "
+                        f"lambda={gate_lambda:.2f}, reward={reward:+.3f}, "
                         f"count={stats['count']}, avg={stats['avg_reward']:+.3f}"
                     )
         except Exception as be:
@@ -385,7 +488,7 @@ class LangGraphQueryRewriter:
                     else explain
                 )
             
-            # ====== UCT Bandit: Score and sort rules ======
+            # ====== Bandit scoring (single-pass generation + bandit sorting) ======
             context = self.bandit.extract_context(state["initial_sql"], explain_info, groups)
             scored_rules = self.bandit.score_rules(lib, context)
             
@@ -617,6 +720,7 @@ class LangGraphQueryRewriter:
                     return await DBMS_EXPLAIN_Tool(self.dbms, sql)
 
             o_exp, r_exp = await asyncio.gather(_exp(init_sql), _exp(rw))
+            rnd = state.get("current_round", 1)
             oc = self._extract_cost_from_explain(o_exp)
             rc = self._extract_cost_from_explain(r_exp)
             info = {
@@ -626,11 +730,11 @@ class LangGraphQueryRewriter:
                 "rewritten_explain_info": json.dumps(r_exp, ensure_ascii=False) if not isinstance(r_exp, str) else r_exp,
                 "groups": groups,
                 "applied_rules": applied,
+                "optimization_advice": state.get("optimization_advice") or [],
                 "original_sql": init_sql,
                 "rewritten_sql": rw,
                 "reason": (state.get("previous_feedback") or {}).get("reason", ""),
             }
-            rnd = state.get("current_round", 1)
             async with self.llm_semaphore:
                 ev = await self.decision_agent.evaluate_with_costs(info, rnd)
             trace.append({"node": "evaluation", "output": ev})
@@ -642,7 +746,12 @@ class LangGraphQueryRewriter:
             best_sql = state.get("best_sql")
             best_rules = state.get("best_rules")
             best_groups = state.get("best_groups", "")
-            if rw != init_sql and rc < (best_cost if best_cost is not None else float("inf")):
+            # Only advance "best kept state" when this round is explicitly kept.
+            if (
+                keep_rewritten
+                and rw != init_sql
+                and rc < (best_cost if best_cost is not None else float("inf"))
+            ):
                 best_cost, best_sql, best_rules, best_groups = rc, rw, applied, groups
 
             out: Dict[str, Any] = {
@@ -663,10 +772,13 @@ class LangGraphQueryRewriter:
             if terminate:
                 out["should_terminate"] = True
                 if rollback:
-                    out["rewritten_sql"] = init_sql
-                    out["final_rewritten_costs"] = oc
+                    # Roll back to last kept/best rewritten state; fallback to original SQL.
+                    fallback_sql = best_sql if best_sql else init_sql
+                    fallback_cost = best_cost if (best_sql and best_cost is not None) else oc
+                    out["rewritten_sql"] = fallback_sql
+                    out["final_rewritten_costs"] = fallback_cost
                     rr = dict(rr)
-                    rr["rewritten_sql"] = init_sql
+                    rr["rewritten_sql"] = fallback_sql
                     out["current_rewrite_result"] = rr
                 elif rc < oc:
                     # Store to global memory
@@ -693,8 +805,15 @@ class LangGraphQueryRewriter:
                 out["should_terminate"] = True
                 ratio = ((rc - oc) / oc * 100) if oc > 0 else 0.0
                 if ratio > self.COST_ROLLBACK_PCT:
-                    out["rewritten_sql"] = init_sql
-                    out["final_rewritten_costs"] = oc
+                    # Cost degrades too much: roll back to last kept/best rewritten state,
+                    # or original SQL when no kept rewrite exists.
+                    fallback_sql = best_sql if best_sql else init_sql
+                    fallback_cost = best_cost if (best_sql and best_cost is not None) else oc
+                    out["rewritten_sql"] = fallback_sql
+                    out["final_rewritten_costs"] = fallback_cost
+                    rr = dict(state.get("current_rewrite_result") or {})
+                    rr["rewritten_sql"] = fallback_sql
+                    out["current_rewrite_result"] = rr
                 elif rc < oc and applied:
                     if self.global_memory:
                         try:
@@ -720,8 +839,12 @@ class LangGraphQueryRewriter:
                 "problematic_rules": ev.get("应用的规则", applied),
             }
             if rollback:
+                fallback_sql = best_sql if best_sql else init_sql
+                fallback_cost = best_cost if (best_sql and best_cost is not None) else oc
+                out["rewritten_sql"] = fallback_sql
+                out["final_rewritten_costs"] = fallback_cost
                 rr = dict(state.get("current_rewrite_result") or {})
-                rr["rewritten_sql"] = init_sql
+                rr["rewritten_sql"] = fallback_sql
                 out["current_rewrite_result"] = rr
             return out
         except Exception as e:

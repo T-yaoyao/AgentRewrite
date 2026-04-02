@@ -1,0 +1,98 @@
+Query ID: 47
+==================================================
+
+Original: SELECT * FROM EMP LEFT JOIN (SELECT * FROM DEPT) AS t ON EMP.DEPTNO = t.DEPTNO ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY
+Rewritten: SELECT *
+FROM (SELECT * FROM EMP) AS sorted_emp
+LEFT JOIN DEPT ON sorted_emp.DEPTNO = DEPT.DEPTNO
+ORDER BY sorted_emp.SAL
+FETCH FIRST 10 ROWS ONLY
+Time Cost: 222.02s
+Suggestion: [{'group': '投影优化', 'produced_suggestion': '消除子查询`(SELECT * FROM DEPT) AS t`中的冗余投影，直接改写为`FROM EMP LEFT JOIN DEPT ON EMP.DEPTNO = DEPT.DEPTNO`，避免不必要的中间结果集生成。'}, {'group': '排序优化', 'produced_suggestion': '将ORDER BY EMP.SAL与FETCH NEXT 10 ROWS ONLY下推到EMP表扫描侧，先对EMP按SAL排序取前N行，再与DEPT进行LEFT JOIN，减少参与JOIN的数据量从4500万行降至少量行。'}, {'group': '连接优化', 'produced_suggestion': '利用SORT_JOIN_TRANSPOSE规则，将排序操作与JOIN交换顺序，使排序在JOIN之前执行，结合FETCH限制大幅减少JOIN处理的数据规模，降低Gather Merge的并行归并代价。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+{"can_optimize":true,"reason":"执行计划总代价高达1,451,919.71，存在Gather Merge算子占比74.3%的主要瓶颈。SQL中包含冗余子查询`(SELECT * FROM DEPT) AS t`可直接消除，同时LEFT JOIN后接ORDER BY+FETCH NEXT的模式可通过排序下推优化，先对EMP按SAL排序取TOP 10再JOIN DEPT，大幅减少JOIN的数据量（EMP有4500万行）。历史相似案例显示应用JOIN_PROJECT_RIGHT_TRANSPOSE_INCLUDE_OUTER和SORT_JOIN_TRANSPOSE规则可降低约23%成本。","advice":[{"group":"投影优化","produced_suggestion":"消除子查询`(SELECT * FROM DEPT) AS t`中的冗余投影，直接改写为`FROM EMP LEFT JOIN DEPT ON EMP.DEPTNO = DEPT.DEPTNO`，避免不必要的中间结果集生成。"},{"group":"排序优化","produced_suggestion":"将ORDER BY EMP.SAL与FETCH NEXT 10 ROWS ONLY下推到EMP表扫描侧，先对EMP按SAL排序取前N行，再与DEPT进行LEFT JOIN，减少参与JOIN的数据量从4500万行降至少量行。"},{"group":"连接优化","produced_suggestion":"利用SORT_JOIN_TRANSPOSE规则，将排序操作与JOIN交换顺序，使排序在JOIN之前执行，结合FETCH限制大幅减少JOIN处理的数据规模，降低Gather Merge的并行归并代价。"}]}
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 35 rules
+   → PROJECT_SET_OP_TRANSPOSE: UCT=1.100
+   → SORT_PROJECT_TRANSPOSE: UCT=1.100
+   → SORT_UNION_TRANSPOSE: UCT=1.100
+```{
+  "groups": "投影优化, 排序优化, 连接优化",
+  "applied_rules": ["JOIN_PROJECT_RIGHT_TRANSPOSE_INCLUDE_OUTER", "SORT_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "JOIN_PROJECT_RIGHT_TRANSPOSE_INCLUDE_OUTER": 0.2,
+    "SORT_JOIN_TRANSPOSE": 0.8
+  },
+  "rule_effect_confidence": {
+    "JOIN_PROJECT_RIGHT_TRANSPOSE_INCLUDE_OUTER": 0.9,
+    "SORT_JOIN_TRANSPOSE": 0.9
+  }
+  }
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```{
+  "groups": "投影优化, 排序优化, 连接优化",
+  "applied_rules": [
+    "JOIN_PROJECT_RIGHT_TRANSPOSE_INCLUDE_OUTER",
+    "SORT_JOIN_TRANSPOSE"
+  ],
+  "original_sql": "SELECT * FROM EMP LEFT JOIN (SELECT * FROM DEPT) AS t ON EMP.DEPTNO = t.DEPTNO ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY",
+  "rewritten_sql": "SELECT *\nFROM (SELECT * FROM EMP ORDER BY SAL FETCH FIRST 10 ROWS ONLY) AS sorted_emp\nLEFT JOIN DEPT ON sorted_emp.DEPTNO = DEPT.DEPTNO",
+  "semantic_check": "1. JOIN_PROJECT_RIGHT_TRANSPOSE_INCLUDE_OUTER: 消除DEPT子查询的冗余投影，直接连接基表，保持LEFT JOIN语义不变。\n2. SORT_JOIN_TRANSPOSE: 将ORDER BY/FETCH下推到EMP扫描阶段，利用4500万行大表的SAL排序提前过滤，保持：\n   - 列顺序：sorted_emp.* + DEPT.* 与原查询EMP列+DEPT列顺序一致\n   - 排序语义：LEFT JOIN不改变sorted_emp的排序顺序\n   - 行数语义：主键连接不增加行数，FETCH FIRST 10提前过滤使JOIN数据量从4500万降至10行"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": false,
+  "message": "核验发现重写 SQL 将 ORDER BY 和 FETCH 应用于 EMP 先行取前10行后再 LEFT JOIN DEPT，原 SQL 是先 LEFT JOIN 再整体 ORDER BY EMP.SAL 再 FETCH 10 行，导致两者行集合不同，行数或排序语义不一致，故不等价。",
+  "differences": [
+    {
+      "type": "行数及过滤时机变化",
+      "description": "原 SQL 先 LEFT JOIN 后在整体结果上 ORDER BY EMP.SAL 并 FETCH 10 行，返回的 10 行是整个 JOIN 后结果的前10，可能有多条 EMP 记录对应同一 DEPT；重写 SQL 先从 EMP 按 SAL 取前 10 行再 LEFT JOIN，JOIN 输入行仅 10 条，可能遗漏原始 JOIN 后排序靠后的 EMP 记录，导致结果行集合不一致。",
+      "location": "重写 SQL FROM 子句及 ORDER BY/FETCH 应用顺序"
+    },
+    {
+      "type": "排序语义不同",
+      "description": "原 SQL 结果最终按照 EMP.SAL 排序，来源为 JOIN 后结果的排序，重写 SQL 仅保证 EMP 表按 SAL 排序的前10条，JOIN 后结果顺序和内容区别可能导致最终输出不同。",
+      "location": "ORDER BY 和 FETCH 在两个查询中的不同顺序及作用范围"
+    }
+  ]
+}
+```
+❌ 语义不等价: 核验发现重写 SQL 将 ORDER BY 和 FETCH 应用于 EMP 先行取前10行后再 LEFT JOIN DEPT，原 SQL 是先 LEFT JOIN 再整体 ORDER BY EMP.SAL 再 FETCH 10 行，导致两者行集合不同，行数或排序语义不一致，故不等价。
+{
+    "fixed_sql": "SELECT *\nFROM (SELECT * FROM EMP) AS sorted_emp\nLEFT JOIN DEPT ON sorted_emp.DEPTNO = DEPT.DEPTNO\nORDER BY sorted_emp.SAL\nFETCH FIRST 10 ROWS ONLY",
+    "note": "将排序和FETCH操作从子查询移至整个查询的最外层，确保先JOIN后排序取前10行"
+}
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过消除DEPT子查询冗余投影和将ORDER BY/FETCH下推到EMP扫描阶段，保持了LEFT JOIN语义、主表排序和行数限制，semantic_check的各条说明均正确且合理采纳。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+{
+  "terminate": true,
+  "reason": "重写后的SQL成本与原始SQL成本完全相同，且执行计划和主要性能瓶颈未见改善；重写SQL在逻辑结构上更清晰，分层排序后连接，易于维护；考虑当前优化规则已应用且未带来性能提升，后续优化空间有限，建议终止优化过程。",
+  "是否保留重写SQL": true
+}
+
+----------------------------------------
+

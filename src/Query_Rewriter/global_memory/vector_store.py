@@ -72,37 +72,12 @@ class VectorStore:
         Initialize vector store
         
         Args:
-            storage_path: Path to store vector database. If None, uses default location.
+            storage_path: Path to store vector database. If None, uses default fixed location.
         """
-        # Set default storage path
+        # Set default storage path: fixed directory for all models
         if storage_path is None:
             project_root = Path(__file__).parent.parent.parent.parent
-            # Get model name from environment variable to distinguish different model tests
-            import os
-            model_name = os.getenv("REASONING_MODEL", "deepseek-v3.2")
-            
-            # Extract model identifier for path naming
-            # Only support deepseek-v3.2 and deepseek-r1
-            if model_name:
-                model_name_lower = model_name.lower()
-                if "deepseek" in model_name_lower:
-                    if "r1" in model_name_lower or "r-1" in model_name_lower:
-                        model_id = "deepseek-r1"
-                    elif "v3.2" in model_name_lower or "v3-2" in model_name_lower or "v32" in model_name_lower:
-                        model_id = "deepseek-v3.2"
-                    elif "v3" in model_name_lower:
-                        # Default v3 to v3.2
-                        model_id = "deepseek-v3.2"
-                    else:
-                        # Default to v3.2 for other deepseek models
-                        model_id = "deepseek-v3.2"
-                else:
-                    # Default to v3.2 for non-deepseek models
-                    model_id = "deepseek-v3.2"
-            else:
-                model_id = "deepseek-v3.2"
-            
-            storage_path = str(project_root / "data" / "global_memory" / model_id / "chroma_db")
+            storage_path = str(project_root / "data" / "global_memory" / "chroma_db")
         
         self.storage_path = storage_path
         os.makedirs(storage_path, exist_ok=True)

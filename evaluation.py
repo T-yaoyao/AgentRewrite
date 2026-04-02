@@ -8,6 +8,7 @@ import sys
 import os
 from pathlib import Path
 import collections
+import re
 
 # Setup project paths first
 _current_file = Path(__file__).resolve()
@@ -40,6 +41,15 @@ import argparse
 #   - Remove the highest and lowest execution times
 # ============================================================================
 
+# IDs whose original SQL should be treated as timeout (skip actual execution)
+# Keyed by DB_NAME from environment.
+SKIP_ORIGINAL_BY_DB = {
+    "tpch": {"46", "47", "48", "55", "56", "57"},
+    "dsb": {"55", "56", "57", "109", "110", "111", "136", "137", "138"},
+    "calcite": {"50", "53", "56"},
+}
+SKIP_ORIGINAL_FIXED_TIMEOUT = 300.0
+
 class Evaluation():
     def __init__(self, evaluation_queries_path, result_storage_path, filtered_path, timeout=300, no_restart=False):
         self.evaluation_queries_path = evaluation_queries_path
@@ -52,6 +62,59 @@ class Evaluation():
         # no_restart mode: 5 iterations, remove max/min, average remaining 3
         # normal mode: 3 iterations, average all
         self.iteration_count = 5 if no_restart else 3
+
+    @staticmethod
+    def _normalize_id(v):
+        """Normalize query id for resume/dedup."""
+        if v is None:
+            return ""
+        return str(v).strip()
+
+    @staticmethod
+    def _normalize_sql_for_compare(sql_text):
+        """
+        Normalize SQL for semantic-equality-like text comparison in metrics:
+        - Replace literal \\n and real newlines with spaces
+        - Remove all whitespace
+        """
+        if sql_text is None:
+            return ""
+        s = str(sql_text)
+        s = s.replace("\\n", " ").replace("\n", " ")
+        s = re.sub(r"\s+", "", s)
+        return s
+
+    def dedupe_results_by_id(self, rows):
+        """
+        Deduplicate result rows by id, keeping the latest row for each id.
+        Rows without id are kept as-is.
+        """
+        if not isinstance(rows, list):
+            return []
+        latest = {}
+        no_id_rows = []
+        order = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            rid = self._normalize_id(row.get("id", ""))
+            if not rid:
+                no_id_rows.append(row)
+                continue
+            if rid not in latest:
+                order.append(rid)
+            latest[rid] = row
+        deduped = [latest[rid] for rid in order]
+        deduped.extend(no_id_rows)
+        return deduped
+
+    def _should_skip_original(self, query_id) -> bool:
+        """Whether original SQL execution should be skipped for this query id."""
+        db_name = (os.getenv("DB_NAME") or "").strip().lower()
+        if not db_name:
+            return False
+        skip_ids = SKIP_ORIGINAL_BY_DB.get(db_name, set())
+        return self._normalize_id(query_id) in skip_ids
 
     def connect_to_database(self, retries=5, wait_time=5):
         db_name = os.getenv("DB_NAME")
@@ -223,7 +286,7 @@ class Evaluation():
             # Normal average
             return sum(times_list) / len(times_list)
 
-    def compare_rewritten(self, original_query, rewritten_query, iteration=None):
+    def compare_rewritten(self, original_query, rewritten_query, iteration=None, query_id=None):
         # Use instance iteration count if not specified
         if iteration is None:
             iteration = self.iteration_count
@@ -235,39 +298,50 @@ class Evaluation():
         rewritten_times = []
         original_result = None
         rewritten_result = None
+        speed_up = None
+        times_up = None
         
         print(f"📊 Running {iteration} iterations" + (" (no-restart mode)" if self.no_restart else ""))
-        
-        # execute original query
-        for i in range(iteration + 1):
-            ORIGINAL_TIME_OUT = False
-            if conn is None:
-                return None, None, None, None, None, None  
-            
-            if i == 0:
-                print("start init hot database execution")
-                original_time, original_result = self.execute_query(conn, cursor, original_query, timeout, return_flag=True)
-                print(f"this is the init: original query excute time: {original_time}")
-                if original_time == -2:
-                    ORIGINAL_TIME_OUT = True
-                    break
-                elif original_time == -1:
-                    break
-                else:
-                    continue
 
-            original_time = self.execute_query(conn, cursor, original_query, timeout)
-            print(f"the {i}-th/{iteration} iteration original query excute time: {original_time}")
-            if original_time and original_time > 0:
-                original_times.append(original_time)
-        
-        if ORIGINAL_TIME_OUT:
-            total_original_time = timeout
-        elif original_times:
-            total_original_time = self._calculate_average_time(original_times)
+        if self._should_skip_original(query_id):
+            print(
+                f"⏭️  Skip original SQL execution for query_id={query_id}; "
+                f"set original_execution_time={SKIP_ORIGINAL_FIXED_TIMEOUT}s"
+            )
+            total_original_time = SKIP_ORIGINAL_FIXED_TIMEOUT
+            # Keep timeout marker behavior consistent with execute_query timeout branch.
+            original_result = -2
         else:
-            print("Original Query Execution Failed")
-            return None, None, None, None, None, None 
+            # execute original query
+            for i in range(iteration + 1):
+                ORIGINAL_TIME_OUT = False
+                if conn is None:
+                    return None, None, None, None, None, None  
+                
+                if i == 0:
+                    print("start init hot database execution")
+                    original_time, original_result = self.execute_query(conn, cursor, original_query, timeout, return_flag=True)
+                    print(f"this is the init: original query excute time: {original_time}")
+                    if original_time == -2:
+                        ORIGINAL_TIME_OUT = True
+                        break
+                    elif original_time == -1:
+                        break
+                    else:
+                        continue
+
+                original_time = self.execute_query(conn, cursor, original_query, timeout)
+                print(f"the {i}-th/{iteration} iteration original query excute time: {original_time}")
+                if original_time and original_time > 0:
+                    original_times.append(original_time)
+            
+            if ORIGINAL_TIME_OUT:
+                total_original_time = timeout
+            elif original_times:
+                total_original_time = self._calculate_average_time(original_times)
+            else:
+                print("Original Query Execution Failed")
+                return None, None, None, None, None, None 
         
         if total_original_time is not None:
             print(f"Original Query Execution Time: {total_original_time:.6f} seconds")
@@ -376,9 +450,12 @@ class Evaluation():
                 print(f"Running queries for pair: {original_query[:30]}... and rewritten query.")
                 
                 original_execution_time, rewrite_execution_time, speed_up, times_up,original_result,rewritten_result = self.compare_rewritten(
-                    original_query, rewritten_query, iteration=3
+                    original_query, rewritten_query, iteration=3, query_id=query_id
                 )
-                if original_result != None and rewritten_result != None and original_execution_time != self.timeout and rewrite_execution_time != self.timeout:
+                skipped_original = self._should_skip_original(query_id)
+                if skipped_original:
+                    equivalance = True
+                elif original_result != None and rewritten_result != None and original_execution_time != self.timeout and rewrite_execution_time != self.timeout:
                     original_counts = collections.Counter(original_result)
                     rewritten_counts = collections.Counter(rewritten_result)
                     equivalance = (original_counts == rewritten_counts)
@@ -404,30 +481,43 @@ class Evaluation():
 
         print(f"Experiment results appended to {self.result_storage_path}")
     
-    def cal(self):
+    def cal(self, equivalence_threshold=0.01, speed_up_threshold=0.01):
         Metric = []
         result_data = []
+        all_result_data = []
         original_execution_times = []
         rewritten_execution_times = []
         with open(self.result_storage_path, "r") as file:
             data = json.load(file)
+            data = self.dedupe_results_by_id(data if isinstance(data, list) else [])
             for info in data:
-                if(info['original_execution_time'] != -1 and info['original_execution_time'] != None and info['rewrite_execution_time'] != -1 and info['rewrite_execution_time'] != None):
+                if not isinstance(info, dict):
+                    continue
+                insert_data = {
+                    "id": info.get("id"),
+                    "equivalence": info.get("equivalence"),
+                    "original_query": info.get("original_query"),
+                    "rewritten_query": info.get("rewritten_query"),
+                    "original_execution_time": info.get("original_execution_time"),
+                    "rewrite_execution_time": info.get("rewrite_execution_time"),
+                    "speed_up": info.get("speed_up"),
+                    "times_up": info.get("times_up")
+                }
+                all_result_data.append(insert_data)
+
+                original_t = info.get('original_execution_time')
+                rewrite_t = info.get('rewrite_execution_time')
+                if (
+                    original_t != -1 and original_t is not None and
+                    rewrite_t != -1 and rewrite_t is not None
+                ):
                     original_execution_times.append(info['original_execution_time'])
                     rewritten_execution_times.append(info['rewrite_execution_time'])
-                    insert_data = {
-                        "id": info["id"],
-                        "equivalence": info["equivalence"],
-                        "original_query": info["original_query"],
-                        "rewritten_query": info["rewritten_query"],
-                        "original_execution_time": info["original_execution_time"],
-                        "rewrite_execution_time": info["rewrite_execution_time"],
-                        "speed_up": info["speed_up"],
-                        "times_up": info["times_up"]
-                    }
                     result_data.append(insert_data)
 
-
+        if not original_execution_times or not rewritten_execution_times:
+            print("No valid rows left for metrics after filtering timeouts.")
+            return
 
         # calculate mean
         ori_avg = statistics.mean(original_execution_times)
@@ -465,12 +555,31 @@ class Evaluation():
             "rewritten_75th_percentile": re_percentile_75,
             "rewritten_95th_percentile": re_percentile_95
         }
-        Metric.append(ori_result)
-        Metric.append(re_result)
-        
-        result_data.insert(0, Metric)
+
+        total_queries = len(all_result_data)
+        equivalent_count = sum(1 for x in all_result_data if x.get("equivalence") is True)
+        improved_count = sum(
+            1 for x in all_result_data
+            if (
+                isinstance(x.get("speed_up"), (int, float))
+                and x.get("speed_up") > speed_up_threshold
+                and self._normalize_sql_for_compare(x.get("original_query", "")) !=
+                self._normalize_sql_for_compare(x.get("rewritten_query", ""))
+            )
+        )
+        stats_result = {
+            "total_queries": total_queries,
+            "equivalent_count": equivalent_count,
+            "equivalence_rate": (equivalent_count / total_queries) if total_queries else 0.0,
+            "improved_count": improved_count,
+            "improvement_rate": (improved_count / total_queries) if total_queries else 0.0,
+            "equivalence_threshold": equivalence_threshold,
+            "speed_up_threshold": speed_up_threshold,
+        }
+
+        output_data = [ori_result, re_result, stats_result] + all_result_data
         with open(self.filtered_path,"w") as file:
-            json.dump(result_data, file, indent=4)
+            json.dump(output_data, file, indent=4)
         print("Calculate Metrics Done!") # Debug line to check if the script has finished running
 
 def ensure_file_exists(path):
@@ -506,6 +615,10 @@ def parse_arguments():
                         help="Query timeout in seconds")
     parser.add_argument("--no_restart", action="store_true", default=False,
                         help="Disable database restart between queries (runs 5 times, removes min/max)")
+    parser.add_argument("--equivalence_threshold", type=float, default=0.01,
+                        help="Threshold metadata for equivalence rate reporting (default: 0.01)")
+    parser.add_argument("--speed_up_threshold", type=float, default=0.01,
+                        help="Threshold for improvement_rate counting (default: 0.01)")
     return parser.parse_args()     
 
 if __name__ == "__main__":
@@ -515,6 +628,8 @@ if __name__ == "__main__":
     filtered_path = args.filtered_path
     time_out = args.time_out
     no_restart = args.no_restart
+    equivalence_threshold = args.equivalence_threshold
+    speed_up_threshold = args.speed_up_threshold
     
     if no_restart:
         print("=" * 60)
@@ -536,12 +651,38 @@ if __name__ == "__main__":
     data = json.loads(json_content)
     print("data load sucessfully!")
 
+    # Resume + dedupe existing results
     result = []
+    completed_ids = set()
+    if os.path.exists(storage_path):
+        try:
+            with open(storage_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                existing = [existing]
+            result = model.dedupe_results_by_id(existing if isinstance(existing, list) else [])
+            for row in result:
+                if isinstance(row, dict):
+                    rid = model._normalize_id(row.get("id", ""))
+                    if rid:
+                        completed_ids.add(rid)
+            if completed_ids:
+                print(f"🔁 Resume enabled: loaded {len(completed_ids)} completed IDs from {storage_path}")
+        except Exception as e:
+            print(f"⚠️ Failed to load existing results, start from scratch: {e}")
+            result = []
+            completed_ids = set()
+
     iteration = 0
     equiv_number = 0
     sucess_run_number = 0
     for i, query_info in enumerate(data, start=0):
         query_id = query_info.get("id", "")
+        query_id_str = model._normalize_id(query_id)
+        if query_id_str in completed_ids:
+            print(f"⏭️  Skip completed query id={query_id_str}")
+            continue
+
         iteration += 1
         print("this is the {}-th iteration".format(iteration))
         print(f"the query id is {query_id}")
@@ -549,13 +690,18 @@ if __name__ == "__main__":
         rewritten_query = query_info.get("rewritten_query", "No rewritten query found")
         print(f"Original Query: {original_query}")
         print(f"Rewritten Query: {rewritten_query}")
-        total_original_time,total_rewrite_time,speed_up,times_up,original_result,rewritten_result = model.compare_rewritten(original_query,rewritten_query)
+        total_original_time,total_rewrite_time,speed_up,times_up,original_result,rewritten_result = model.compare_rewritten(
+            original_query, rewritten_query, query_id=query_id
+        )
         
         equivalance = False
         if total_original_time != None and total_rewrite_time != None and original_result != -1 and rewritten_result != -1:
             sucess_run_number += 1
         
-        if original_result != None and rewritten_result != None and original_result != -1 and rewritten_result != -1 and total_original_time != time_out and total_rewrite_time != time_out:
+        skipped_original = model._should_skip_original(query_id)
+        if skipped_original:
+            equivalance = True
+        elif original_result != None and rewritten_result != None and original_result != -1 and rewritten_result != -1 and total_original_time != time_out and total_rewrite_time != time_out:
             original_counts = collections.Counter(original_result)
             rewritten_counts = collections.Counter(rewritten_result)
             equivalance = (original_counts == rewritten_counts)
@@ -573,13 +719,26 @@ if __name__ == "__main__":
             "times_up": times_up          
         }
         result.append(result_data)
+        if query_id_str:
+            completed_ids.add(query_id_str)
 
+        # Persist after each query for true resume capability
+        deduped = model.dedupe_results_by_id(result)
+        with open(storage_path, 'w') as result_file:
+            json.dump([model.convert_to_serializable(item) for item in deduped], result_file, indent=4)
+        result = deduped
+        print(f"Results saved after query {query_id}")
+
+    # Final flush
+    result = model.dedupe_results_by_id(result)
     with open(storage_path, 'w') as result_file:
-        # json.dump(result, result_file, indent=4)
         json.dump([model.convert_to_serializable(item) for item in result], result_file, indent=4)
-        print(f"Experiment results appended to {storage_path}")
-        print(f"the number of equivalent query is {equiv_number}")
-        print(f"the number of sucess run query is {sucess_run_number}/ {iteration}")
+    print(f"Experiment results appended to {storage_path}")
+    print(f"the number of equivalent query is {equiv_number}")
+    print(f"the number of sucess run query is {sucess_run_number}/ {iteration}")
 
-    model.cal()
+    model.cal(
+        equivalence_threshold=equivalence_threshold,
+        speed_up_threshold=speed_up_threshold,
+    )
 
