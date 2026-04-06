@@ -9,15 +9,21 @@
 
 import argparse
 import csv
-import json
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
+
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from src.utils.llm_json_utils import load_with_repair
 
 
 def load_rewrites(json_path: Path) -> List[Dict[str, Any]]:
     with json_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+        data = load_with_repair(f)
         if not isinstance(data, list):
             raise ValueError("JSON 根应为列表(list)")
         return data

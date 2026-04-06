@@ -17,6 +17,7 @@ setup_python_path()
 load_project_env()
 
 from src.Rewrite_Middleware.middleware import DBMS, DBMS_EXPLAIN_Tool, DBMS_Syntax_Tool
+from src.utils.llm_json_utils import loads_with_repair
 from src.Rewrite_Middleware.Agent_Memory_Buffer.memory_buffer import (
     AgentMemoryBuffer,
     OutputCollector,
@@ -104,6 +105,8 @@ class LangGraphQueryRewriter:
     MAX_SEMANTIC_FIX = 3
     MAX_SYNTAX_AFTER_SEMANTIC = 3
     COST_ROLLBACK_PCT = 20.0
+    # 相对原始代价涨幅超过该比例时，无视评估 LLM 的「是否保留重写SQL」，强制回退原始 SQL。
+    COST_FORCE_ROLLBACK_PCT = 10.0
 
     def __init__(
         self,
@@ -185,7 +188,7 @@ class LangGraphQueryRewriter:
                 if m:
                     return float(m.group(1).replace(",", ""))
                 try:
-                    explain_result = json.loads(explain_result)
+                    explain_result = loads_with_repair(explain_result)
                 except json.JSONDecodeError:
                     return 0.0
             if isinstance(explain_result, dict):
@@ -523,6 +526,7 @@ class LangGraphQueryRewriter:
                 "original_sql": init_sql,
                 "rewritten_sql": rw,
                 "reason": (state.get("previous_feedback") or {}).get("reason", ""),
+                "optimization_advice": state.get("optimization_advice") or [],
             }
             rnd = state.get("current_round", 1)
             async with self.llm_semaphore:
@@ -532,12 +536,35 @@ class LangGraphQueryRewriter:
             keep_rewritten = ev.get("是否保留重写SQL", True)
             rollback = not keep_rewritten
 
+            cost_increase_pct = ((rc - oc) / oc * 100.0) if oc > 0 else 0.0
+            forced_cost_rollback = (
+                oc > 0
+                and rw != init_sql
+                and cost_increase_pct > self.COST_FORCE_ROLLBACK_PCT
+            )
+            if forced_cost_rollback:
+                rollback = True
+                keep_rewritten = False
+                ev_merged = dict(ev)
+                ev_merged["是否保留重写SQL"] = False
+                ev_merged["forced_cost_rollback"] = True
+                ev_merged["forced_cost_increase_pct"] = round(cost_increase_pct, 4)
+                trace[-1] = {"node": "evaluation", "output": ev_merged}
+
             best_cost = state.get("best_cost")
             best_sql = state.get("best_sql")
             best_rules = state.get("best_rules")
             best_groups = state.get("best_groups", "")
             if rw != init_sql and rc < (best_cost if best_cost is not None else float("inf")):
                 best_cost, best_sql, best_rules, best_groups = rc, rw, applied, groups
+
+            eval_reason = ev.get("reason", "") or ""
+            if forced_cost_rollback:
+                eval_reason = (
+                    f"{eval_reason}"
+                    f"（系统硬性规则：重写代价较原始上涨 {cost_increase_pct:.2f}% > "
+                    f"{self.COST_FORCE_ROLLBACK_PCT:g}%，强制回退原始 SQL。）"
+                ).strip()
 
             out: Dict[str, Any] = {
                 "final_original_costs": oc,
@@ -547,7 +574,7 @@ class LangGraphQueryRewriter:
                 "best_sql": best_sql,
                 "best_rules": best_rules,
                 "best_groups": best_groups,
-                "evaluation_reason": ev.get("reason", "") or "",
+                "evaluation_reason": eval_reason,
                 "evaluation_terminate": ev.get("terminate", True),
                 "evaluation_rollback_sql": rollback,
                 "agent_trace": trace,

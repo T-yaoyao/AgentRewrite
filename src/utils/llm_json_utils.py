@@ -13,6 +13,44 @@ except ImportError:
     _json_repair = None
 
 
+def _parse_with_optional_repair(s: str, **kwargs: Any) -> Tuple[Any, bool]:
+    """json.loads first; on failure repair with json-repair then json.loads. Returns (obj, used_repair)."""
+    try:
+        return json.loads(s, **kwargs), False
+    except json.JSONDecodeError as err:
+        if _json_repair is None:
+            raise
+        try:
+            fixed = _json_repair(s)
+            return json.loads(fixed, **kwargs), True
+        except json.JSONDecodeError as err2:
+            raise err2 from err
+
+
+def loads_with_repair(s: str | bytes, **kwargs: Any) -> Any:
+    """Parse a JSON string or bytes: standard json.loads, then json-repair + json.loads if needed."""
+    if isinstance(s, bytes):
+        s = s.decode("utf-8")
+    obj, _ = _parse_with_optional_repair(str(s), **kwargs)
+    return obj
+
+
+def load_with_repair(fp: Any, **kwargs: Any) -> Any:
+    """Parse JSON from a file-like object: json.load first; on failure rewind (if possible) and loads_with_repair."""
+    try:
+        return json.load(fp, **kwargs)
+    except json.JSONDecodeError:
+        if hasattr(fp, "seek"):
+            try:
+                fp.seek(0)
+            except OSError:
+                pass
+        raw = fp.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        return loads_with_repair(raw, **kwargs)
+
+
 def repair_json_string(raw: str) -> str:
     """Try to fix common LLM JSON issues (trailing commas, unclosed brackets)."""
     if not raw or not raw.strip():
@@ -79,6 +117,17 @@ def parse_llm_json(
 
     candidates = []
     blob = str(text).strip()
+
+    # Primary path for structured JSON output:
+    # when callers use LLM's json response format, the whole string should already be a JSON object.
+    # Prefer direct parse and skip extraction/repair to reduce brittleness.
+    try:
+        direct, used_rep = _parse_with_optional_repair(blob)
+        if isinstance(direct, dict):
+            return direct, used_rep
+    except json.JSONDecodeError:
+        pass
+
     # Strip markdown code fence
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", blob, re.IGNORECASE)
     if fence:
@@ -97,13 +146,12 @@ def parse_llm_json(
         if not cand or cand in seen:
             continue
         seen.add(cand)
-        for variant in (cand, repair_json_string(cand)):
-            try:
-                data = json.loads(variant)
-                if isinstance(data, dict):
-                    return data, variant != cand
-            except json.JSONDecodeError:
-                continue
+        try:
+            data, used_rep = _parse_with_optional_repair(cand)
+            if isinstance(data, dict):
+                return data, used_rep
+        except json.JSONDecodeError:
+            continue
     return None, False
 
 

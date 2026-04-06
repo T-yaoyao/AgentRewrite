@@ -4,6 +4,8 @@ PostgreSQL数据库连接工具（简化版）
 """
 import json
 from typing import Dict, Any, Optional
+
+from src.utils.llm_json_utils import loads_with_repair
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -117,7 +119,7 @@ class PostgresConnector:
                     # 如果 plan_data 是字符串，尝试解析JSON
                     if isinstance(plan_data, str):
                         try:
-                            plan_data = json.loads(plan_data)
+                            plan_data = loads_with_repair(plan_data)
                         except json.JSONDecodeError:
                             return {'error': f'无法解析JSON格式的执行计划: {plan_data[:200]}'}
                     

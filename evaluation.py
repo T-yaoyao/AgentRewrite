@@ -16,8 +16,11 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from src.utils.path_config import PROJECT_ROOT, setup_python_path, load_project_env
+
 setup_python_path()
 load_project_env()
+
+from src.utils.llm_json_utils import load_with_repair, loads_with_repair
 
 from decimal import Decimal
 from datetime import date
@@ -352,14 +355,14 @@ class Evaluation():
 
     def evaluate(self):
         with open(self.evaluation_queries_path, 'r') as file:
-            data = json.load(file)
+            data = load_with_repair(file)
 
         existing_results = []
 
         if os.path.exists(self.result_storage_path):
             with open(self.result_storage_path, 'r') as result_file:
                 try:
-                    existing_results = json.load(result_file)
+                    existing_results = load_with_repair(result_file)
                     if isinstance(existing_results, dict):
                         existing_results = [existing_results]
                     elif not isinstance(existing_results, list):
@@ -410,7 +413,7 @@ class Evaluation():
         original_execution_times = []
         rewritten_execution_times = []
         with open(self.result_storage_path, "r") as file:
-            data = json.load(file)
+            data = load_with_repair(file)
             for info in data:
                 if(info['original_execution_time'] != -1 and info['original_execution_time'] != None and info['rewrite_execution_time'] != -1 and info['rewrite_execution_time'] != None):
                     original_execution_times.append(info['original_execution_time'])
@@ -533,7 +536,7 @@ if __name__ == "__main__":
 
     with open(queries_path, 'r') as file:
         json_content = file.read()
-    data = json.loads(json_content)
+    data = loads_with_repair(json_content)
     print("data load sucessfully!")
 
     result = []

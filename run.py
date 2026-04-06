@@ -24,6 +24,7 @@ from src.Rewrite_Middleware.middleware import DBMS, DBMS_Syntax_Tool
 from src.utils.agent_template import MessageContent, Message, MemoryWindow, MessageQueue
 from src.Query_Rewriter.langgraph_rewriter import LangGraphQueryRewriter
 from src.utils.llm_client import GPT
+from src.utils.llm_json_utils import load_with_repair
 
 def parse_arguments():
     """Parse parameters from command line or use default values"""
@@ -84,7 +85,7 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
     
     # laod input data
     with open(args.input_path, "r", encoding='utf-8') as f:
-        data = json.load(f)
+        data = load_with_repair(f)
     
     count = 0
     all_results = []  # Store all results in memory
@@ -95,7 +96,7 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
     if final_output_file.exists():
         try:
             with open(final_output_file, "r", encoding='utf-8') as f:
-                existing_results = json.load(f)
+                existing_results = load_with_repair(f)
                 if isinstance(existing_results, list):
                     all_results = existing_results
                     for row in all_results:

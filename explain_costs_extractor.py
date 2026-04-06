@@ -12,6 +12,12 @@ import json
 import os
 import sys
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.utils.llm_json_utils import load_with_repair, loads_with_repair
 from typing import Dict, List, Optional, Tuple
 
 import psycopg2
@@ -52,7 +58,7 @@ def extract_cost_from_explain(explain_result: any) -> Optional[float]:
         # 如果是字符串，尝试解析 JSON
         if isinstance(explain_result, str):
             try:
-                explain_result = json.loads(explain_result)
+                explain_result = loads_with_repair(explain_result)
             except json.JSONDecodeError:
                 return None
 
@@ -166,7 +172,7 @@ def process_json_file(input_file: Path, output_file: Path, database_name: Option
     # 读取 JSON 文件
     try:
         with open(input_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+            data = load_with_repair(f)
     except Exception as e:
         print(f"❌ 读取 JSON 文件失败: {e}")
         sys.exit(1)

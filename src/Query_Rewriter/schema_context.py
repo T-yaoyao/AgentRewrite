@@ -9,6 +9,8 @@ import re
 from pathlib import Path
 from typing import Any, List, Set
 
+from src.utils.llm_json_utils import loads_with_repair
+
 
 def load_schema_file(schema_path: str) -> str:
     if not schema_path:
@@ -145,7 +147,7 @@ def filter_data_statistics_for_sql(data_statistics: Any, sql: str) -> Any:
     was_str = isinstance(data_statistics, str)
     if was_str:
         try:
-            as_list: List = json.loads(data_statistics)
+            as_list: List = loads_with_repair(data_statistics)
         except (json.JSONDecodeError, TypeError):
             return data_statistics
     elif isinstance(data_statistics, list):

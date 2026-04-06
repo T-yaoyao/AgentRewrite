@@ -17,6 +17,7 @@ load_project_env()
 from typing import List, Dict,Any, Optional,Tuple
 from psycopg2.extras import RealDictCursor
 from src.Rewrite_Middleware.Structured_Knowledge_Base.knowledge_base import Structured_Knowledge_Base
+from src.utils.llm_json_utils import load_with_repair, loads_with_repair
 from typing import List, Dict, Any   
 
 
@@ -82,7 +83,7 @@ class DBMS:
             # Check if explain_result is a string or list and parse accordingly
             if isinstance(explain_result, str):
                 self.close()
-                return True, json.loads(explain_result)
+                return True, loads_with_repair(explain_result)
             elif isinstance(explain_result, list):
                 self.close()
                 return True, explain_result  # Return list directly
@@ -140,7 +141,7 @@ class DBMS:
     def read_sql_from_json(self, json_file_path):
         try:
             with open(json_file_path, 'r', encoding='utf-8') as file:
-                data = json.load(file)
+                data = load_with_repair(file)
             return [item['query'] for item in data]
         except Exception as e:
             print(f"Error reading JSON file: {e}")

@@ -1,5 +1,4 @@
 import csv
-import json
 import os
 import sys
 import time
@@ -9,6 +8,7 @@ from typing import List, Optional
 import psycopg2
 import psycopg2.errors
 
+from src.utils.llm_json_utils import load_with_repair
 from src.utils.postgres_connector import PostgresConnector
 
 
@@ -280,7 +280,7 @@ def process_json(
         )
 
     with input_json.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+        data = load_with_repair(f)
 
     if not isinstance(data, list):
         raise ValueError(f"JSON 文件 {input_json} 顶层结构必须是数组。")

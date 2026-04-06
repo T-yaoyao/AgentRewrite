@@ -21,17 +21,26 @@ fi
 
 # 2. 检查JSON文件
 echo -e "${YELLOW}2. 检查JSON文件...${NC}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JSON_FILE="experiments_results/tpch/QUITE_tpch_63queries_rewritten_only.json"
-if [ -f "$JSON_FILE" ]; then
+FULL_JSON="$REPO_ROOT/$JSON_FILE"
+if [ -f "$FULL_JSON" ]; then
     echo -e "${GREEN}✓ JSON文件存在${NC}"
-    QUERY_COUNT=$(python3 -c "import json; data=json.load(open('$JSON_FILE')); print(len(data))" 2>/dev/null)
+    QUERY_COUNT=$(REPO_ROOT="$REPO_ROOT" FULL_JSON="$FULL_JSON" python3 -c '
+import os, sys
+sys.path.insert(0, os.environ["REPO_ROOT"])
+from src.utils.llm_json_utils import load_with_repair
+with open(os.environ["FULL_JSON"], encoding="utf-8") as f:
+    data = load_with_repair(f)
+print(len(data))
+' 2>/dev/null)
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}  包含 $QUERY_COUNT 条查询${NC}"
     else
         echo -e "${RED}  ✗ JSON文件格式可能有问题${NC}"
     fi
 else
-    echo -e "${RED}✗ JSON文件不存在: $JSON_FILE${NC}"
+    echo -e "${RED}✗ JSON文件不存在: $FULL_JSON${NC}"
     exit 1
 fi
 

@@ -46,6 +46,10 @@ sys.path.append('../../../')
 from utils.llm_client import GPT
 
 PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", Path(__file__).resolve().parents[4]))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from src.utils.llm_json_utils import load_with_repair, loads_with_repair
+
 LOAD_PATH = PROJECT_ROOT / "config_file" / ".env"
 load_dotenv(dotenv_path=LOAD_PATH)      
 llm = GPT(
@@ -108,7 +112,7 @@ class cleaner():
         if os.path.exists(json_file_path):
             try:
                 with open(json_file_path, 'r', encoding='utf-8') as file:
-                    content = json.load(file)
+                    content = load_with_repair(file)
                     documents.append(content)
             except json.JSONDecodeError as e:
                 print(f"Error parsing JSON file {json_file_path}: {e}")
@@ -325,24 +329,10 @@ class cleaner():
                         print(f"🤖 Analyzing {doc_type} item: {item.get('method', 'Unknown')}...")
                         res = self.llm.get_LLM_response(prompt, json_format=True)
                         
-                        # Handle string response that may contain JSON
+                        # With json_format=True, the model should return pure JSON.
                         if isinstance(res, str):
-                            # Extract JSON from the response if needed
                             try:
-                                import re
-                                json_match = re.search(r'```json\s*(\{.*?\})\s*```', res, re.DOTALL)
-                                if json_match:
-                                    json_str = json_match.group(1)
-                                    res = json.loads(json_str)
-                                else:
-                                    # Try to find JSON without code blocks
-                                    json_match = re.search(r'(\{[^}]*"useful"[^}]*\})', res, re.DOTALL)
-                                    if json_match:
-                                        json_str = json_match.group(1)
-                                        res = json.loads(json_str)
-                                    else:
-                                        print(f"❌ No JSON found in response")
-                                        continue
+                                res = loads_with_repair(res)
                             except json.JSONDecodeError as e:
                                 print(f"❌ Failed to parse JSON: {e}")
                                 continue
@@ -413,7 +403,7 @@ class cleaner():
                 file_path = os.path.join(folder_path, filename)
                 try:
                     with open(file_path, 'r', encoding='utf-8') as file:
-                        data = json.load(file)
+                        data = load_with_repair(file)
 
                     # If it's an array, process each item individually
                     if isinstance(data, list):
@@ -482,7 +472,7 @@ class cleaner():
                 return False
 
             with open(self.save_file_dir, 'r', encoding='utf-8') as file:
-                data = json.load(file)
+                data = load_with_repair(file)
             
             # Generate ID and standard format for each document
             documents_with_id = []
@@ -599,25 +589,10 @@ class cleaner():
                         prompt = self.con_prompt1(data)
                         res = self.llm.get_LLM_response(prompt, json_format=True)
                         
-                        # Handle string response that may contain JSON
+                        # With json_format=True, the model should return pure JSON.
                         if isinstance(res, str):
-                            # Extract JSON from the response if needed
                             try:
-                                import re
-                                json_match = re.search(r'```json\s*(\{.*?\})\s*```', res, re.DOTALL)
-                                if json_match:
-                                    json_str = json_match.group(1)
-                                    res = json.loads(json_str)
-                                else:
-                                    # Try to find JSON without code blocks
-                                    json_match = re.search(r'(\{[^}]*"useful"[^}]*\})', res, re.DOTALL)
-                                    if json_match:
-                                        json_str = json_match.group(1)
-                                        res = json.loads(json_str)
-                                    else:
-                                        tqdm.write(f"❌ {filename}: No JSON found in response")
-                                        successful_files += 1  # Count as processed even if failed
-                                        continue
+                                res = loads_with_repair(res)
                             except json.JSONDecodeError as e:
                                 tqdm.write(f"❌ {filename}: Failed to parse JSON: {e}")
                                 successful_files += 1  # Count as processed even if failed
@@ -639,24 +614,10 @@ class cleaner():
                                 prompt = self.con_prompt2(data, group)
                                 res = self.llm.get_LLM_response(prompt, json_format=True)
                                 
-                                # Handle string response that may contain JSON
+                                # With json_format=True, the model should return pure JSON.
                                 if isinstance(res, str):
-                                    # Extract JSON from the response if needed
                                     try:
-                                        import re
-                                        json_match = re.search(r'```json\s*(\{.*?\})\s*```', res, re.DOTALL)
-                                        if json_match:
-                                            json_str = json_match.group(1)
-                                            res = json.loads(json_str)
-                                        else:
-                                            # Try to find JSON without code blocks
-                                            json_match = re.search(r'(\{[^}]*"Question_description"[^}]*\})', res, re.DOTALL)
-                                            if json_match:
-                                                json_str = json_match.group(1)
-                                                res = json.loads(json_str)
-                                            else:
-                                                tqdm.write(f"❌ {filename}: No JSON found in stage 2 response")
-                                                continue
+                                        res = loads_with_repair(res)
                                     except json.JSONDecodeError as e:
                                         tqdm.write(f"❌ {filename}: Failed to parse stage 2 JSON: {e}")
                                         continue

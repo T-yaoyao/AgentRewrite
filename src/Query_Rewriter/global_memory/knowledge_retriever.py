@@ -5,6 +5,9 @@ Retrieves similar SQL optimization cases from knowledge base
 
 import json
 from typing import List, Dict, Optional
+
+from src.utils.llm_json_utils import loads_with_repair
+
 from .vector_store import VectorStore
 from .sql_fingerprint import SQLFingerprintGenerator
 
@@ -47,8 +50,9 @@ class KnowledgeRetriever:
         for result in results:
             metadata = result['metadata']
             try:
-                rule_sequence = json.loads(metadata.get('rule_sequence', '[]'))
-            except:
+                raw_rs = metadata.get('rule_sequence', '[]')
+                rule_sequence = raw_rs if isinstance(raw_rs, list) else loads_with_repair(raw_rs)
+            except (json.JSONDecodeError, TypeError, ValueError):
                 rule_sequence = []
             
             formatted_result = {

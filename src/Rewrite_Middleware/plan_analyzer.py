@@ -2,6 +2,8 @@ import json
 import os
 from typing import Optional
 
+from src.utils.llm_json_utils import loads_with_repair
+
 class PlanAnalyzer:
     def __init__(self, explain_json_str: Optional[str] = None, sql_query: Optional[str] = None, 
                  analyze: bool = False, db_config: Optional[dict] = None, db_name: Optional[str] = None):
@@ -50,7 +52,7 @@ class PlanAnalyzer:
             cleaned_str = '\n'.join(cleaned_lines)
             
             # 2. 解析 JSON
-            parsed = json.loads(cleaned_str)
+            parsed = loads_with_repair(cleaned_str)
             if isinstance(parsed, list) and len(parsed) > 0 and 'Plan' in parsed[0]:
                 self.plan_root = parsed[0]['Plan']
             elif isinstance(parsed, dict) and 'Plan' in parsed:

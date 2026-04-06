@@ -19,6 +19,7 @@ setup_python_path()
 load_project_env()
 
 from src.utils.llm_client import GPT
+from src.utils.llm_json_utils import load_with_repair, loads_with_repair
 from src.utils.data_distribution import get_statistics_list, get_available_databases
 from src.utils.get_data_statistics import get_data_statistics
 from src.Rewrite_Middleware.middleware import DBMS
@@ -148,7 +149,7 @@ if __name__ == '__main__':
     input_queries = []
     
     with open(input_path, 'r', encoding='utf-8') as f:
-        input_queries = json.load(f)
+        input_queries = load_with_repair(f)
    
     for i in tqdm(range(len(input_queries)), desc="Processing queries"):
         prompt = con_prompt1(input_queries[i], data_statistics)
@@ -157,7 +158,7 @@ if __name__ == '__main__':
         # Handle case where response is a string instead of dict
         if isinstance(res, str):
             try:
-                res = json.loads(res)
+                res = loads_with_repair(res)
             except json.JSONDecodeError as e:
                 print(f"Error parsing JSON response: {e}")
                 print(f"Raw response: {res}")
@@ -195,7 +196,7 @@ if __name__ == '__main__':
                         # Handle case where response is a string instead of dict
                         if isinstance(response, str):
                             try:
-                                response = json.loads(response)
+                                response = loads_with_repair(response)
                             except json.JSONDecodeError as e:
                                 print(f"Error parsing JSON response in iteration {iteration}: {e}")
                                 print(f"Raw response: {response}")

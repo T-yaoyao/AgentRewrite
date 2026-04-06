@@ -8,9 +8,15 @@
 """
 
 import argparse
-import json
 import csv
+import sys
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from src.utils.llm_json_utils import load_with_repair
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,7 +53,7 @@ def main() -> None:
 
     # 读取JSON文件
     with open(input_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        data = load_with_repair(f)
 
     # 准备CSV数据
     csv_rows = []

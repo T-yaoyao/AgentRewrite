@@ -18,8 +18,11 @@ from typing import List, Dict
 
 # Setup project paths
 from src.utils.path_config import PROJECT_ROOT, setup_python_path, load_project_env
+
 setup_python_path()
 load_project_env()
+
+from src.utils.llm_json_utils import load_with_repair, loads_with_repair
 
 class Structured_Knowledge_Base:
     def __init__(self, folder_path, json_file_path, document_store_path=None):
@@ -191,7 +194,7 @@ class Structured_Knowledge_Base:
         documents = []
         if os.path.exists(self.json_file_path):
             with open(self.json_file_path, 'r', encoding='utf-8') as file:
-                documents_data = json.load(file)
+                documents_data = load_with_repair(file)
                 for doc_data in documents_data:
                     documents.append(Document(id=doc_data["id"], content=doc_data["content"]))
 
@@ -212,7 +215,7 @@ class Structured_Knowledge_Base:
                 file_path = os.path.join(self.folder_path, filename)
                 try:
                     with open(file_path, 'r', encoding='utf-8') as file:
-                        data = json.load(file)
+                        data = load_with_repair(file)
 
                     # If it's an array, process each item individually
                     if isinstance(data, list):
@@ -274,38 +277,40 @@ class Structured_Knowledge_Base:
             if not text.strip():
                 return [{"suggestion": "No suggestion content"}]
 
-            # Extract JSON content - Simplified using regular expressions
-            text = text.strip()
-
-            # Try to extract content surrounded by ```json...``` or ```...```
-            json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
-            if json_match:
-                json_content = json_match.group(1).strip()
-            else:
-                # Try to extract JSON starting from the first { or [
-                brace_match = re.search(r'[{\[].*[}\]]', text, re.DOTALL)
-                if brace_match:
-                    json_content = brace_match.group(0)
-                else:
-                    json_content = text
-
-            # Try to parse JSON
             try:
-                parsed = json.loads(json_content)
+                # Prefer direct JSON parsing (works when generator uses response_format/json_object).
+                parsed = loads_with_repair(text)
                 if isinstance(parsed, list):
                     return parsed
-                elif isinstance(parsed, dict):
+                if isinstance(parsed, dict):
                     return [parsed]
-                else:
-                    return [{"suggestion": str(parsed)}]
+                return [{"suggestion": str(parsed)}]
             except json.JSONDecodeError:
-                # JSON parsing failed, try to extract suggestion field
-                suggestions = re.findall(r'"suggestion"\s*:\s*"([^"]*)"', json_content)
-                if suggestions:
-                    return [{"suggestion": s} for s in suggestions]
+                # Fallback: Extract JSON content from code blocks / noisy text.
+                json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+                if json_match:
+                    json_content = json_match.group(1).strip()
+                else:
+                    # Try to extract JSON starting from the first { or [
+                    brace_match = re.search(r'[{\[].*[}\]]', text, re.DOTALL)
+                    if brace_match:
+                        json_content = brace_match.group(0)
+                    else:
+                        json_content = text
 
-                # Last resort: return cleaned text
-                return [{"suggestion": json_content}]
+                try:
+                    parsed = loads_with_repair(json_content)
+                    if isinstance(parsed, list):
+                        return parsed
+                    if isinstance(parsed, dict):
+                        return [parsed]
+                    return [{"suggestion": str(parsed)}]
+                except json.JSONDecodeError:
+                    # Last resort: try to extract suggestion field value.
+                    suggestions = re.findall(r'"suggestion"\s*:\s*"([^"]*)"', json_content)
+                    if suggestions:
+                        return [{"suggestion": s} for s in suggestions]
+                    return [{"suggestion": json_content}]
                 
         except Exception as e:
             print(f"Error in format_suggestion: {e}")
@@ -348,7 +353,20 @@ class Structured_Knowledge_Base:
         retriever = InMemoryBM25Retriever(document_store=self.document_store)
         # retriever = InMemoryEmbeddingRetriever(document_store=self.document_store)
         prompt_builder = PromptBuilder(template=prompt_template)
-        llm = OpenAIGenerator(api_key = self.open_api_key, model = self.model, api_base_url = self.api_base_url)
+        # Prefer structured JSON output from the model.
+        try:
+            llm = OpenAIGenerator(
+                api_key=self.open_api_key,
+                model=self.model,
+                api_base_url=self.api_base_url,
+                generation_kwargs={
+                    "temperature": 0.0,
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        except TypeError:
+            # Compatibility fallback for older haystack versions.
+            llm = OpenAIGenerator(api_key=self.open_api_key, model=self.model, api_base_url=self.api_base_url)
 
         rag_pipeline = Pipeline()
         rag_pipeline.add_component("retriever", retriever)

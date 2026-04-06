@@ -13,7 +13,12 @@ load_project_env()
 
 from src.utils.agent_template import MessageQueue, Agent
 from src.utils.llm_client import GPT
-from src.utils.llm_json_utils import parse_llm_json, parse_llm_json_with_default
+from src.utils.llm_json_utils import (
+    load_with_repair,
+    loads_with_repair,
+    parse_llm_json,
+    parse_llm_json_with_default,
+)
 
 class ReasoningAgent(Agent):
     """MDP-based Reasoning Agent"""
@@ -70,13 +75,13 @@ class ReasoningAgent(Agent):
         你是一名经验丰富的 DBA，你的任务是基于决策Agent提供的优化方向，从规则库中挑选合适的优化规则序列。
 
         1. 规则选择原则：
-           - 只能选择与当前SQL结构相符且能够优化该SQL的规则
+           - 只能选择与当前SQL结构相符且能够优化该SQL的规则,只选择明确能够解决性能瓶颈的规则，不要选择无法解决性能瓶颈的规则。
            - 当查询语句包含复杂的WHERE/JOIN条件，或存在重复子查询计算时，可考虑使用公共表表达式（CTE）
            - 若查询语句本身结构简单，或使用CTE无法减少冗余计算，则应避免过度使用CTE，多余的CTE可能会增加系统开销
         2. 规则选择逻辑：
            - 先分析输入SQL的结构和执行计划中的瓶颈
-           - 逐一考虑规则库中的规则，判断其是否适用
-           - 挑选能够解决问题的规则
+           - 逐一考虑规则库中的规则，判断其是否适用，只能选择规则库中的规则，不能选择其他规则
+           - 挑选能够解决问题的规则序列，要注意规则之间的依赖关系，不要选择不满足依赖关系的规则序列
            - 按照规则依赖关系进行排序
            {few_shot_context}
 
@@ -100,18 +105,15 @@ class ReasoningAgent(Agent):
         <执行计划分析结果>
         {explain_info}
 
-        3. 输出格式（**最后必须严格按此输出**）：
-        <rule_sequence>
+        3. **只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）：
         {{
             "groups": "{groups_text}",
             "applied_rules": []
         }}
-        </rule_sequence>
-
         注意：applied_rules 中的规则 ID 必须来自上述 <rule_library>，禁止编造。
         """)
 
-        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt)
+        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
 
         default = {"groups": groups_text, "applied_rules": []}
         sequence_match = re.search(r"<rule_sequence>(.*?)</rule_sequence>", thought_chain, re.DOTALL)
@@ -212,7 +214,7 @@ class DecisionAgent(Agent):
         {explain_info}
         """)
 
-        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt)
+        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
 
         default_result = {
             "can_optimize": False,
@@ -238,6 +240,12 @@ class DecisionAgent(Agent):
         original_sql = optimization_info.get("original_sql", "")
         rewritten_sql = optimization_info.get("rewritten_sql", "")
         reason = optimization_info.get("reason", "")
+        optimization_advice = optimization_info.get("optimization_advice") or []
+        advice_text = (
+            json.dumps(optimization_advice, ensure_ascii=False, indent=2)
+            if optimization_advice
+            else "（无）"
+        )
 
         # Calculate cost reduction
         cost_reduction = original_costs - rewritten_costs if original_costs > 0 else 0
@@ -249,23 +257,25 @@ class DecisionAgent(Agent):
 
         当前是第{iteration_round}轮优化。
 
-        评估信息：
+        评估信息（数值摘要；详情见下方分块）：
         - 原始SQL成本: {original_costs}
         - 重写SQL成本: {rewritten_costs}
         - 成本减少: {cost_reduction} ({cost_reduction_percent:.2f}%)
-        - 优化类别: {groups}
-        - 应用的规则: {', '.join(applied_rules)}
-         * 注意：<original_sql> 和 <rewritten_sql> 的costs来自数据库优化器，可能不精确。基于详细分析做出决定。*  
+         * 注意：<original_sql> 和 <rewritten_sql> 的costs来自数据库优化器，可能不精确。基于详细分析做出决定。*
         终止条件：
         [True]（terminate 为 true）：
             1. rewritten_sql costs 明显低于 ori_sql costs（优化成功，直接终止；通常「是否保留重写SQL」为 true）
-            2. rewritten_sql costs 略微大于 ori_sql costs，代价没有增加得很夸张，但重写后 SQL 的执行计划更优，直接终止；「是否保留重写SQL」为 true。
+            2. rewritten_sql costs 略微大于 ori_sql costs，代价增加没有超过1%或相等，但你认为重写后 SQL 的在逻辑上更简洁易读或执行计划更优，「是否保留重写SQL」为 true。
             3. rewritten_sql costs ≥ ori_sql costs，明显不如原始 SQL，且你认为在重写层面已无法继续优化时，可终止；若最终应采用原始 SQL，则「是否保留重写SQL」为 false（系统将回退到原始 SQL）。
-
         [False]（terminate 为 false）：
             若规则选择不当，或 SQL 与执行计划仍显示有明显优化空间，继续下一轮优化。
 
-        「是否保留重写SQL」：true 表示当前重写更优，保留当前重写 SQL；false 表示不保留、回退到原始 SQL。
+        「是否保留重写SQL」：**仅表示系统最终要执行的 SQL**——true = 采用当前重写 SQL 作为结果；false = 采用原始 SQL（回退）。与「仅供参考/逻辑更清晰但性能更差」无关；只要最终应执行原始 SQL，就必须为 false。
+
+        **一致性（硬性）**：
+        - 「reason」与「是否保留重写SQL」不得矛盾：reason 若明确写「回退原始 SQL」「最终采用原始」「不能采用当前重写作为执行方案」等，则「是否保留重写SQL」必须为 false。
+        - 当重写成本明显高于原始（如增幅超过约 1% 且你判断不应上线该重写）时，通常为 false；不要仅因「结构更清晰」填 true，除非同时认为代价可接受或符合上文终止条件 2。
+        - 终止条件 3（明显不如原始）与条件 4（瓶颈不变但可终止）同时适用时：**成本明显恶化优先**：应 false 回退，除非符合条件 2 的微幅代价增加例外。
 
         {f"上一轮评估失败原因: {reason}" if reason else ""}
 
@@ -283,6 +293,10 @@ class DecisionAgent(Agent):
         <重写SQL成本信息>
         成本: {rewritten_costs}
         执行计划: {rewritten_explain_info}
+
+        <决策Agent优化建议 optimization_advice>
+        {advice_text}
+        </决策Agent优化建议>
 
         <优化信息>
         类别: {groups}
@@ -319,7 +333,7 @@ def load_rule_knowledge_base() -> dict:
     try:
         rule_file = "/root/AgentRewrite/src/Rewrite_Middleware/Structured_Knowledge_Base/preparation/data/Rule_Examples.json"
         with open(rule_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+            data = load_with_repair(f)
         return data
     except Exception as e:
         print(f"Error loading rule knowledge base: {e}")
@@ -466,20 +480,17 @@ class RewriteAgent(Agent):
         <统计信息>
         {data_statistics}
 {schema_section}{idx_section}
-        4. 输出格式（**最后必须严格按此输出**，rewritten_sql 为单行可执行 SQL，JSON 内用 \\n 转义换行）：
-        <rewrite>
+        4. **只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）。
+           仅允许返回以下字段：
         {{
             "groups": "{groups}",
             "applied_rules": {json.dumps(applied_rules)},
-            "original_sql": "",
-            "rewritten_sql": "重写后的完整SQL",
+            "rewritten_sql": "重写后的完整SQL（可包含换行）",
             "semantic_check": "语义等价性说明"
         }}
-        </rewrite>
-        说明：original_sql 字段请填与上方 <original_sql> 相同的字符串（注意 JSON 转义）。
         """)
 
-        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt)
+        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
 
         try:
             rewrite_match = re.search(r"<rewrite>(.*?)</rewrite>", thought_chain, re.DOTALL)
@@ -489,7 +500,6 @@ class RewriteAgent(Agent):
                 parsed.setdefault("groups", groups)
                 parsed.setdefault("applied_rules", applied_rules)
                 parsed.setdefault("semantic_check", "")
-                parsed["original_sql"] = sql
                 return parsed
 
             # If JSON parsing failed, try to extract SQL from response
@@ -502,16 +512,16 @@ class RewriteAgent(Agent):
                 return {
                     "groups": groups,
                     "applied_rules": applied_rules,
-                    "original_sql": sql,
                     "rewritten_sql": extracted_sql,
+                    "semantic_check": "",
                     "parse_error": True  # Flag to indicate parsing error
                 }
 
             return {
                 "groups": groups,
                 "applied_rules": applied_rules,
-                "original_sql": sql,
                 "rewritten_sql": sql,  # fallback to original
+                "semantic_check": "",
                 "parse_error": True
             }
         except json.JSONDecodeError as e:
@@ -524,8 +534,8 @@ class RewriteAgent(Agent):
                 return {
                     "groups": groups,
                     "applied_rules": applied_rules,
-                    "original_sql": sql,
                     "rewritten_sql": extracted_sql,
+                    "semantic_check": "",
                     "parse_error": True,
                     "error_info": f"JSON解析错误: {str(e)}"
                 }
@@ -533,8 +543,8 @@ class RewriteAgent(Agent):
             return {
                 "groups": groups,
                 "applied_rules": applied_rules,
-                "original_sql": sql,
                 "rewritten_sql": sql,
+                "semantic_check": "",
                 "parse_error": True,
                 "error_info": f"JSON解析错误: {str(e)}"
             }
@@ -617,9 +627,10 @@ class RewriteAgent(Agent):
            - 生成可执行的、语法正确的SQL
 
         3. 输出要求：
-           - 直接输出修正后的完整SQL
-           - 不要包含任何解释或额外格式
-           - 确保SQL语法完全正确
+           - **只输出一个 JSON 对象**（不要 markdown / 不要额外文本）
+           - 必须包含字段 rewritten_sql，值为修正后的完整可执行 SQL
+           - 可选字段 note 用一句话说明修复点
+           - 示例：{{"rewritten_sql":"SELECT ...","note":"修复了别名不存在错误"}}
 
         <original_sql>
         {sql}
@@ -631,8 +642,12 @@ class RewriteAgent(Agent):
         {json.dumps(previous_rewrite, ensure_ascii=False, indent=2)}
         """)
 
-        response = await self.llm.get_LLM_response_async(prompt=prompt)
-        # Extract SQL from response
+        response = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        data = parse_llm_json_with_default(response, {})
+        rewritten_sql = data.get("rewritten_sql") if isinstance(data, dict) else ""
+        if isinstance(rewritten_sql, str) and rewritten_sql.strip():
+            return rewritten_sql.strip()
+        # Fallback for non-compliant model outputs.
         return self._extract_sql_from_response_robust(response)
     
     async def correct_sql(self, original_sql: str, rewritten_sql: str, error: str) -> str:
@@ -656,22 +671,29 @@ class RewriteAgent(Agent):
             <original_sql>
             {original_sql}
 
-            请严格遵循以下格式：
-            [format]
-            </analysis>
-            分析错误原因和修正方案
-            </analysis>
-
-            </corrected_sql>
-            ```sql
-            插入修正后的 SQL 语句。
-            ```
-            </corrected_sql>
+            只输出一个 JSON 对象（不要 markdown / 不要额外文本），格式：
+            {{
+                "corrected_sql": "修正后的完整 SQL",
+                "note": "一句话说明修复点"
+            }}
             """)
 
-        response = await self.llm.get_LLM_response_async(prompt=prompt)
+        response = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        data = parse_llm_json_with_default(response, {})
+        if isinstance(data, dict):
+            corrected_sql = (
+                data.get("corrected_sql")
+                or data.get("rewritten_sql")
+                or data.get("fixed_sql")
+                or ""
+            )
+            if isinstance(corrected_sql, str) and corrected_sql.strip():
+                return corrected_sql.strip()
+        # Fallback: keep compatibility with old tag format and free-form SQL.
         corrected_sql = self.extract_corrected_sql_content(response)
-        return corrected_sql
+        if corrected_sql:
+            return corrected_sql
+        return self._extract_sql_from_response_robust(response)
     
     def extract_corrected_sql_content(self, text: str) -> str:
         """
@@ -704,8 +726,8 @@ class RewriteAgent(Agent):
         if rewritten_match:
             sql_content = rewritten_match.group(1)
             try:
-                # Use json.loads to properly unescape the JSON string
-                sql_content = json.loads(f'"{sql_content}"')
+                # Use JSON parse to properly unescape the string literal
+                sql_content = loads_with_repair(f'"{sql_content}"')
                 if sql_content.strip():
                     return sql_content.strip()
             except json.JSONDecodeError:
