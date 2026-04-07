@@ -1,0 +1,66 @@
+Query ID: 109
+==================================================
+
+Original: with customer_total_return as  (select cr_returning_customer_sk as ctr_customer_sk         ,ca_state as ctr_state,   	sum(cr_return_amt_inc_tax) as ctr_total_return  from catalog_returns      ,date_dim      ,customer_address  where cr_returned_date_sk = d_date_sk     and d_year =1998    and cr_returning_addr_sk = ca_address_sk   group by cr_returning_customer_sk          ,ca_state )   select  c_customer_id,c_salutation,c_first_name,c_last_name,ca_street_number,ca_street_name                    ,ca_street_type,ca_suite_number,ca_city,ca_county,ca_state,ca_zip,ca_country,ca_gmt_offset                   ,ca_location_type,ctr_total_return  from customer_total_return ctr1      ,customer_address      ,customer  where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2  			  from customer_total_return ctr2                    	  where ctr1.ctr_state = ctr2.ctr_state)        and ca_address_sk = c_current_addr_sk        and ca_state = 'IL'        and ctr1.ctr_customer_sk = c_customer_sk  order by c_customer_id,c_salutation,c_first_name,c_last_name,ca_street_number,ca_street_name                    ,ca_street_type,ca_suite_number,ca_city,ca_county,ca_state,ca_zip,ca_country,ca_gmt_offset                   ,ca_location_type,ctr_total_return  limit 100;
+Rewritten: {'tpch': [{'rewritten_query': "with customer_total_return as  (select cr_returning_customer_sk as ctr_customer_sk         ,ca_state as ctr_state,   \tsum(cr_return_amt_inc_tax) as ctr_total_return  from catalog_returns      ,date_dim      ,customer_address  where cr_returned_date_sk = d_date_sk     and d_year =1998    and cr_returning_addr_sk = ca_address_sk   group by cr_returning_customer_sk          ,ca_state )   select  c_customer_id,c_salutation,c_first_name,c_last_name,ca_street_number,ca_street_name                    ,ca_street_type,ca_suite_number,ca_city,ca_county,ca_state,ca_zip,ca_country,ca_gmt_offset                   ,ca_location_type,ctr_total_return  from customer_total_return ctr1      ,customer_address      ,customer  where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2  \t\t\t  from customer_total_return ctr2                    \t  where ctr1.ctr_state = ctr2.ctr_state)        and ca_address_sk = c_current_addr_sk        and ca_state = 'IL'        and ctr1.ctr_customer_sk = c_customer_sk  order by c_customer_id,c_salutation,c_first_name,c_last_name,ca_street_number,ca_street_name                    ,ca_street_type,ca_suite_number,ca_city,ca_county,ca_state,ca_zip,ca_country,ca_gmt_offset                   ,ca_location_type,ctr_total_return  limit 100;", 'original_costs': 2596351.55, 'rewrite_costs': 2596351.55, 'costs_reduction_rate': 0, 'rewrite_rules': None}]}
+Time Cost: 26.16s
+Suggestion: []
+🔍 开始初始优化可行性检查...
+📚 检索历史优化经验...
+✅ 发现高度相似的历史案例 (相似度: 1.0000, 成本降低: 97.73%)，作为参考上下文
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+基于对SQL语句、统计信息和执行计划分析结果的综合分析，我的判断如下：
+
+**分析过程：**
+
+1. **执行计划瓶颈识别**：CTE Scan代价占比99.2%，且存在相关子查询`SubPlan 2`（`ctr_total_return > (select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state)`），这是典型的逐行执行相关子查询，导致性能极差。
+
+2. **相关子查询问题**：主查询每行都需要执行一次子查询计算各州的平均值，catalog_returns有215万行数据，造成巨大开销。
+
+3. **历史案例支持**：三个相似度100%的历史案例均通过`FILTER_CORRELATE`和`FILTER_SUB_QUERY_TO_CORRELATE`规则优化，成本降低约97%，强烈支持可优化判断。
+
+4. **优化方向**：将相关子查询转为窗口函数或预聚合JOIN，消除逐行子查询执行。
+
+<advice>
+[
+    {
+        "group": "子查询优化",
+        "produced_suggestion": "将主查询中的相关子查询 `(select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state)` 转换为非相关子查询或JOIN操作。具体做法：在CTE外部预先计算每个州的平均退款额（`SELECT ctr_state, avg(ctr_total_return)*1.2 AS avg_return FROM customer_total_return GROUP BY ctr_state`），然后将结果作为派生表与ctr1进行JOIN，避免对每行数据重复执行相关子查询，将O(N)次子查询执行降为1次聚合扫描。"
+    },
+    {
+        "group": "聚合优化",
+        "produced_suggestion": "使用窗口函数替代相关子查询：在CTE或外层查询中添加 `AVG(ctr_total_return) OVER (PARTITION BY ctr_state) * 1.2 AS avg_state_return`，直接在扫描阶段计算各州平均值，无需额外的子查询扫描，消除重复聚合计算，与相关子查询转JOIN方案二选一或结合使用。"
+    },
+    {
+        "group": "谓词简化",
+        "produced_suggestion": "将 `ca_state = 'IL'` 谓词尽早下推到CTE内部或JOIN条件中，减少ctr1 CTE Scan的处理行数。由于最终结果只需要IL州的客户，可在customer_total_return CTE中增加对ca_state的过滤，或在主查询JOIN customer_address时提前过滤，减少后续相关子查询或聚合操作的数据规模。"
+    }
+]
+</advice>
+
+```json
+{
+    "can_optimize": true,
+    "reason": "执行计划显示CTE Scan代价占比高达99.2%，核心瓶颈在于Filter条件中包含相关子查询(SubPlan 2)，该子查询需要对ctr1的每一行按州匹配计算avg(ctr_total_return)*1.2，造成大量重复扫描和聚合操作。catalog_returns表有215万行数据，相关子查询的逐行执行导致极高执行代价（自身消耗251万）。历史上相同SQL指纹的3个案例均通过FILTER_CORRELATE和FILTER_SUB_QUERY_TO_CORRELATE规则优化，成本降低约97%，验证了优化可行性。主要优化方向为将相关子查询改写为预聚合JOIN或窗口函数，同时可将ca_state='IL'谓词下推以减少处理数据量。",
+    "advice": [
+        {
+            "group": "子查询优化",
+            "produced_suggestion": "将主查询中的相关子查询 `(select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state)` 转换为非相关子查询或JOIN操作。具体做法：在CTE外部预先计算每个州的平均退款额（`SELECT ctr_state, avg(ctr_total_return)*1.2 AS avg_return FROM customer_total_return GROUP BY ctr_state`），然后将结果作为派生表与ctr1进行JOIN，避免对每行数据重复执行相关子查询，将O(N)次子查询执行降为1次聚合扫描。"
+        },
+        {
+            "group": "聚合优化",
+            "produced_suggestion": "使用窗口函数替代相关子查询：在CTE或外层查询中添加 `AVG(ctr_total_return) OVER (PARTITION BY ctr_state) * 1.2 AS avg_state_return`，直接在扫描阶段计算各州平均值，无需额外的子查询扫描，消除重复聚合计算，与相关子查询转JOIN方案二选一或结合使用。"
+        },
+        {
+            "group": "谓词简化",
+            "produced_suggestion": "将 `ca_state = 'IL'` 谓词尽早下推到CTE内部或JOIN条件中，减少ctr1 CTE Scan的处理行数。由于最终结果只需要IL州的客户，可在customer_total_return CTE中增加对ca_state的过滤，或在主查询JOIN customer_address时提前过滤，减少后续相关子查询或聚合操作的数据规模。"
+        }
+    ]
+}
+```
+JSON解析错误: Extra data: line 4 column 6 (char 394)
+❌ SQL无需优化，终止流程
+
+----------------------------------------
+
