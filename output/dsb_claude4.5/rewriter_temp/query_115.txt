@@ -2,125 +2,86 @@ Query ID: 115
 ==================================================
 
 Original: select  c_customer_id as customer_id        , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername  from customer      ,customer_address      ,customer_demographics      ,household_demographics      ,income_band      ,store_returns  where ca_city	        =  'Hopewell'    and c_current_addr_sk = ca_address_sk    and ib_lower_bound   >=  32287    and ib_upper_bound   <=  32287 + 50000    and ib_income_band_sk = hd_income_band_sk    and cd_demo_sk = c_current_cdemo_sk    and hd_demo_sk = c_current_hdemo_sk    and sr_cdemo_sk = cd_demo_sk  order by c_customer_id  limit 100;
-Rewritten: WITH filtered_customer_address AS (
-    SELECT ca_address_sk
-    FROM customer_address
-    WHERE ca_city = 'Hopewell'
-),
-filtered_income_band AS (
-    SELECT ib_income_band_sk
-    FROM income_band
-    WHERE ib_lower_bound >= 32287
-      AND ib_upper_bound <= 82287
-),
-customer_projected AS (
-    SELECT c_customer_id, c_last_name, c_first_name, c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk
-    FROM customer
-),
-customer_demographics_projected AS (
-    SELECT cd_demo_sk
-    FROM customer_demographics
-),
-household_demographics_projected AS (
-    SELECT hd_demo_sk, hd_income_band_sk
-    FROM household_demographics
-),
-store_returns_projected AS (
-    SELECT sr_cdemo_sk
-    FROM store_returns
-)
-SELECT 
-    customer_projected.c_customer_id AS customer_id,
-    COALESCE(customer_projected.c_last_name, '') || ', ' || COALESCE(customer_projected.c_first_name, '') AS customername
-FROM customer_projected
-JOIN filtered_customer_address ON customer_projected.c_current_addr_sk = filtered_customer_address.ca_address_sk
-JOIN customer_demographics_projected ON customer_demographics_projected.cd_demo_sk = customer_projected.c_current_cdemo_sk
-JOIN household_demographics_projected ON household_demographics_projected.hd_demo_sk = customer_projected.c_current_hdemo_sk
-JOIN filtered_income_band ON filtered_income_band.ib_income_band_sk = household_demographics_projected.hd_income_band_sk
-JOIN store_returns_projected ON store_returns_projected.sr_cdemo_sk = customer_demographics_projected.cd_demo_sk
-ORDER BY customer_projected.c_customer_id
-LIMIT 100;
-Time Cost: 230.25s
-Suggestion: [{'group': '连接优化', 'produced_suggestion': '将多表的逗号连接改写为显式JOIN，调整连接顺序，优先连接过滤较多的小表，避免大表全扫描。'}, {'group': '谓词简化', 'produced_suggestion': '将过滤条件下推至数据量更小的表过滤，合并相关谓词，减少后续连接的行数。'}, {'group': '常量折叠', 'produced_suggestion': '预计算表达式中的常量部分，如ib_upper_bound <= 32287 + 50000，避免执行时重复计算。'}, {'group': '投影优化', 'produced_suggestion': '只选择必要列，避免查询中无用的列投影，减少数据传输和处理。'}, {'group': '子查询优化', 'produced_suggestion': '若存在隐含的子查询或复杂表达式，考虑用CTE或显式子查询分解部分逻辑，提升可读性和执行性能。'}]
+Rewritten: SELECT c_customer_id AS customer_id, COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername FROM customer INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk AND ca_city = 'Hopewell' INNER JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk INNER JOIN store_returns ON sr_cdemo_sk = cd_demo_sk INNER JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk INNER JOIN income_band ON ib_income_band_sk = hd_income_band_sk AND ib_lower_bound >= 32287 AND ib_upper_bound <= 82287 ORDER BY c_customer_id LIMIT 100
+Time Cost: 190.70s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '将隐式逗号连接改写为显式INNER JOIN，明确连接条件和连接顺序。建议先连接小表和有过滤条件的表（customer_address、income_band、household_demographics），再连接大表（customer、store_returns），避免笛卡尔积'}, {'group': '谓词简化', 'produced_suggestion': "将ca_city='Hopewell'过滤条件尽早应用，建议在customer_address表扫描时就过滤，减少后续JOIN的数据量。同时将ib_lower_bound和ib_upper_bound的范围条件下推到income_band表扫描阶段"}, {'group': '连接优化', 'produced_suggestion': 'store_returns表缺少与其他表的直接连接条件，仅通过sr_cdemo_sk=cd_demo_sk连接。建议检查业务逻辑是否需要store_returns表，如果只是为了过滤customer_demographics，可考虑使用EXISTS子查询或半连接优化'}, {'group': '谓词简化', 'produced_suggestion': 'ib_upper_bound <= 32287 + 50000 可以预计算为 ib_upper_bound <= 82287，避免运行时重复计算常量表达式'}, {'group': '连接优化', 'produced_suggestion': '建议调整连接顺序为：先连接income_band和household_demographics（小表），再连接customer_address（有过滤条件），然后连接customer_demographics，最后连接customer和store_returns，利用过滤后的小结果集减少大表JOIN代价'}]
 🔍 开始初始优化可行性检查...
 🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
+```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示store_returns表的顺序扫描占据了超过80%的总代价，且该表约有720万行。查询中对store_returns的连接和过滤条件未利用索引，导致高成本的Seq Scan。SQL中有多表连接，连接条件和过滤条件可以优化，且存在过滤条件（如ib_lower_bound、ib_upper_bound）可以考虑谓词下推或常量折叠。此外，查询的JOIN写法较为陈旧（逗号连接），可以转换为显式JOIN并优化连接顺序以减少数据量。",
+  "reason": "执行计划显示存在严重性能瓶颈：1) store_returns表全表扫描占比80.7%（148,910代价），扫描719万行数据但未使用任何过滤条件；2) customer表全表扫描占比8.6%；3) 隐式笛卡尔积风险高，6张表通过逗号连接但缺少明确JOIN条件；4) customer_address表虽有ca_city过滤但仍需扫描25万行。SQL结构可通过显式JOIN改写、连接顺序调整、谓词下推等方式优化。",
   "advice": [
     {
       "group": "连接优化",
-      "produced_suggestion": "将多表的逗号连接改写为显式JOIN，调整连接顺序，优先连接过滤较多的小表，避免大表全扫描。"
+      "produced_suggestion": "将隐式逗号连接改写为显式INNER JOIN，明确连接条件和连接顺序。建议先连接小表和有过滤条件的表（customer_address、income_band、household_demographics），再连接大表（customer、store_returns），避免笛卡尔积"
     },
     {
       "group": "谓词简化",
-      "produced_suggestion": "将过滤条件下推至数据量更小的表过滤，合并相关谓词，减少后续连接的行数。"
+      "produced_suggestion": "将ca_city='Hopewell'过滤条件尽早应用，建议在customer_address表扫描时就过滤，减少后续JOIN的数据量。同时将ib_lower_bound和ib_upper_bound的范围条件下推到income_band表扫描阶段"
     },
     {
-      "group": "常量折叠",
-      "produced_suggestion": "预计算表达式中的常量部分，如ib_upper_bound <= 32287 + 50000，避免执行时重复计算。"
+      "group": "连接优化",
+      "produced_suggestion": "store_returns表缺少与其他表的直接连接条件，仅通过sr_cdemo_sk=cd_demo_sk连接。建议检查业务逻辑是否需要store_returns表，如果只是为了过滤customer_demographics，可考虑使用EXISTS子查询或半连接优化"
     },
     {
-      "group": "投影优化",
-      "produced_suggestion": "只选择必要列，避免查询中无用的列投影，减少数据传输和处理。"
+      "group": "谓词简化",
+      "produced_suggestion": "ib_upper_bound <= 32287 + 50000 可以预计算为 ib_upper_bound <= 82287，避免运行时重复计算常量表达式"
     },
     {
-      "group": "子查询优化",
-      "produced_suggestion": "若存在隐含的子查询或复杂表达式，考虑用CTE或显式子查询分解部分逻辑，提升可读性和执行性能。"
+      "group": "连接优化",
+      "produced_suggestion": "建议调整连接顺序为：先连接income_band和household_demographics（小表），再连接customer_address（有过滤条件），然后连接customer_demographics，最后连接customer和store_returns，利用过滤后的小结果集减少大表JOIN代价"
     }
   ]
 }
+```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 66 rules
+📊 UCT scored 45 rules
    → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
    → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
    → JOIN_EXTRACT_FILTER: UCT=1.100
 {
-  "groups": "连接优化, 谓词简化, 常量折叠, 子查询优化, 投影优化",
+  "groups": "连接优化, 谓词简化",
   "applied_rules": [
     "FILTER_REDUCE_EXPRESSIONS",
     "FILTER_INTO_JOIN",
     "JOIN_CONDITION_PUSH",
     "JOIN_PUSH_TRANSITIVE_PREDICATES",
-    "PROJECT_JOIN_TRANSPOSE",
-    "STRATEGY_CTE_DECOMPOSITION"
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN"
   ],
   "rule_effect_scores": {
-    "FILTER_REDUCE_EXPRESSIONS": 0.1,
+    "FILTER_REDUCE_EXPRESSIONS": 0.2,
     "FILTER_INTO_JOIN": 0.2,
-    "JOIN_CONDITION_PUSH": 0.2,
+    "JOIN_CONDITION_PUSH": 0.1,
     "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.1,
-    "PROJECT_JOIN_TRANSPOSE": 0.1,
-    "STRATEGY_CTE_DECOMPOSITION": 0.3
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.4
   },
   "rule_effect_confidence": {
-    "FILTER_REDUCE_EXPRESSIONS": 0.9,
-    "FILTER_INTO_JOIN": 0.8,
-    "JOIN_CONDITION_PUSH": 0.8,
-    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.7,
-    "PROJECT_JOIN_TRANSPOSE": 0.8,
-    "STRATEGY_CTE_DECOMPOSITION": 0.6
+    "FILTER_REDUCE_EXPRESSIONS": 0.628,
+    "FILTER_INTO_JOIN": 0.563,
+    "JOIN_CONDITION_PUSH": 0.552,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.617,
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.911
   }
 }
-✅ 选择了 6 个规则
+✅ 选择了 5 个规则
 🔧 开始SQL重写...
+```json
 {
-  "groups": "连接优化, 谓词简化, 常量折叠, 子查询优化, 投影优化",
+  "groups": "连接优化, 谓词简化",
   "applied_rules": [
     "FILTER_REDUCE_EXPRESSIONS",
     "FILTER_INTO_JOIN",
     "JOIN_CONDITION_PUSH",
     "JOIN_PUSH_TRANSITIVE_PREDICATES",
-    "PROJECT_JOIN_TRANSPOSE",
-    "STRATEGY_CTE_DECOMPOSITION"
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN"
   ],
-  "original_sql": "select  c_customer_id as customer_id        , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername  from customer      ,customer_address      ,customer_demographics      ,household_demographics      ,income_band      ,store_returns  where ca_city          =  'Hopewell'    and c_current_addr_sk = ca_address_sk    and ib_lower_bound   >=  32287    and ib_upper_bound   <=  32287 + 50000    and ib_income_band_sk = hd_income_band_sk    and cd_demo_sk = c_current_cdemo_sk    and hd_demo_sk = c_current_hdemo_sk    and sr_cdemo_sk = cd_demo_sk  order by c_customer_id  limit 100;",
-  "rewritten_sql": "WITH filtered_customer_address AS (\n    SELECT ca_address_sk\n    FROM customer_address\n    WHERE ca_city = 'Hopewell'\n),\nfiltered_income_band AS (\n    SELECT ib_income_band_sk\n    FROM income_band\n    WHERE ib_lower_bound >= 32287\n      AND ib_upper_bound <= 82287\n),\ncustomer_projected AS (\n    SELECT c_customer_id, c_last_name, c_first_name, c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk\n    FROM customer\n),\ncustomer_demographics_projected AS (\n    SELECT cd_demo_sk\n    FROM customer_demographics\n),\nhousehold_demographics_projected AS (\n    SELECT hd_demo_sk, hd_income_band_sk\n    FROM household_demographics\n),\nstore_returns_projected AS (\n    SELECT sr_cdemo_sk\n    FROM store_returns\n)\nSELECT \n    customer_projected.c_customer_id AS customer_id,\n    COALESCE(customer_projected.c_last_name, '') || ', ' || COALESCE(customer_projected.c_first_name, '') AS customername\nFROM customer_projected\nJOIN filtered_customer_address ON customer_projected.c_current_addr_sk = filtered_customer_address.ca_address_sk\nJOIN customer_demographics_projected ON customer_demographics_projected.cd_demo_sk = customer_projected.c_current_cdemo_sk\nJOIN household_demographics_projected ON household_demographics_projected.hd_demo_sk = customer_projected.c_current_hdemo_sk\nJOIN filtered_income_band ON filtered_income_band.ib_income_band_sk = household_demographics_projected.hd_income_band_sk\nJOIN store_returns_projected ON store_returns_projected.sr_cdemo_sk = customer_demographics_projected.cd_demo_sk\nORDER BY customer_projected.c_customer_id\nLIMIT 100;",
-  "semantic_check": "重写后的SQL在语义上与原始SQL等价，原因如下：\n1. 常量折叠：将表达式32287+50000计算为82287，简化了条件。\n2. 隐式连接改为显式JOIN：使用显式JOIN语法，但保持相同的连接逻辑。\n3. 过滤条件下推：将单表过滤条件（ca_city='Hopewell'和income_band的范围条件）下推到子查询（后转为CTE）中提前过滤，减少中间结果。\n4. 投影优化：每个CTE和主查询仅选择必要的列，减少数据传输量。\n5. 使用CTE：将子查询提取为CTE，提升可读性和复用性。\n6. 所有连接条件、过滤条件和结果列均保持不变，排序和分页逻辑一致。\n7. 结果集列名、计算表达式（customername）和排序顺序（c_customer_id）完全一致。"
+  "rewritten_sql": "SELECT\n    c_customer_id AS customer_id,\n    COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername\nFROM customer\nINNER JOIN customer_address\n    ON c_current_addr_sk = ca_address_sk\n    AND ca_city = 'Hopewell'\nINNER JOIN customer_demographics\n    ON cd_demo_sk = c_current_cdemo_sk\n    AND EXISTS (\n        SELECT 1\n        FROM store_returns\n        WHERE sr_cdemo_sk = cd_demo_sk\n    )\nINNER JOIN household_demographics\n    ON hd_demo_sk = c_current_hdemo_sk\nINNER JOIN income_band\n    ON ib_income_band_sk = hd_income_band_sk\n    AND ib_lower_bound >= 32287\n    AND ib_upper_bound <= 82287\nORDER BY c_customer_id\nLIMIT 100"
 }
+```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -129,22 +90,44 @@ DBMS_syntax_Tool ends...
 🧠 开始语义等价检查...
 ```json
 {
-  "equivalent": true,
-  "message": "经核验，重写SQL对常量表达式折叠、连接改写为显式JOIN、条件推送、投影裁剪及CTE改写的优化，均在语义等价范围内，且保持了过滤和连接逻辑一致，结果列与排序一致，采纳semantic_check主张认定等价。",
-  "differences": []
+    "equivalent": false,
+    "message": "原始SQL对store_returns做INNER JOIN会产生重复行，重写SQL用EXISTS改为半连接只保留一行，结果集行数不同",
+    "differences": [
+        {
+            "type": "JOIN语义差异",
+            "description": "原始SQL中store_returns通过sr_cdemo_sk=cd_demo_sk做INNER JOIN，当一个cd_demo_sk对应多条store_returns时会产生笛卡尔积式的重复行；重写SQL用EXISTS子查询替换，只检查存在性不产生重复，导致最终行数不一致",
+            "location": "store_returns表的连接方式"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL对store_returns做INNER JOIN会产生重复行，重写SQL用EXISTS改为半连接只保留一行，结果集行数不同
+
+
+```json
+{"fixed_sql": "SELECT c_customer_id AS customer_id, COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername FROM customer INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk AND ca_city = 'Hopewell' INNER JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk INNER JOIN store_returns ON sr_cdemo_sk = cd_demo_sk INNER JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk INNER JOIN income_band ON ib_income_band_sk = hd_income_band_sk AND ib_lower_bound >= 32287 AND ib_upper_bound <= 82287 ORDER BY c_customer_id LIMIT 100", "note": "将EXISTS子查询改回INNER JOIN store_returns以保留原始SQL的笛卡尔积行为"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "重写将隐式交叉连接转为显式INNER JOIN，所有连接条件和过滤条件均正确保留，语义等价",
+    "differences": []
 }
 ```
 ✅ 语义等价
 📊 开始评估优化结果...
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-{
-  "terminate": true,
-  "reason": "本轮优化的重写SQL成本与原始SQL成本完全相同，且主要瓶颈依然是表store_returns的大量顺序扫描，且未见明显的逻辑或结构简化改进。当前重写虽然采用了CTE分解和投影优化，但未能显著降低成本，且主表扫描未被优化。鉴于首轮后主要瓶颈未缓解且成本无下降，基于规则4，建议终止后续优化流程。",
-  "是否保留重写SQL": false
-}
+```json
+{"terminate": true, "reason": "重写costs与原始costs几乎相同(184444.6 vs 184444.47)，未触发§0快捷规则。虽然重写将隐式逗号连接改为显式INNER JOIN、谓词预计算(82287)、条件下推更清晰，符合§1结构优化信号，但SQL已相当干净，仅剩边角优化空间，无明确依据认为下一轮能进一步降低执行时间", "保留重写SQL": true}
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 473
+   - 规则序列: ['FILTER_REDUCE_EXPRESSIONS', 'FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH', 'JOIN_PUSH_TRANSITIVE_PREDICATES', 'JOIN_ADD_REDUNDANT_SEMI_JOIN']
+   - 优化组别: 连接优化, 谓词简化
+   - 估计代价: 原始=184444.47, 重写=184444.6，相对变化: -0.00%
+✅ 成功存储，记录ID: 4a5b893f-3c95-4a8e-a7e7-b5f0eeea1237
 
 ----------------------------------------
 

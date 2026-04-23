@@ -88,6 +88,7 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
     
     count = 0
     all_results = []  # Store all results in memory
+    result_index = {}  # id -> index in all_results (upsert by id)
 
     # Load existing results if file exists (append mode)
     temp_dir = directories['rewriter_temp']
@@ -101,6 +102,11 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
                     for row in all_results:
                         if isinstance(row, dict):
                             row.pop("agent_trace", None)
+                    result_index = {
+                        str(row.get("id")): idx
+                        for idx, row in enumerate(all_results)
+                        if isinstance(row, dict) and row.get("id") is not None
+                    }
                     count = len(all_results)
                     print(f"📂 Loaded {count} existing results from {final_output_file}")
         except (json.JSONDecodeError, FileNotFoundError):
@@ -181,8 +187,15 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
                 "llm_costs": query_llm_cost,
                 "rewrite_suggestion": suggestion if success else "Error occurred during processing",
             }
-            all_results.append(tmp)
-            count += 1
+            # Upsert by id: overwrite existing entry instead of appending duplicates
+            item_id = str(tmp.get("id"))
+            existing_idx = result_index.get(item_id)
+            if existing_idx is not None:
+                all_results[existing_idx] = tmp
+            else:
+                all_results.append(tmp)
+                result_index[item_id] = len(all_results) - 1
+            count = len(all_results)
 
             # Write all results to the final output file
             with open(final_output_file, "w", encoding='utf-8') as f:

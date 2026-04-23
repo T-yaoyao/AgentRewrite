@@ -2,135 +2,160 @@ Query ID: 137
 ==================================================
 
 Original: select     sum(ws_ext_discount_amt)  as "Excess Discount Amount" from     web_sales    ,item    ,date_dim where (i_manufact_id BETWEEN 749 and 948 or i_category IN ('Books', 'Home', 'Sports')) and i_item_sk = ws_item_sk and d_date between '2001-01-31' and         cast('2001-01-31' as date) + interval '90' day and d_date_sk = ws_sold_date_sk and ws_wholesale_cost BETWEEN 57 AND 77 and ws_ext_discount_amt      > (          SELECT             1.3 * avg(ws_ext_discount_amt)          FROM             web_sales            ,date_dim          WHERE               ws_item_sk = i_item_sk           and d_date between '2001-01-31' and                              cast('2001-01-31' as date) + interval '90' day           and d_date_sk = ws_sold_date_sk           and ws_wholesale_cost BETWEEN 57 AND 77           and ws_sales_price / ws_list_price BETWEEN 17 * 0.01 AND 32 * 0.01   ) order by sum(ws_ext_discount_amt) limit 100;
-Rewritten: SELECT SUM(ws.ws_ext_discount_amt) AS "Excess Discount Amount"
-FROM (SELECT ws_item_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sold_date_sk FROM web_sales) ws
-JOIN (SELECT i_item_sk, i_manufact_id, i_category FROM item) i 
-  ON i.i_item_sk = ws.ws_item_sk 
-  AND (i.i_manufact_id BETWEEN 749 AND 948 OR i.i_category IN ('Books', 'Home', 'Sports'))
-  AND ws.ws_wholesale_cost BETWEEN 57 AND 77
-JOIN (SELECT d_date_sk, d_date FROM date_dim) d 
-  ON d.d_date_sk = ws.ws_sold_date_sk 
-  AND d.d_date BETWEEN '2001-01-31' AND CAST('2001-01-31' AS DATE) + INTERVAL '90' DAY
-JOIN (
-  SELECT ws2.ws_item_sk, 
-         1.3 * (SUM(ws2.ws_ext_discount_amt) / COUNT(ws2.ws_ext_discount_amt)) AS avg_discount
-  FROM (SELECT ws_item_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sales_price, ws_list_price, ws_sold_date_sk FROM web_sales) ws2
-  JOIN (SELECT d_date_sk, d_date FROM date_dim) d2 
-    ON d2.d_date_sk = ws2.ws_sold_date_sk
-    AND d2.d_date BETWEEN '2001-01-31' AND CAST('2001-01-31' AS DATE) + INTERVAL '90' DAY
-  WHERE ws2.ws_wholesale_cost BETWEEN 57 AND 77
-    AND ws2.ws_sales_price / ws2.ws_list_price BETWEEN 0.17 AND 0.32
-  GROUP BY ws2.ws_item_sk
-) sub 
-  ON ws.ws_item_sk = sub.ws_item_sk 
-  AND ws.ws_ext_discount_amt > sub.avg_discount
-ORDER BY SUM(ws.ws_ext_discount_amt)
-LIMIT 100;
-Time Cost: 440.51s
-Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将子查询改写为JOIN，避免对web_sales表的重复扫描，提升过滤效率。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，将过滤条件更严格的小表item和date_dim先驱动，减少主表扫描量。'}, {'group': '谓词简化', 'produced_suggestion': '将ws_wholesale_cost等过滤条件尽早下推至web_sales扫描阶段，减少扫描行数。'}, {'group': '聚合优化', 'produced_suggestion': '考虑分拆聚合计算或使用部分提前计算加速sum和avg函数性能。'}, {'group': '投影优化', 'produced_suggestion': '裁剪无关列，避免全表列扫描，减少数据读取和传输成本。'}, {'group': '排序优化', 'produced_suggestion': '结合索引或改写查询避免全表排序，优化limit对应的排序开销。'}]
+Rewritten: WITH item_avg_discount AS (
+  SELECT 
+    ws_item_sk,
+    1.3 * AVG(ws_ext_discount_amt) AS threshold
+  FROM 
+    web_sales
+    JOIN date_dim ON d_date_sk = ws_sold_date_sk 
+      AND d_date BETWEEN '2001-01-31' AND '2001-05-01'
+  WHERE 
+    ws_wholesale_cost BETWEEN 57 AND 77
+    AND ws_sales_price / ws_list_price BETWEEN 0.17 AND 0.32
+  GROUP BY ws_item_sk
+)
+SELECT 
+  SUM(ws_ext_discount_amt) AS "Excess Discount Amount"
+FROM 
+  web_sales
+  JOIN item ON i_item_sk = ws_item_sk 
+    AND (i_manufact_id BETWEEN 749 AND 948 OR i_category IN ('Books', 'Home', 'Sports'))
+  JOIN date_dim ON d_date_sk = ws_sold_date_sk 
+    AND d_date BETWEEN '2001-01-31' AND '2001-05-01'
+  JOIN item_avg_discount ON item_avg_discount.ws_item_sk = web_sales.ws_item_sk
+WHERE 
+  ws_wholesale_cost BETWEEN 57 AND 77
+  AND ws_ext_discount_amt > item_avg_discount.threshold
+LIMIT 100
+Time Cost: 178.67s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将相关子查询转换为CTE或JOIN：子查询与外层查询都扫描web_sales表且过滤条件高度重复(d_date范围、ws_wholesale_cost范围)，建议使用CTE预计算阈值或通过窗口函数一次性计算avg(ws_ext_discount_amt)，避免对每个i_item_sk重复执行子查询'}, {'group': '谓词简化', 'produced_suggestion': '优化过滤条件下推：将ws_wholesale_cost BETWEEN 57 AND 77、d_date范围条件尽早应用到web_sales扫描阶段，减少JOIN前的数据量；将item表的i_manufact_id和i_category条件合并简化，考虑先过滤小表再JOIN大表'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：当前执行计划先扫描大表web_sales(720万行)，建议先过滤小表date_dim(90天范围)和item(manufact_id或category条件)，然后通过索引连接web_sales，利用ws_sold_date_sk和ws_item_sk的主键索引减少扫描量'}, {'group': '常量折叠', 'produced_suggestion': "预计算常量表达式：将cast('2001-01-31' as date) + interval '90' day预计算为'2001-05-01'，将ws_sales_price / ws_list_price BETWEEN 17 * 0.01 AND 32 * 0.01简化为BETWEEN 0.17 AND 0.32，减少运行时计算开销"}, {'group': '聚合优化', 'produced_suggestion': '优化聚合计算：外层查询的sum(ws_ext_discount_amt)与子查询的avg(ws_ext_discount_amt)可以通过一次扫描完成，使用CASE WHEN或窗口函数同时计算总和与平均值，避免重复聚合'}, {'group': '排序优化', 'produced_suggestion': '消除冗余排序：ORDER BY sum(ws_ext_discount_amt)作用于单行聚合结果(只有一个sum值)，该排序操作无实际意义，可以移除以减少不必要的排序开销'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
+```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示web_sales表进行全表扫描（Seq Scan）成本极高（94%总代价），且存在子查询与多个连接，SQL结构复杂，具备转换子查询为JOIN及谓词下推等优化空间。",
+  "reason": "执行计划显示存在严重性能瓶颈：1) web_sales表全表扫描占94%代价(720万行)，2) 相关子查询导致重复扫描web_sales表，3) 缺少有效索引支持过滤条件(ws_wholesale_cost, ws_sold_date_sk)，4) 子查询与外层查询存在大量重复计算。历史案例显示相似SQL通过CTE分解、谓词下推、连接条件优化可显著提升性能。",
   "advice": [
     {
       "group": "子查询优化",
-      "produced_suggestion": "将子查询改写为JOIN，避免对web_sales表的重复扫描，提升过滤效率。"
-    },
-    {
-      "group": "连接优化",
-      "produced_suggestion": "调整连接顺序，将过滤条件更严格的小表item和date_dim先驱动，减少主表扫描量。"
+      "produced_suggestion": "将相关子查询转换为CTE或JOIN：子查询与外层查询都扫描web_sales表且过滤条件高度重复(d_date范围、ws_wholesale_cost范围)，建议使用CTE预计算阈值或通过窗口函数一次性计算avg(ws_ext_discount_amt)，避免对每个i_item_sk重复执行子查询"
     },
     {
       "group": "谓词简化",
-      "produced_suggestion": "将ws_wholesale_cost等过滤条件尽早下推至web_sales扫描阶段，减少扫描行数。"
+      "produced_suggestion": "优化过滤条件下推：将ws_wholesale_cost BETWEEN 57 AND 77、d_date范围条件尽早应用到web_sales扫描阶段，减少JOIN前的数据量；将item表的i_manufact_id和i_category条件合并简化，考虑先过滤小表再JOIN大表"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：当前执行计划先扫描大表web_sales(720万行)，建议先过滤小表date_dim(90天范围)和item(manufact_id或category条件)，然后通过索引连接web_sales，利用ws_sold_date_sk和ws_item_sk的主键索引减少扫描量"
+    },
+    {
+      "group": "常量折叠",
+      "produced_suggestion": "预计算常量表达式：将cast('2001-01-31' as date) + interval '90' day预计算为'2001-05-01'，将ws_sales_price / ws_list_price BETWEEN 17 * 0.01 AND 32 * 0.01简化为BETWEEN 0.17 AND 0.32，减少运行时计算开销"
     },
     {
       "group": "聚合优化",
-      "produced_suggestion": "考虑分拆聚合计算或使用部分提前计算加速sum和avg函数性能。"
-    },
-    {
-      "group": "投影优化",
-      "produced_suggestion": "裁剪无关列，避免全表列扫描，减少数据读取和传输成本。"
+      "produced_suggestion": "优化聚合计算：外层查询的sum(ws_ext_discount_amt)与子查询的avg(ws_ext_discount_amt)可以通过一次扫描完成，使用CASE WHEN或窗口函数同时计算总和与平均值，避免重复聚合"
     },
     {
       "group": "排序优化",
-      "produced_suggestion": "结合索引或改写查询避免全表排序，优化limit对应的排序开销。"
+      "produced_suggestion": "消除冗余排序：ORDER BY sum(ws_ext_discount_amt)作用于单行聚合结果(只有一个sum值)，该排序操作无实际意义，可以移除以减少不必要的排序开销"
     }
   ]
 }
+```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 80 rules
+📊 UCT scored 88 rules
    → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.220
    → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
-   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
 {
-  "groups": "子查询优化, 连接优化, 谓词简化, 聚合优化, 投影优化, 排序优化",
+  "groups": "子查询优化, 谓词简化, 连接优化, 常量折叠, 聚合优化, 排序优化",
   "applied_rules": [
-    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "PROJECT_REDUCE_EXPRESSIONS",
     "JOIN_CONDITION_PUSH",
     "FILTER_INTO_JOIN",
-    "AGGREGATE_REDUCE_FUNCTIONS",
-    "PROJECT_JOIN_TRANSPOSE"
+    "SORT_REMOVE"
   ],
   "rule_effect_scores": {
-    "FILTER_SUB_QUERY_TO_CORRELATE": 0.3,
+    "STRATEGY_CTE_DECOMPOSITION": 0.3,
+    "FILTER_REDUCE_EXPRESSIONS": 0.1,
+    "PROJECT_REDUCE_EXPRESSIONS": 0.1,
     "JOIN_CONDITION_PUSH": 0.2,
-    "FILTER_INTO_JOIN": 0.25,
-    "AGGREGATE_REDUCE_FUNCTIONS": 0.15,
-    "PROJECT_JOIN_TRANSPOSE": 0.1
+    "FILTER_INTO_JOIN": 0.2,
+    "SORT_REMOVE": 0.1
   },
   "rule_effect_confidence": {
-    "FILTER_SUB_QUERY_TO_CORRELATE": 0.7,
-    "JOIN_CONDITION_PUSH": 0.6,
-    "FILTER_INTO_JOIN": 0.75,
-    "AGGREGATE_REDUCE_FUNCTIONS": 0.85,
-    "PROJECT_JOIN_TRANSPOSE": 0.65
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "FILTER_REDUCE_EXPRESSIONS": 0.5,
+    "PROJECT_REDUCE_EXPRESSIONS": 0.6,
+    "JOIN_CONDITION_PUSH": 0.5,
+    "FILTER_INTO_JOIN": 0.6,
+    "SORT_REMOVE": 0.9
   }
 }
-✅ 选择了 5 个规则
+✅ 选择了 6 个规则
 🔧 开始SQL重写...
+```json
 {
-  "groups": "子查询优化, 连接优化, 谓词简化, 聚合优化, 投影优化, 排序优化",
+  "groups": "子查询优化, 谓词简化, 连接优化, 常量折叠, 聚合优化, 排序优化",
   "applied_rules": [
-    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "PROJECT_REDUCE_EXPRESSIONS",
     "JOIN_CONDITION_PUSH",
     "FILTER_INTO_JOIN",
-    "AGGREGATE_REDUCE_FUNCTIONS",
-    "PROJECT_JOIN_TRANSPOSE"
+    "SORT_REMOVE"
   ],
-  "original_sql": "select     sum(ws_ext_discount_amt)  as \"Excess Discount Amount\" from     web_sales    ,item    ,date_dim where (i_manufact_id BETWEEN 749 and 948 or i_category IN ('Books', 'Home', 'Sports')) and i_item_sk = ws_item_sk and d_date between '2001-01-31' and         cast('2001-01-31' as date) + interval '90' day and d_date_sk = ws_sold_date_sk and ws_wholesale_cost BETWEEN 57 AND 77 and ws_ext_discount_amt      > (          SELECT             1.3 * avg(ws_ext_discount_amt)          FROM             web_sales            ,date_dim          WHERE               ws_item_sk = i_item_sk           and d_date between '2001-01-31' and                              cast('2001-01-31' as date) + interval '90' day           and d_date_sk = ws_sold_date_sk           and ws_wholesale_cost BETWEEN 57 AND 77           and ws_sales_price / ws_list_price BETWEEN 17 * 0.01 AND 32 * 0.01   ) order by sum(ws_ext_discount_amt) limit 100;",
-  "rewritten_sql": "SELECT SUM(ws.ws_ext_discount_amt) AS \"Excess Discount Amount\"\nFROM (SELECT ws_item_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sold_date_sk FROM web_sales) ws\nJOIN (SELECT i_item_sk, i_manufact_id, i_category FROM item) i \n  ON i.i_item_sk = ws.ws_item_sk \n  AND (i.i_manufact_id BETWEEN 749 AND 948 OR i.i_category IN ('Books', 'Home', 'Sports'))\n  AND ws.ws_wholesale_cost BETWEEN 57 AND 77\nJOIN (SELECT d_date_sk, d_date FROM date_dim) d \n  ON d.d_date_sk = ws.ws_sold_date_sk \n  AND d.d_date BETWEEN '2001-01-31' AND CAST('2001-01-31' AS DATE) + INTERVAL '90' DAY\nJOIN (\n  SELECT ws2.ws_item_sk, \n         1.3 * (SUM(ws2.ws_ext_discount_amt) / COUNT(ws2.ws_ext_discount_amt)) AS avg_discount\n  FROM (SELECT ws_item_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sales_price, ws_list_price, ws_sold_date_sk FROM web_sales) ws2\n  JOIN (SELECT d_date_sk, d_date FROM date_dim) d2 \n    ON d2.d_date_sk = ws2.ws_sold_date_sk\n    AND d2.d_date BETWEEN '2001-01-31' AND CAST('2001-01-31' AS DATE) + INTERVAL '90' DAY\n  WHERE ws2.ws_wholesale_cost BETWEEN 57 AND 77\n    AND ws2.ws_sales_price / ws2.ws_list_price BETWEEN 0.17 AND 0.32\n  GROUP BY ws2.ws_item_sk\n) sub \n  ON ws.ws_item_sk = sub.ws_item_sk \n  AND ws.ws_ext_discount_amt > sub.avg_discount\nORDER BY SUM(ws.ws_ext_discount_amt)\nLIMIT 100;",
-  "semantic_check": "1. 子查询优化：将相关子查询改写为JOIN操作，通过分组聚合预计算平均折扣值，消除Nested Loop风险\n2. 连接优化：将表过滤条件(i_manufact_id/i_category/d_date)下推至JOIN ON子句，提前过滤数据\n3. 谓词简化：将ws_sales_price/ws_list_price计算转换为0.17-0.32区间，提升可读性\n4. 聚合优化：将AVG()拆解为SUM()/COUNT()组合，确保NULL安全处理\n5. 投影优化：为每个表添加投影子查询，仅选择必要字段(减少70%列)\n6. 语义等价性：保持原查询过滤逻辑(日期/成本/折扣条件)、聚合计算(sum)及排序顺序，结果集完全一致"
+  "rewritten_sql": "WITH item_avg_discount AS (\n  SELECT \n    ws_item_sk,\n    1.3 * AVG(ws_ext_discount_amt) AS threshold\n  FROM \n    web_sales\n    JOIN date_dim ON d_date_sk = ws_sold_date_sk \n      AND d_date BETWEEN '2001-01-31' AND '2001-05-01'\n  WHERE \n    ws_wholesale_cost BETWEEN 57 AND 77\n    AND ws_sales_price / ws_list_price BETWEEN 0.17 AND 0.32\n  GROUP BY ws_item_sk\n)\nSELECT \n  SUM(ws_ext_discount_amt) AS \"Excess Discount Amount\"\nFROM \n  web_sales\n  JOIN item ON i_item_sk = ws_item_sk \n    AND (i_manufact_id BETWEEN 749 AND 948 OR i_category IN ('Books', 'Home', 'Sports'))\n  JOIN date_dim ON d_date_sk = ws_sold_date_sk \n    AND d_date BETWEEN '2001-01-31' AND '2001-05-01'\n  JOIN item_avg_discount ON item_avg_discount.ws_item_sk = ws_item_sk\nWHERE \n  ws_wholesale_cost BETWEEN 57 AND 77\n  AND ws_ext_discount_amt > item_avg_discount.threshold\nLIMIT 100"
 }
+```
 🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: column reference "ws_item_sk" is ambiguous
+LINE 22: ...em_avg_discount ON item_avg_discount.ws_item_sk = ws_item_sk
+                                                              ^
+
+{'flag': False, 'error': 'column reference "ws_item_sk" is ambiguous\nLINE 22: ...em_avg_discount ON item_avg_discount.ws_item_sk = ws_item_sk\n                                                              ^\n'}
+DBMS_syntax_Tool ends...
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: column reference "ws_item_sk" is ambiguous
+LINE 22: ...em_avg_discount ON item_avg_discount.ws_item_sk = ws_item_sk
+                                                              ^
+
+{'flag': False, 'error': 'column reference "ws_item_sk" is ambiguous\nLINE 22: ...em_avg_discount ON item_avg_discount.ws_item_sk = ws_item_sk\n                                                              ^\n'}
+DBMS_syntax_Tool ends...
+{"rewritten_sql":"WITH item_avg_discount AS (\n  SELECT \n    ws_item_sk,\n    1.3 * AVG(ws_ext_discount_amt) AS threshold\n  FROM \n    web_sales\n    JOIN date_dim ON d_date_sk = ws_sold_date_sk \n      AND d_date BETWEEN '2001-01-31' AND '2001-05-01'\n  WHERE \n    ws_wholesale_cost BETWEEN 57 AND 77\n    AND ws_sales_price / ws_list_price BETWEEN 0.17 AND 0.32\n  GROUP BY ws_item_sk\n)\nSELECT \n  SUM(ws_ext_discount_amt) AS \"Excess Discount Amount\"\nFROM \n  web_sales\n  JOIN item ON i_item_sk = ws_item_sk \n    AND (i_manufact_id BETWEEN 749 AND 948 OR i_category IN ('Books', 'Home', 'Sports'))\n  JOIN date_dim ON d_date_sk = ws_sold_date_sk \n    AND d_date BETWEEN '2001-01-31' AND '2001-05-01'\n  JOIN item_avg_discount ON item_avg_discount.ws_item_sk = web_sales.ws_item_sk\nWHERE \n  ws_wholesale_cost BETWEEN 57 AND 77\n  AND ws_ext_discount_amt > item_avg_discount.threshold\nLIMIT 100","note":"将 JOIN 条件中歧义的 ws_item_sk 限定为 web_sales.ws_item_sk 以消除列引用歧义"}
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
-✅ 语法检查通过
 🧠 开始语义等价检查...
 ```json
 {
   "equivalent": true,
-  "message": "重写SQL准确保留了原始SQL的过滤逻辑、连接条件及聚合计算，合理应用semantic_check中的子查询优化、连接条件下推和AVG拆解，结果集等价。",
+  "message": "重写将相关子查询成功提取为CTE，两查询对每个item计算的阈值相同，最终聚合结果等价",
   "differences": []
 }
 ```
 ✅ 语义等价
 📊 开始评估优化结果...
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
+```json
 {
   "terminate": true,
-  "reason": "重写SQL的成本较原始SQL增加了7.58%，且主要瓶颈仍为对大表web_sales的全表扫描，成本未见明显下降。尽管重写在逻辑上做了较多子查询改写、连接调整和谓词下推，结构更复杂且成本未降低，表明通过查询重写层面本轮难以进一步优化。建议终止优化流程，回退采用原始SQL，因为当前重写SQL性能明显恶化且对主要瓶颈无实质改进。",
-  "是否保留重写SQL": false
+  "reason": "重写costs更高(263937 vs 245298)，按§0不适用快捷规则；虽然重写将相关子查询改为CTE+JOIN、常量折叠、去除无意义排序等符合§1多项优化信号，但CTE物化可能导致优化器无法充分利用索引下推，且当前已应用6条规则后结构已相当干净，难以明确指出下一轮必然降低执行时间的点",
+  "保留重写SQL": true
 }
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 605
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_REDUCE_EXPRESSIONS', 'PROJECT_REDUCE_EXPRESSIONS', 'JOIN_CONDITION_PUSH', 'FILTER_INTO_JOIN', 'SORT_REMOVE']
+   - 优化组别: 子查询优化, 谓词简化, 连接优化, 常量折叠, 聚合优化, 排序优化
+   - 估计代价: 原始=245298.18, 重写=263937.47，相对变化: -7.60%
+✅ 成功存储，记录ID: bd304651-1caf-48e0-bf02-8d5547872b70
 
 ----------------------------------------
 

@@ -261,7 +261,7 @@ async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
                     analyzer = PlanAnalyzer(explain_json_str=explain_json_str, db_name=db_name)
                     
                     # Get structured bottlenecks
-                    bottlenecks = analyzer.get_top_bottlenecks(top_n=10, min_percentage=5)
+                    bottlenecks = analyzer.get_top_bottlenecks(top_n=10, min_percentage=1)
                     
                     # Calculate cost analysis
                     cost_analysis = _calculate_cost_analysis(analyzer, bottlenecks)
@@ -270,7 +270,7 @@ async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
                     formatted_bottlenecks = _format_bottlenecks(bottlenecks)
                     
                     # Generate text report for backward compatibility
-                    text_report = analyzer.format_analysis_report(top_n=10, min_percentage=5)
+                    text_report = analyzer.format_analysis_report(top_n=10, min_percentage=1)
                     
                     # Directly use text_report as the analysis result (not wrapped in JSON)
                     all_analyses.append(text_report)
@@ -303,6 +303,48 @@ async def DBMS_EXPLAIN_Tool(dbms: DBMS, input_sql: str) -> str:
     
     print("✅ 计划分析器完成分析")
     return result
+
+
+async def DBMS_RAW_EXPLAIN_JSON_Tool(dbms: DBMS, input_sql: str) -> str:
+    """
+    Return raw EXPLAIN (FORMAT JSON) plan tree(s) as JSON text, without PlanAnalyzer.
+
+    Mirrors DBMS_EXPLAIN_Tool statement splitting (CREATE/DROP VIEW side effects) so
+    callers get the same statement boundaries as the analyzed explain path.
+    """
+    input_sql = _normalize_sql_text(input_sql)
+    statements = [stmt.strip() for stmt in input_sql.split(";") if stmt.strip()]
+    all_plans: List[Any] = []
+
+    try:
+        for stmt in statements:
+            if stmt.upper().startswith("CREATE VIEW"):
+                dbms.execute_statement(stmt)
+                continue
+            if stmt.upper().startswith("DROP VIEW"):
+                dbms.execute_statement(stmt)
+                continue
+            success, explain_result = dbms.execute_explain(stmt)
+            if not success:
+                all_plans.append(
+                    {
+                        "statement": stmt[:100] + "..." if len(stmt) > 100 else stmt,
+                        "error": str(explain_result),
+                    }
+                )
+            else:
+                all_plans.append(explain_result)
+    except Exception as e:
+        print(f"Raw EXPLAIN JSON tool failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return json.dumps({"error": str(e)}, ensure_ascii=False, indent=2)
+
+    if not all_plans:
+        return "[]"
+    payload = all_plans[0] if len(all_plans) == 1 else all_plans
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _calculate_cost_analysis(analyzer: 'PlanAnalyzer', bottlenecks: List[Dict]) -> Dict:

@@ -619,6 +619,8 @@ def parse_arguments():
                         help="Threshold metadata for equivalence rate reporting (default: 0.01)")
     parser.add_argument("--speed_up_threshold", type=float, default=0.01,
                         help="Threshold for improvement_rate counting (default: 0.01)")
+    parser.add_argument("--time-only", action="store_true", default=False,
+                        help="Only measure execution time, skip full rewrite and semantic check")
     return parser.parse_args()     
 
 if __name__ == "__main__":
@@ -630,6 +632,7 @@ if __name__ == "__main__":
     no_restart = args.no_restart
     equivalence_threshold = args.equivalence_threshold
     speed_up_threshold = args.speed_up_threshold
+    time_only = getattr(args, 'time_only', False)
     
     if no_restart:
         print("=" * 60)
@@ -639,11 +642,15 @@ if __name__ == "__main__":
         print("Running 5 iterations per query, removing min/max for average.")
         print("=" * 60)
 
+    if time_only:
+        print("=" * 60)
+        print("⏱️  TIME-ONLY MODE ENABLED")
+        print("Only measuring execution time for dsb_test.json (skipping full rewrite & semantic check)")
+        print("=" * 60)
+
     ensure_file_exists(storage_path)
     ensure_file_exists(filtered_path)
-    # test part
     model = Evaluation(queries_path, storage_path, filtered_path, time_out, no_restart=no_restart)
-    # model.evaluate()
 
 
     with open(queries_path, 'r') as file:
@@ -686,10 +693,17 @@ if __name__ == "__main__":
         iteration += 1
         print("this is the {}-th iteration".format(iteration))
         print(f"the query id is {query_id}")
-        original_query = query_info.get("original_query", "No original query found")
-        rewritten_query = query_info.get("rewritten_query", "No rewritten query found")
-        print(f"Original Query: {original_query}")
-        print(f"Rewritten Query: {rewritten_query}")
+
+        # Support both "query" (in dsb_test.json) and "original_query"
+        original_query = query_info.get("original_query") or query_info.get("query")
+        if time_only:
+            rewritten_query = original_query  # In time-only mode, we only test original for now
+            print(f"Original Query (time-only): {original_query[:80]}...")
+        else:
+            rewritten_query = query_info.get("rewritten_query", "No rewritten query found")
+            print(f"Original Query: {original_query[:80]}...")
+            print(f"Rewritten Query: {rewritten_query[:80]}...")
+
         total_original_time,total_rewrite_time,speed_up,times_up,original_result,rewritten_result = model.compare_rewritten(
             original_query, rewritten_query, query_id=query_id
         )

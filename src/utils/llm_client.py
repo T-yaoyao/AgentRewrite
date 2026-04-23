@@ -128,7 +128,7 @@ class GPT:
             "total_cost_rmb": cls._global_cost_rmb,
         }
 
-    def get_LLM_response(self, prompt, system_message=None, json_format=False) -> str:
+    def get_LLM_response(self, prompt, system_message=None, json_format=False, json_schema=None) -> str:
         """
         Get a streaming response from GPT.
 
@@ -136,6 +136,8 @@ class GPT:
             prompt (str): The user prompt to send to GPT
             system_message (str, optional): System message to set context. Defaults to None.
             json_format (bool, optional): Whether to request JSON formatted response. Defaults to False.
+            json_schema (dict, optional): Strict JSON schema spec. If provided, uses
+                response_format=json_schema with strict mode.
 
         Returns:
             str: The complete response from GPT
@@ -152,15 +154,47 @@ class GPT:
             extra_params["extra_body"] = {"enable_thinking": True}
 
         if json_format:
-            # Request JSON formatted response
-            completion = self.client.chat.completions.create(
-                temperature=0.0,
-                model=self.model,
-                response_format={"type": "json_object"},
-                messages=messages,
-                stream=True,
-                **extra_params
-            )
+            # Request JSON formatted response (prefer strict schema when provided)
+            response_format = {"type": "json_object"}
+            if isinstance(json_schema, dict) and json_schema:
+                if "type" in json_schema and json_schema.get("type") == "json_schema":
+                    response_format = json_schema
+                else:
+                    schema_name = str(json_schema.get("name", "structured_output"))
+                    schema_body = (
+                        json_schema.get("schema")
+                        if isinstance(json_schema.get("schema"), dict)
+                        else json_schema
+                    )
+                    strict = bool(json_schema.get("strict", True))
+                    response_format = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema_name,
+                            "strict": strict,
+                            "schema": schema_body,
+                        },
+                    }
+            try:
+                completion = self.client.chat.completions.create(
+                    temperature=0.0,
+                    model=self.model,
+                    response_format=response_format,
+                    messages=messages,
+                    stream=True,
+                    **extra_params
+                )
+            except Exception:
+                if isinstance(json_schema, dict) and json_schema:
+                    raise
+                completion = self.client.chat.completions.create(
+                    temperature=0.0,
+                    model=self.model,
+                    response_format={"type": "json_object"},
+                    messages=messages,
+                    stream=True,
+                    **extra_params
+                )
 
             if self.is_deepseek_thinking:
                 full_response = self._process_deepseek_streaming_response(completion)
@@ -203,7 +237,7 @@ class GPT:
             self._update_usage(prompt, full_response)
             return full_response
     
-    async def get_LLM_response_async(self, prompt, system_message=None, json_format=False) -> str:
+    async def get_LLM_response_async(self, prompt, system_message=None, json_format=False, json_schema=None) -> str:
             """
             Get an asynchronous streaming response from GPT.
 
@@ -211,6 +245,8 @@ class GPT:
                 prompt (str): The user prompt to send to GPT
                 system_message (str, optional): System message to set context. Defaults to None.
                 json_format (bool, optional): Whether to request JSON formatted response. Defaults to False.
+                json_schema (dict, optional): Strict JSON schema spec. If provided, uses
+                    response_format=json_schema with strict mode.
 
             Returns:
                 str: The complete response from GPT
@@ -227,15 +263,47 @@ class GPT:
                 extra_params["extra_body"] = {"enable_thinking": True}
 
             if json_format:
-                # Request JSON formatted response
-                completion = await self.async_client.chat.completions.create(
-                    temperature=0.0,
-                    model=self.model,
-                    response_format={"type": "json_object"},
-                    messages=messages,
-                    stream=True,
-                    **extra_params
-                )
+                # Request JSON formatted response (prefer strict schema when provided)
+                response_format = {"type": "json_object"}
+                if isinstance(json_schema, dict) and json_schema:
+                    if "type" in json_schema and json_schema.get("type") == "json_schema":
+                        response_format = json_schema
+                    else:
+                        schema_name = str(json_schema.get("name", "structured_output"))
+                        schema_body = (
+                            json_schema.get("schema")
+                            if isinstance(json_schema.get("schema"), dict)
+                            else json_schema
+                        )
+                        strict = bool(json_schema.get("strict", True))
+                        response_format = {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": schema_name,
+                                "strict": strict,
+                                "schema": schema_body,
+                            },
+                        }
+                try:
+                    completion = await self.async_client.chat.completions.create(
+                        temperature=0.0,
+                        model=self.model,
+                        response_format=response_format,
+                        messages=messages,
+                        stream=True,
+                        **extra_params
+                    )
+                except Exception:
+                    if isinstance(json_schema, dict) and json_schema:
+                        raise
+                    completion = await self.async_client.chat.completions.create(
+                        temperature=0.0,
+                        model=self.model,
+                        response_format={"type": "json_object"},
+                        messages=messages,
+                        stream=True,
+                        **extra_params
+                    )
 
                 if self.is_deepseek_thinking:
                     full_response = await self._process_deepseek_streaming_response_async(completion)

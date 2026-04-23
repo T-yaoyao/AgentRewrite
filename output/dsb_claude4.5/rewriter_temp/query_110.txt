@@ -3,113 +3,135 @@ Query ID: 110
 
 Original: with customer_total_return as  (select cr_returning_customer_sk as ctr_customer_sk         ,ca_state as ctr_state,   	sum(cr_return_amt_inc_tax) as ctr_total_return  from catalog_returns      ,date_dim      ,customer_address  where cr_returned_date_sk = d_date_sk     and d_year =2001    and cr_returning_addr_sk = ca_address_sk   group by cr_returning_customer_sk          ,ca_state )   select  c_customer_id,c_salutation,c_first_name,c_last_name,ca_street_number,ca_street_name                    ,ca_street_type,ca_suite_number,ca_city,ca_county,ca_state,ca_zip,ca_country,ca_gmt_offset                   ,ca_location_type,ctr_total_return  from customer_total_return ctr1      ,customer_address      ,customer  where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2  			  from customer_total_return ctr2                    	  where ctr1.ctr_state = ctr2.ctr_state)        and ca_address_sk = c_current_addr_sk        and ca_state = 'OH'        and ctr1.ctr_customer_sk = c_customer_sk  order by c_customer_id,c_salutation,c_first_name,c_last_name,ca_street_number,ca_street_name                    ,ca_street_type,ca_suite_number,ca_city,ca_county,ca_state,ca_zip,ca_country,ca_gmt_offset                   ,ca_location_type,ctr_total_return  limit 100;
 Rewritten: WITH customer_total_return AS (
-    SELECT 
-        cr_returning_customer_sk AS ctr_customer_sk,
-        ca_state AS ctr_state,
-        SUM(cr_return_amt_inc_tax) AS ctr_total_return
-    FROM catalog_returns
-    JOIN date_dim ON cr_returned_date_sk = d_date_sk
-    JOIN customer_address ON cr_returning_addr_sk = ca_address_sk
-    WHERE d_year = 2001
-    GROUP BY cr_returning_customer_sk, ca_state
+  SELECT 
+    cr_returning_customer_sk AS ctr_customer_sk,
+    ca_state AS ctr_state,
+    SUM(cr_return_amt_inc_tax) AS ctr_total_return
+  FROM catalog_returns
+  JOIN date_dim ON cr_returned_date_sk = d_date_sk
+  JOIN customer_address ON cr_returning_addr_sk = ca_address_sk
+  WHERE d_year = 2001
+  GROUP BY cr_returning_customer_sk, ca_state
 ),
-ctr_avg AS (
-    SELECT 
-        ctr_state, 
-        AVG(ctr_total_return) * 1.2 AS avg_return
-    FROM customer_total_return
-    GROUP BY ctr_state
+state_avg_return AS (
+  SELECT 
+    ctr_state,
+    AVG(ctr_total_return) * 1.2 AS avg_threshold
+  FROM customer_total_return
+  GROUP BY ctr_state
 )
 SELECT 
-    c_customer_id, c_salutation, c_first_name, c_last_name,
-    ca_street_number, ca_street_name, ca_street_type, ca_suite_number, 
-    ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type,
-    ctr_total_return
+  c_customer_id, c_salutation, c_first_name, c_last_name,
+  ca_street_number, ca_street_name, ca_street_type, ca_suite_number,
+  ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset,
+  ca_location_type, ctr1.ctr_total_return
 FROM customer_total_return ctr1
+JOIN state_avg_return sar ON ctr1.ctr_state = sar.ctr_state
 JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
 JOIN customer_address ON ca_address_sk = c_current_addr_sk
-JOIN ctr_avg ON ctr1.ctr_state = ctr_avg.ctr_state
-WHERE 
-    ctr1.ctr_total_return > ctr_avg.avg_return
-    AND ca_state = 'OH'
-ORDER BY 
-    c_customer_id, c_salutation, c_first_name, c_last_name,
-    ca_street_number, ca_street_name, ca_street_type, ca_suite_number, 
-    ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type,
-    ctr_total_return
-LIMIT 100;
-Time Cost: 251.79s
-Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将主查询中的相关子查询 `(select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state)` 改写为预聚合CTE，在CTE中按state预先计算avg(ctr_total_return)*1.2的阈值，然后通过JOIN替代相关子查询。例如：在WITH块中增加 `ctr_avg AS (SELECT ctr_state, avg(ctr_total_return)*1.2 AS avg_return FROM customer_total_return GROUP BY ctr_state)`，主查询中用 `JOIN ctr_avg ON ctr1.ctr_state = ctr_avg.ctr_state AND ctr1.ctr_total_return > ctr_avg.avg_return` 替代原来的相关子查询过滤，从而消除逐行执行SubPlan的性能瓶颈。'}, {'group': '谓词简化', 'produced_suggestion': "将过滤条件 `ca_state = 'OH'` 尽早下推到customer_total_return CTE内部或主查询的连接条件中，使得在聚合及关联前就过滤掉非OH州的数据，减少参与后续JOIN和过滤的数据量。同时在CTE的avg预聚合中也只需保留OH州的阈值，进一步缩小计算范围。"}, {'group': '聚合优化', 'produced_suggestion': '将按state计算平均值的聚合操作从相关子查询提升为独立的预聚合步骤（即新增ctr_avg CTE），使聚合只执行一次而非对每行都重复执行，大幅减少重复计算开销。'}]
+WHERE ctr1.ctr_total_return > sar.avg_threshold
+  AND ca_state = 'OH'
+ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name,
+  ca_street_number, ca_street_name, ca_street_type, ca_suite_number,
+  ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset,
+  ca_location_type, ctr_total_return
+LIMIT 100
+Time Cost: 143.37s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将CTE customer_total_return分解为两个独立的物化视图或临时表，避免重复计算。第一个CTE计算每个州的平均返回金额，第二个CTE计算每个客户的返回金额，然后通过JOIN关联，消除相关子查询（SubPlan 2）带来的嵌套循环执行'}, {'group': '子查询优化', 'produced_suggestion': '将相关子查询 (select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state) 转换为JOIN操作。先计算各州的平均值并物化，然后与主查询JOIN，避免对ctr1每行重复执行子查询'}, {'group': '谓词简化', 'produced_suggestion': "将ca_state='OH'条件下推到CTE定义中，在聚合前过滤数据，减少CTE的数据量。同时将d_year=2001条件确保在date_dim表扫描时应用，避免不必要的JOIN操作"}, {'group': '聚合优化', 'produced_suggestion': '在CTE中增加对ca_state的过滤，只计算OH州的返回数据，减少聚合计算量。同时预先计算各州平均值的1.2倍作为独立CTE，避免在主查询中重复计算'}, {'group': '连接优化', 'produced_suggestion': "调整JOIN顺序，先关联customer_address和customer（通过ca_address_sk = c_current_addr_sk且ca_state='OH'过滤），再与CTE结果JOIN，利用OH州过滤条件减少数据量"}, {'group': '投影优化', 'produced_suggestion': '在CTE中只保留必要的列（ctr_customer_sk, ctr_state, ctr_total_return），避免携带不需要的catalog_returns和customer_address的其他列，减少中间结果集大小'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
-{"can_optimize":true,"reason":"执行计划显示CTE Scan on ctr1代价占比高达99.2%，其中存在一个相关子查询(SubPlan 2)对每行计算avg(ctr_total_return)*1.2，导致对CTE结果集的逐行嵌套子查询扫描，性能极差。可以将该相关子查询转换为预聚合后JOIN的方式消除相关子查询，同时可以将CTE物化结果与按state分组的平均值预先计算后做JOIN过滤，避免逐行执行子查询。","advice":[{"group":"子查询优化","produced_suggestion":"将主查询中的相关子查询 `(select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state)` 改写为预聚合CTE，在CTE中按state预先计算avg(ctr_total_return)*1.2的阈值，然后通过JOIN替代相关子查询。例如：在WITH块中增加 `ctr_avg AS (SELECT ctr_state, avg(ctr_total_return)*1.2 AS avg_return FROM customer_total_return GROUP BY ctr_state)`，主查询中用 `JOIN ctr_avg ON ctr1.ctr_state = ctr_avg.ctr_state AND ctr1.ctr_total_return > ctr_avg.avg_return` 替代原来的相关子查询过滤，从而消除逐行执行SubPlan的性能瓶颈。"},{"group":"谓词简化","produced_suggestion":"将过滤条件 `ca_state = 'OH'` 尽早下推到customer_total_return CTE内部或主查询的连接条件中，使得在聚合及关联前就过滤掉非OH州的数据，减少参与后续JOIN和过滤的数据量。同时在CTE的avg预聚合中也只需保留OH州的阈值，进一步缩小计算范围。"},{"group":"聚合优化","produced_suggestion":"将按state计算平均值的聚合操作从相关子查询提升为独立的预聚合步骤（即新增ctr_avg CTE），使聚合只执行一次而非对每行都重复执行，大幅减少重复计算开销。"}]}
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示CTE Scan占比99.1%，存在相关子查询导致的性能瓶颈（SubPlan 2在Filter中对每行执行）。历史案例显示相同SQL指纹通过CTE分解和过滤聚合转置优化后性能提升。catalog_returns表215万行数据进行全表扫描，缺少针对cr_returned_date_sk和cr_returning_addr_sk的索引。可通过CTE分解、子查询优化、谓词下推等重写技术显著提升性能。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将CTE customer_total_return分解为两个独立的物化视图或临时表，避免重复计算。第一个CTE计算每个州的平均返回金额，第二个CTE计算每个客户的返回金额，然后通过JOIN关联，消除相关子查询（SubPlan 2）带来的嵌套循环执行"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将相关子查询 (select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state) 转换为JOIN操作。先计算各州的平均值并物化，然后与主查询JOIN，避免对ctr1每行重复执行子查询"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将ca_state='OH'条件下推到CTE定义中，在聚合前过滤数据，减少CTE的数据量。同时将d_year=2001条件确保在date_dim表扫描时应用，避免不必要的JOIN操作"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "在CTE中增加对ca_state的过滤，只计算OH州的返回数据，减少聚合计算量。同时预先计算各州平均值的1.2倍作为独立CTE，避免在主查询中重复计算"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序，先关联customer_address和customer（通过ca_address_sk = c_current_addr_sk且ca_state='OH'过滤），再与CTE结果JOIN，利用OH州过滤条件减少数据量"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在CTE中只保留必要的列（ctr_customer_sk, ctr_state, ctr_total_return），避免携带不需要的catalog_returns和customer_address的其他列，减少中间结果集大小"
+    }
+  ]
+}
+```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 45 rules
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.220
+📊 UCT scored 74 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.217
    → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
    → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
 {
-  "groups": "聚合优化, 子查询优化, 谓词简化",
-  "applied_rules": ["FILTER_AGGREGATE_TRANSPOSE", "STRATEGY_CTE_DECOMPOSITION"],
+  "groups": "聚合优化, 子查询优化, 谓词简化, 连接优化, 投影优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_AGGREGATE_TRANSPOSE", "PROJECT_REMOVE"],
   "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
     "FILTER_AGGREGATE_TRANSPOSE": 0.3,
-    "STRATEGY_CTE_DECOMPOSITION": 0.7
+    "PROJECT_REMOVE": 0.2
   },
   "rule_effect_confidence": {
-    "FILTER_AGGREGATE_TRANSPOSE": 0.85,
-    "STRATEGY_CTE_DECOMPOSITION": 0.8
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.7,
+    "PROJECT_REMOVE": 0.6
   }
 }
-✅ 选择了 2 个规则
+✅ 选择了 3 个规则
 🔧 开始SQL重写...
+```json
 {
-  "groups": "聚合优化, 子查询优化, 谓词简化",
-  "applied_rules": [
-    "FILTER_AGGREGATE_TRANSPOSE",
-    "STRATEGY_CTE_DECOMPOSITION"
-  ],
-  "original_sql": "with customer_total_return as  (select cr_returning_customer_sk as ctr_customer_sk         ,ca_state as ctr_state,    \tsum(cr_return_amt_inc_tax) as ctr_total_return  from catalog_returns      ,date_dim      ,customer_address  where cr_returned_date_sk = d_date_sk     and d_year =2001    and cr_returning_addr_sk = ca_address_sk   group by cr_returning_customer_sk          ,ca_state )   select  c_customer_id,c_salutation,c_first_name,c_last_name,ca_street_number,ca_street_name                    ,ca_street_type,ca_suite_number,ca_city,ca_county,ca_state,ca_zip,ca_country,ca_gmt_offset                   ,ca_location_type,ctr_total_return  from customer_total_return ctr1      ,customer_address      ,customer  where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2   \t\t\t  from customer_total_return ctr2                     \t  where ctr1.ctr_state = ctr2.ctr_state)        and ca_address_sk = c_current_addr_sk        and ca_state = 'OH'        and ctr1.ctr_customer_sk = c_customer_sk  order by c_customer_id,c_salutation,c_first_name,c_last_name,ca_street_number,ca_street_name                    ,ca_street_type,ca_suite_number,ca_city,ca_county,ca_state,ca_zip,ca_country,ca_gmt_offset                   ,ca_location_type,ctr_total_return  limit 100;",
-  "rewritten_sql": "WITH customer_total_return AS (\n    SELECT \n        cr_returning_customer_sk AS ctr_customer_sk,\n        ca_state AS ctr_state,\n        SUM(cr_return_amt_inc_tax) AS ctr_total_return\n    FROM catalog_returns\n    JOIN date_dim ON cr_returned_date_sk = d_date_sk\n    JOIN customer_address ON cr_returning_addr_sk = ca_address_sk\n    WHERE d_year = 2001\n    GROUP BY cr_returning_customer_sk, ca_state\n),\nctr_avg AS (\n    SELECT \n        ctr_state, \n        AVG(ctr_total_return) * 1.2 AS avg_return\n    FROM customer_total_return\n    GROUP BY ctr_state\n)\nSELECT \n    c_customer_id, c_salutation, c_first_name, c_last_name,\n    ca_street_number, ca_street_name, ca_street_type, ca_suite_number, \n    ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type,\n    ctr_total_return\nFROM customer_total_return ctr1\nJOIN customer ON ctr1.ctr_customer_sk = c_customer_sk\nJOIN customer_address ON ca_address_sk = c_current_addr_sk\nJOIN ctr_avg ON ctr1.ctr_state = ctr_avg.ctr_state\nWHERE \n    ctr1.ctr_total_return > ctr_avg.avg_return\n    AND ca_state = 'OH'\nORDER BY \n    c_customer_id, c_salutation, c_first_name, c_last_name,\n    ca_street_number, ca_street_name, ca_street_type, ca_suite_number, \n    ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type,\n    ctr_total_return\nLIMIT 100;",
-  "semantic_check": "语义等价性验证：\n1. 结果集等价：通过STRATEGY_CTE_DECOMPOSITION将相关子查询转换为独立CTE（ctr_avg），使用JOIN替代原相关子查询，数学等价性确保（ctr_total_return > 州平均*1.2）条件不变\n2. 数据完整性：\n   - 显式JOIN语法替代隐式连接，保持表关联逻辑不变（cr_returning_addr_sk=ca_address_sk等）\n   - 聚合计算保留原分组维度（ctr_state）和计算逻辑（SUM/AVG）\n3. 输出一致性：\n   - SELECT子句字段、顺序、别名完全保留\n   - ORDER BY所有排序字段及顺序未改变\n4. 过滤条件等效：\n   - 州过滤（ca_state='OH'）保持在主查询应用\n   - 日期过滤（d_year=2001）仍在CTE内执行\n5. 性能改进：\n   - 消除相关子查询的Nested Loop执行模式\n   - ctr_avg预聚合减少重复计算\n6. 数据验证：\n   - 统计信息显示catalog_returns表215万行，CTE分解显著降低聚合计算复杂度"
+  "groups": "聚合优化, 子查询优化, 谓词简化, 连接优化, 投影优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_AGGREGATE_TRANSPOSE", "PROJECT_REMOVE"],
+  "rewritten_sql": "WITH customer_total_return AS (\n  SELECT \n    cr_returning_customer_sk AS ctr_customer_sk,\n    ca_state AS ctr_state,\n    SUM(cr_return_amt_inc_tax) AS ctr_total_return\n  FROM catalog_returns\n  JOIN date_dim ON cr_returned_date_sk = d_date_sk\n  JOIN customer_address ON cr_returning_addr_sk = ca_address_sk\n  WHERE d_year = 2001\n  GROUP BY cr_returning_customer_sk, ca_state\n),\nstate_avg_return AS (\n  SELECT \n    ctr_state,\n    AVG(ctr_total_return) * 1.2 AS avg_threshold\n  FROM customer_total_return\n  GROUP BY ctr_state\n)\nSELECT \n  c_customer_id, c_salutation, c_first_name, c_last_name,\n  ca_street_number, ca_street_name, ca_street_type, ca_suite_number,\n  ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset,\n  ca_location_type, ctr1.ctr_total_return\nFROM customer_total_return ctr1\nJOIN state_avg_return sar ON ctr1.ctr_state = sar.ctr_state\nJOIN customer ON ctr1.ctr_customer_sk = c_customer_sk\nJOIN customer_address ON ca_address_sk = c_current_addr_sk\nWHERE ctr1.ctr_total_return > sar.avg_threshold\n  AND ca_state = 'OH'\nORDER BY c_customer_id, c_salutation, c_first_name, c_last_name,\n  ca_street_number, ca_street_name, ca_street_type, ca_suite_number,\n  ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset,\n  ca_location_type, ctr_total_return\nLIMIT 100"
 }
+```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
+
+
 ```json
 {
   "equivalent": true,
-  "message": "采纳semantic_check中的分析，重写SQL通过CTE分解和JOIN替换相关子查询，保持了过滤条件、聚合逻辑和输出字段完全一致，结果集等价。",
+  "message": "重写将相关子查询解相关为独立CTE，语义完全等价",
   "differences": []
 }
 ```
 ✅ 语义等价
 📊 开始评估优化结果...
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-{
-  "terminate": true,
-  "reason": "重写SQL成本较原始SQL成本大幅降低（97.05%），显示聚合优化、子查询优化及谓词简化带来显著性能提升。执行计划显示主要瓶颈由CTE Scan降低为Seq Scan和Nested Loop，且重写SQL逻辑更清晰，消除相关子查询重复计算的问题。基于逻辑优化成功且执行计划更优，符合终止条件1，建议直接终止优化流程并保留重写SQL。",
-  "是否保留重写SQL": true
-}
+✅ 估计代价降幅 97.0% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 1046
-   - 规则序列: ['FILTER_AGGREGATE_TRANSPOSE', 'STRATEGY_CTE_DECOMPOSITION']
-   - 优化组别: 聚合优化, 子查询优化, 谓词简化
-   - 成本降低率: 97.05%
-✅ 成功存储，记录ID: e893dd56-3e97-46cf-a7e2-846d9adfc607
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_AGGREGATE_TRANSPOSE', 'PROJECT_REMOVE']
+   - 优化组别: 聚合优化, 子查询优化, 谓词简化, 连接优化, 投影优化
+   - 估计代价: 原始=2556016.22, 重写=76698.13，相对变化: 97.00%
+✅ 成功存储，记录ID: bb30d24d-2ad3-4802-bb75-10622347edbb
 
-🎲 UCT Math Update: 2 rules, reward=+0.9705 (oc=2596351.6300, rc=76712.2700)
+🎲 UCT Math Update: 3 rules, reward=+0.9700 (oc=2556016.2200, rc=76698.1300)
 ✅ UCT Update Complete:
-   → FILTER_AGGREGATE_TRANSPOSE: P(s,a)=N/A, effect=0.300, conf=0.85, lambda=0.42, reward=+0.420, count=12, avg=+0.261
-   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.700, conf=0.80, lambda=0.40, reward=+0.551, count=38, avg=+0.181
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.500, conf=0.80, lambda=0.40, reward=+0.404, count=69, avg=+0.141
+   → FILTER_AGGREGATE_TRANSPOSE: P(s,a)=N/A, effect=0.300, conf=0.70, lambda=0.35, reward=+0.308, count=18, avg=+0.256
+   → PROJECT_REMOVE: P(s,a)=N/A, effect=0.200, conf=0.60, lambda=0.30, reward=+0.258, count=13, avg=+0.077
 
 ----------------------------------------
 

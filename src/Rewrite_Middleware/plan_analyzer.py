@@ -413,7 +413,7 @@ class PlanAnalyzer:
             
         return results
 
-    def get_top_bottlenecks(self, top_n=5, min_percentage=5):
+    def get_top_bottlenecks(self, top_n=5, min_percentage=1):
         """
         获取主要性能瓶颈列表，返回结构化数据而不是格式化字符串
         返回格式: [node1, node2, ...] 其中每个node包含代价信息
@@ -438,7 +438,7 @@ class PlanAnalyzer:
         # --- 排序策略 ---
         sorted_nodes = sorted(all_nodes, key=lambda x: x['self_cost'], reverse=True)
 
-        # --- 筛选：代价占比大于20%的节点，按顺序输出 ---
+        # --- 筛选：代价占比大于min_percentage的节点，按顺序输出 ---
         filtered_nodes = []
         seen_startups = set()
 
@@ -448,17 +448,17 @@ class PlanAnalyzer:
 
             # 计算显示用的百分比：看自身消耗占全量代价的比例
             display_pct = (node['self_cost'] / denominator_full) * 100
-            if display_pct < 1.0: continue
+            if display_pct < min_percentage: continue
 
-            # 筛选条件：代价占比大于20%
-            if display_pct >= 20.0:
+            # 筛选条件：代价占比大于min_percentage
+            if display_pct >= min_percentage:
                 # 添加到结果中
                 node['display_pct'] = display_pct
                 filtered_nodes.append(node)
 
         return filtered_nodes
 
-    def format_analysis_report(self, top_n=5, min_percentage=5):
+    def format_analysis_report(self, top_n=5, min_percentage=1):
         if not self.plan_root: return "无法生成报告：执行计划解析失败"
 
         # 分母：用于全量模式 (防止 > 100%)
@@ -477,7 +477,7 @@ class PlanAnalyzer:
         # --- 排序策略 ---
         sorted_nodes = sorted(all_nodes, key=lambda x: x['self_cost'], reverse=True)
 
-        # --- 筛选：代价占比大于20%的节点，按顺序输出 ---
+        # --- 筛选：代价占比大于1%的节点，按顺序输出 ---
         filtered_nodes = []
         seen_startups = set()
         
@@ -489,8 +489,8 @@ class PlanAnalyzer:
             display_pct = (node['self_cost'] / denominator_full) * 100
             if display_pct < 1.0: continue
 
-            # 筛选条件：代价占比大于20%
-            if display_pct >= 20.0:
+            # 筛选条件：代价占比大于1%
+            if display_pct >= 1.0:
                 # 添加到结果中
                 node['display_pct'] = display_pct
                 filtered_nodes.append(node)
@@ -508,7 +508,7 @@ class PlanAnalyzer:
         else:
             lines.append(f"模式检测: 全量执行")
 
-        lines.append(f"\n发现 {len(filtered_nodes)} 个主要性能瓶颈 (代价占比 > 20%):\n")
+        lines.append(f"\n发现 {len(filtered_nodes)} 个主要性能瓶颈 (代价占比 > 1%):\n")
         
         for i, node in enumerate(filtered_nodes, 1):
             flags = []

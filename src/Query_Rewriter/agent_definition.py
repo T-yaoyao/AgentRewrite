@@ -15,6 +15,134 @@ from src.utils.agent_template import MessageQueue, Agent
 from src.utils.llm_client import GPT
 from src.utils.llm_json_utils import parse_llm_json, parse_llm_json_with_default
 
+STRICT_JSON_SCHEMAS = {
+    "rule_selection": {
+        "name": "rule_selection_output",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "groups": {"type": "string"},
+                "applied_rules": {"type": "array", "items": {"type": "string"}},
+                "rule_effect_scores": {
+                    "type": "object",
+                    "additionalProperties": {"type": "number"},
+                },
+                "rule_effect_confidence": {
+                    "type": "object",
+                    "additionalProperties": {"type": "number"},
+                },
+            },
+            "required": ["groups", "applied_rules", "rule_effect_scores", "rule_effect_confidence"],
+            "additionalProperties": False,
+        },
+    },
+    "initial_check": {
+        "name": "initial_optimization_check",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "can_optimize": {"type": "boolean"},
+                "reason": {"type": "string"},
+                "advice": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "group": {"type": "string"},
+                            "produced_suggestion": {"type": "string"},
+                        },
+                        "required": ["group", "produced_suggestion"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["can_optimize", "reason", "advice"],
+            "additionalProperties": False,
+        },
+    },
+    "evaluation": {
+        "name": "rewrite_evaluation",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "terminate": {"type": "boolean"},
+                "reason": {"type": "string"},
+            },
+            "required": ["terminate", "reason"],
+            "additionalProperties": False,
+        },
+    },
+    "rewrite": {
+        "name": "rewrite_output",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "groups": {"type": "string"},
+                "applied_rules": {"type": "array", "items": {"type": "string"}},
+                "rewritten_sql": {"type": "string"},
+            },
+            "required": ["groups", "applied_rules", "rewritten_sql"],
+            "additionalProperties": False,
+        },
+    },
+    "semantic_fix": {
+        "name": "semantic_fix_output",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "fixed_sql": {"type": "string"},
+                "note": {"type": "string"},
+            },
+            "required": ["fixed_sql", "note"],
+            "additionalProperties": False,
+        },
+    },
+    "iterative_rewrite": {
+        "name": "iterative_rewrite_output",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "rewritten_sql": {"type": "string"},
+                "note": {"type": "string"},
+            },
+            "required": ["rewritten_sql", "note"],
+            "additionalProperties": False,
+        },
+    },
+    "semantic_equivalence": {
+        "name": "semantic_equivalence_output",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "equivalent": {"type": "boolean"},
+                "message": {"type": "string"},
+                "differences": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "description": {"type": "string"},
+                            "location": {"type": "string"},
+                        },
+                        "required": ["type", "description", "location"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["equivalent", "message", "differences"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 class ReasoningAgent(Agent):
     """MDP-based Reasoning Agent"""
     def __init__(self, mq: MessageQueue):
@@ -149,7 +277,6 @@ class ReasoningAgent(Agent):
                 few_shot_context += f"- SQL指纹: {example.get('sql_fingerprint', '')[:150]}...\n"
                 few_shot_context += f"- 应用的规则序列: {example.get('rule_sequence', [])}\n"
                 few_shot_context += f"- 优化组别: {example.get('groups', '')}\n"
-                few_shot_context += f"- 优化效果: 成本降低 {example.get('cost_reduction_rate', 0) * 100:.2f}%\n"
                 few_shot_context += f"- 命中次数: {example.get('frequency', 0)}\n\n"
             few_shot_context += "</相似历史案例>\n"
 
@@ -208,7 +335,11 @@ class ReasoningAgent(Agent):
         示例：{{"groups": "{groups_text}", "applied_rules": ["RULE_ID_1"], "rule_effect_scores": {{"RULE_ID_1": 1.0}}, "rule_effect_confidence": {{"RULE_ID_1": 0.8}}}}
         """)
 
-        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        thought_chain = await self.llm.get_LLM_response_async(
+            prompt=prompt,
+            json_format=True,
+            json_schema=STRICT_JSON_SCHEMAS["rule_selection"],
+        )
 
         default = {
             "groups": groups_text,
@@ -269,7 +400,6 @@ class DecisionAgent(Agent):
                 few_shot_context += f"- 相似度: {example.get('score', 0):.4f}\n"
                 few_shot_context += f"- SQL指纹: {example.get('sql_fingerprint', '')[:100]}...\n"
                 few_shot_context += f"- 应用的规则序列: {example.get('rule_sequence', [])}\n"
-                few_shot_context += f"- 优化效果: 成本降低 {example.get('cost_reduction_rate', 0) * 100:.2f}%\n"
                 few_shot_context += f"- 命中次数: {example.get('frequency', 0)}\n\n"
             few_shot_context += "</相似历史案例>\n"
         
@@ -324,7 +454,11 @@ class DecisionAgent(Agent):
         {explain_info}
         """)
 
-        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        thought_chain = await self.llm.get_LLM_response_async(
+            prompt=prompt,
+            json_format=True,
+            json_schema=STRICT_JSON_SCHEMAS["initial_check"],
+        )
 
         default_result = {
             "can_optimize": False,
@@ -340,87 +474,91 @@ class DecisionAgent(Agent):
         return parsed
 
     async def evaluate_with_costs(self, optimization_info: dict, iteration_round: int = 1) -> dict:
-        """Evaluate optimization results with cost analysis for multi-round optimization"""
+        """Evaluate rewrite quality and whether to terminate optimization loop."""
         original_costs = optimization_info.get("original_costs", 0)
         rewritten_costs = optimization_info.get("rewritten_costs", 0)
-        original_explain_info = optimization_info.get("original_explain_info", "")
-        rewritten_explain_info = optimization_info.get("rewritten_explain_info", "")
         groups = optimization_info.get("groups", "")
         applied_rules = optimization_info.get("applied_rules", [])
         optimization_advice = optimization_info.get("optimization_advice", [])
         original_sql = optimization_info.get("original_sql", "")
         rewritten_sql = optimization_info.get("rewritten_sql", "")
-        reason = optimization_info.get("reason", "")
+        original_explain = optimization_info.get("original_explain_plan_json", "")
+        rewritten_explain = optimization_info.get("rewritten_explain_plan_json", "")
         advice_text = json.dumps(optimization_advice, ensure_ascii=False, indent=2) if optimization_advice else "[]"
 
-        # Calculate cost reduction
-        cost_reduction = original_costs - rewritten_costs if original_costs > 0 else 0
-        cost_reduction_percent = (cost_reduction / original_costs * 100) if original_costs > 0 else 0
-
         prompt = textwrap.dedent(f"""
-        <Mission>
-        你负责评估 SQL 优化是否符合标准，决定是否终止优化过程或继续下一轮优化。必须是在逻辑上基于查询重写的优化，如果只能通过物理上如索引等进行优化就终止优化流程。
+        你负责评估 SQL 优化是否达标，并判断是否终止优化流程。
 
-        当前是第{iteration_round}轮优化。
+        基于 `original_sql` 与 `rewritten_sql/enhanced_sql` 的 EXPLAIN、cost、执行时间等信息进行综合评估，重点对比：
+        1) 执行计划变化（扫描方式、连接顺序/算法、过滤下推、排序聚合、临时表/回表等）；
+        2) 成本差异（注意 cost 可能不精确，仅作参考）；
+        3) 重写 SQL 改进点（执行计划层面 + SQL 逻辑层面）；
+        4) 执行时间表现及是否存在基数估计误差。
 
-        评估信息：
-        - 原始SQL成本: {original_costs}
-        - 重写SQL成本: {rewritten_costs}
-        - 成本减少: {cost_reduction} ({cost_reduction_percent:.2f}%)
-        - 优化类别: {groups}
-        - 应用的规则: {', '.join(applied_rules)}
-         * 注意：<original_sql> 和 <rewritten_sql> 的costs来自数据库优化器，可能不精确。基于详细分析做出决定。*  
+        注意：`original_sql` 和 `enhanced_sql` 的 costs 来自优化器，可能不够精确；必须基于详细分析客观判断 rewritten_sql 是否满足成功重写关键指标。
+
         终止条件：
-        [True]（terminate 为 true）：
-            1. rewritten_sql costs 明显低于 ori_sql costs（优化成功，直接终止；通常「是否保留重写SQL」为 true）
-            2. rewritten_sql costs 稍微≥ ori_sql costs，代价没有明显超过原始代价，但重写后 SQL 在逻辑层面更优/更简洁（例如结构更清晰、冗余更少、可维护性更好）或执行计划更优，可保留重写SQL；「是否保留重写SQL」为 true。
-            3. rewritten_sql costs ≥ ori_sql costs，重写SQL在性能上明显恶化，不如原始 SQL，且你认为在重写层面已无法继续优化时，可终止；若最终应采用原始 SQL，则「是否保留重写SQL」为 false（系统将回退到原始 SQL）。
-            4. 若首轮后从执行计划可判断“主要瓶颈仍是同一大表全表扫描且成本不降”，可直接终止优化；此时若重写SQL在逻辑结构上更优/更简洁可保留（true），否则不保留（false）。
+        - `terminate = true`：
+          a. `rewritten_sql` 的 costs < `ori_sql` 的 costs；或
+          b. `rewritten_sql` 执行时间 >= `ori_sql`，但属于基数估计误差导致，且重写本质仍有改进。
+        - `terminate = false`：
+          `rewritten_sql` 执行时间 >= `ori_sql`，且属于明显性能恶化。
 
-        [False]（terminate 为 false）：
-            若规则选择不当，或 SQL 与执行计划仍显示有明显优化空间，继续下一轮优化。
+        严格仅输出以下 JSON（不得有任何额外文本）：
+        {{
+          "terminate": true/false,
+          "reason": "简要说明依据：执行计划变化、成本差异、改进点、执行时间对比、是否基数估计误差、最终结论。"
+        }}
 
-        「是否保留重写SQL」：true 表示当前重写更优，保留当前重写 SQL；false 表示不保留、回退到原始 SQL。
+        <original_sql>
+        {original_sql}
+        </original_sql>
 
-        {f"上一轮评估失败原因: {reason}" if reason else ""}
+        <enhanced_sql>
+        {rewritten_sql}
+        </enhanced_sql>
 
-        **只输出一个 JSON 对象**（不要 markdown）。字段：terminate（布尔）、reason（字符串）、是否保留重写SQL（布尔）。
+        <original_sql_costs>
+        {original_costs}
+        </original_sql_costs>
 
-        <原始SQL成本信息>
-        成本: {original_costs}
-        执行计划: {original_explain_info}
+        <enhanced_sql_costs>
+        {rewritten_costs}
+        </enhanced_sql_costs>
 
-        <重写SQL成本信息>
-        成本: {rewritten_costs}
-        执行计划: {rewritten_explain_info}
+        <original_sql_explain>
+        {json.dumps(original_explain, ensure_ascii=False, indent=2) if isinstance(original_explain, (dict, list)) else original_explain}
+        </original_sql_explain>
 
-        <优化信息>
-        类别: {groups}
-        决策建议(advice): {advice_text}
-        规则: {applied_rules}
-        原始SQL: {original_sql}
-        重写SQL: {rewritten_sql}
+        <enhanced_sql_explain>
+        {json.dumps(rewritten_explain, ensure_ascii=False, indent=2) if isinstance(rewritten_explain, (dict, list)) else rewritten_explain}
+        </enhanced_sql_explain>
+
+        <optimization_context>
+        round: {iteration_round}
+        groups: {groups}
+        optimization_advice:
+        {advice_text}
+        applied_rules:
+        {applied_rules}
+        </optimization_context>
         """)
 
         response = await self.llm.get_LLM_response_async(
             prompt=prompt,
-            json_format=True
+            json_format=True,
+            json_schema=STRICT_JSON_SCHEMAS["evaluation"],
         )
 
         fallback = {
             "terminate": True,
             "reason": "无法解析响应，默认终止优化",
-            "应用的规则": applied_rules,
-            "是否保留重写SQL": True,
         }
         result = parse_llm_json_with_default(response, fallback)
         if not isinstance(result, dict):
             return fallback
         result.setdefault("terminate", True)
         result.setdefault("reason", "")
-        result.setdefault("应用的规则", applied_rules)
-        result.setdefault("是否保留重写SQL", True)
-        result["应用的规则"] = applied_rules
         return result
 
 
@@ -580,12 +718,14 @@ class RewriteAgent(Agent):
         4. **只输出一个 JSON 对象**（不要 <rewrite> 标签、不要 markdown）。字段：
            - groups: 字符串 "{groups}"
            - applied_rules: 数组，与当前序列一致：{json.dumps(applied_rules, ensure_ascii=False)}
-           - original_sql: 字符串，与上方 <original_sql> 全文相同（注意 JSON 字符串转义）
            - rewritten_sql: 重写后的完整可执行 SQL（字符串内换行用 \\n）
-           - semantic_check: 语义等价性说明字符串
         """)
 
-        thought_chain = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        thought_chain = await self.llm.get_LLM_response_async(
+            prompt=prompt,
+            json_format=True,
+            json_schema=STRICT_JSON_SCHEMAS["rewrite"],
+        )
 
         try:
             parsed, _ = parse_llm_json(thought_chain, {})
@@ -593,7 +733,6 @@ class RewriteAgent(Agent):
                 parsed.setdefault("groups", groups)
                 parsed.setdefault("applied_rules", applied_rules)
                 parsed.setdefault("semantic_check", "")
-                parsed["original_sql"] = sql
                 return parsed
 
             rewrite_match = re.search(r"<rewrite>(.*?)</rewrite>", thought_chain, re.DOTALL)
@@ -603,7 +742,6 @@ class RewriteAgent(Agent):
                 parsed.setdefault("groups", groups)
                 parsed.setdefault("applied_rules", applied_rules)
                 parsed.setdefault("semantic_check", "")
-                parsed["original_sql"] = sql
                 return parsed
 
             # If JSON parsing failed, try to extract SQL from response
@@ -616,7 +754,6 @@ class RewriteAgent(Agent):
                 return {
                     "groups": groups,
                     "applied_rules": applied_rules,
-                    "original_sql": sql,
                     "rewritten_sql": extracted_sql,
                     "parse_error": True  # Flag to indicate parsing error
                 }
@@ -624,7 +761,6 @@ class RewriteAgent(Agent):
             return {
                 "groups": groups,
                 "applied_rules": applied_rules,
-                "original_sql": sql,
                 "rewritten_sql": sql,  # fallback to original
                 "parse_error": True
             }
@@ -638,7 +774,6 @@ class RewriteAgent(Agent):
                 return {
                     "groups": groups,
                     "applied_rules": applied_rules,
-                    "original_sql": sql,
                     "rewritten_sql": extracted_sql,
                     "parse_error": True,
                     "error_info": f"JSON解析错误: {str(e)}"
@@ -647,7 +782,6 @@ class RewriteAgent(Agent):
             return {
                 "groups": groups,
                 "applied_rules": applied_rules,
-                "original_sql": sql,
                 "rewritten_sql": sql,
                 "parse_error": True,
                 "error_info": f"JSON解析错误: {str(e)}"
@@ -691,7 +825,11 @@ class RewriteAgent(Agent):
         输出要求：**只输出一个 JSON 对象**（不要 markdown），格式：
         {{"fixed_sql": "修复后的完整 SQL 单行或合理换行", "note": "一句话说明如何修复"}}
         """)
-        resp = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        resp = await self.llm.get_LLM_response_async(
+            prompt=prompt,
+            json_format=True,
+            json_schema=STRICT_JSON_SCHEMAS["semantic_fix"],
+        )
         data = parse_llm_json_with_default(resp, {})
         fixed = data.get("fixed_sql") or data.get("rewritten_sql") or ""
         return fixed.strip() if isinstance(fixed, str) else ""
@@ -749,7 +887,11 @@ class RewriteAgent(Agent):
         {json.dumps(previous_rewrite, ensure_ascii=False, indent=2)}
         """)
 
-        response = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        response = await self.llm.get_LLM_response_async(
+            prompt=prompt,
+            json_format=True,
+            json_schema=STRICT_JSON_SCHEMAS["iterative_rewrite"],
+        )
         data = parse_llm_json_with_default(response, {})
         rewritten_sql = data.get("rewritten_sql") if isinstance(data, dict) else ""
         if isinstance(rewritten_sql, str) and rewritten_sql.strip():
@@ -1003,6 +1145,10 @@ class SemanticCheckAgent(Agent):
         }}
         equivalent 为 true 时 differences 必须为 []。
         """)
-        response = await self.llm.get_LLM_response_async(prompt=prompt, json_format=True)
+        response = await self.llm.get_LLM_response_async(
+            prompt=prompt,
+            json_format=True,
+            json_schema=STRICT_JSON_SCHEMAS["semantic_equivalence"],
+        )
         return self._parse_equivalence_response(response)
 

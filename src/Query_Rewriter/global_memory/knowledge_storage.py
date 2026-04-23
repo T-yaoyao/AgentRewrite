@@ -32,7 +32,7 @@ class KnowledgeStorage:
         metadata: Optional[Dict] = None
     ) -> Optional[str]:
         """
-        Store a successful optimization case
+        Store a kept rewrite case: rewritten SQL must differ from original and yield a SQL fingerprint.
         
         Args:
             original_sql: Original SQL query
@@ -46,18 +46,10 @@ class KnowledgeStorage:
         Returns:
             Record ID if stored successfully, None otherwise
         """
-        # Only store if optimization was successful (cost reduced)
-        if original_cost <= 0:
-            print(f"⚠️ 跳过存储：原始成本为0或负数 ({original_cost})")
+        if not rewritten_sql or (rewritten_sql.strip() == original_sql.strip()):
+            print("⚠️ 跳过存储：重写 SQL 与原始相同或为空")
             return None
-        
-        if rewritten_cost >= original_cost:
-            print(f"⚠️ 跳过存储：重写成本 ({rewritten_cost}) >= 原始成本 ({original_cost})")
-            return None
-        
-        # Calculate cost reduction rate
-        cost_reduction_rate = (original_cost - rewritten_cost) / original_cost
-        
+
         # Generate fingerprint from original SQL
         fingerprint = self.fingerprint_generator.get_template(original_sql)
         
@@ -74,20 +66,22 @@ class KnowledgeStorage:
         
         # Store in vector database
         try:
+            if original_cost > 0:
+                cost_reduction_rate = (original_cost - rewritten_cost) / original_cost
+                cost_note = f"{cost_reduction_rate * 100:.2f}%"
+            else:
+                cost_note = "N/A（原始估计代价为0或未解析）"
             print(f"💾 正在存储优化案例到向量数据库...")
             print(f"   - SQL指纹长度: {len(fingerprint)}")
             print(f"   - 规则序列: {rule_sequence}")
             print(f"   - 优化组别: {groups}")
-            print(f"   - 成本降低率: {cost_reduction_rate*100:.2f}%")
+            print(f"   - 估计代价: 原始={original_cost}, 重写={rewritten_cost}，相对变化: {cost_note}")
             
             record_id = self.vector_store.add(
                 sql_fingerprint=fingerprint,
                 rule_sequence=rule_sequence,
                 groups=groups,
-                cost_reduction_rate=cost_reduction_rate,
-                original_cost=original_cost,
-                rewritten_cost=rewritten_cost,
-                metadata=storage_metadata
+                metadata=storage_metadata,
             )
             
             if record_id:

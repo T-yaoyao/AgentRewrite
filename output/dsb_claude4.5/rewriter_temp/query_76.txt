@@ -2,102 +2,152 @@ Query ID: 76
 ==================================================
 
 Original: select    min(s_store_name)   ,min(s_company_id)   ,min(s_street_number)   ,min(s_street_name)   ,min(s_suite_number)   ,min(s_city)   ,min(s_zip)   ,min(ss_ticket_number)   ,min(ss_sold_date_sk)   ,min(sr_returned_date_sk)   ,min(ss_item_sk)   ,min(d1.d_date_sk) from    store_sales   ,store_returns   ,store   ,date_dim d1   ,date_dim d2 where     d2.d_moy = 8 and ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk and ss_sold_date_sk   = d1.d_date_sk and sr_returned_date_sk   = d2.d_date_sk and ss_customer_sk = sr_customer_sk and ss_store_sk = s_store_sk and sr_store_sk = s_store_sk and d1.d_date between (d2.d_date - interval '120' day)                and d2.d_date and d1.d_dow = 2 and s_state in ('GA','IL','OH')  ;
-Rewritten: WITH filtered_d2 AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_moy = 8),
-     filtered_store AS (SELECT s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name, s_suite_number, s_city, s_zip FROM store WHERE s_state IN ('GA','IL','OH')),
-     filtered_d1 AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_dow = 2)
-SELECT min(s_store_name),
-       min(s_company_id),
-       min(s_street_number),
-       min(s_street_name),
-       min(s_suite_number),
-       min(s_city),
-       min(s_zip),
-       min(ss_ticket_number),
-       min(ss_sold_date_sk),
-       min(sr_returned_date_sk),
-       min(ss_item_sk),
-       min(filtered_d1.d_date_sk)
-FROM (SELECT ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, ss_sold_date_sk
-      FROM store_sales
-      WHERE ss_customer_sk IS NOT NULL AND ss_store_sk IS NOT NULL AND ss_sold_date_sk IS NOT NULL) AS store_sales
-JOIN (SELECT sr_ticket_number, sr_item_sk, sr_customer_sk, sr_store_sk, sr_returned_date_sk
-      FROM store_returns
-      WHERE sr_customer_sk IS NOT NULL AND sr_store_sk IS NOT NULL AND sr_returned_date_sk IS NOT NULL) AS store_returns
-  ON store_sales.ss_ticket_number = store_returns.sr_ticket_number
- AND store_sales.ss_item_sk = store_returns.sr_item_sk
- AND store_sales.ss_customer_sk = store_returns.sr_customer_sk
-JOIN filtered_store
-  ON store_sales.ss_store_sk = filtered_store.s_store_sk
- AND store_returns.sr_store_sk = filtered_store.s_store_sk
-JOIN filtered_d1
-  ON store_sales.ss_sold_date_sk = filtered_d1.d_date_sk
-JOIN filtered_d2
-  ON store_returns.sr_returned_date_sk = filtered_d2.d_date_sk
-WHERE filtered_d1.d_date BETWEEN (filtered_d2.d_date - INTERVAL '120' DAY) AND filtered_d2.d_date;
-Time Cost: 365.36s
-Suggestion: [{'group': '连接优化', 'produced_suggestion': '考虑将 store_returns 和 store_sales 之间的 Nested Loop 连接优化为更高效的 Hash Join 或 Merge Join，调整连接顺序，先使用小表过滤减少数据量。'}, {'group': '谓词简化', 'produced_suggestion': "将过滤条件 d2.d_moy = 8 和 s_state in ('GA','IL','OH') 下推至对应表的扫描阶段，减少数据量，避免 Seq Scan 的全表扫描。"}, {'group': '子查询优化', 'produced_suggestion': '考虑将复杂多表连接拆分为多个 CTE 或内联视图，实现阶段性过滤和连接，分解查询提升并行度和效率。'}, {'group': '聚合优化', 'produced_suggestion': 'min 聚合函数在多列上执行，考虑先裁剪列再按连接进行聚合下推，减少数据量和计算复杂度。'}, {'group': '投影优化', 'produced_suggestion': '只选择查询中真正需要的列，避免不必要的列参与连接和聚合，减少传输和计算代价。'}]
+Rewritten: WITH d2_filtered AS (
+    SELECT d_date_sk, d_date
+    FROM date_dim
+    WHERE d_moy = 8
+      AND d_date_sk IS NOT NULL
+),
+d1_filtered AS (
+    SELECT d_date_sk, d_date
+    FROM date_dim
+    WHERE d_dow = 2
+      AND d_date_sk IS NOT NULL
+),
+store_filtered AS (
+    SELECT s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name,
+           s_suite_number, s_city, s_zip
+    FROM store
+    WHERE s_state IN ('GA', 'IL', 'OH')
+      AND s_store_sk IS NOT NULL
+),
+sr_base AS (
+    SELECT sr_ticket_number, sr_item_sk, sr_customer_sk, sr_store_sk, sr_returned_date_sk
+    FROM store_returns
+    WHERE sr_ticket_number IS NOT NULL
+      AND sr_item_sk IS NOT NULL
+      AND sr_returned_date_sk IS NOT NULL
+      AND sr_customer_sk IS NOT NULL
+      AND sr_store_sk IS NOT NULL
+),
+ss_base AS (
+    SELECT ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, ss_sold_date_sk
+    FROM store_sales
+    WHERE ss_ticket_number IS NOT NULL
+      AND ss_item_sk IS NOT NULL
+      AND ss_sold_date_sk IS NOT NULL
+      AND ss_customer_sk IS NOT NULL
+      AND ss_store_sk IS NOT NULL
+)
+SELECT
+    min(sf.s_store_name),
+    min(sf.s_company_id),
+    min(sf.s_street_number),
+    min(sf.s_street_name),
+    min(sf.s_suite_number),
+    min(sf.s_city),
+    min(sf.s_zip),
+    min(ss.ss_ticket_number),
+    min(ss.ss_sold_date_sk),
+    min(sr.sr_returned_date_sk),
+    min(ss.ss_item_sk),
+    min(d1.d_date_sk)
+FROM ss_base ss
+JOIN sr_base sr
+    ON ss.ss_ticket_number = sr.sr_ticket_number
+   AND ss.ss_item_sk = sr.sr_item_sk
+   AND ss.ss_customer_sk = sr.sr_customer_sk
+JOIN store_filtered sf
+    ON ss.ss_store_sk = sf.s_store_sk
+   AND sr.sr_store_sk = sf.s_store_sk
+JOIN d1_filtered d1
+    ON ss.ss_sold_date_sk = d1.d_date_sk
+JOIN d2_filtered d2
+    ON sr.sr_returned_date_sk = d2.d_date_sk
+   AND d1.d_date BETWEEN (d2.d_date - INTERVAL '120' DAY) AND d2.d_date
+;
+Time Cost: 163.65s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '优化连接顺序：先用date_dim d2的高选择性过滤条件(d_moy=8)过滤，再与store_returns连接，避免大表全扫描后再过滤。建议调整为：先连接d2和store_returns(通过sr_returned_date_sk)，利用d2的过滤条件减少中间结果集。'}, {'group': '连接优化', 'produced_suggestion': '将Nested Loop连接转换为Hash Join：store_returns与store_sales的连接当前使用Nested Loop(外表719万行)效率极低，建议改为Hash Join，以ss_ticket_number和ss_item_sk作为Hash条件，可大幅降低连接代价。'}, {'group': '谓词简化', 'produced_suggestion': "过滤条件下推：将d1.d_dow=2和s_state in ('GA','IL','OH')等高选择性条件尽早应用，在连接前过滤date_dim d1和store表，减少参与连接的数据量。特别是s_state条件可在store表扫描时直接应用。"}, {'group': '连接优化', 'produced_suggestion': "利用日期范围条件优化：d1.d_date between (d2.d_date - interval '120' day) and d2.d_date这个条件涉及两个date_dim表，建议先确定d2的日期范围(d_moy=8)，再用这个范围反推d1的可能日期范围，提前过滤d1表。"}, {'group': '子查询优化', 'produced_suggestion': '考虑CTE分解策略：将复杂的多表连接分解为多个CTE，先处理高选择性的date_dim过滤和store过滤，再逐步连接事实表。参考历史案例的STRATEGY_CTE_DECOMPOSITION规则，可提升优化器对各子查询的优化效果。'}, {'group': '聚合优化', 'produced_suggestion': '聚合函数简化：查询中所有列都使用MIN聚合且无GROUP BY，实际只需返回一行。可考虑添加LIMIT 1并移除不必要的MIN函数，或者在确认业务逻辑后简化聚合逻辑。'}]
 🔍 开始初始优化可行性检查...
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
+```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示 store_returns 表存在大量 Seq Scan，代价占比超过60%，且 store_returns 和 store_sales 之间存在高代价 Nested Loop 连接，说明当前连接方法不够高效。SQL中涉及多表连接和多个过滤条件，存在优化空间。统计信息显示 store_sales 表数据量较大，当前执行计划未充分利用索引和过滤下推，导致大表全扫描和低效连接。",
+  "reason": "执行计划显示存在严重性能瓶颈：1) store_returns表全表扫描代价占比61.2%，涉及719万行数据；2) Nested Loop连接代价占比34.1%，外表719万行与内表2880万行进行嵌套循环连接效率极低；3) 多表连接顺序未优化，导致中间结果集过大。历史案例显示相似SQL通过CTE分解、连接条件下推、连接顺序调整等规则可显著提升性能。",
   "advice": [
     {
       "group": "连接优化",
-      "produced_suggestion": "考虑将 store_returns 和 store_sales 之间的 Nested Loop 连接优化为更高效的 Hash Join 或 Merge Join，调整连接顺序，先使用小表过滤减少数据量。"
+      "produced_suggestion": "优化连接顺序：先用date_dim d2的高选择性过滤条件(d_moy=8)过滤，再与store_returns连接，避免大表全扫描后再过滤。建议调整为：先连接d2和store_returns(通过sr_returned_date_sk)，利用d2的过滤条件减少中间结果集。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将Nested Loop连接转换为Hash Join：store_returns与store_sales的连接当前使用Nested Loop(外表719万行)效率极低，建议改为Hash Join，以ss_ticket_number和ss_item_sk作为Hash条件，可大幅降低连接代价。"
     },
     {
       "group": "谓词简化",
-      "produced_suggestion": "将过滤条件 d2.d_moy = 8 和 s_state in ('GA','IL','OH') 下推至对应表的扫描阶段，减少数据量，避免 Seq Scan 的全表扫描。"
+      "produced_suggestion": "过滤条件下推：将d1.d_dow=2和s_state in ('GA','IL','OH')等高选择性条件尽早应用，在连接前过滤date_dim d1和store表，减少参与连接的数据量。特别是s_state条件可在store表扫描时直接应用。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用日期范围条件优化：d1.d_date between (d2.d_date - interval '120' day) and d2.d_date这个条件涉及两个date_dim表，建议先确定d2的日期范围(d_moy=8)，再用这个范围反推d1的可能日期范围，提前过滤d1表。"
     },
     {
       "group": "子查询优化",
-      "produced_suggestion": "考虑将复杂多表连接拆分为多个 CTE 或内联视图，实现阶段性过滤和连接，分解查询提升并行度和效率。"
+      "produced_suggestion": "考虑CTE分解策略：将复杂的多表连接分解为多个CTE，先处理高选择性的date_dim过滤和store过滤，再逐步连接事实表。参考历史案例的STRATEGY_CTE_DECOMPOSITION规则，可提升优化器对各子查询的优化效果。"
     },
     {
       "group": "聚合优化",
-      "produced_suggestion": "min 聚合函数在多列上执行，考虑先裁剪列再按连接进行聚合下推，减少数据量和计算复杂度。"
-    },
-    {
-      "group": "投影优化",
-      "produced_suggestion": "只选择查询中真正需要的列，避免不必要的列参与连接和聚合，减少传输和计算代价。"
+      "produced_suggestion": "聚合函数简化：查询中所有列都使用MIN聚合且无GROUP BY，实际只需返回一行。可考虑添加LIMIT 1并移除不必要的MIN函数，或者在确认业务逻辑后简化聚合逻辑。"
     }
   ]
 }
+```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 74 rules
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.205
+📊 UCT scored 71 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.208
    → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
    → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
 {
-  "groups": "连接优化, 谓词简化, 子查询优化, 聚合优化, 投影优化",
-  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE"],
+  "groups": "连接优化, 谓词简化, 子查询优化, 聚合优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_INTO_JOIN",
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE",
+    "JOIN_CONDITION_PUSH",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
   "rule_effect_scores": {
-    "STRATEGY_CTE_DECOMPOSITION": 0.3,
+    "STRATEGY_CTE_DECOMPOSITION": 0.25,
     "FILTER_INTO_JOIN": 0.2,
     "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.2,
     "JOIN_CONDITION_PUSH": 0.2,
-    "PROJECT_JOIN_TRANSPOSE": 0.1
+    "PROJECT_JOIN_TRANSPOSE": 0.15
   },
   "rule_effect_confidence": {
-    "STRATEGY_CTE_DECOMPOSITION": 0.8,
-    "FILTER_INTO_JOIN": 0.8,
-    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.8,
-    "JOIN_CONDITION_PUSH": 0.8,
-    "PROJECT_JOIN_TRANSPOSE": 0.8
+    "STRATEGY_CTE_DECOMPOSITION": 0.85,
+    "FILTER_INTO_JOIN": 0.85,
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.85,
+    "JOIN_CONDITION_PUSH": 0.85,
+    "PROJECT_JOIN_TRANSPOSE": 0.85
   }
 }
 ✅ 选择了 5 个规则
 🔧 开始SQL重写...
-```{
-  "groups": "连接优化, 谓词简化, 子查询优化, 聚合优化, 投影优化",
-  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE"],
-  "original_sql": "select    min(s_store_name)   ,min(s_company_id)   ,min(s_street_number)   ,min(s_street_name)   ,min(s_suite_number)   ,min(s_city)   ,min(s_zip)   ,min(ss_ticket_number)   ,min(ss_sold_date_sk)   ,min(sr_returned_date_sk)   ,min(ss_item_sk)   ,min(d1.d_date_sk) from    store_sales   ,store_returns   ,store   ,date_dim d1   ,date_dim d2 where     d2.d_moy = 8 and ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk and ss_sold_date_sk   = d1.d_date_sk and sr_returned_date_sk   = d2.d_date_sk and ss_customer_sk = sr_customer_sk and ss_store_sk = s_store_sk and sr_store_sk = s_store_sk and d1.d_date between (d2.d_date - interval '120' day)                and d2.d_date and d1.d_dow = 2 and s_state in ('GA','IL','OH')  ;",
-  "rewritten_sql": "WITH filtered_d2 AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_moy = 8),\n     filtered_store AS (SELECT s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name, s_suite_number, s_city, s_zip FROM store WHERE s_state IN ('GA','IL','OH')),\n     filtered_d1 AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_dow = 2)\nSELECT min(s_store_name),\n       min(s_company_id),\n       min(s_street_number),\n       min(s_street_name),\n       min(s_suite_number),\n       min(s_city),\n       min(s_zip),\n       min(ss_ticket_number),\n       min(ss_sold_date_sk),\n       min(sr_returned_date_sk),\n       min(ss_item_sk),\n       min(filtered_d1.d_date_sk)\nFROM (SELECT ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, ss_sold_date_sk\n      FROM store_sales\n      WHERE ss_customer_sk IS NOT NULL AND ss_store_sk IS NOT NULL AND ss_sold_date_sk IS NOT NULL) AS store_sales\nJOIN (SELECT sr_ticket_number, sr_item_sk, sr_customer_sk, sr_store_sk, sr_returned_date_sk\n      FROM store_returns\n      WHERE sr_customer_sk IS NOT NULL AND sr_store_sk IS NOT NULL AND sr_returned_date_sk IS NOT NULL) AS store_returns\n  ON store_sales.ss_ticket_number = store_returns.sr_ticket_number\n AND store_sales.ss_item_sk = store_returns.sr_item_sk\n AND store_sales.ss_customer_sk = store_returns.sr_customer_sk\nJOIN filtered_store\n  ON store_sales.ss_store_sk = filtered_store.s_store_sk\n AND store_returns.sr_store_sk = filtered_store.s_store_sk\nJOIN filtered_d1\n  ON store_sales.ss_sold_date_sk = filtered_d1.d_date_sk\nJOIN filtered_d2\n  ON store_returns.sr_returned_date_sk = filtered_d2.d_date_sk\nWHERE filtered_d1.d_date BETWEEN (filtered_d2.d_date - INTERVAL '120' DAY) AND filtered_d2.d_date;",
-  "semantic_check": "重写后SQL保持语义等价性：\n1. 通过CTE提前过滤date_dim和store表，减少连接数据量\n2. 显式添加IS NOT NULL约束确保连接有效性\n3. 将空值过滤下推至子查询减少中间结果\n4. 投影下推仅选择必要列\n5. 所有连接条件/过滤条件与原始SQL逻辑一致\n6. 聚合函数作用对象和结果集结构完全不变"
-  }
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化, 聚合优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_INTO_JOIN",
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE",
+    "JOIN_CONDITION_PUSH",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "WITH d2_filtered AS (\n    SELECT d_date_sk, d_date\n    FROM date_dim\n    WHERE d_moy = 8\n      AND d_date_sk IS NOT NULL\n),\nd1_filtered AS (\n    SELECT d_date_sk, d_date\n    FROM date_dim\n    WHERE d_dow = 2\n      AND d_date_sk IS NOT NULL\n),\nstore_filtered AS (\n    SELECT s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name,\n           s_suite_number, s_city, s_zip\n    FROM store\n    WHERE s_state IN ('GA', 'IL', 'OH')\n      AND s_store_sk IS NOT NULL\n),\nsr_base AS (\n    SELECT sr_ticket_number, sr_item_sk, sr_customer_sk, sr_store_sk, sr_returned_date_sk\n    FROM store_returns\n    WHERE sr_ticket_number IS NOT NULL\n      AND sr_item_sk IS NOT NULL\n      AND sr_returned_date_sk IS NOT NULL\n      AND sr_customer_sk IS NOT NULL\n      AND sr_store_sk IS NOT NULL\n),\nss_base AS (\n    SELECT ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, ss_sold_date_sk\n    FROM store_sales\n    WHERE ss_ticket_number IS NOT NULL\n      AND ss_item_sk IS NOT NULL\n      AND ss_sold_date_sk IS NOT NULL\n      AND ss_customer_sk IS NOT NULL\n      AND ss_store_sk IS NOT NULL\n)\nSELECT\n    min(sf.s_store_name),\n    min(sf.s_company_id),\n    min(sf.s_street_number),\n    min(sf.s_street_name),\n    min(sf.s_suite_number),\n    min(sf.s_city),\n    min(sf.s_zip),\n    min(ss.ss_ticket_number),\n    min(ss.ss_sold_date_sk),\n    min(sr.sr_returned_date_sk),\n    min(ss.ss_item_sk),\n    min(d1.d_date_sk)\nFROM ss_base ss\nJOIN sr_base sr\n    ON ss.ss_ticket_number = sr.sr_ticket_number\n   AND ss.ss_item_sk = sr.sr_item_sk\n   AND ss.ss_customer_sk = sr.sr_customer_sk\nJOIN store_filtered sf\n    ON ss.ss_store_sk = sf.s_store_sk\n   AND sr.sr_store_sk = sf.s_store_sk\nJOIN d1_filtered d1\n    ON ss.ss_sold_date_sk = d1.d_date_sk\nJOIN d2_filtered d2\n    ON sr.sr_returned_date_sk = d2.d_date_sk\n   AND d1.d_date BETWEEN (d2.d_date - INTERVAL '120' DAY) AND d2.d_date\n;"
+}
+```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -107,31 +157,27 @@ DBMS_syntax_Tool ends...
 ```json
 {
   "equivalent": true,
-  "message": "采纳 semantic_check 全部主张：CTE拆分、IS NOT NULL推导（源于等值INNER JOIN自然过滤NULL）、谓词下推、投影下推均不改变最终行集，所有连接条件与过滤条件逻辑完全一致，聚合列对象和结构不变，两SQL等价。",
+  "message": "重写SQL通过CTE分解将WHERE过滤条件推入各子查询，并将隐式笛卡尔积+WHERE改写为等价的显式INNER JOIN；所有新增IS NOT NULL过滤均作用于JOIN键列，其中PK列本身不可为NULL，其余可空列在原始SQL的等值JOIN条件下NULL行已被隐式排除，故结果集完全一致。",
   "differences": []
 }
 ```
 ✅ 语义等价
 📊 开始评估优化结果...
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-{"terminate": true, "reason": "重写SQL成本从247445.02降至238297.74，减少约3.7%。主要瓶颈仍是store_returns的全量Seq Scan（7198194行）和store_returns与store_sales之间的Nested Loop Join，这是大表全表扫描导致的固有瓶颈，无法通过查询重写进一步消除。重写SQL通过CTE分解、谓词下推（IS NOT NULL过滤、状态过滤、月份过滤）在逻辑层面更清晰、结构更优，且Nested Loop自身消耗从86987.76降至78695.82，有实际改善。继续重写优化空间有限，主要瓶颈需依赖索引等物理优化手段解决，终止优化并保留重写SQL。", "是否保留重写SQL": true}
+{"terminate": true, "reason": "重写costs（234491.94）严格小于原始costs（243503.66），且重写通过CTE将过滤条件提前应用于各表（d2_filtered/d1_filtered/store_filtered）并扁平化为显式JOIN，结构更清晰、复杂度未增加，符合§0快捷规则，直接接受并结束多轮优化。", "保留重写SQL": true}
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 626
    - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_INTO_JOIN', 'JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE', 'JOIN_CONDITION_PUSH', 'PROJECT_JOIN_TRANSPOSE']
-   - 优化组别: 连接优化, 谓词简化, 子查询优化, 聚合优化, 投影优化
-   - 成本降低率: 3.70%
-✅ 成功存储，记录ID: 614166de-2522-4d5e-9a97-8f37be0e2977
+   - 优化组别: 连接优化, 谓词简化, 子查询优化, 聚合优化
+   - 估计代价: 原始=243503.66, 重写=234491.94，相对变化: 3.70%
+✅ 成功存储，记录ID: 3435171e-4b19-42bc-83bd-98fb2b771115
 
-🎲 UCT Math Update: 5 rules, reward=+0.0370 (oc=247445.0200, rc=238297.7400)
+🎲 UCT Math Update: 5 rules, reward=+0.0370 (oc=243503.6600, rc=234491.9400)
 ✅ UCT Update Complete:
-   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.300, conf=0.80, lambda=0.40, reward=+0.010, count=32, avg=+0.172
-   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.200, conf=0.80, lambda=0.40, reward=+0.008, count=38, avg=+0.093
-   → JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE: P(s,a)=N/A, effect=0.200, conf=0.80, lambda=0.40, reward=+0.007, count=7, avg=+0.002
-   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.200, conf=0.80, lambda=0.40, reward=+0.007, count=23, avg=+0.064
-   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.100, conf=0.80, lambda=0.40, reward=+0.005, count=27, avg=+0.090
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.250, conf=0.85, lambda=0.42, reward=+0.009, count=63, avg=+0.133
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.200, conf=0.85, lambda=0.42, reward=+0.008, count=70, avg=+0.060
+   → JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE: P(s,a)=N/A, effect=0.200, conf=0.85, lambda=0.42, reward=+0.007, count=23, avg=+0.002
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.200, conf=0.85, lambda=0.42, reward=+0.007, count=49, avg=+0.036
+   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.150, conf=0.85, lambda=0.42, reward=+0.006, count=48, avg=+0.057
 
 ----------------------------------------
 

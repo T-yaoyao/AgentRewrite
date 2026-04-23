@@ -2,81 +2,84 @@ Query ID: 72
 ==================================================
 
 Original: select    min(w_state)   ,min(i_item_id)   ,min(cs_item_sk)   ,min(cs_order_number)   ,min(cr_item_sk)   ,min(cr_order_number)  from    catalog_sales left outer join catalog_returns on        (cs_order_number = cr_order_number         and cs_item_sk = cr_item_sk)   ,warehouse   ,item   ,date_dim  where  i_item_sk          = cs_item_sk  and cs_warehouse_sk    = w_warehouse_sk  and cs_sold_date_sk    = d_date_sk  and d_date between (cast ('2000-05-08' as date) - interval '30' day)                 and (cast ('2000-05-08' as date) + interval '30' day)   and i_category  = 'Books'  and i_manager_id between 61 and 100  and cs_wholesale_cost between 81 and 100  and cr_reason_sk = 40 ;
-Rewritten: SELECT min(w_state), min(i_item_id), min(cs_item_sk), min(cs_order_number), min(cr_item_sk), min(cr_order_number)
-FROM
-   catalog_sales
-   LEFT JOIN LATERAL (
-       SELECT * 
-       FROM catalog_returns 
-       WHERE catalog_sales.cs_order_number = catalog_returns.cr_order_number 
-         AND catalog_sales.cs_item_sk = catalog_returns.cr_item_sk
-         AND catalog_returns.cr_reason_sk = 40
-   ) AS catalog_returns ON TRUE
-   , warehouse, item, date_dim
-WHERE 
-   i_item_sk = cs_item_sk
-   AND cs_warehouse_sk = w_warehouse_sk
-   AND cs_sold_date_sk = d_date_sk
-   AND d_date BETWEEN (CAST('2000-05-08' AS DATE) - INTERVAL '30' DAY) AND (CAST('2000-05-08' AS DATE) + INTERVAL '30' DAY)
-   AND i_category = 'Books'
-   AND i_manager_id BETWEEN 61 AND 100
-   AND cs_wholesale_cost BETWEEN 81 AND 100
-   AND catalog_returns.cr_reason_sk IS NOT NULL;
-Time Cost: 328.16s
-Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将过滤条件 cr_reason_sk = 40 推送到 catalog_returns 表扫描阶段，避免全表扫描带来的高代价。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，优先过滤小表和高选择性过滤条件，减少关联数据量，避免大表和无索引表的笛卡尔积式扫描。'}, {'group': '子查询优化', 'produced_suggestion': '如果可能，将左外连接改写为内连接或使用 CTE，分解复杂的连接逻辑，减少不必要的数据量。'}, {'group': '投影优化', 'produced_suggestion': '避免使用过多min函数同时处理多列，视需求只选取必要列，减少数据传输和计算。'}]
+Rewritten: WITH cr_filtered AS (
+  SELECT cr_item_sk, cr_order_number
+  FROM catalog_returns
+  WHERE cr_reason_sk = 40
+)
+SELECT
+  MIN(w_state),
+  MIN(i_item_id),
+  MIN(cs_item_sk),
+  MIN(cs_order_number),
+  MIN(cr_item_sk),
+  MIN(cr_order_number)
+FROM catalog_sales
+INNER JOIN cr_filtered ON cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk
+INNER JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+INNER JOIN item ON i_item_sk = cs_item_sk
+  AND i_category = 'Books'
+  AND i_manager_id BETWEEN 61 AND 100
+INNER JOIN date_dim ON cs_sold_date_sk = d_date_sk
+  AND d_date BETWEEN (CAST('2000-05-08' AS DATE) - INTERVAL '30' DAY)
+                 AND (CAST('2000-05-08' AS DATE) + INTERVAL '30' DAY)
+WHERE cs_wholesale_cost BETWEEN 81 AND 100
+Time Cost: 108.18s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '将LEFT OUTER JOIN转换为INNER JOIN：由于后续过滤条件cr_reason_sk=40作用于catalog_returns表，LEFT JOIN实际已退化为INNER JOIN语义，显式改写为INNER JOIN可让优化器选择更优的连接顺序和方法'}, {'group': '谓词简化', 'produced_suggestion': '将cr_reason_sk=40过滤条件前置到JOIN条件中：避免catalog_returns全表扫描后再过滤，建议在JOIN前通过子查询或CTE先过滤catalog_returns表，减少参与连接的数据量'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：优先连接小表和过滤后的表，建议先连接date_dim(日期范围过滤)、item(category和manager_id过滤)、warehouse，再连接catalog_sales，最后连接过滤后的catalog_returns，减少中间结果集'}, {'group': '子查询优化', 'produced_suggestion': '考虑CTE分解策略：将catalog_returns的过滤逻辑提取为CTE，先执行WHERE cr_reason_sk=40的过滤，然后再参与主查询连接，利用物化减少重复扫描'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
+```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示 catalog_returns 表上存在高代价的 Seq Scan，占比82.5%，且该表有215万行数据。过滤条件 cr_reason_sk=40 未命中索引，导致全表扫描。SQL中多表连接且过滤条件较多，存在潜在连接顺序不合理和谓词下推不足的问题，查询结构较复杂，具备查询重写优化空间。",
+  "reason": "执行计划显示catalog_returns表全表扫描代价占比82.3%，且该表有2158260行数据，仅通过cr_reason_sk=40过滤。LEFT OUTER JOIN后续又通过Nested Loop进行内连接，说明LEFT JOIN可能退化为INNER JOIN。此外，相似历史案例显示该SQL指纹曾成功应用JOIN_TO_CORRELATE、FILTER_CORRELATE等优化规则。可通过连接优化、谓词简化和子查询优化提升性能。",
   "advice": [
     {
+      "group": "连接优化",
+      "produced_suggestion": "将LEFT OUTER JOIN转换为INNER JOIN：由于后续过滤条件cr_reason_sk=40作用于catalog_returns表，LEFT JOIN实际已退化为INNER JOIN语义，显式改写为INNER JOIN可让优化器选择更优的连接顺序和方法"
+    },
+    {
       "group": "谓词简化",
-      "produced_suggestion": "将过滤条件 cr_reason_sk = 40 推送到 catalog_returns 表扫描阶段，避免全表扫描带来的高代价。"
+      "produced_suggestion": "将cr_reason_sk=40过滤条件前置到JOIN条件中：避免catalog_returns全表扫描后再过滤，建议在JOIN前通过子查询或CTE先过滤catalog_returns表，减少参与连接的数据量"
     },
     {
       "group": "连接优化",
-      "produced_suggestion": "调整连接顺序，优先过滤小表和高选择性过滤条件，减少关联数据量，避免大表和无索引表的笛卡尔积式扫描。"
+      "produced_suggestion": "调整连接顺序：优先连接小表和过滤后的表，建议先连接date_dim(日期范围过滤)、item(category和manager_id过滤)、warehouse，再连接catalog_sales，最后连接过滤后的catalog_returns，减少中间结果集"
     },
     {
       "group": "子查询优化",
-      "produced_suggestion": "如果可能，将左外连接改写为内连接或使用 CTE，分解复杂的连接逻辑，减少不必要的数据量。"
-    },
-    {
-      "group": "投影优化",
-      "produced_suggestion": "避免使用过多min函数同时处理多列，视需求只选取必要列，减少数据传输和计算。"
+      "produced_suggestion": "考虑CTE分解策略：将catalog_returns的过滤逻辑提取为CTE，先执行WHERE cr_reason_sk=40的过滤，然后再参与主查询连接，利用物化减少重复扫描"
     }
   ]
 }
+```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 55 rules
-   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
-   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
-   → FILTER_VALUES_MERGE: UCT=1.100
+📊 UCT scored 52 rules
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_EXTRACT_FILTER: UCT=1.100
 {
-  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
-  "applied_rules": ["JOIN_TO_CORRELATE", "FILTER_CORRELATE"],
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN"],
   "rule_effect_scores": {
-    "JOIN_TO_CORRELATE": 0.6,
-    "FILTER_CORRELATE": 0.4
+    "STRATEGY_CTE_DECOMPOSITION": 0.6,
+    "FILTER_INTO_JOIN": 0.4
   },
   "rule_effect_confidence": {
-    "JOIN_TO_CORRELATE": 0.85,
-    "FILTER_CORRELATE": 0.9
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "FILTER_INTO_JOIN": 0.7
   }
 }
 ✅ 选择了 2 个规则
 🔧 开始SQL重写...
+```json
 {
-  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
-  "applied_rules": ["JOIN_TO_CORRELATE", "FILTER_CORRELATE"],
-  "original_sql": "select    min(w_state)   ,min(i_item_id)   ,min(cs_item_sk)   ,min(cs_order_number)   ,min(cr_item_sk)   ,min(cr_order_number)  from    catalog_sales left outer join catalog_returns on        (cs_order_number = cr_order_number         and cs_item_sk = cr_item_sk)   ,warehouse   ,item   ,date_dim  where  i_item_sk          = cs_item_sk  and cs_warehouse_sk    = w_warehouse_sk  and cs_sold_date_sk    = d_date_sk  and d_date between (cast ('2000-05-08' as date) - interval '30' day)                 and (cast ('2000-05-08' as date) + interval '30' day)   and i_category  = 'Books'  and i_manager_id between 61 and 100  and cs_wholesale_cost between 81 and 100  and cr_reason_sk = 40 ;",
-  "rewritten_sql": "SELECT min(w_state), min(i_item_id), min(cs_item_sk), min(cs_order_number), min(cr_item_sk), min(cr_order_number)\nFROM\n   catalog_sales\n   LEFT JOIN LATERAL (\n       SELECT * \n       FROM catalog_returns \n       WHERE catalog_sales.cs_order_number = catalog_returns.cr_order_number \n         AND catalog_sales.cs_item_sk = catalog_returns.cr_item_sk\n         AND catalog_returns.cr_reason_sk = 40\n   ) AS catalog_returns ON TRUE\n   , warehouse, item, date_dim\nWHERE \n   i_item_sk = cs_item_sk\n   AND cs_warehouse_sk = w_warehouse_sk\n   AND cs_sold_date_sk = d_date_sk\n   AND d_date BETWEEN (CAST('2000-05-08' AS DATE) - INTERVAL '30' DAY) AND (CAST('2000-05-08' AS DATE) + INTERVAL '30' DAY)\n   AND i_category = 'Books'\n   AND i_manager_id BETWEEN 61 AND 100\n   AND cs_wholesale_cost BETWEEN 81 AND 100\n   AND catalog_returns.cr_reason_sk IS NOT NULL;",
-  "semantic_check": "重写后的SQL与原始SQL语义等价。理由：1) 使用LATERAL子查询保持了左外连接的语义，同时将连接条件移至子查询内部；2) 将条件cr_reason_sk=40下推至子查询内部，并在外部使用IS NOT NULL条件过滤掉不匹配的行（由于子查询内部已确保匹配行的cr_reason_sk=40，因此IS NOT NULL等价于原始条件的效果）；3) 其他连接与过滤条件保持不变。最终结果集在列名、数据类型、排序顺序及聚合结果上均保持一致。"
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN"],
+  "rewritten_sql": "WITH cr_filtered AS (\n  SELECT cr_item_sk, cr_order_number\n  FROM catalog_returns\n  WHERE cr_reason_sk = 40\n)\nSELECT\n  MIN(w_state),\n  MIN(i_item_id),\n  MIN(cs_item_sk),\n  MIN(cs_order_number),\n  MIN(cr_item_sk),\n  MIN(cr_order_number)\nFROM catalog_sales\nINNER JOIN cr_filtered ON cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk\nINNER JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk\nINNER JOIN item ON i_item_sk = cs_item_sk\n  AND i_category = 'Books'\n  AND i_manager_id BETWEEN 61 AND 100\nINNER JOIN date_dim ON cs_sold_date_sk = d_date_sk\n  AND d_date BETWEEN (CAST('2000-05-08' AS DATE) - INTERVAL '30' DAY)\n                 AND (CAST('2000-05-08' AS DATE) + INTERVAL '30' DAY)\nWHERE cs_wholesale_cost BETWEEN 81 AND 100"
 }
+```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -85,33 +88,26 @@ DBMS_syntax_Tool ends...
 🧠 开始语义等价检查...
 ```json
 {
-  "equivalent": true,
-  "message": "采纳重写代理的 semantic_check 结论：重写SQL通过LATERAL子查询保持了原左外连接语义，下推cr_reason_sk=40条件且用IS NOT NULL等价过滤，最终结果全等价。",
-  "differences": []
+    "equivalent": true,
+    "message": "原始SQL的LEFT JOIN配合WHERE中cr_reason_sk=40过滤，语义等同于INNER JOIN；重写正确地将其转换为显式INNER JOIN并用CTE预过滤，所有谓词和聚合逻辑保持一致",
+    "differences": []
 }
 ```
 ✅ 语义等价
 📊 开始评估优化结果...
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
+```json
 {
   "terminate": true,
-  "reason": "重写后的SQL成本仅较原始SQL降低约0.08%，成本减少幅度非常有限，且两者执行计划中的主要性能瓶颈依然是 catalog_returns 表的全表扫描，且成本和过滤条件差异不大。逻辑上重写SQL结构更清晰，通过将连接改写为LATERAL子查询实现连接优化和谓词下推，提升了SQL的逻辑简洁性和可维护性，但执行计划未显著改善主要性能瓶颈，表明基于查询重写的优化空间已基本挖掘完毕。后续除非引入物理手段如索引，否则难以继续明显优化。符合终止优化条件2：成本基本持平且结构更优，推荐保留重写SQL继续使用。",
-  "是否保留重写SQL": true
+  "reason": "重写costs与原始costs相等(65898.22)，但重写SQL将LEFT OUTER JOIN改为INNER JOIN并通过CTE预过滤catalog_returns(cr_reason_sk=40)，结构更清晰且JOIN语义更明确，符合§1优化信号；已应用CTE分解与过滤下推，剩余优化空间有限",
+  "保留重写SQL": true
 }
+```
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 531
-   - 规则序列: ['JOIN_TO_CORRELATE', 'FILTER_CORRELATE']
-   - 优化组别: 谓词简化, 连接优化, 子查询优化, 投影优化
-   - 成本降低率: 0.08%
-✅ 成功存储，记录ID: c989cada-8b4d-4476-9bc0-f455f7be4209
-
-🎲 UCT Math Update: 2 rules, reward=+0.0008 (oc=65740.5300, rc=65690.3200)
-✅ UCT Update Complete:
-   → JOIN_TO_CORRELATE: P(s,a)=N/A, effect=0.600, conf=0.85, lambda=0.42, reward=+0.000, count=3, avg=+0.088
-   → FILTER_CORRELATE: P(s,a)=N/A, effect=0.400, conf=0.90, lambda=0.45, reward=+0.000, count=3, avg=+0.001
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_INTO_JOIN']
+   - 优化组别: 连接优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=65898.22, 重写=65898.22，相对变化: 0.00%
+✅ 成功存储，记录ID: 76cbadd1-112c-47fe-b422-7bf145ef7e29
 
 ----------------------------------------
 

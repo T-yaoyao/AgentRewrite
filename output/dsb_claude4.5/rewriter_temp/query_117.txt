@@ -2,103 +2,87 @@ Query ID: 117
 ==================================================
 
 Original: select  c_customer_id as customer_id        , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername  from customer      ,customer_address      ,customer_demographics      ,household_demographics      ,income_band      ,store_returns  where ca_city	        =  'Pleasant Hill'    and c_current_addr_sk = ca_address_sk    and ib_lower_bound   >=  35577    and ib_upper_bound   <=  35577 + 50000    and ib_income_band_sk = hd_income_band_sk    and cd_demo_sk = c_current_cdemo_sk    and hd_demo_sk = c_current_hdemo_sk    and sr_cdemo_sk = cd_demo_sk  order by c_customer_id  limit 100;
-Rewritten: WITH cd_sr AS (
-    SELECT cd.cd_demo_sk 
-    FROM customer_demographics cd 
-    JOIN store_returns sr ON cd.cd_demo_sk = sr.sr_cdemo_sk
-)
-SELECT c_customer_id AS customer_id, 
-       COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername
-FROM 
-    (SELECT c_customer_id, c_last_name, c_first_name, c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk 
-     FROM customer 
-     ORDER BY c_customer_id) AS customer,
-    (SELECT ca_address_sk, ca_city FROM customer_address) AS customer_address,
-    cd_sr,
-    (SELECT hd_income_band_sk, hd_demo_sk FROM household_demographics) AS household_demographics,
-    (SELECT ib_income_band_sk, ib_lower_bound, ib_upper_bound FROM income_band) AS income_band
-WHERE ca_city = 'Pleasant Hill'
-  AND c_current_addr_sk = ca_address_sk
-  AND ib_lower_bound >= 35577
-  AND ib_upper_bound <= 35577 + 50000
-  AND ib_income_band_sk = hd_income_band_sk
-  AND cd_sr.cd_demo_sk = c_current_cdemo_sk
-  AND hd_demo_sk = c_current_hdemo_sk
-ORDER BY c_customer_id
-LIMIT 100;
-Time Cost: 264.07s
-Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将store_returns表上过滤条件 (如 sr_cdemo_sk = cd_demo_sk) 及相关过滤提前下推，尽量减少大型表的全表扫描。'}, {'group': '连接优化', 'produced_suggestion': '调整多表连接顺序，优先连接过滤较多的小表，避免store_returns表的大量无谓连接导致全表扫描。'}, {'group': '子查询优化', 'produced_suggestion': '考虑将部分连接拆分为子查询或CTE，分步骤过滤大表数据后再关联，降低中间结果集大小。'}, {'group': '投影优化', 'produced_suggestion': '裁剪查询中不必要的列，减少列的传递，降低内存和I/O开销。'}, {'group': '排序优化', 'produced_suggestion': '考虑在索引支持下避免全表排序，或者先过滤再排序，结合LIMIT减少排序数据量。'}]
+Rewritten: SELECT c_customer_id AS customer_id, coalesce(c_last_name, '') || ', ' || coalesce(c_first_name, '') AS customername FROM customer JOIN customer_address ON c_current_addr_sk = ca_address_sk AND ca_city = 'Pleasant Hill' JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk JOIN income_band ON ib_income_band_sk = hd_income_band_sk AND ib_lower_bound >= 35577 AND ib_upper_bound <= 85577 JOIN store_returns ON sr_cdemo_sk = cd_demo_sk ORDER BY c_customer_id LIMIT 100
+Time Cost: 147.02s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '调整连接顺序：先连接小表customer_address(过滤后)、income_band、household_demographics、customer_demographics，再连接customer，最后连接store_returns大表，减少中间结果集'}, {'group': '谓词简化', 'produced_suggestion': '将income_band的范围过滤条件(ib_lower_bound >= 35577 AND ib_upper_bound <= 85577)尽早应用，通过JOIN传递到household_demographics过滤'}, {'group': '连接优化', 'produced_suggestion': '考虑将store_returns与customer_demographics的连接转换为半连接(SEMI JOIN)，因为只需要验证sr_cdemo_sk存在性，不需要store_returns的其他列'}, {'group': '谓词简化', 'produced_suggestion': '将customer_address的ca_city过滤条件作为驱动条件，通过c_current_addr_sk传递到customer表，减少customer表的扫描行数'}, {'group': '连接优化', 'produced_suggestion': '利用传递性谓词：通过hd_income_band_sk = ib_income_band_sk和c_current_hdemo_sk = hd_demo_sk的连接关系，将income_band的过滤条件传递到customer表'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
+```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示store_returns表存在高代价的Seq Scan操作，且SQL语句涉及多表连接和复杂过滤条件，存在优化空间。store_returns表行数较多（约720万行），Seq Scan导致高代价，需要考虑通过谓词下推和连接优化减少扫描量。SQL结构较复杂，JOIN较多，可以尝试重写以减少大表扫描和改进连接顺序。",
+  "reason": "执行计划显示存在严重性能瓶颈：1) store_returns表全表扫描占比80.6%（7198194行），但该表仅通过sr_cdemo_sk参与连接，未使用其他过滤条件；2) 连接顺序不合理，应先过滤小表再连接大表；3) customer_address表有ca_city过滤条件，应作为驱动表；4) 多个表之间存在传递性谓词可下推优化；5) 历史案例显示相同SQL指纹通过FILTER_INTO_JOIN、JOIN_CONDITION_PUSH等规则优化后性能提升明显",
   "advice": [
     {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先连接小表customer_address(过滤后)、income_band、household_demographics、customer_demographics，再连接customer，最后连接store_returns大表，减少中间结果集"
+    },
+    {
       "group": "谓词简化",
-      "produced_suggestion": "将store_returns表上过滤条件 (如 sr_cdemo_sk = cd_demo_sk) 及相关过滤提前下推，尽量减少大型表的全表扫描。"
+      "produced_suggestion": "将income_band的范围过滤条件(ib_lower_bound >= 35577 AND ib_upper_bound <= 85577)尽早应用，通过JOIN传递到household_demographics过滤"
     },
     {
       "group": "连接优化",
-      "produced_suggestion": "调整多表连接顺序，优先连接过滤较多的小表，避免store_returns表的大量无谓连接导致全表扫描。"
+      "produced_suggestion": "考虑将store_returns与customer_demographics的连接转换为半连接(SEMI JOIN)，因为只需要验证sr_cdemo_sk存在性，不需要store_returns的其他列"
     },
     {
-      "group": "子查询优化",
-      "produced_suggestion": "考虑将部分连接拆分为子查询或CTE，分步骤过滤大表数据后再关联，降低中间结果集大小。"
+      "group": "谓词简化",
+      "produced_suggestion": "将customer_address的ca_city过滤条件作为驱动条件，通过c_current_addr_sk传递到customer表，减少customer表的扫描行数"
     },
     {
-      "group": "投影优化",
-      "produced_suggestion": "裁剪查询中不必要的列，减少列的传递，降低内存和I/O开销。"
-    },
-    {
-      "group": "排序优化",
-      "produced_suggestion": "考虑在索引支持下避免全表排序，或者先过滤再排序，结合LIMIT减少排序数据量。"
+      "group": "连接优化",
+      "produced_suggestion": "利用传递性谓词：通过hd_income_band_sk = ib_income_band_sk和c_current_hdemo_sk = hd_demo_sk的连接关系，将income_band的过滤条件传递到customer表"
     }
   ]
 }
+```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 61 rules
-   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
-   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
-   → FILTER_VALUES_MERGE: UCT=1.100
-```{
-  "groups": "谓词简化, 连接优化, 子查询优化, 排序优化, 投影优化",
+📊 UCT scored 45 rules
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_EXTRACT_FILTER: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化",
   "applied_rules": [
-    "JOIN_ADD_REDUNDANT_SEMI_JOIN",
-    "STRATEGY_CTE_DECOMPOSITION",
-    "PROJECT_JOIN_TRANSPOSE",
-    "SORT_JOIN_TRANSPOSE"
+    "FILTER_REDUCE_EXPRESSIONS",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN"
   ],
   "rule_effect_scores": {
-    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.4,
-    "STRATEGY_CTE_DECOMPOSITION": 0.3,
-    "PROJECT_JOIN_TRANSPOSE": 0.2,
-    "SORT_JOIN_TRANSPOSE": 0.1
+    "FILTER_REDUCE_EXPRESSIONS": 0.15,
+    "FILTER_INTO_JOIN": 0.20,
+    "JOIN_CONDITION_PUSH": 0.20,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.25,
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.20
   },
   "rule_effect_confidence": {
-    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.85,
-    "STRATEGY_CTE_DECOMPOSITION": 0.75,
-    "PROJECT_JOIN_TRANSPOSE": 0.9,
-    "SORT_JOIN_TRANSPOSE": 0.7
+    "FILTER_REDUCE_EXPRESSIONS": 0.628,
+    "FILTER_INTO_JOIN": 0.563,
+    "JOIN_CONDITION_PUSH": 0.552,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.617,
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.911
   }
 }
-✅ 选择了 4 个规则
+✅ 选择了 5 个规则
 🔧 开始SQL重写...
+
+
+```json
 {
-  "groups": "谓词简化, 连接优化, 子查询优化, 排序优化, 投影优化",
+  "groups": "连接优化, 谓词简化",
   "applied_rules": [
-    "JOIN_ADD_REDUNDANT_SEMI_JOIN",
-    "STRATEGY_CTE_DECOMPOSITION",
-    "PROJECT_JOIN_TRANSPOSE",
-    "SORT_JOIN_TRANSPOSE"
+    "FILTER_REDUCE_EXPRESSIONS",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN"
   ],
-  "original_sql": "select  c_customer_id as customer_id        , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername  from customer      ,customer_address      ,customer_demographics      ,household_demographics      ,income_band      ,store_returns  where ca_city         =  'Pleasant Hill'    and c_current_addr_sk = ca_address_sk    and ib_lower_bound   >=  35577    and ib_upper_bound   <=  35577 + 50000    and ib_income_band_sk = hd_income_band_sk    and cd_demo_sk = c_current_cdemo_sk    and hd_demo_sk = c_current_hdemo_sk    and sr_cdemo_sk = cd_demo_sk  order by c_customer_id  limit 100;",
-  "rewritten_sql": "WITH cd_sr AS (\n    SELECT cd.cd_demo_sk \n    FROM customer_demographics cd \n    JOIN store_returns sr ON cd.cd_demo_sk = sr.sr_cdemo_sk\n)\nSELECT c_customer_id AS customer_id, \n       COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername\nFROM \n    (SELECT c_customer_id, c_last_name, c_first_name, c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk \n     FROM customer \n     ORDER BY c_customer_id) AS customer,\n    (SELECT ca_address_sk, ca_city FROM customer_address) AS customer_address,\n    cd_sr,\n    (SELECT hd_income_band_sk, hd_demo_sk FROM household_demographics) AS household_demographics,\n    (SELECT ib_income_band_sk, ib_lower_bound, ib_upper_bound FROM income_band) AS income_band\nWHERE ca_city = 'Pleasant Hill'\n  AND c_current_addr_sk = ca_address_sk\n  AND ib_lower_bound >= 35577\n  AND ib_upper_bound <= 35577 + 50000\n  AND ib_income_band_sk = hd_income_band_sk\n  AND cd_sr.cd_demo_sk = c_current_cdemo_sk\n  AND hd_demo_sk = c_current_hdemo_sk\nORDER BY c_customer_id\nLIMIT 100;",
-  "semantic_check": "1. 步骤1（JOIN_ADD_REDUNDANT_SEMI_JOIN）增加了EXISTS子查询，但原始连接条件已保证存在性，逻辑冗余但语义不变。\n2. 步骤2（STRATEGY_CTE_DECOMPOSITION）将customer_demographics与store_returns的连接提取为CTE cd_sr，并替换原表。CTE保留cd_demo_sk的重复行（因store_returns匹配），确保连接后行数与原始一致。\n3. 步骤3（PROJECT_JOIN_TRANSPOSE）裁剪各表列，仅保留必要列，不改变结果集。\n4. 步骤4（SORT_JOIN_TRANSPOSE）将customer表排序下推至子查询。因连接为等值连接且最终保留ORDER BY，结果顺序不变。\n综上，重写后SQL在列名、数据类型、排序顺序、结果集上与原始SQL完全等价。"
+  "rewritten_sql": "SELECT c_customer_id AS customer_id,\n       coalesce(c_last_name, '') || ', ' || coalesce(c_first_name, '') AS customername\nFROM customer\nJOIN customer_address ON c_current_addr_sk = ca_address_sk AND ca_city = 'Pleasant Hill'\nJOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk\nJOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk\nJOIN income_band ON ib_income_band_sk = hd_income_band_sk AND ib_lower_bound >= 35577 AND ib_upper_bound <= 85577\nWHERE EXISTS (\n    SELECT 1\n    FROM store_returns\n    WHERE sr_cdemo_sk = cd_demo_sk\n)\nORDER BY c_customer_id\nLIMIT 100"
 }
+```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -107,22 +91,46 @@ DBMS_syntax_Tool ends...
 🧠 开始语义等价检查...
 ```json
 {
-  "equivalent": true,
-  "message": "重写代理的 semantic_check 说明步骤1-4均正确，CTE分解、列裁剪及排序下推均不改变结果集语义，充分保证了两条SQL在行、列、排序及过滤条件一致，判定等价。",
-  "differences": []
+    "equivalent": false,
+    "message": "两SQL不等价：原始SQL中store_returns通过WHERE条件形成INNER JOIN可能产生重复行，重写SQL使用EXISTS半连接去除了重复，导致结果集行数不同",
+    "differences": [
+        {
+            "type": "JOIN语义变化",
+            "description": "原始SQL中store_returns通过sr_cdemo_sk=cd_demo_sk形成INNER JOIN，若store_returns有多条匹配记录会导致customer重复；重写SQL使用EXISTS半连接只检查存在性，每个customer最多出现一次",
+            "location": "store_returns表的连接方式"
+        }
+    ]
+}
+```
+❌ 语义不等价: 两SQL不等价：原始SQL中store_returns通过WHERE条件形成INNER JOIN可能产生重复行，重写SQL使用EXISTS半连接去除了重复，导致结果集行数不同
+```json
+{"fixed_sql": "SELECT c_customer_id AS customer_id, coalesce(c_last_name, '') || ', ' || coalesce(c_first_name, '') AS customername FROM customer JOIN customer_address ON c_current_addr_sk = ca_address_sk AND ca_city = 'Pleasant Hill' JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk JOIN income_band ON ib_income_band_sk = hd_income_band_sk AND ib_lower_bound >= 35577 AND ib_upper_bound <= 85577 JOIN store_returns ON sr_cdemo_sk = cd_demo_sk ORDER BY c_customer_id LIMIT 100", "note": "将EXISTS半连接改回INNER JOIN以保留原始SQL中store_returns多条匹配时产生重复行的语义"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL将隐式JOIN转为显式JOIN语法，所有连接条件、过滤条件、投影列、排序和限制完全一致，语义等价。",
+    "differences": []
 }
 ```
 ✅ 语义等价
 📊 开始评估优化结果...
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
+```json
 {
   "terminate": true,
-  "reason": "重写SQL的成本(299028.52)明显高于原始SQL成本(184422.24)，代价增加超过62%，且主要瓶颈仍是store_returns表的全表扫描，且出现了新增的流水线阻塞的排序开销。虽然重写SQL在逻辑结构上更清晰（使用CTE分解，投影连接调整），但成本明显恶化且仍未解决关键瓶颈，全表扫描未减少。在仅基于查询重写的优化已尝试且效果不佳的情况下，建议终止进一步重写优化，回退使用原始SQL。",
-  "是否保留重写SQL": false
+  "reason": "成本相同且重写将隐式逗号连接改为显式JOIN，结构更清晰；但未带来成本下降，已达当前优化边界",
+  "保留重写SQL": true
 }
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 473
+   - 规则序列: ['FILTER_REDUCE_EXPRESSIONS', 'FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH', 'JOIN_PUSH_TRANSITIVE_PREDICATES', 'JOIN_ADD_REDUNDANT_SEMI_JOIN']
+   - 优化组别: 连接优化, 谓词简化
+   - 估计代价: 原始=184561.1, 重写=184561.1，相对变化: 0.00%
+✅ 成功存储，记录ID: 68319f03-ffc2-46d3-9c39-ff95280e1dbc
 
 ----------------------------------------
 

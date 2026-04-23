@@ -2,143 +2,89 @@ Query ID: 147
 ==================================================
 
 Original: select min(w_warehouse_name)   ,min(sm_type)   ,min(cc_name)   ,min(cs_order_number)   ,min(cs_item_sk) from    catalog_sales   ,warehouse   ,ship_mode   ,call_center   ,date_dim where     d_month_seq between 1189 and 1189 + 23 and cs_ship_date_sk   = d_date_sk and cs_warehouse_sk   = w_warehouse_sk and cs_ship_mode_sk   = sm_ship_mode_sk and cs_call_center_sk = cc_call_center_sk and cs_list_price between 94 and 123 and sm_type = 'REGULAR' and cc_class = 'medium' and w_gmt_offset = -5 ;
-Rewritten: WITH filtered_date_dim AS (
-    SELECT d_date_sk 
-    FROM date_dim 
-    WHERE d_month_seq BETWEEN 1189 AND 1212
-),
-filtered_warehouse AS (
-    SELECT w_warehouse_sk, w_warehouse_name 
-    FROM warehouse 
-    WHERE w_gmt_offset = -5
-),
-filtered_ship_mode AS (
-    SELECT sm_ship_mode_sk, sm_type 
-    FROM ship_mode 
-    WHERE sm_type = 'REGULAR'
-),
-filtered_call_center AS (
-    SELECT cc_call_center_sk, cc_name 
-    FROM call_center 
-    WHERE cc_class = 'medium'
-),
-filtered_catalog_sales AS (
-    SELECT cs_ship_date_sk, cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk, cs_order_number, cs_item_sk
-    FROM catalog_sales 
-    WHERE cs_list_price BETWEEN 94 AND 123
-)
-SELECT 
-    min(wh.w_warehouse_name),
-    min(sm.sm_type),
-    min(cc.cc_name),
-    min(cs.cs_order_number),
-    min(cs.cs_item_sk)
-FROM filtered_catalog_sales cs
-JOIN filtered_date_dim dd ON cs.cs_ship_date_sk = dd.d_date_sk
-JOIN filtered_warehouse wh ON cs.cs_warehouse_sk = wh.w_warehouse_sk
-JOIN filtered_ship_mode sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk
-JOIN filtered_call_center cc ON cs.cs_call_center_sk = cc.cc_call_center_sk;
-Time Cost: 192.03s
-Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将过滤条件中cs_list_price的范围过滤下推为catalog_sales表扫描的最初筛选条件，避免全表扫描中加载过多无关数据。'}, {'group': '连接优化', 'produced_suggestion': '根据表大小和过滤后行数，调整连接顺序优先处理过滤力度大的维度表，减少中间结果集规模，避免大表与所有表笛卡尔连接。'}, {'group': '投影优化', 'produced_suggestion': '只查询所需的最小字段，避免select min(*)中无用列，减少数据传输和计算压力。'}, {'group': '子查询优化', 'produced_suggestion': '考虑将多表连接拆解为多个CTE或子查询，先计算中间结果后join，提升可读性和执行引擎优化机会。'}, {'group': '常量折叠', 'produced_suggestion': '利用常量表达式预计算边界条件，比如d_month_seq between 1189 and 1212，将具体值写入以便查询优化器更好优化。'}, {'group': '索引建议', 'produced_suggestion': '建议在catalog_sales表的cs_list_price列建立适合范围查询的索引或分区，降低扫描代价（索引优化建议虽不在查询重写范围，但可结合考虑）。'}]
+Rewritten: SELECT min(w_warehouse_name), min(sm_type), min(cc_name), min(cs_order_number), min(cs_item_sk)
+FROM catalog_sales
+JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk AND w_gmt_offset = -5
+JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk AND sm_type = 'REGULAR'
+JOIN call_center ON cs_call_center_sk = cc_call_center_sk AND cc_class = 'medium'
+JOIN date_dim ON cs_ship_date_sk = d_date_sk AND d_month_seq BETWEEN 1189 AND 1189 + 23
+WHERE cs_list_price BETWEEN 94 AND 123
+Time Cost: 104.88s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '调整JOIN顺序，优先关联小表和高选择性过滤条件的维度表。建议顺序：date_dim(d_month_seq过滤) -> ship_mode(sm_type过滤) -> call_center(cc_class过滤) -> warehouse(w_gmt_offset过滤) -> catalog_sales，利用维度表的过滤条件减少与事实表关联的数据量'}, {'group': '谓词简化', 'produced_suggestion': '将维度表的过滤条件提前应用，形成派生表或CTE，减少JOIN时的数据量。例如：先过滤出符合条件的date_dim、ship_mode、call_center、warehouse的主键集合，再与catalog_sales进行半连接或内连接'}, {'group': '聚合优化', 'produced_suggestion': '由于SELECT子句只使用MIN聚合函数且没有GROUP BY，可以考虑在JOIN之前对各维度表进行预聚合或提前获取MIN值，减少最终聚合时的数据量'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
+```json
 {
   "can_optimize": true,
-  "reason": "执行计划中catalog_sales表上的Seq Scan代价非常高（99.4%），且表数据量巨大（约1.44千万行）。查询中cs_list_price列的范围过滤未利用索引，导致全表扫描。SQL包含多个表连接和多个过滤条件，其中连接条件和过滤条件可进一步优化。当前SQL通过简单的笛卡尔积+过滤连接实现，存在调整连接顺序、过滤条件下推、谓词简化，以及投影裁剪空间，可以大幅提升性能。",
+  "reason": "执行计划显示catalog_sales表进行全表扫描(Seq Scan)，代价占比99%，扫描1439万行数据。虽然存在主键索引，但WHERE条件中的过滤条件(cs_list_price、cs_ship_date_sk等)和JOIN条件分散在多个维度表上。可以通过谓词下推和连接顺序优化来减少数据扫描量：先用高选择性的维度表过滤条件(sm_type='REGULAR'、cc_class='medium'、w_gmt_offset=-5、d_month_seq范围)进行JOIN，再关联大表catalog_sales，从而减少需要扫描的数据量。",
   "advice": [
     {
-      "group": "谓词简化",
-      "produced_suggestion": "将过滤条件中cs_list_price的范围过滤下推为catalog_sales表扫描的最初筛选条件，避免全表扫描中加载过多无关数据。"
-    },
-    {
       "group": "连接优化",
-      "produced_suggestion": "根据表大小和过滤后行数，调整连接顺序优先处理过滤力度大的维度表，减少中间结果集规模，避免大表与所有表笛卡尔连接。"
+      "produced_suggestion": "调整JOIN顺序，优先关联小表和高选择性过滤条件的维度表。建议顺序：date_dim(d_month_seq过滤) -> ship_mode(sm_type过滤) -> call_center(cc_class过滤) -> warehouse(w_gmt_offset过滤) -> catalog_sales，利用维度表的过滤条件减少与事实表关联的数据量"
     },
     {
-      "group": "投影优化",
-      "produced_suggestion": "只查询所需的最小字段，避免select min(*)中无用列，减少数据传输和计算压力。"
+      "group": "谓词简化",
+      "produced_suggestion": "将维度表的过滤条件提前应用，形成派生表或CTE，减少JOIN时的数据量。例如：先过滤出符合条件的date_dim、ship_mode、call_center、warehouse的主键集合，再与catalog_sales进行半连接或内连接"
     },
     {
-      "group": "子查询优化",
-      "produced_suggestion": "考虑将多表连接拆解为多个CTE或子查询，先计算中间结果后join，提升可读性和执行引擎优化机会。"
-    },
-    {
-      "group": "常量折叠",
-      "produced_suggestion": "利用常量表达式预计算边界条件，比如d_month_seq between 1189 and 1212，将具体值写入以便查询优化器更好优化。"
-    },
-    {
-      "group": "索引建议",
-      "produced_suggestion": "建议在catalog_sales表的cs_list_price列建立适合范围查询的索引或分区，降低扫描代价（索引优化建议虽不在查询重写范围，但可结合考虑）。"
+      "group": "聚合优化",
+      "produced_suggestion": "由于SELECT子句只使用MIN聚合函数且没有GROUP BY，可以考虑在JOIN之前对各维度表进行预聚合或提前获取MIN值，减少最终聚合时的数据量"
     }
   ]
 }
+```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 66 rules
-   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
-   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
-   → FILTER_VALUES_MERGE: UCT=1.100
+📊 UCT scored 64 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.218
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
 {
-  "groups": "谓词简化, 连接优化, 子查询优化, 常量折叠, 投影优化",
-  "applied_rules": [
-    "FILTER_REDUCE_EXPRESSIONS",
-    "STRATEGY_CTE_DECOMPOSITION",
-    "PROJECT_JOIN_TRANSPOSE",
-    "JOIN_CONDITION_PUSH"
-  ],
-  "rule_effect_scores": {
-    "FILTER_REDUCE_EXPRESSIONS": 0.1,
-    "STRATEGY_CTE_DECOMPOSITION": 0.6,
-    "PROJECT_JOIN_TRANSPOSE": 0.2,
-    "JOIN_CONDITION_PUSH": 0.1
-  },
-  "rule_effect_confidence": {
-    "FILTER_REDUCE_EXPRESSIONS": 0.9,
-    "STRATEGY_CTE_DECOMPOSITION": 0.7,
-    "PROJECT_JOIN_TRANSPOSE": 0.8,
-    "JOIN_CONDITION_PUSH": 0.6
-  }
+  "groups": "聚合优化, 连接优化, 谓词简化",
+  "applied_rules": ["FILTER_INTO_JOIN"],
+  "rule_effect_scores": {"FILTER_INTO_JOIN": 1.0},
+  "rule_effect_confidence": {"FILTER_INTO_JOIN": 0.8}
 }
-✅ 选择了 4 个规则
+✅ 选择了 1 个规则
 🔧 开始SQL重写...
+```json
 {
-  "groups": "谓词简化, 连接优化, 子查询优化, 常量折叠, 投影优化",
-  "applied_rules": [
-    "FILTER_REDUCE_EXPRESSIONS",
-    "STRATEGY_CTE_DECOMPOSITION",
-    "PROJECT_JOIN_TRANSPOSE",
-    "JOIN_CONDITION_PUSH"
-  ],
-  "original_sql": "select min(w_warehouse_name)   ,min(sm_type)   ,min(cc_name)   ,min(cs_order_number)   ,min(cs_item_sk) from    catalog_sales   ,warehouse   ,ship_mode   ,call_center   ,date_dim where     d_month_seq between 1189 and 1189 + 23 and cs_ship_date_sk   = d_date_sk and cs_warehouse_sk   = w_warehouse_sk and cs_ship_mode_sk   = sm_ship_mode_sk and cs_call_center_sk = cc_call_center_sk and cs_list_price between 94 and 123 and sm_type = 'REGULAR' and cc_class = 'medium' and w_gmt_offset = -5 ;",
-  "rewritten_sql": "WITH filtered_date_dim AS (\n    SELECT d_date_sk \n    FROM date_dim \n    WHERE d_month_seq BETWEEN 1189 AND 1212\n),\nfiltered_warehouse AS (\n    SELECT w_warehouse_sk, w_warehouse_name \n    FROM warehouse \n    WHERE w_gmt_offset = -5\n),\nfiltered_ship_mode AS (\n    SELECT sm_ship_mode_sk, sm_type \n    FROM ship_mode \n    WHERE sm_type = 'REGULAR'\n),\nfiltered_call_center AS (\n    SELECT cc_call_center_sk, cc_name \n    FROM call_center \n    WHERE cc_class = 'medium'\n),\nfiltered_catalog_sales AS (\n    SELECT cs_ship_date_sk, cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk, cs_order_number, cs_item_sk\n    FROM catalog_sales \n    WHERE cs_list_price BETWEEN 94 AND 123\n)\nSELECT \n    min(wh.w_warehouse_name),\n    min(sm.sm_type),\n    min(cc.cc_name),\n    min(cs.cs_order_number),\n    min(cs.cs_item_sk)\nFROM filtered_catalog_sales cs\nJOIN filtered_date_dim dd ON cs.cs_ship_date_sk = dd.d_date_sk\nJOIN filtered_warehouse wh ON cs.cs_warehouse_sk = wh.w_warehouse_sk\nJOIN filtered_ship_mode sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk\nJOIN filtered_call_center cc ON cs.cs_call_center_sk = cc.cc_call_center_sk;",
-  "semantic_check": "重写后的SQL通过以下方式保持语义等价性：\n1. FILTER_REDUCE_EXPRESSIONS规则：将d_month_seq条件中的表达式1189+23计算为1212，简化了常量表达式。\n2. STRATEGY_CTE_DECOMPOSITION规则：将各表过滤逻辑提取为CTE，保持过滤条件不变（date_dim范围过滤、warehouse偏移量过滤、ship_mode类型过滤、call_center类别过滤、catalog_sales价格过滤）。\n3. PROJECT_JOIN_TRANSPOSE规则：在每个CTE中仅选择连接键和输出所需列，减少数据传输量。\n4. JOIN_CONDITION_PUSH规则：CTE已提前过滤数据，连接时仅需使用连接键匹配，减少中间结果集。\n最终输出列、聚合函数、排序顺序与原始SQL完全一致，结果集等价。"
+  "groups": "聚合优化, 连接优化, 谓词简化",
+  "applied_rules": ["FILTER_INTO_JOIN"],
+  "rewritten_sql": "SELECT min(w_warehouse_name), min(sm_type), min(cc_name), min(cs_order_number), min(cs_item_sk)\nFROM catalog_sales\nJOIN warehouse ON cs_warehouse_sk = w_warehouse_sk AND w_gmt_offset = -5\nJOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk AND sm_type = 'REGULAR'\nJOIN call_center ON cs_call_center_sk = cc_call_center_sk AND cc_class = 'medium'\nJOIN date_dim ON cs_ship_date_sk = d_date_sk AND d_month_seq BETWEEN 1189 AND 1189 + 23\nWHERE cs_list_price BETWEEN 94 AND 123"
 }
+```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
+
+
 ```json
 {
-  "equivalent": true,
-  "message": "经核验，重写SQL采用了FILTER_REDUCE_EXPRESSIONS、STRATEGY_CTE_DECOMPOSITION、PROJECT_JOIN_TRANSPOSE和JOIN_CONDITION_PUSH规则，保持了原始SQL的过滤条件、JOIN逻辑及聚合语义，结果集等价，采纳重写代理的semantic_check主张。",
-  "differences": []
+    "equivalent": true,
+    "message": "重写将维度表过滤条件推入JOIN ON子句，对INNER JOIN语义等价，所有连接条件与过滤条件均保持一致。",
+    "differences": []
 }
 ```
 ✅ 语义等价
 📊 开始评估优化结果...
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
+```json
 {
   "terminate": true,
-  "reason": "重写SQL成本与原始SQL成本完全相同，且两者执行计划均显示主要瓶颈仍为catalog_sales表的全表扫描，成本未降低；当前优化基于逻辑重写（CTE拆解、谓词下推等）已较为充分，但性能瓶颈未缓解，表明在逻辑查询改写层面已难继续优化。虽然重写SQL结构更清晰，语义更明确，有助于后续维护和理解，因此建议保留重写SQL，但鉴于首轮成本无降幅且全表扫描仍是瓶颈，终止进一步优化流程。",
-  "是否保留重写SQL": true
+  "reason": "重写costs与原始相同，但重写将WHERE子句中的过滤条件下推到各JOIN的ON子句中，使过滤更靠近数据源，结构更清晰且符合优化器友好写法；已达到当前规则能实现的主要改进",
+  "保留重写SQL": true
 }
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 412
+   - 规则序列: ['FILTER_INTO_JOIN']
+   - 优化组别: 聚合优化, 连接优化, 谓词简化
+   - 估计代价: 原始=463379.42, 重写=463379.42，相对变化: 0.00%
+✅ 成功存储，记录ID: 3e8618b1-6daf-40b0-9626-89750a3757ef
 
 ----------------------------------------
 

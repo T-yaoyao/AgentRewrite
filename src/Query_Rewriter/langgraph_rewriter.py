@@ -19,7 +19,13 @@ from src.utils.path_config import setup_python_path, load_project_env
 setup_python_path()
 load_project_env()
 
-from src.Rewrite_Middleware.middleware import DBMS, DBMS_EXPLAIN_Tool, DBMS_Syntax_Tool
+from src.Rewrite_Middleware.middleware import (
+    DBMS,
+    DBMS_EXPLAIN_Tool,
+    DBMS_RAW_EXPLAIN_JSON_Tool,
+    DBMS_Syntax_Tool,
+    _normalize_sql_text,
+)
 from src.Rewrite_Middleware.Agent_Memory_Buffer.memory_buffer import (
     AgentMemoryBuffer,
     OutputCollector,
@@ -104,6 +110,11 @@ def _stats_str(stats: Any) -> str:
     return stats if isinstance(stats, str) else json.dumps(stats, ensure_ascii=False)
 
 
+def _state_sql(sql: Any) -> str:
+    """与 DB 工具一致的 SQL 文本清洗；写入 LangGraph 状态中的 SQL 均应经此处理。"""
+    return _normalize_sql_text(sql)
+
+
 class LangGraphQueryRewriter:
     MIN_SIMILARITY = 0.80
     HIGH_SIMILARITY = 0.90
@@ -111,6 +122,8 @@ class LangGraphQueryRewriter:
     MAX_SEMANTIC_FIX = 3
     MAX_SYNTAX_AFTER_SEMANTIC = 3
     COST_ROLLBACK_PCT = 20.0
+    # If estimated cost drops by more than this fraction vs original, skip LLM evaluation and exit.
+    EARLY_TERMINATE_COST_REDUCTION_RATIO = 0.40
     EFFECT_SCORE_LAMBDA_BASE = 0.5
 
     def __init__(
@@ -397,10 +410,7 @@ class LangGraphQueryRewriter:
                 raw = self.global_memory.retrieve(state["initial_sql"], top_k=3)
                 filtered = [r for r in raw if r.get("score", 0) >= self.MIN_SIMILARITY]
                 if filtered:
-                    filtered.sort(
-                        key=lambda x: (x.get("cost_reduction_rate", 0), x.get("score", 0)),
-                        reverse=True,
-                    )
+                    filtered.sort(key=lambda x: x.get("score", 0), reverse=True)
                     few_shot = filtered[:3]
                     best = filtered[0]
                     if best.get("id"):
@@ -549,6 +559,8 @@ class LangGraphQueryRewriter:
                     schema_content=state.get("schema_content") or "",
                     index_info=idx,
                 )
+            rr = dict(rr or {})
+            rr["rewritten_sql"] = _state_sql(rr.get("rewritten_sql", state["initial_sql"]))
             trace.append({"node": "rewrite", "output": dict(rr)})
             if rr.get("parse_error") and rr.get("rewritten_sql") == state["initial_sql"]:
                 async with self.llm_semaphore:
@@ -560,7 +572,7 @@ class LangGraphQueryRewriter:
                         index_info=idx,
                     )
                 if fixed:
-                    rr["rewritten_sql"] = fixed
+                    rr["rewritten_sql"] = _state_sql(fixed)
                     rr.pop("parse_error", None)
             raw_note = rr.get("semantic_check")
             note_s = raw_note.strip() if isinstance(raw_note, str) else ""
@@ -579,8 +591,9 @@ class LangGraphQueryRewriter:
     async def _syntax_check_node(self, state: RewriteState) -> Dict[str, Any]:
         print("🔍 开始语法检查...")
         trace = list(state.get("agent_trace") or [])
-        rr = state.get("current_rewrite_result") or {}
-        sql = rr.get("rewritten_sql", state["initial_sql"])
+        rr = dict(state.get("current_rewrite_result") or {})
+        sql = _state_sql(rr.get("rewritten_sql", state["initial_sql"]))
+        rr["rewritten_sql"] = sql
         stats = _stats_str(state["data_statistics"])
         idx = state.get("index_info") or self.index_info
         try:
@@ -598,13 +611,16 @@ class LangGraphQueryRewriter:
                 prev["rewritten_sql"] = cur
                 prev["error_info"] = err
                 async with self.llm_semaphore:
-                    cur = await self.rewrite_agent.iterative_rewrite(
-                        state["initial_sql"],
-                        err,
-                        prev,
-                        data_statistics=stats,
-                        index_info=idx,
-                    ) or cur
+                    cur = _state_sql(
+                        await self.rewrite_agent.iterative_rewrite(
+                            state["initial_sql"],
+                            err,
+                            prev,
+                            data_statistics=stats,
+                            index_info=idx,
+                        )
+                        or cur
+                    )
                 if cur and (await DBMS_Syntax_Tool(self.dbms, cur)).get("flag", True):
                     rr["rewritten_sql"] = cur
                     trace.append({"node": "syntax_check", "output": {"valid": True, "attempts": attempt + 1}})
@@ -623,8 +639,9 @@ class LangGraphQueryRewriter:
     async def _semantic_check_node(self, state: RewriteState) -> Dict[str, Any]:
         print("🧠 开始语义等价检查...")
         trace = list(state.get("agent_trace") or [])
-        rr = state.get("current_rewrite_result") or {}
-        cur = rr.get("rewritten_sql", state["initial_sql"])
+        rr = dict(state.get("current_rewrite_result") or {})
+        cur = _state_sql(rr.get("rewritten_sql", state["initial_sql"]))
+        rr["rewritten_sql"] = cur
         rules = rr.get("applied_rules") or (state.get("selected_rules") or {}).get("applied_rules", [])
         schema = (state.get("schema_content") or "").strip()
         stats = _stats_str(state["data_statistics"])
@@ -648,7 +665,7 @@ class LangGraphQueryRewriter:
             last_chk = chk
             trace.append({"node": "semantic_check", "output": chk})
             if chk.get("equivalent"):
-                rr["rewritten_sql"] = cur
+                rr["rewritten_sql"] = _state_sql(cur)
                 print("✅ 语义等价")
                 return {
                     "current_rewrite_result": rr,
@@ -667,12 +684,12 @@ class LangGraphQueryRewriter:
                 )
             if not fixed:
                 break
-            candidate = fixed
+            candidate = _state_sql(fixed)
             syntax_ok = False
             for _s in range(self.MAX_SYNTAX_AFTER_SEMANTIC):
                 syn = await DBMS_Syntax_Tool(self.dbms, candidate)
                 if syn.get("flag", syn.get("valid", True)):
-                    cur = candidate
+                    cur = _state_sql(candidate)
                     syntax_ok = True
                     break
                 err = syn.get("error", "")
@@ -680,13 +697,16 @@ class LangGraphQueryRewriter:
                 prev["rewritten_sql"] = candidate
                 prev["error_info"] = err
                 async with self.llm_semaphore:
-                    candidate = await self.rewrite_agent.iterative_rewrite(
-                        state["initial_sql"],
-                        err,
-                        prev,
-                        data_statistics=stats,
-                        index_info=idx,
-                    ) or candidate
+                    candidate = _state_sql(
+                        await self.rewrite_agent.iterative_rewrite(
+                            state["initial_sql"],
+                            err,
+                            prev,
+                            data_statistics=stats,
+                            index_info=idx,
+                        )
+                        or candidate
+                    )
             if not syntax_ok:
                 break
 
@@ -707,43 +727,78 @@ class LangGraphQueryRewriter:
         if not state.get("can_optimize"):
             return {"should_terminate": True, "agent_trace": trace}
 
-        init_sql = state["initial_sql"]
-        rr = state.get("current_rewrite_result") or {}
-        rw = rr.get("rewritten_sql", init_sql)
+        init_sql = _state_sql(state["initial_sql"])
+        rr = dict(state.get("current_rewrite_result") or {})
+        rw = _state_sql(rr.get("rewritten_sql", init_sql))
+        rr["rewritten_sql"] = rw
         sel = state.get("selected_rules") or {}
         groups = sel.get("groups", "")
         applied = sel.get("applied_rules", [])
 
         try:
-            async def _exp(sql: str):
+            async def _raw_exp(sql: str):
                 async with self.db_semaphore:
-                    return await DBMS_EXPLAIN_Tool(self.dbms, sql)
+                    return await DBMS_RAW_EXPLAIN_JSON_Tool(self.dbms, sql)
 
-            o_exp, r_exp = await asyncio.gather(_exp(init_sql), _exp(rw))
+            o_exp, r_exp = await asyncio.gather(_raw_exp(init_sql), _raw_exp(rw))
             rnd = state.get("current_round", 1)
             oc = self._extract_cost_from_explain(o_exp)
             rc = self._extract_cost_from_explain(r_exp)
-            info = {
-                "original_costs": oc,
-                "rewritten_costs": rc,
-                "original_explain_info": json.dumps(o_exp, ensure_ascii=False) if not isinstance(o_exp, str) else o_exp,
-                "rewritten_explain_info": json.dumps(r_exp, ensure_ascii=False) if not isinstance(r_exp, str) else r_exp,
-                "groups": groups,
-                "applied_rules": applied,
-                "optimization_advice": state.get("optimization_advice") or [],
-                "original_sql": init_sql,
-                "rewritten_sql": rw,
-                "reason": (state.get("previous_feedback") or {}).get("reason", ""),
-            }
-            async with self.llm_semaphore:
-                ev = await self.decision_agent.evaluate_with_costs(info, rnd)
-            trace.append({"node": "evaluation", "output": ev})
+
+            cost_reduction_ratio = (oc - rc) / oc if oc > 0 else 0.0
+            if (
+                oc > 0
+                and rw != init_sql
+                and rc < oc
+                and cost_reduction_ratio > self.EARLY_TERMINATE_COST_REDUCTION_RATIO
+            ):
+                pct = cost_reduction_ratio * 100.0
+                thr_pct = self.EARLY_TERMINATE_COST_REDUCTION_RATIO * 100.0
+                print(
+                    f"✅ 估计代价降幅 {pct:.1f}% 超过 {thr_pct:.0f}%，跳过 LLM 评估，直接终止并保留重写 SQL"
+                )
+                ev = {
+                    "terminate": True,
+                    "reason": (
+                        f"估计代价降幅 {pct:.1f}% 超过 {thr_pct:.0f}%，"
+                        "按规则跳过模型评估：直接终止多轮优化并保留本轮重写 SQL。"
+                    ),
+                    "保留重写SQL": True,
+                    "应用的规则": applied,
+                }
+                trace.append({"node": "evaluation", "output": ev, "skipped_llm": True})
+            else:
+                info = {
+                    "original_costs": oc,
+                    "rewritten_costs": rc,
+                    "original_explain_plan_json": o_exp,
+                    "rewritten_explain_plan_json": r_exp,
+                    "groups": groups,
+                    "applied_rules": applied,
+                    "optimization_advice": state.get("optimization_advice") or [],
+                    "original_sql": init_sql,
+                    "rewritten_sql": rw,
+                    "reason": (state.get("previous_feedback") or {}).get("reason", ""),
+                }
+                async with self.llm_semaphore:
+                    ev = await self.decision_agent.evaluate_with_costs(info, rnd)
+                trace.append({"node": "evaluation", "output": ev})
             terminate = ev.get("terminate", True)
-            keep_rewritten = ev.get("是否保留重写SQL", True)
+            keep_rewritten = ev.get("保留重写SQL", ev.get("是否保留重写SQL", True))
             rollback = not keep_rewritten
+
+            # 仅当「明确下一轮有望降低执行时间」时才续轮：未保留本轮重写时不允许进入下一轮
+            if not terminate and not keep_rewritten:
+                print(
+                    "⚠️ 评估为续轮 (terminate=false) 但未保留本轮重写 SQL；"
+                    "不满足续轮条件，强制终止多轮优化。"
+                )
+                terminate = True
 
             best_cost = state.get("best_cost")
             best_sql = state.get("best_sql")
+            if best_sql:
+                best_sql = _state_sql(best_sql)
             best_rules = state.get("best_rules")
             best_groups = state.get("best_groups", "")
             # Only advance "best kept state" when this round is explicitly kept.
@@ -763,7 +818,7 @@ class LangGraphQueryRewriter:
                 "best_rules": best_rules,
                 "best_groups": best_groups,
                 "evaluation_reason": ev.get("reason", "") or "",
-                "evaluation_terminate": ev.get("terminate", True),
+                "evaluation_terminate": terminate,
                 "evaluation_rollback_sql": rollback,
                 "agent_trace": trace,
             }
@@ -773,15 +828,15 @@ class LangGraphQueryRewriter:
                 out["should_terminate"] = True
                 if rollback:
                     # Roll back to last kept/best rewritten state; fallback to original SQL.
-                    fallback_sql = best_sql if best_sql else init_sql
+                    fallback_sql = _state_sql(best_sql if best_sql else init_sql)
                     fallback_cost = best_cost if (best_sql and best_cost is not None) else oc
                     out["rewritten_sql"] = fallback_sql
                     out["final_rewritten_costs"] = fallback_cost
                     rr = dict(rr)
                     rr["rewritten_sql"] = fallback_sql
                     out["current_rewrite_result"] = rr
-                elif rc < oc:
-                    # Store to global memory
+                elif rw != init_sql:
+                    # 本轮保留了重写 SQL：写入全局记忆（不要求估计代价下降）
                     if self.global_memory:
                         try:
                             self.global_memory.store_successful_optimization(
@@ -794,10 +849,14 @@ class LangGraphQueryRewriter:
                             )
                         except Exception as ex:
                             print(f"⚠️ 知识库存储失败: {ex}")
-                    
-                    out["_uct_update_info"] = self._uct_update_payload(
-                        sel, applied, init_sql, rw, o_exp, r_exp, oc, rc
-                    )
+                    if rc < oc:
+                        out["_uct_update_info"] = self._uct_update_payload(
+                            sel, applied, init_sql, rw, o_exp, r_exp, oc, rc
+                        )
+                out["rewritten_sql"] = _state_sql(out.get("rewritten_sql", rw))
+                cr = dict(out.get("current_rewrite_result") or rr)
+                cr["rewritten_sql"] = out["rewritten_sql"]
+                out["current_rewrite_result"] = cr
                 return out
 
             nxt = rnd + 1
@@ -807,14 +866,14 @@ class LangGraphQueryRewriter:
                 if ratio > self.COST_ROLLBACK_PCT:
                     # Cost degrades too much: roll back to last kept/best rewritten state,
                     # or original SQL when no kept rewrite exists.
-                    fallback_sql = best_sql if best_sql else init_sql
+                    fallback_sql = _state_sql(best_sql if best_sql else init_sql)
                     fallback_cost = best_cost if (best_sql and best_cost is not None) else oc
                     out["rewritten_sql"] = fallback_sql
                     out["final_rewritten_costs"] = fallback_cost
                     rr = dict(state.get("current_rewrite_result") or {})
                     rr["rewritten_sql"] = fallback_sql
                     out["current_rewrite_result"] = rr
-                elif rc < oc and applied:
+                elif rw != init_sql:
                     if self.global_memory:
                         try:
                             self.global_memory.store_successful_optimization(
@@ -827,9 +886,14 @@ class LangGraphQueryRewriter:
                             )
                         except Exception as ex:
                             print(f"⚠️ 知识库存储失败: {ex}")
-                    out["_uct_update_info"] = self._uct_update_payload(
-                        sel, applied, init_sql, rw, o_exp, r_exp, oc, rc
-                    )
+                    if rc < oc and applied:
+                        out["_uct_update_info"] = self._uct_update_payload(
+                            sel, applied, init_sql, rw, o_exp, r_exp, oc, rc
+                        )
+                out["rewritten_sql"] = _state_sql(out.get("rewritten_sql", rw))
+                cr = dict(out.get("current_rewrite_result") or rr)
+                cr["rewritten_sql"] = out["rewritten_sql"]
+                out["current_rewrite_result"] = cr
                 return out
 
             out["should_terminate"] = False
@@ -839,13 +903,17 @@ class LangGraphQueryRewriter:
                 "problematic_rules": ev.get("应用的规则", applied),
             }
             if rollback:
-                fallback_sql = best_sql if best_sql else init_sql
+                fallback_sql = _state_sql(best_sql if best_sql else init_sql)
                 fallback_cost = best_cost if (best_sql and best_cost is not None) else oc
                 out["rewritten_sql"] = fallback_sql
                 out["final_rewritten_costs"] = fallback_cost
                 rr = dict(state.get("current_rewrite_result") or {})
                 rr["rewritten_sql"] = fallback_sql
                 out["current_rewrite_result"] = rr
+            out["rewritten_sql"] = _state_sql(out.get("rewritten_sql", rw))
+            cr = dict(out.get("current_rewrite_result") or rr)
+            cr["rewritten_sql"] = out["rewritten_sql"]
+            out["current_rewrite_result"] = cr
             return out
         except Exception as e:
             print(f"评估失败: {e}")
@@ -867,9 +935,9 @@ class LangGraphQueryRewriter:
                 "rewrite_suggestion": [],
                 "agent_trace": state.get("agent_trace", []),
             }
-        final_sql = state.get("rewritten_sql") or state["initial_sql"]
+        final_sql = _state_sql(state.get("rewritten_sql") or state["initial_sql"])
         if state.get("current_rewrite_result"):
-            final_sql = state["current_rewrite_result"].get("rewritten_sql", final_sql)
+            final_sql = _state_sql(state["current_rewrite_result"].get("rewritten_sql", final_sql))
         rc = state.get("final_rewritten_costs", oc)
         if final_sql == state["initial_sql"]:
             rc = oc
@@ -893,6 +961,7 @@ class LangGraphQueryRewriter:
         }
 
     async def run(self, initial_sql: str) -> Dict[str, Any]:
+        initial_sql = _state_sql(initial_sql)
         schema_content = build_filtered_schema_content(self.schema_file, initial_sql)
         data_stats = filter_data_statistics_for_sql(self.data_statistics, initial_sql)
         memory = create_memory_buffer(

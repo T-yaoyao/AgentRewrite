@@ -2,109 +2,125 @@ Query ID: 32
 ==================================================
 
 Original: select min(i_brand_id), min(i_manufact_id),  	min(ss_ext_sales_price)  from date_dim, store_sales, item,customer,customer_address,store  where d_date_sk = ss_sold_date_sk    and ss_item_sk = i_item_sk    and ss_customer_sk = c_customer_sk    and c_current_addr_sk = ca_address_sk    and ss_store_sk = s_store_sk    AND i_category  = 'Sports'    and d_year=1999    and d_moy = 3    and substring(ca_zip,1,5) <> substring(s_zip,1,5)    and ca_state  = 'VA'    and c_birth_month = 10    and ss_wholesale_cost BETWEEN 23 AND 43  ;
-Rewritten: WITH 
-  date_dim_cte AS (SELECT d_date_sk FROM date_dim WHERE d_year=1999 AND d_moy=3),
-  item_cte AS (SELECT i_item_sk, i_brand_id, i_manufact_id FROM item WHERE i_category='Sports'),
-  customer_address_cte AS (SELECT ca_address_sk, ca_zip FROM customer_address WHERE ca_state='VA'),
-  customer_cte AS (SELECT c_customer_sk, c_current_addr_sk FROM customer WHERE c_birth_month=10),
-  store_cte AS (SELECT s_store_sk, s_zip FROM store),
-  store_sales_cte AS (SELECT ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_store_sk, ss_ext_sales_price FROM store_sales WHERE ss_wholesale_cost BETWEEN 23 AND 43)
-SELECT 
-  min(i_brand_id), 
-  min(i_manufact_id), 
-  min(ss_ext_sales_price)
-FROM store_sales_cte
-JOIN date_dim_cte ON store_sales_cte.ss_sold_date_sk = date_dim_cte.d_date_sk
-JOIN item_cte ON store_sales_cte.ss_item_sk = item_cte.i_item_sk
-JOIN customer_cte ON store_sales_cte.ss_customer_sk = customer_cte.c_customer_sk
-JOIN customer_address_cte ON customer_cte.c_current_addr_sk = customer_address_cte.ca_address_sk
-JOIN store_cte ON store_sales_cte.ss_store_sk = store_cte.s_store_sk 
-  AND substring(customer_address_cte.ca_zip,1,5) <> substring(store_cte.s_zip,1,5);
-Time Cost: 218.85s
-Suggestion: [{'group': '谓词简化', 'produced_suggestion': '考虑在store_sales表的ss_wholesale_cost列上建立合适的索引，或者将该过滤条件下推至索引扫描阶段以避免全表扫描。'}, {'group': '连接优化', 'produced_suggestion': '重新调整JOIN顺序，优先连接过滤更严格（行数更少）的表以减少中间结果规模。'}, {'group': '投影优化', 'produced_suggestion': '精简查询列，只返回必要的聚合结果，避免引入无用列增加I/O和内存开销。'}, {'group': '谓词简化', 'produced_suggestion': '优化字符串比较谓词 substring(ca_zip,1,5) <> substring(s_zip,1,5)，尝试通过预计算或额外列索引减少表达式计算成本。'}, {'group': '子查询优化', 'produced_suggestion': '虽然当前SQL无显式子查询，但复杂关联条件下可考虑用CTE或物化视图分解计算，降低连接复杂度。'}]
+Rewritten: SELECT
+    min(i_brand_id),
+    min(i_manufact_id),
+    min(ss_ext_sales_price)
+FROM (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 1999
+      AND d_moy = 3
+) AS dd
+JOIN (
+    SELECT ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_store_sk, ss_ext_sales_price
+    FROM store_sales
+    WHERE ss_wholesale_cost BETWEEN 23 AND 43
+) AS ss ON dd.d_date_sk = ss.ss_sold_date_sk
+JOIN (
+    SELECT i_item_sk, i_brand_id, i_manufact_id
+    FROM item
+    WHERE i_category = 'Sports'
+) AS i ON ss.ss_item_sk = i.i_item_sk
+JOIN (
+    SELECT c_customer_sk, c_current_addr_sk
+    FROM customer
+    WHERE c_birth_month = 10
+) AS c ON ss.ss_customer_sk = c.c_customer_sk
+JOIN (
+    SELECT ca_address_sk, ca_zip
+    FROM customer_address
+    WHERE ca_state = 'VA'
+) AS ca ON c.c_current_addr_sk = ca.ca_address_sk
+JOIN store AS s
+    ON ss.ss_store_sk = s.s_store_sk
+    AND substring(ca.ca_zip, 1, 5) <> substring(s.s_zip, 1, 5)
+Time Cost: 99.70s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将date_dim的过滤条件(d_year=1999 AND d_moy=3)、item的过滤条件(i_category='Sports')、customer的过滤条件(c_birth_month=10)和customer_address的过滤条件(ca_state='VA')尽早应用，通过子查询或CTE先过滤小表，减少后续连接的数据量"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：优先连接高选择性的小表(date_dim过滤后、item过滤后、customer过滤后)，将store_sales的连接推迟到最后，利用前置过滤条件减少store_sales的扫描范围'}, {'group': '谓词简化', 'produced_suggestion': '将store_sales的过滤条件(ss_wholesale_cost BETWEEN 23 AND 43)与其他表的连接条件结合，考虑在连接前通过EXISTS或半连接方式先确定有效的ss_sold_date_sk、ss_item_sk、ss_customer_sk和ss_store_sk范围'}, {'group': '连接优化', 'produced_suggestion': 'substring(ca_zip,1,5) <> substring(s_zip,1,5)条件涉及函数计算，建议将此条件后置，先通过其他等值连接条件减少数据量后再应用此非等值条件'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
+```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示store_sales表存在严重的Seq Scan（全表扫描）性能瓶颈，占总代价98.6%。该表约有2880万行，且过滤条件ss_wholesale_cost BETWEEN 23 AND 43未能有效利用索引，导致全表扫描代价巨大。SQL涉及多表JOIN和多条件过滤，存在优化空间。",
+  "reason": "执行计划显示store_sales表的全表扫描(Seq Scan)占总代价98.6%，扫描2880万行数据。该SQL涉及6表连接且存在多个过滤条件，可通过谓词下推、连接顺序调整和过滤条件优化来减少数据扫描量。历史案例显示相似SQL通过FILTER_INTO_JOIN和JOIN_CONDITION_PUSH规则成功优化。",
   "advice": [
     {
       "group": "谓词简化",
-      "produced_suggestion": "考虑在store_sales表的ss_wholesale_cost列上建立合适的索引，或者将该过滤条件下推至索引扫描阶段以避免全表扫描。"
+      "produced_suggestion": "将date_dim的过滤条件(d_year=1999 AND d_moy=3)、item的过滤条件(i_category='Sports')、customer的过滤条件(c_birth_month=10)和customer_address的过滤条件(ca_state='VA')尽早应用，通过子查询或CTE先过滤小表，减少后续连接的数据量"
     },
     {
       "group": "连接优化",
-      "produced_suggestion": "重新调整JOIN顺序，优先连接过滤更严格（行数更少）的表以减少中间结果规模。"
-    },
-    {
-      "group": "投影优化",
-      "produced_suggestion": "精简查询列，只返回必要的聚合结果，避免引入无用列增加I/O和内存开销。"
+      "produced_suggestion": "调整连接顺序：优先连接高选择性的小表(date_dim过滤后、item过滤后、customer过滤后)，将store_sales的连接推迟到最后，利用前置过滤条件减少store_sales的扫描范围"
     },
     {
       "group": "谓词简化",
-      "produced_suggestion": "优化字符串比较谓词 substring(ca_zip,1,5) <> substring(s_zip,1,5)，尝试通过预计算或额外列索引减少表达式计算成本。"
+      "produced_suggestion": "将store_sales的过滤条件(ss_wholesale_cost BETWEEN 23 AND 43)与其他表的连接条件结合，考虑在连接前通过EXISTS或半连接方式先确定有效的ss_sold_date_sk、ss_item_sk、ss_customer_sk和ss_store_sk范围"
     },
     {
-      "group": "子查询优化",
-      "produced_suggestion": "虽然当前SQL无显式子查询，但复杂关联条件下可考虑用CTE或物化视图分解计算，降低连接复杂度。"
+      "group": "连接优化",
+      "produced_suggestion": "substring(ca_zip,1,5) <> substring(s_zip,1,5)条件涉及函数计算，建议将此条件后置，先通过其他等值连接条件减少数据量后再应用此非等值条件"
     }
   ]
 }
+```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 55 rules
-   → FILTER_CORRELATE: UCT=1.100
+📊 UCT scored 45 rules
    → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
    → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
-```{
-  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
-  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH"],
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH"],
   "rule_effect_scores": {
-    "STRATEGY_CTE_DECOMPOSITION": 0.5,
-    "FILTER_INTO_JOIN": 0.3,
-    "JOIN_CONDITION_PUSH": 0.2
+    "FILTER_INTO_JOIN": 0.55,
+    "JOIN_CONDITION_PUSH": 0.45
   },
   "rule_effect_confidence": {
-    "STRATEGY_CTE_DECOMPOSITION": 0.7,
-    "FILTER_INTO_JOIN": 0.8,
+    "FILTER_INTO_JOIN": 0.85,
     "JOIN_CONDITION_PUSH": 0.75
   }
 }
-✅ 选择了 3 个规则
+✅ 选择了 2 个规则
 🔧 开始SQL重写...
+```json
 {
-  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
-  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH"],
-  "original_sql": "select min(i_brand_id), min(i_manufact_id),   min(ss_ext_sales_price)  from date_dim, store_sales, item,customer,customer_address,store  where d_date_sk = ss_sold_date_sk    and ss_item_sk = i_item_sk    and ss_customer_sk = c_customer_sk    and c_current_addr_sk = ca_address_sk    and ss_store_sk = s_store_sk    AND i_category  = 'Sports'    and d_year=1999    and d_moy = 3    and substring(ca_zip,1,5) <> substring(s_zip,1,5)    and ca_state  = 'VA'    and c_birth_month = 10    and ss_wholesale_cost BETWEEN 23 AND 43  ;",
-  "rewritten_sql": "WITH \n  date_dim_cte AS (SELECT d_date_sk FROM date_dim WHERE d_year=1999 AND d_moy=3),\n  item_cte AS (SELECT i_item_sk, i_brand_id, i_manufact_id FROM item WHERE i_category='Sports'),\n  customer_address_cte AS (SELECT ca_address_sk, ca_zip FROM customer_address WHERE ca_state='VA'),\n  customer_cte AS (SELECT c_customer_sk, c_current_addr_sk FROM customer WHERE c_birth_month=10),\n  store_cte AS (SELECT s_store_sk, s_zip FROM store),\n  store_sales_cte AS (SELECT ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_store_sk, ss_ext_sales_price FROM store_sales WHERE ss_wholesale_cost BETWEEN 23 AND 43)\nSELECT \n  min(i_brand_id), \n  min(i_manufact_id), \n  min(ss_ext_sales_price)\nFROM store_sales_cte\nJOIN date_dim_cte ON store_sales_cte.ss_sold_date_sk = date_dim_cte.d_date_sk\nJOIN item_cte ON store_sales_cte.ss_item_sk = item_cte.i_item_sk\nJOIN customer_cte ON store_sales_cte.ss_customer_sk = customer_cte.c_customer_sk\nJOIN customer_address_cte ON customer_cte.c_current_addr_sk = customer_address_cte.ca_address_sk\nJOIN store_cte ON store_sales_cte.ss_store_sk = store_cte.s_store_sk \n  AND substring(customer_address_cte.ca_zip,1,5) <> substring(store_cte.s_zip,1,5);",
-  "semantic_check": "1. 语义等价性验证：\n   - CTE分解提前过滤所有表(date_dim/year-moy, item/category, customer/birth_month等)，减少连接数据量\n   - 显式JOIN结构确保连接逻辑不变，所有原始WHERE条件均保留\n   - 投影列完全一致(min(i_brand_id), min(i_manufact_id), min(ss_ext_sales_price))\n   - 连接条件优化：\n     * 单表过滤条件推入CTE（STRATEGY_CTE_DECOMPOSITION）\n     * 多表依赖条件(ca_zip/s_zip)推入JOIN ON子句（FILTER_INTO_JOIN）\n     * 连接键(d_date_sk等)保持原关联关系（JOIN_CONDITION_PUSH）\n2. 数据一致性保证：\n   - 所有表通过主键/外键关联（d_date_sk, i_item_sk等）\n   - 聚合函数作用范围不变（全表min值计算）\n   - 字符串函数处理逻辑一致（substring位置参数未改变）"
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH"],
+  "rewritten_sql": "SELECT\n    min(i_brand_id),\n    min(i_manufact_id),\n    min(ss_ext_sales_price)\nFROM (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 1999\n      AND d_moy = 3\n) AS dd\nJOIN (\n    SELECT ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_store_sk, ss_ext_sales_price\n    FROM store_sales\n    WHERE ss_wholesale_cost BETWEEN 23 AND 43\n) AS ss ON dd.d_date_sk = ss.ss_sold_date_sk\nJOIN (\n    SELECT i_item_sk, i_brand_id, i_manufact_id\n    FROM item\n    WHERE i_category = 'Sports'\n) AS i ON ss.ss_item_sk = i.i_item_sk\nJOIN (\n    SELECT c_customer_sk, c_current_addr_sk\n    FROM customer\n    WHERE c_birth_month = 10\n) AS c ON ss.ss_customer_sk = c.c_customer_sk\nJOIN (\n    SELECT ca_address_sk, ca_zip\n    FROM customer_address\n    WHERE ca_state = 'VA'\n) AS ca ON c.c_current_addr_sk = ca.ca_address_sk\nJOIN store AS s\n    ON ss.ss_store_sk = s.s_store_sk\n    AND substring(ca.ca_zip, 1, 5) <> substring(s.s_zip, 1, 5)"
 }
+```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
+
+
 ```json
 {
-  "equivalent": true,
-  "message": "重写SQL通过CTE提前过滤，推入连接条件，保持了原始SQL所有过滤条件和连接逻辑，投影及聚合完全一致，采纳semantic_check的等价性分析",
-  "differences": []
+    "equivalent": true,
+    "message": "两SQL等价：重写将WHERE条件推入各表子查询及JOIN ON，符合FILTER_INTO_JOIN与JOIN_CONDITION_PUSH规则，不改变结果集与聚合语义。",
+    "differences": []
 }
 ```
 ✅ 语义等价
 📊 开始评估优化结果...
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
+```json
 {
   "terminate": true,
-  "reason": "本轮优化中，重写SQL的成本与原始SQL完全相同（成本无明显下降），且两者的主要性能瓶颈依然是store_sales表的全表扫描。重写SQL虽然在逻辑层面通过CTE分解使结构更清晰，但未解决核心性能瓶颈。鉴于成本未下降且全表扫描问题未改善，基于查询重写层面已无明显优化空间，建议终止优化流程。若后续优化需依赖物理层面（如索引建立），则应终止本逻辑重写优化。按照规则，重写SQL逻辑更简洁，应保留重写SQL。",
-  "是否保留重写SQL": true
+  "reason": "重写costs与原始相同(701742.14)，但重写将所有过滤条件下推到各表的派生子查询中，结构更清晰且利于优化器提前过滤，减少JOIN时的数据量；已完成主要优化点，无明显可继续改进的结构问题",
+  "保留重写SQL": true
 }
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 444
+   - 规则序列: ['FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH']
+   - 优化组别: 谓词简化, 连接优化
+   - 估计代价: 原始=701742.14, 重写=701742.14，相对变化: 0.00%
+✅ 成功存储，记录ID: d1fd92e4-cdbf-4dda-91e4-3ffcbc2cf1ee
 
 ----------------------------------------
 

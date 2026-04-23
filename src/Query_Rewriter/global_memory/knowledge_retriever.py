@@ -57,10 +57,7 @@ class KnowledgeRetriever:
                 "sql_fingerprint": metadata.get('sql_fingerprint', ''),
                 "rule_sequence": rule_sequence,
                 "groups": metadata.get('groups', ''),
-                "cost_reduction_rate": float(metadata.get('cost_reduction_rate', '0')),
-                "original_cost": float(metadata.get('original_cost', '0')),
-                "rewritten_cost": float(metadata.get('rewritten_cost', '0')),
-                "frequency": int(metadata.get('frequency', '0'))
+                "frequency": int(metadata.get('frequency', '0')),
             }
             formatted_results.append(formatted_result)
         

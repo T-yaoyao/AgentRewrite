@@ -47,7 +47,8 @@ class GlobalMemoryManager:
         metadata: Optional[Dict] = None
     ) -> Optional[str]:
         """
-        Store successful optimization case
+        Store an optimization case when the workflow kept a non-identical rewritten SQL
+        (estimated cost comparison is not required).
         
         Args:
             original_sql: Original SQL
@@ -95,6 +96,16 @@ class GlobalMemoryManager:
             True if cleared successfully
         """
         return self.vector_store.clear_all()
+
+    def strip_legacy_cost_metadata(self) -> int:
+        """
+        Migrate existing Chroma rows: drop cost_reduction_rate, original_cost, rewritten_cost
+        from metadata without deleting vectors or documents.
+
+        Returns:
+            Number of records updated.
+        """
+        return self.vector_store.strip_legacy_cost_metadata()
     
     def list_all_records(self) -> List[Dict]:
         """
@@ -114,7 +125,6 @@ class GlobalMemoryManager:
                         'id': record_id,
                         'sql_fingerprint': result.get('metadata', {}).get('sql_fingerprint', '')[:100],
                         'rule_sequence': result.get('metadata', {}).get('rule_sequence', ''),
-                        'cost_reduction_rate': result.get('metadata', {}).get('cost_reduction_rate', '0'),
                         'frequency': result.get('metadata', {}).get('frequency', '0')
                     })
                     break

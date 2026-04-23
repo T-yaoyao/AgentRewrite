@@ -223,15 +223,16 @@ class VectorStore:
         hash_bytes = hash_obj.digest()
         return [float(b) / 255.0 for b in hash_bytes]
     
+    _FORBIDDEN_METADATA_KEYS = frozenset(
+        {"cost_reduction_rate", "original_cost", "rewritten_cost"}
+    )
+
     def add(
         self,
         sql_fingerprint: str,
         rule_sequence: List[str],
         groups: str,
-        cost_reduction_rate: float,
-        original_cost: float,
-        rewritten_cost: float,
-        metadata: Optional[Dict] = None
+        metadata: Optional[Dict] = None,
     ) -> str:
         """
         Add a new optimization case to the knowledge base
@@ -240,10 +241,7 @@ class VectorStore:
             sql_fingerprint: Normalized SQL template
             rule_sequence: List of applied rule IDs
             groups: Optimization groups (comma-separated)
-            cost_reduction_rate: Cost reduction percentage
-            original_cost: Original query cost
-            rewritten_cost: Rewritten query cost
-            metadata: Additional metadata
+            metadata: Additional metadata (cost fields are never persisted)
             
         Returns:
             Record ID
@@ -251,20 +249,19 @@ class VectorStore:
         record_id = str(uuid.uuid4())
         embedding = self.generate_embedding(sql_fingerprint)
         
-        # Prepare metadata
+        # Prepare metadata (do not store estimated cost or cost reduction in Chroma)
         record_metadata = {
             "sql_fingerprint": sql_fingerprint,
             "rule_sequence": json.dumps(rule_sequence),
             "groups": groups,
-            "cost_reduction_rate": str(cost_reduction_rate),
-            "original_cost": str(original_cost),
-            "rewritten_cost": str(rewritten_cost),
             "frequency": "1",
             "success": "true"
         }
         
         if metadata:
             record_metadata.update(metadata)
+        for k in self._FORBIDDEN_METADATA_KEYS:
+            record_metadata.pop(k, None)
         
         if self.collection:
             try:
@@ -433,6 +430,63 @@ class VectorStore:
             # In-memory clear
             self._in_memory_store.clear()
             return True
+
+    def strip_legacy_cost_metadata(self) -> int:
+        """
+        Remove cost-related keys from every record's metadata (in-place migration).
+
+        Strips: cost_reduction_rate, original_cost, rewritten_cost (see _FORBIDDEN_METADATA_KEYS).
+        Vectors and documents are unchanged.
+
+        Returns:
+            Number of records whose metadata was modified.
+        """
+        keys = self._FORBIDDEN_METADATA_KEYS
+        updated = 0
+        if self.collection:
+            try:
+                res = self.collection.get(include=["metadatas"])
+                ids = res.get("ids") or []
+                metadatas = res.get("metadatas") or []
+                if len(ids) != len(metadatas):
+                    print("⚠️ strip_legacy_cost_metadata: ids/metadatas length mismatch, aborting")
+                    return 0
+                batch_ids: List[str] = []
+                batch_meta: List[Dict] = []
+                batch_size = 128
+
+                for i, rid in enumerate(ids):
+                    old = dict(metadatas[i] or {})
+                    if not any(k in old for k in keys):
+                        continue
+                    new_meta = {k: v for k, v in old.items() if k not in keys}
+                    batch_ids.append(rid)
+                    batch_meta.append(new_meta)
+                    if len(batch_ids) >= batch_size:
+                        self.collection.update(ids=batch_ids, metadatas=batch_meta)
+                        updated += len(batch_ids)
+                        batch_ids = []
+                        batch_meta = []
+
+                if batch_ids:
+                    self.collection.update(ids=batch_ids, metadatas=batch_meta)
+                    updated += len(batch_ids)
+            except Exception as e:
+                print(f"⚠️ strip_legacy_cost_metadata (Chroma) failed: {e}")
+                import traceback
+
+                traceback.print_exc()
+                return updated
+            return updated
+
+        for _rid, record in getattr(self, "_in_memory_store", {}).items():
+            m = record.get("metadata") or {}
+            if not any(k in m for k in keys):
+                continue
+            for k in keys:
+                m.pop(k, None)
+            updated += 1
+        return updated
     
     def get_all_ids(self) -> List[str]:
         """
