@@ -11,10 +11,18 @@ Usage:
     response = gpt.get_LLM_response("Hello, world!", system_message="You are a helpful assistant.")
 """
 
-from openai import OpenAI, AsyncOpenAI
+from openai import OpenAI, AsyncOpenAI, BadRequestError
 import sys
 import json
 import tiktoken
+
+
+def _is_response_format_rejection(exc: BaseException) -> bool:
+    """True when the API rejected structured output / response_format (retry with looser format)."""
+    if not isinstance(exc, BadRequestError):
+        return False
+    msg = str(exc).lower()
+    return "response_format" in msg or "json_schema" in msg
 
 
 
@@ -29,7 +37,14 @@ class GPT:
     _global_output_tokens = 0
     _global_cost_rmb = 0.0
 
-    def __init__(self, api_key, model, base_url):
+    def __init__(
+        self,
+        api_key,
+        model,
+        base_url,
+        thinking_type: str | None = None,
+        reasoning_effort: str | None = None,
+    ):
         """
         Initialize the GPT client.
 
@@ -41,13 +56,15 @@ class GPT:
         self.api_key = api_key
         self.model = model or ""
         self.base_url = base_url
+        self.thinking_type = (thinking_type or "").strip().lower()
+        self.reasoning_effort = (reasoning_effort or "").strip().lower()
 
         # Per-instance accumulators
         self.input_tokens = 0
         self.output_tokens = 0
         self.cost_rmb = 0.0
 
-        # Check if this is a DeepSeek thinking model
+        # Legacy switch for older DeepSeek thinking models
         self.is_deepseek_thinking = "deepseek" in self.model.lower() and ("v3" in self.model or "thinking" in self.model)
 
         # Initialize synchronous client
@@ -148,10 +165,14 @@ class GPT:
             messages.append({"role": "system", "content": system_message})
         messages.append({"role": "user", "content": prompt})
 
-        # Prepare extra parameters for DeepSeek thinking models
+        # Prepare extra parameters for DeepSeek/OpenAI-compatible thinking controls
         extra_params = {}
-        if self.is_deepseek_thinking:
+        if self.thinking_type in {"enabled", "disabled"}:
+            extra_params["extra_body"] = {"thinking": {"type": self.thinking_type}}
+        elif self.is_deepseek_thinking:
             extra_params["extra_body"] = {"enable_thinking": True}
+        if self.reasoning_effort in {"high", "max"}:
+            extra_params["reasoning_effort"] = self.reasoning_effort
 
         if json_format:
             # Request JSON formatted response (prefer strict schema when provided)
@@ -184,6 +205,34 @@ class GPT:
                     stream=True,
                     **extra_params
                 )
+            except BadRequestError as exc:
+                # Many OpenAI-compatible gateways support json_object but not json_schema;
+                # prompt already constrains shape, so fall back to plain JSON object mode.
+                if (
+                    isinstance(json_schema, dict)
+                    and json_schema
+                    and response_format.get("type") == "json_schema"
+                    and _is_response_format_rejection(exc)
+                ):
+                    completion = self.client.chat.completions.create(
+                        temperature=0.0,
+                        model=self.model,
+                        response_format={"type": "json_object"},
+                        messages=messages,
+                        stream=True,
+                        **extra_params
+                    )
+                elif not (isinstance(json_schema, dict) and json_schema):
+                    completion = self.client.chat.completions.create(
+                        temperature=0.0,
+                        model=self.model,
+                        response_format={"type": "json_object"},
+                        messages=messages,
+                        stream=True,
+                        **extra_params
+                    )
+                else:
+                    raise
             except Exception:
                 if isinstance(json_schema, dict) and json_schema:
                     raise
@@ -257,10 +306,14 @@ class GPT:
                 messages.append({"role": "system", "content": system_message})
             messages.append({"role": "user", "content": prompt})
 
-            # Prepare extra parameters for DeepSeek thinking models
+            # Prepare extra parameters for DeepSeek/OpenAI-compatible thinking controls
             extra_params = {}
-            if self.is_deepseek_thinking:
+            if self.thinking_type in {"enabled", "disabled"}:
+                extra_params["extra_body"] = {"thinking": {"type": self.thinking_type}}
+            elif self.is_deepseek_thinking:
                 extra_params["extra_body"] = {"enable_thinking": True}
+            if self.reasoning_effort in {"high", "max"}:
+                extra_params["reasoning_effort"] = self.reasoning_effort
 
             if json_format:
                 # Request JSON formatted response (prefer strict schema when provided)
@@ -293,6 +346,32 @@ class GPT:
                         stream=True,
                         **extra_params
                     )
+                except BadRequestError as exc:
+                    if (
+                        isinstance(json_schema, dict)
+                        and json_schema
+                        and response_format.get("type") == "json_schema"
+                        and _is_response_format_rejection(exc)
+                    ):
+                        completion = await self.async_client.chat.completions.create(
+                            temperature=0.0,
+                            model=self.model,
+                            response_format={"type": "json_object"},
+                            messages=messages,
+                            stream=True,
+                            **extra_params
+                        )
+                    elif not (isinstance(json_schema, dict) and json_schema):
+                        completion = await self.async_client.chat.completions.create(
+                            temperature=0.0,
+                            model=self.model,
+                            response_format={"type": "json_object"},
+                            messages=messages,
+                            stream=True,
+                            **extra_params
+                        )
+                    else:
+                        raise
                 except Exception:
                     if isinstance(json_schema, dict) and json_schema:
                         raise

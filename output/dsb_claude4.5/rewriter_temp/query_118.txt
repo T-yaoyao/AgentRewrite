@@ -2,120 +2,85 @@ Query ID: 118
 ==================================================
 
 Original: select min(c_customer_id),     min(sr_ticket_number),     min(sr_item_sk)  from customer      ,customer_address      ,customer_demographics      ,household_demographics      ,income_band      ,store_returns  where ca_city	        =  'Hopewell'    and c_current_addr_sk = ca_address_sk    and ib_lower_bound   >=  3 * 10000    and ib_upper_bound   <=  3 * 10000 + 50000    and ib_income_band_sk = hd_income_band_sk    and cd_demo_sk = c_current_cdemo_sk    and hd_demo_sk = c_current_hdemo_sk    and sr_cdemo_sk = cd_demo_sk  ;
-Rewritten: select min(c_customer_id), min(sr_ticket_number), min(sr_item_sk)
-from (select ca_address_sk from customer_address where ca_city = 'Hopewell') as ca
-inner join (select c_customer_sk, c_customer_id, c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk from customer) as c
-  on c.c_current_addr_sk = ca.ca_address_sk
-inner join (select hd_demo_sk, hd_income_band_sk from household_demographics) as hd
-  on hd.hd_demo_sk = c.c_current_hdemo_sk
-inner join (select ib_income_band_sk from income_band where ib_lower_bound >= 30000 and ib_upper_bound <= 80000) as ib
-  on ib.ib_income_band_sk = hd.hd_income_band_sk
-inner join (select cd_demo_sk from customer_demographics) as cd
-  on cd.cd_demo_sk = c.c_current_cdemo_sk
-inner join (select sr_cdemo_sk, sr_ticket_number, sr_item_sk from store_returns) as sr
-  on sr.sr_cdemo_sk = cd.cd_demo_sk
-Time Cost: 145.38s
-Suggestion: [{'group': '连接优化', 'produced_suggestion': '将隐式连接改写为显式INNER JOIN，明确连接顺序和条件。建议先连接小表（income_band、household_demographics、customer_demographics），再连接customer_address（带过滤条件），最后连接大表store_returns，避免笛卡尔积'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：优先执行customer_address的ca_city过滤（选择性高），然后与customer通过c_current_addr_sk连接，再依次连接household_demographics、income_band、customer_demographics，最后连接store_returns，减少中间结果集'}, {'group': '谓词简化', 'produced_suggestion': '将WHERE子句中的连接条件移至ON子句，将过滤条件保留在WHERE或移至最早可应用的表。例如：customer_address的ca_city过滤、income_band的ib_lower_bound/ib_upper_bound过滤应尽早执行'}, {'group': '谓词简化', 'produced_suggestion': '简化income_band的范围条件：ib_lower_bound >= 30000 AND ib_upper_bound <= 80000 可以合并为 ib_income_band_sk IN (SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 30000 AND ib_upper_bound <= 80000)，或直接在连接前过滤'}, {'group': '投影优化', 'produced_suggestion': '查询只需要三个MIN聚合值，可以在连接前对各表进行列裁剪，只保留连接键和最终需要的列（c_customer_id、sr_ticket_number、sr_item_sk），减少数据传输量'}, {'group': '连接优化', 'produced_suggestion': '考虑将store_returns的连接改为半连接或EXISTS子查询，因为只需要验证存在性而非获取store_returns的具体列值（除sr_ticket_number和sr_item_sk外）'}]
+Rewritten: SELECT MIN(c_customer_id), MIN(sr_ticket_number), MIN(sr_item_sk)
+FROM (SELECT c_customer_id, c_current_cdemo_sk, c_current_hdemo_sk, c_current_addr_sk FROM customer) AS c
+JOIN (SELECT ca_address_sk FROM customer_address WHERE ca_city = 'Hopewell') AS ca ON c.c_current_addr_sk = ca.ca_address_sk
+JOIN (SELECT cd_demo_sk FROM customer_demographics) AS cd ON c.c_current_cdemo_sk = cd.cd_demo_sk
+JOIN (SELECT hd_demo_sk, hd_income_band_sk FROM household_demographics) AS hd ON c.c_current_hdemo_sk = hd.hd_demo_sk
+JOIN (SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 30000 AND ib_upper_bound <= 80000) AS ib ON hd.hd_income_band_sk = ib.ib_income_band_sk
+JOIN (SELECT sr_ticket_number, sr_item_sk, sr_cdemo_sk FROM store_returns) AS sr ON cd.cd_demo_sk = sr.sr_cdemo_sk
+Time Cost: 68.54s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将过滤条件ca_city = 'Hopewell'尽早应用于customer_address表，减少后续连接的数据量。"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，先连接过滤后的小表（如customer_address、income_band），再连接大表（store_returns），避免大表全表扫描后再连接。'}, {'group': '谓词简化', 'produced_suggestion': '将income_band上的范围条件ib_lower_bound >= 30000 AND ib_upper_bound <= 80000尽早应用，减少参与连接的行数。'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
-```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示存在严重性能瓶颈：1) store_returns表全表扫描占比80.7%，涉及719万行数据；2) 多表笛卡尔积连接导致中间结果集膨胀；3) 连接条件分散在WHERE子句中，优化器无法有效利用索引；4) customer_address过滤条件未能有效减少数据量。通过连接优化和谓词优化可显著提升性能。",
+  "reason": "执行计划中存在高代价的Seq Scan操作（store_returns表扫描代价占比80.7%，customer表扫描代价占比8.6%），且SQL结构复杂，涉及多表连接和过滤条件，可通过谓词下推、连接顺序调整等方式优化。",
   "advice": [
     {
-      "group": "连接优化",
-      "produced_suggestion": "将隐式连接改写为显式INNER JOIN，明确连接顺序和条件。建议先连接小表（income_band、household_demographics、customer_demographics），再连接customer_address（带过滤条件），最后连接大表store_returns，避免笛卡尔积"
+      "group": "谓词简化",
+      "produced_suggestion": "将过滤条件ca_city = 'Hopewell'尽早应用于customer_address表，减少后续连接的数据量。"
     },
     {
       "group": "连接优化",
-      "produced_suggestion": "调整连接顺序：优先执行customer_address的ca_city过滤（选择性高），然后与customer通过c_current_addr_sk连接，再依次连接household_demographics、income_band、customer_demographics，最后连接store_returns，减少中间结果集"
+      "produced_suggestion": "调整连接顺序，先连接过滤后的小表（如customer_address、income_band），再连接大表（store_returns），避免大表全表扫描后再连接。"
     },
     {
       "group": "谓词简化",
-      "produced_suggestion": "将WHERE子句中的连接条件移至ON子句，将过滤条件保留在WHERE或移至最早可应用的表。例如：customer_address的ca_city过滤、income_band的ib_lower_bound/ib_upper_bound过滤应尽早执行"
-    },
-    {
-      "group": "谓词简化",
-      "produced_suggestion": "简化income_band的范围条件：ib_lower_bound >= 30000 AND ib_upper_bound <= 80000 可以合并为 ib_income_band_sk IN (SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 30000 AND ib_upper_bound <= 80000)，或直接在连接前过滤"
-    },
-    {
-      "group": "投影优化",
-      "produced_suggestion": "查询只需要三个MIN聚合值，可以在连接前对各表进行列裁剪，只保留连接键和最终需要的列（c_customer_id、sr_ticket_number、sr_item_sk），减少数据传输量"
-    },
-    {
-      "group": "连接优化",
-      "produced_suggestion": "考虑将store_returns的连接改为半连接或EXISTS子查询，因为只需要验证存在性而非获取store_returns的具体列值（除sr_ticket_number和sr_item_sk外）"
+      "produced_suggestion": "将income_band上的范围条件ib_lower_bound >= 30000 AND ib_upper_bound <= 80000尽早应用，减少参与连接的行数。"
     }
   ]
 }
-```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 48 rules
-   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
-   → JOIN_EXTRACT_FILTER: UCT=1.100
+📊 UCT scored 45 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
 {
-  "groups": "连接优化, 谓词简化, 投影优化",
-  "applied_rules": [
-    "FILTER_INTO_JOIN",
-    "JOIN_CONDITION_PUSH",
-    "PROJECT_JOIN_TRANSPOSE",
-    "SEMI_JOIN_JOIN_TRANSPOSE"
-  ],
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE"],
   "rule_effect_scores": {
-    "FILTER_INTO_JOIN": 0.2,
-    "JOIN_CONDITION_PUSH": 0.2,
-    "PROJECT_JOIN_TRANSPOSE": 0.2,
-    "SEMI_JOIN_JOIN_TRANSPOSE": 0.4
+    "FILTER_INTO_JOIN": 0.4,
+    "JOIN_CONDITION_PUSH": 0.3,
+    "PROJECT_JOIN_TRANSPOSE": 0.3
   },
   "rule_effect_confidence": {
-    "FILTER_INTO_JOIN": 0.499,
-    "JOIN_CONDITION_PUSH": 0.5,
-    "PROJECT_JOIN_TRANSPOSE": 0.532,
-    "SEMI_JOIN_JOIN_TRANSPOSE": 0.911
+    "FILTER_INTO_JOIN": 0.8,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "PROJECT_JOIN_TRANSPOSE": 0.9
   }
 }
-✅ 选择了 4 个规则
+✅ 选择了 3 个规则
 🔧 开始SQL重写...
-```json
 {
-  "groups": "连接优化, 谓词简化, 投影优化",
-  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE", "SEMI_JOIN_JOIN_TRANSPOSE"],
-  "rewritten_sql": "select min(c_customer_id), min(sr_ticket_number), min(sr_item_sk)\nfrom (select ca_address_sk from customer_address where ca_city = 'Hopewell') as ca\ninner join (select c_customer_sk, c_customer_id, c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk from customer) as c\n  on c.c_current_addr_sk = ca.ca_address_sk\ninner join (select hd_demo_sk, hd_income_band_sk from household_demographics) as hd\n  on hd.hd_demo_sk = c.c_current_hdemo_sk\ninner join (select ib_income_band_sk from income_band where ib_lower_bound >= 30000 and ib_upper_bound <= 80000) as ib\n  on ib.ib_income_band_sk = hd.hd_income_band_sk\ninner join (select cd_demo_sk from customer_demographics) as cd\n  on cd.cd_demo_sk = c.c_current_cdemo_sk\ninner join (select sr_cdemo_sk, sr_ticket_number, sr_item_sk from store_returns) as sr\n  on sr.sr_cdemo_sk = cd.cd_demo_sk"
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE"],
+  "rewritten_sql": "SELECT MIN(c_customer_id), MIN(sr_ticket_number), MIN(sr_item_sk)\nFROM (SELECT c_customer_id, c_current_cdemo_sk, c_current_hdemo_sk, c_current_addr_sk FROM customer) AS c\nJOIN (SELECT ca_address_sk FROM customer_address WHERE ca_city = 'Hopewell') AS ca ON c.c_current_addr_sk = ca.ca_address_sk\nJOIN (SELECT cd_demo_sk FROM customer_demographics) AS cd ON c.c_current_cdemo_sk = cd.cd_demo_sk\nJOIN (SELECT hd_demo_sk, hd_income_band_sk FROM household_demographics) AS hd ON c.c_current_hdemo_sk = hd.hd_demo_sk\nJOIN (SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 30000 AND ib_upper_bound <= 80000) AS ib ON hd.hd_income_band_sk = ib.ib_income_band_sk\nJOIN (SELECT sr_ticket_number, sr_item_sk, sr_cdemo_sk FROM store_returns) AS sr ON cd.cd_demo_sk = sr.sr_cdemo_sk",
+  "semantic_correctness_guarantee": "1. 将原 WHERE 子句中仅涉及 customer_address 表的过滤条件 ca_city = 'Hopewell' 下推至 customer_address 的子查询中，提前过滤，减少参与连接的行数，等价于原查询中该条件在连接后过滤的效果。\n2. 将原 WHERE 子句中仅涉及 income_band 表的范围条件 ib_lower_bound >= 30000 AND ib_upper_bound <= 80000 下推至 income_band 的子查询中，提前过滤，等价于原查询中该条件在连接后过滤的效果。\n3. 将原查询中隐式连接（逗号分隔）改写为显式 JOIN 语法，并按照连接条件重新组织连接顺序，但连接图与原查询完全一致：customer 通过 c_current_addr_sk 连接 customer_address，通过 c_current_cdemo_sk 连接 customer_demographics，通过 c_current_hdemo_sk 连接 household_demographics，household_demographics 通过 hd_income_band_sk 连接 income_band，customer_demographics 通过 cd_demo_sk 连接 store_returns 的 sr_cdemo_sk。所有连接均为等值连接，且未改变连接类型（均为内连接），因此结果集不变。\n4. 对每张表仅投影出后续连接或聚合所需的列，减少数据传输量，但不影响聚合函数 MIN 的计算，因为 MIN 仅依赖于这些列的存在，且投影未引入重复行或改变行值。\n5. 原查询中的聚合函数 MIN 作用于整个连接结果集，重写后仍作用于相同的连接结果集，且未引入额外的分组或过滤，因此聚合结果完全一致。\n6. 所有表的主键或唯一索引保证了连接不会产生意外的重复行，且原查询中无 DISTINCT 或 GROUP BY，重写后语义保持一致。"
 }
-```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
-```json
 {
-    "equivalent": true,
-    "message": "重写SQL将隐式JOIN改为显式INNER JOIN，并应用了FILTER_INTO_JOIN和PROJECT_JOIN_TRANSPOSE规则，所有JOIN条件、过滤条件和聚合逻辑保持一致，结果集等价。",
-    "differences": []
+  "equivalent": true,
+  "message": "重写SQL通过谓词下推、显式JOIN和列裁剪，保持了与原SQL相同的连接图和过滤条件，聚合结果一致。",
+  "differences": []
 }
-```
 ✅ 语义等价
 📊 开始评估优化结果...
-```json
 {
   "terminate": true,
-  "reason": "重写costs与原始相同（184424.53），但重写将隐式连接改为显式INNER JOIN并通过派生表实现列裁剪和过滤下推，结构更清晰且符合优化器友好写法，已应用多条规则后达到较优形态，继续优化空间有限",
-  "保留重写SQL": true
+  "reason": "执行计划结构完全一致（节点类型、扫描方式、连接顺序、索引使用均相同），仅最终Hash Join的行数估计略有差异（209 vs 1361），但整体成本接近（184424.53 vs 184437.98）。重写SQL仅通过子查询显式投影列，未改变执行路径，无结构性改进或退化。由于结构无变化且成本差异极小，优化空间已耗尽，按不确定终止处理。",
+  "no_further_optimization": true,
+  "keep_rewrite_sql": true
 }
-```
-💾 正在存储优化案例到向量数据库...
-   - SQL指纹长度: 403
-   - 规则序列: ['FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH', 'PROJECT_JOIN_TRANSPOSE', 'SEMI_JOIN_JOIN_TRANSPOSE']
-   - 优化组别: 连接优化, 谓词简化, 投影优化
-   - 估计代价: 原始=184424.53, 重写=184424.53，相对变化: 0.00%
-✅ 成功存储，记录ID: 88cd2879-b87f-4137-a9c4-794d56d81455
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库与 UCT 更新。
 
 ----------------------------------------
 

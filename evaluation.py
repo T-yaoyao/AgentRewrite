@@ -45,7 +45,7 @@ import argparse
 # Keyed by DB_NAME from environment.
 SKIP_ORIGINAL_BY_DB = {
     "tpch": {"46", "47", "48", "55", "56", "57"},
-    "dsb": {"55", "56", "57", "109", "110", "111", "136", "137", "138"},
+    "dsb": {"55", "56", "57", "79", "109", "110", "111", "136", "137", "138"},
     "calcite": {"50", "53", "56"},
 }
 SKIP_ORIGINAL_FIXED_TIMEOUT = 300.0
@@ -83,6 +83,44 @@ class Evaluation():
         s = s.replace("\\n", " ").replace("\n", " ")
         s = re.sub(r"\s+", "", s)
         return s
+
+    @staticmethod
+    def _coerce_sql_text(sql_value):
+        """
+        Convert possible structured SQL payloads into executable SQL text.
+        Accepts plain strings or dict-like entries that contain rewritten SQL fields.
+        """
+        if isinstance(sql_value, str):
+            return sql_value
+        if isinstance(sql_value, dict):
+            # Direct field lookup first.
+            for key in ("rewritten_query", "rewritten_sql", "original_query", "original_sql", "query", "sql"):
+                v = sql_value.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v
+            # Common QUITE output wrapper: {"tpch":[{"rewritten_query":"..."}]}
+            tpch_block = sql_value.get("tpch")
+            if isinstance(tpch_block, list):
+                for item in tpch_block:
+                    extracted = Evaluation._coerce_sql_text(item)
+                    if isinstance(extracted, str) and extracted.strip():
+                        return extracted
+            # Recursive fallback for nested dict/list payloads.
+            for v in sql_value.values():
+                extracted = Evaluation._coerce_sql_text(v)
+                if isinstance(extracted, str) and extracted.strip():
+                    return extracted
+            # Last-resort: stable JSON text (won't execute, but avoids crashes and is debuggable)
+            return json.dumps(sql_value, ensure_ascii=False)
+        if isinstance(sql_value, list):
+            for item in sql_value:
+                extracted = Evaluation._coerce_sql_text(item)
+                if isinstance(extracted, str) and extracted.strip():
+                    return extracted
+            return ""
+        if sql_value is None:
+            return ""
+        return str(sql_value)
 
     def dedupe_results_by_id(self, rows):
         """
@@ -236,7 +274,7 @@ class Evaluation():
                     pass
                 print(f"Error exe cuting query: {e}")
                 # self.restart_postgresql()
-                return None
+                return (None, None) if return_flag else None
         
         except psycopg2.Error as e:
             try:
@@ -247,7 +285,7 @@ class Evaluation():
             if return_flag == False:
                 return -1  
             else:
-                return None
+                return None, None
             
         except Exception as e:
             try:
@@ -481,7 +519,7 @@ class Evaluation():
 
         print(f"Experiment results appended to {self.result_storage_path}")
     
-    def cal(self, equivalence_threshold=0.01, speed_up_threshold=0.01):
+    def cal(self, equivalence_threshold=0.01, min_abs_time_improvement=0.1):
         Metric = []
         result_data = []
         all_result_data = []
@@ -561,8 +599,12 @@ class Evaluation():
         improved_count = sum(
             1 for x in all_result_data
             if (
-                isinstance(x.get("speed_up"), (int, float))
-                and x.get("speed_up") > speed_up_threshold
+                isinstance(x.get("original_execution_time"), (int, float))
+                and isinstance(x.get("rewrite_execution_time"), (int, float))
+                and (
+                    x.get("original_execution_time") - x.get("rewrite_execution_time")
+                    > min_abs_time_improvement
+                )
                 and self._normalize_sql_for_compare(x.get("original_query", "")) !=
                 self._normalize_sql_for_compare(x.get("rewritten_query", ""))
             )
@@ -574,7 +616,7 @@ class Evaluation():
             "improved_count": improved_count,
             "improvement_rate": (improved_count / total_queries) if total_queries else 0.0,
             "equivalence_threshold": equivalence_threshold,
-            "speed_up_threshold": speed_up_threshold,
+            "min_abs_time_improvement": min_abs_time_improvement,
         }
 
         output_data = [ori_result, re_result, stats_result] + all_result_data
@@ -583,9 +625,37 @@ class Evaluation():
         print("Calculate Metrics Done!") # Debug line to check if the script has finished running
 
 def ensure_file_exists(path):
+    parent_dir = os.path.dirname(path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     if not os.path.exists(path):
         with open(path, 'w') as f:
             json.dump([], f)  # Create an empty JSON array if the file does not exist
+
+
+def extract_query_entries(raw_data):
+    """
+    Flatten mixed JSON payloads and keep only query dict entries.
+    Supports files whose top-level list may contain nested summary blocks.
+    """
+    entries = []
+
+    def _walk(node):
+        if isinstance(node, dict):
+            # Keep rows that look like query pairs.
+            if (
+                node.get("original_query")
+                or node.get("query")
+                or node.get("original_sql")
+            ):
+                entries.append(node)
+            return
+        if isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(raw_data)
+    return entries
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -617,10 +687,14 @@ def parse_arguments():
                         help="Disable database restart between queries (runs 5 times, removes min/max)")
     parser.add_argument("--equivalence_threshold", type=float, default=0.01,
                         help="Threshold metadata for equivalence rate reporting (default: 0.01)")
-    parser.add_argument("--speed_up_threshold", type=float, default=0.01,
-                        help="Threshold for improvement_rate counting (default: 0.01)")
+    parser.add_argument("--min_abs_time_improvement", type=float, default=0.1,
+                        help="Absolute time improvement threshold in seconds for improvement_rate counting (default: 0.1)")
     parser.add_argument("--time-only", action="store_true", default=False,
                         help="Only measure execution time, skip full rewrite and semantic check")
+    parser.add_argument("--watch_queries", action="store_true", default=False,
+                        help="Continuously watch queries_path and evaluate newly appended query IDs")
+    parser.add_argument("--watch_interval", type=float, default=2.0,
+                        help="Polling interval in seconds for --watch_queries mode (default: 2.0)")
     return parser.parse_args()     
 
 if __name__ == "__main__":
@@ -631,8 +705,10 @@ if __name__ == "__main__":
     time_out = args.time_out
     no_restart = args.no_restart
     equivalence_threshold = args.equivalence_threshold
-    speed_up_threshold = args.speed_up_threshold
+    min_abs_time_improvement = args.min_abs_time_improvement
     time_only = getattr(args, 'time_only', False)
+    watch_queries = getattr(args, 'watch_queries', False)
+    watch_interval = max(0.5, float(getattr(args, 'watch_interval', 2.0)))
     
     if no_restart:
         print("=" * 60)
@@ -652,11 +728,6 @@ if __name__ == "__main__":
     ensure_file_exists(filtered_path)
     model = Evaluation(queries_path, storage_path, filtered_path, time_out, no_restart=no_restart)
 
-
-    with open(queries_path, 'r') as file:
-        json_content = file.read()
-    data = json.loads(json_content)
-    print("data load sucessfully!")
 
     # Resume + dedupe existing results
     result = []
@@ -680,79 +751,124 @@ if __name__ == "__main__":
             result = []
             completed_ids = set()
 
-    iteration = 0
-    equiv_number = 0
-    sucess_run_number = 0
-    for i, query_info in enumerate(data, start=0):
-        query_id = query_info.get("id", "")
-        query_id_str = model._normalize_id(query_id)
-        if query_id_str in completed_ids:
-            print(f"⏭️  Skip completed query id={query_id_str}")
-            continue
+    stats = {
+        "iteration": 0,
+        "equiv_number": 0,
+        "sucess_run_number": 0,
+    }
 
-        iteration += 1
-        print("this is the {}-th iteration".format(iteration))
-        print(f"the query id is {query_id}")
+    def load_query_entries():
+        with open(queries_path, 'r') as file:
+            json_content = file.read()
+        raw_data = json.loads(json_content)
+        return extract_query_entries(raw_data)
 
-        # Support both "query" (in dsb_test.json) and "original_query"
-        original_query = query_info.get("original_query") or query_info.get("query")
-        if time_only:
-            rewritten_query = original_query  # In time-only mode, we only test original for now
-            print(f"Original Query (time-only): {original_query[:80]}...")
-        else:
-            rewritten_query = query_info.get("rewritten_query", "No rewritten query found")
-            print(f"Original Query: {original_query[:80]}...")
-            print(f"Rewritten Query: {rewritten_query[:80]}...")
+    def evaluate_pending_once(data):
+        processed_now = 0
+        for i, query_info in enumerate(data, start=0):
+            if not isinstance(query_info, dict):
+                print(f"⏭️  Skip invalid query entry at index={i}: type={type(query_info).__name__}")
+                continue
+            query_id = query_info.get("id", "")
+            query_id_str = model._normalize_id(query_id)
+            if query_id_str in completed_ids:
+                continue
 
-        total_original_time,total_rewrite_time,speed_up,times_up,original_result,rewritten_result = model.compare_rewritten(
-            original_query, rewritten_query, query_id=query_id
+            stats["iteration"] += 1
+            processed_now += 1
+            print("this is the {}-th iteration".format(stats["iteration"]))
+            print(f"the query id is {query_id}")
+
+            # Support both "query" (in dsb_test.json) and "original_query"
+            original_query = model._coerce_sql_text(query_info.get("original_query") or query_info.get("query"))
+            if time_only:
+                rewritten_query = original_query  # In time-only mode, we only test original for now
+                print(f"Original Query (time-only): {original_query[:80]}...")
+            else:
+                rewritten_query = model._coerce_sql_text(
+                    query_info.get("rewritten_query", query_info.get("rewritten_sql", "No rewritten query found"))
+                )
+                print(f"Original Query: {original_query[:80]}...")
+                print(f"Rewritten Query: {rewritten_query[:80]}...")
+
+            total_original_time,total_rewrite_time,speed_up,times_up,original_result,rewritten_result = model.compare_rewritten(
+                original_query, rewritten_query, query_id=query_id
+            )
+            
+            equivalance = False
+            if total_original_time != None and total_rewrite_time != None and original_result != -1 and rewritten_result != -1:
+                stats["sucess_run_number"] += 1
+            
+            skipped_original = model._should_skip_original(query_id)
+            if skipped_original:
+                equivalance = True
+            elif original_result != None and rewritten_result != None and original_result != -1 and rewritten_result != -1 and total_original_time != time_out and total_rewrite_time != time_out:
+                original_counts = collections.Counter(original_result)
+                rewritten_counts = collections.Counter(rewritten_result)
+                equivalance = (original_counts == rewritten_counts)
+
+            if equivalance:
+                stats["equiv_number"] += 1
+            result_data = {
+                "id": query_id,
+                "equivalence": equivalance,
+                "original_query": original_query,
+                "rewritten_query": rewritten_query,
+                "original_execution_time": total_original_time,
+                "rewrite_execution_time": total_rewrite_time,
+                "speed_up": speed_up,
+                "times_up": times_up          
+            }
+            result.append(result_data)
+            if query_id_str:
+                completed_ids.add(query_id_str)
+
+            # Persist after each query for true resume capability
+            deduped = model.dedupe_results_by_id(result)
+            with open(storage_path, 'w') as result_file:
+                json.dump([model.convert_to_serializable(item) for item in deduped], result_file, indent=4)
+            result[:] = deduped
+            print(f"Results saved after query {query_id}")
+
+            # Refresh metrics after each newly evaluated query.
+            model.cal(
+                equivalence_threshold=equivalence_threshold,
+                min_abs_time_improvement=min_abs_time_improvement,
+            )
+        return processed_now
+
+    data = load_query_entries()
+    if not data:
+        raise ValueError(
+            "No valid query entries found in queries_path. "
+            "Expected dict items containing original_query/query/original_sql."
         )
-        
-        equivalance = False
-        if total_original_time != None and total_rewrite_time != None and original_result != -1 and rewritten_result != -1:
-            sucess_run_number += 1
-        
-        skipped_original = model._should_skip_original(query_id)
-        if skipped_original:
-            equivalance = True
-        elif original_result != None and rewritten_result != None and original_result != -1 and rewritten_result != -1 and total_original_time != time_out and total_rewrite_time != time_out:
-            original_counts = collections.Counter(original_result)
-            rewritten_counts = collections.Counter(rewritten_result)
-            equivalance = (original_counts == rewritten_counts)
+    print("data load sucessfully!")
 
-        if equivalance:
-            equiv_number += 1
-        result_data = {
-            "id": query_id,
-            "equivalence": equivalance,
-            "original_query": original_query,
-            "rewritten_query": rewritten_query,
-            "original_execution_time": total_original_time,
-            "rewrite_execution_time": total_rewrite_time,
-            "speed_up": speed_up,
-            "times_up": times_up          
-        }
-        result.append(result_data)
-        if query_id_str:
-            completed_ids.add(query_id_str)
-
-        # Persist after each query for true resume capability
-        deduped = model.dedupe_results_by_id(result)
-        with open(storage_path, 'w') as result_file:
-            json.dump([model.convert_to_serializable(item) for item in deduped], result_file, indent=4)
-        result = deduped
-        print(f"Results saved after query {query_id}")
+    if watch_queries:
+        print(f"👀 Watch mode enabled: polling every {watch_interval:.1f}s")
+        while True:
+            try:
+                data = load_query_entries()
+                processed_now = evaluate_pending_once(data)
+                if processed_now == 0:
+                    time.sleep(watch_interval)
+            except KeyboardInterrupt:
+                print("\n🛑 Watch mode stopped by user")
+                break
+    else:
+        evaluate_pending_once(data)
 
     # Final flush
     result = model.dedupe_results_by_id(result)
     with open(storage_path, 'w') as result_file:
         json.dump([model.convert_to_serializable(item) for item in result], result_file, indent=4)
     print(f"Experiment results appended to {storage_path}")
-    print(f"the number of equivalent query is {equiv_number}")
-    print(f"the number of sucess run query is {sucess_run_number}/ {iteration}")
+    print(f"the number of equivalent query is {stats['equiv_number']}")
+    print(f"the number of sucess run query is {stats['sucess_run_number']}/ {stats['iteration']}")
 
     model.cal(
         equivalence_threshold=equivalence_threshold,
-        speed_up_threshold=speed_up_threshold,
+        min_abs_time_improvement=min_abs_time_improvement,
     )
 

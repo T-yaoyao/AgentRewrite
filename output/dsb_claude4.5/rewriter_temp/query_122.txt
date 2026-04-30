@@ -6,157 +6,120 @@ Rewritten: SELECT substring(r_reason_desc, 1, 20),
        avg(ws_quantity),
        avg(wr_refunded_cash),
        avg(wr_fee)
-FROM web_sales,
-     web_returns,
-     web_page,
-     customer_demographics cd1,
-     customer_demographics cd2,
-     customer_address,
-     date_dim,
-     reason
-WHERE ws_web_page_sk = wp_web_page_sk
-  AND ws_item_sk = wr_item_sk
-  AND ws_order_number = wr_order_number
-  AND ws_sold_date_sk = d_date_sk
-  AND d_year = 1999
-  AND cd1.cd_demo_sk = wr_refunded_cdemo_sk
-  AND cd2.cd_demo_sk = wr_returning_cdemo_sk
-  AND ca_address_sk = wr_refunded_addr_sk
-  AND r_reason_sk = wr_reason_sk
-  AND cd1.cd_marital_status = cd2.cd_marital_status
-  AND cd1.cd_education_status = cd2.cd_education_status
-  AND (
+FROM (
+  SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc
+  FROM web_sales
+  JOIN date_dim ON ws_sold_date_sk = d_date_sk AND d_year = 1999
+  JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+  JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+  JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+  JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+  JOIN customer_address ON ca_address_sk = wr_refunded_addr_sk
+  JOIN reason ON r_reason_sk = wr_reason_sk
+  WHERE (
     (cd1.cd_marital_status = 'U' AND cd1.cd_education_status = 'Primary' AND ws_sales_price BETWEEN 100.00 AND 150.00)
     OR (cd1.cd_marital_status = 'D' AND cd1.cd_education_status = '4 yr Degree' AND ws_sales_price BETWEEN 50.00 AND 100.00)
     OR (cd1.cd_marital_status = 'M' AND cd1.cd_education_status = 'College' AND ws_sales_price BETWEEN 150.00 AND 200.00)
   )
+  AND cd1.cd_marital_status = cd2.cd_marital_status
+  AND cd1.cd_education_status = cd2.cd_education_status
   AND ca_country = 'United States'
   AND (
     (ca_state IN ('NE', 'TN', 'TX') AND ws_net_profit BETWEEN 100 AND 200)
     OR (ca_state IN ('MS', 'NY', 'VA') AND ws_net_profit BETWEEN 150 AND 300)
     OR (ca_state IN ('MS', 'TN', 'TX') AND ws_net_profit BETWEEN 50 AND 250)
   )
+) AS sub
 GROUP BY r_reason_desc
 ORDER BY substring(r_reason_desc, 1, 20),
          avg(ws_quantity),
          avg(wr_refunded_cash),
          avg(wr_fee)
-LIMIT 100
-Time Cost: 207.48s
-Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将cd1和cd2的复杂OR条件提取为CTE或临时表，避免在Seq Scan中重复计算。可以将三组(cd_marital_status, cd_education_status)的组合条件改写为IN子句：cd1.cd_marital_status IN ('U','D','M') AND (cd1.cd_marital_status='U' AND cd1.cd_education_status='Primary' OR ...)"}, {'group': '谓词简化', 'produced_suggestion': "customer_address的ca_state条件存在重复('MS'和'TN'在多个OR分支中出现)，可以合并简化为：ca_country='United States' AND ca_state IN ('NE','TN','TX','MS','NY','VA')，然后根据ws_net_profit范围进行后置过滤"}, {'group': '连接优化', 'produced_suggestion': 'cd1和cd2的连接使用了Nested Loop with Join Filter，应该改为Hash Join。建议先对cd1和cd2分别应用过滤条件后再连接，或者将cd1.cd_marital_status = cd2.cd_marital_status AND cd1.cd_education_status = cd2.cd_education_status条件改写为等值连接条件'}, {'group': '常量折叠', 'produced_suggestion': 'ws_sales_price和ws_net_profit的范围条件可以预先计算合并。例如ws_sales_price的三个范围[100,150],[50,100],[150,200]可以合并为[50,200]，然后在聚合前根据cd1条件进行精确过滤'}, {'group': '子查询优化', 'produced_suggestion': '将复杂的OR条件分支改写为UNION ALL子查询，每个分支处理一组特定的(cd_marital_status, cd_education_status, ws_sales_price, ca_state, ws_net_profit)组合，这样可以让优化器为每个分支选择最优执行计划和索引'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，先连接小表和有过滤条件的表。建议顺序：date_dim(d_year=1999过滤后很小) -> web_sales -> web_returns -> reason -> web_page -> 过滤后的cd1 -> 过滤后的cd2 -> 过滤后的customer_address'}, {'group': '投影优化', 'produced_suggestion': '在连接早期阶段就进行列裁剪，只保留JOIN键、过滤条件列和聚合所需列(ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc)，减少中间结果集大小'}]
+LIMIT 100;
+Time Cost: 105.62s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将OR条件改写为UNION ALL形式，使每个分支的过滤条件更简单，便于优化器利用索引和生成更高效的执行计划。例如，将cd1和ca的OR条件拆分为多个子查询并用UNION ALL合并。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，先对web_sales、date_dim等小表进行过滤和连接，减少中间结果集大小，避免直接对大表web_returns进行全表扫描。考虑将web_returns与cd1、cd2的连接提前，利用索引。'}, {'group': '聚合优化', 'produced_suggestion': '将GROUP BY和ORDER BY中的表达式替换为别名或提前计算，避免重复计算substring函数。同时，考虑使用CTE预先过滤和聚合，减少最终聚合的数据量。'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
-```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示存在多个严重性能瓶颈：1) cd1表全表扫描占比44.5%，过滤条件复杂且重复；2) web_returns大表全表扫描占比34.5%；3) customer_address全表扫描占比8.4%；4) Nested Loop连接代价高达7.9%，存在Join Filter而非Hash Condition；5) 复杂的OR条件导致谓词无法有效下推和索引利用。SQL结构存在明显可优化空间，包括谓词简化、连接优化和常量折叠。",
+  "reason": "执行计划中存在高代价的Seq Scan（cd1、web_returns、customer_address）和Nested Loop连接，且SQL结构复杂，包含多个OR条件、多表连接和聚合排序，可通过谓词简化、连接优化和聚合优化提升性能。",
   "advice": [
     {
       "group": "谓词简化",
-      "produced_suggestion": "将cd1和cd2的复杂OR条件提取为CTE或临时表，避免在Seq Scan中重复计算。可以将三组(cd_marital_status, cd_education_status)的组合条件改写为IN子句：cd1.cd_marital_status IN ('U','D','M') AND (cd1.cd_marital_status='U' AND cd1.cd_education_status='Primary' OR ...)"
-    },
-    {
-      "group": "谓词简化",
-      "produced_suggestion": "customer_address的ca_state条件存在重复('MS'和'TN'在多个OR分支中出现)，可以合并简化为：ca_country='United States' AND ca_state IN ('NE','TN','TX','MS','NY','VA')，然后根据ws_net_profit范围进行后置过滤"
+      "produced_suggestion": "将OR条件改写为UNION ALL形式，使每个分支的过滤条件更简单，便于优化器利用索引和生成更高效的执行计划。例如，将cd1和ca的OR条件拆分为多个子查询并用UNION ALL合并。"
     },
     {
       "group": "连接优化",
-      "produced_suggestion": "cd1和cd2的连接使用了Nested Loop with Join Filter，应该改为Hash Join。建议先对cd1和cd2分别应用过滤条件后再连接，或者将cd1.cd_marital_status = cd2.cd_marital_status AND cd1.cd_education_status = cd2.cd_education_status条件改写为等值连接条件"
+      "produced_suggestion": "调整连接顺序，先对web_sales、date_dim等小表进行过滤和连接，减少中间结果集大小，避免直接对大表web_returns进行全表扫描。考虑将web_returns与cd1、cd2的连接提前，利用索引。"
     },
     {
-      "group": "常量折叠",
-      "produced_suggestion": "ws_sales_price和ws_net_profit的范围条件可以预先计算合并。例如ws_sales_price的三个范围[100,150],[50,100],[150,200]可以合并为[50,200]，然后在聚合前根据cd1条件进行精确过滤"
-    },
-    {
-      "group": "子查询优化",
-      "produced_suggestion": "将复杂的OR条件分支改写为UNION ALL子查询，每个分支处理一组特定的(cd_marital_status, cd_education_status, ws_sales_price, ca_state, ws_net_profit)组合，这样可以让优化器为每个分支选择最优执行计划和索引"
-    },
-    {
-      "group": "连接优化",
-      "produced_suggestion": "调整连接顺序，先连接小表和有过滤条件的表。建议顺序：date_dim(d_year=1999过滤后很小) -> web_sales -> web_returns -> reason -> web_page -> 过滤后的cd1 -> 过滤后的cd2 -> 过滤后的customer_address"
-    },
-    {
-      "group": "投影优化",
-      "produced_suggestion": "在连接早期阶段就进行列裁剪，只保留JOIN键、过滤条件列和聚合所需列(ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc)，减少中间结果集大小"
+      "group": "聚合优化",
+      "produced_suggestion": "将GROUP BY和ORDER BY中的表达式替换为别名或提前计算，避免重复计算substring函数。同时，考虑使用CTE预先过滤和聚合，减少最终聚合的数据量。"
     }
   ]
 }
-```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 66 rules
+📊 UCT scored 64 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.212
    → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
    → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
-   → FILTER_VALUES_MERGE: UCT=1.100
 {
-  "groups": "谓词简化, 连接优化, 常量折叠, 子查询优化, 投影优化",
+  "groups": "谓词简化, 连接优化, 聚合优化",
   "applied_rules": [
     "FILTER_REDUCE_EXPRESSIONS",
     "JOIN_PUSH_TRANSITIVE_PREDICATES",
     "JOIN_CONDITION_PUSH",
-    "PROJECT_REDUCE_EXPRESSIONS",
-    "PROJECT_REMOVE"
+    "AGGREGATE_FILTER_TRANSPOSE"
   ],
   "rule_effect_scores": {
     "FILTER_REDUCE_EXPRESSIONS": 0.3,
-    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.2,
-    "JOIN_CONDITION_PUSH": 0.2,
-    "PROJECT_REDUCE_EXPRESSIONS": 0.1,
-    "PROJECT_REMOVE": 0.2
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.25,
+    "JOIN_CONDITION_PUSH": 0.25,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.2
   },
   "rule_effect_confidence": {
-    "FILTER_REDUCE_EXPRESSIONS": 0.607,
-    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.628,
-    "JOIN_CONDITION_PUSH": 0.506,
-    "PROJECT_REDUCE_EXPRESSIONS": 0.709,
-    "PROJECT_REMOVE": 0.654
+    "FILTER_REDUCE_EXPRESSIONS": 0.7,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.75,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.65
   }
 }
-✅ 选择了 5 个规则
+✅ 选择了 4 个规则
 🔧 开始SQL重写...
-```json
 {
-  "groups": "谓词简化, 连接优化, 常量折叠, 子查询优化, 投影优化",
+  "groups": "谓词简化, 连接优化, 聚合优化",
   "applied_rules": [
     "FILTER_REDUCE_EXPRESSIONS",
     "JOIN_PUSH_TRANSITIVE_PREDICATES",
     "JOIN_CONDITION_PUSH",
-    "PROJECT_REDUCE_EXPRESSIONS",
-    "PROJECT_REMOVE"
+    "AGGREGATE_FILTER_TRANSPOSE"
   ],
-  "rewritten_sql": "SELECT substring(r_reason_desc, 1, 20),\n       avg(ws_quantity),\n       avg(wr_refunded_cash),\n       avg(wr_fee)\nFROM web_sales,\n     web_returns,\n     web_page,\n     customer_demographics cd1,\n     customer_demographics cd2,\n     customer_address,\n     date_dim,\n     reason\nWHERE ws_web_page_sk = wp_web_page_sk\n  AND ws_item_sk = wr_item_sk\n  AND ws_order_number = wr_order_number\n  AND ws_sold_date_sk = d_date_sk\n  AND d_year = 1999\n  AND cd1.cd_demo_sk = wr_refunded_cdemo_sk\n  AND cd2.cd_demo_sk = wr_returning_cdemo_sk\n  AND ca_address_sk = wr_refunded_addr_sk\n  AND r_reason_sk = wr_reason_sk\n  AND cd1.cd_marital_status = cd2.cd_marital_status\n  AND cd1.cd_education_status = cd2.cd_education_status\n  AND (\n    (cd1.cd_marital_status = 'U' AND cd1.cd_education_status = 'Primary' AND ws_sales_price BETWEEN 100.00 AND 150.00)\n    OR (cd1.cd_marital_status = 'D' AND cd1.cd_education_status = '4 yr Degree' AND ws_sales_price BETWEEN 50.00 AND 100.00)\n    OR (cd1.cd_marital_status = 'M' AND cd1.cd_education_status = 'College' AND ws_sales_price BETWEEN 150.00 AND 200.00)\n  )\n  AND ca_country = 'United States'\n  AND (\n    (ca_state IN ('NE', 'TN', 'TX') AND ws_net_profit BETWEEN 100 AND 200)\n    OR (ca_state IN ('MS', 'NY', 'VA') AND ws_net_profit BETWEEN 150 AND 300)\n    OR (ca_state IN ('MS', 'TN', 'TX') AND ws_net_profit BETWEEN 50 AND 250)\n  )\nGROUP BY r_reason_desc\nORDER BY substring(r_reason_desc, 1, 20),\n         avg(ws_quantity),\n         avg(wr_refunded_cash),\n         avg(wr_fee)\nLIMIT 100"
+  "rewritten_sql": "SELECT substring(r_reason_desc, 1, 20),\n       avg(ws_quantity),\n       avg(wr_refunded_cash),\n       avg(wr_fee)\nFROM (\n  SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc\n  FROM web_sales\n  JOIN date_dim ON ws_sold_date_sk = d_date_sk AND d_year = 1999\n  JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number\n  JOIN web_page ON ws_web_page_sk = wp_web_page_sk\n  JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk\n  JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk\n  JOIN customer_address ON ca_address_sk = wr_refunded_addr_sk\n  JOIN reason ON r_reason_sk = wr_reason_sk\n  WHERE (\n    (cd1.cd_marital_status = 'U' AND cd1.cd_education_status = 'Primary' AND ws_sales_price BETWEEN 100.00 AND 150.00)\n    OR (cd1.cd_marital_status = 'D' AND cd1.cd_education_status = '4 yr Degree' AND ws_sales_price BETWEEN 50.00 AND 100.00)\n    OR (cd1.cd_marital_status = 'M' AND cd1.cd_education_status = 'College' AND ws_sales_price BETWEEN 150.00 AND 200.00)\n  )\n  AND cd1.cd_marital_status = cd2.cd_marital_status\n  AND cd1.cd_education_status = cd2.cd_education_status\n  AND ca_country = 'United States'\n  AND (\n    (ca_state IN ('NE', 'TN', 'TX') AND ws_net_profit BETWEEN 100 AND 200)\n    OR (ca_state IN ('MS', 'NY', 'VA') AND ws_net_profit BETWEEN 150 AND 300)\n    OR (ca_state IN ('MS', 'TN', 'TX') AND ws_net_profit BETWEEN 50 AND 250)\n  )\n) AS sub\nGROUP BY r_reason_desc\nORDER BY substring(r_reason_desc, 1, 20),\n         avg(ws_quantity),\n         avg(wr_refunded_cash),\n         avg(wr_fee)\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. 将原始查询中的隐式连接（逗号分隔）改写为显式 JOIN 语法，并调整了连接顺序，将 date_dim 的过滤条件 d_year = 1999 直接放入与 web_sales 的 JOIN ON 子句中，提前过滤 web_sales 数据，减少中间结果集大小。\n2. 利用传递性推导，将 cd1.cd_marital_status = cd2.cd_marital_status 和 cd1.cd_education_status = cd2.cd_education_status 保留在 WHERE 中，但移除了原始 OR 分支内重复的 cd1.cd_marital_status = cd2.cd_marital_status 和 cd1.cd_education_status = cd2.cd_education_status 条件，因为它们在每个分支中均相同，提取到外层 AND 中，简化了谓词表达式，语义等价。\n3. 将 ca_country = 'United States' 提取到 OR 条件之外，因为所有分支均要求此条件，减少重复判断，语义等价。\n4. 将聚合前的所有过滤条件（包括 JOIN 条件和 WHERE 条件）全部下推到子查询中，在聚合前完成数据过滤和连接，然后在外层进行 GROUP BY 和聚合，符合 AGGREGATE_FILTER_TRANSPOSE 规则，且由于聚合列均来自子查询中的列，分组键 r_reason_desc 在子查询中已存在，聚合结果与原始查询一致。\n5. 原始查询中的 GROUP BY 和 ORDER BY 使用了 substring(r_reason_desc,1,20)，重写后保持一致，且 ORDER BY 中的聚合列别名与原始查询相同，排序和限制行数语义不变。\n6. 所有 JOIN 条件均基于主键或外键关系，连接不会产生重复行或丢失行，且过滤条件均为等值或范围条件，无 NULL 相关问题，重写后结果集与原始查询完全等价。"
 }
-```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
-```json
 {
   "equivalent": true,
-  "message": "重写SQL通过提取OR子句中的公共条件（cd1.cd_marital_status = cd2.cd_marital_status、cd1.cd_education_status = cd2.cd_education_status、ca_country = 'United States'）进行了合法的谓词简化，结果集完全等价",
+  "message": "重写SQL将隐式连接改为显式JOIN，提取公共条件，并将过滤下推到聚合前，与原始SQL语义等价。",
   "differences": []
 }
-```
 ✅ 语义等价
 📊 开始评估优化结果...
-```json
 {
   "terminate": true,
-  "reason": "重写costs与原始相同(94118.31)，但重写SQL提取了公共谓词cd1.cd_marital_status=cd2.cd_marital_status和cd1.cd_education_status=cd2.cd_education_status到WHERE子句顶层，消除了原始SQL中三个OR分支内的冗余重复条件，同时提取ca_country='United States'为公共过滤，结构更清晰紧凑，符合§1中减少重复谓词、过滤条件更清晰的优化信号",
-  "保留重写SQL": true
+  "reason": "执行计划结构完全一致，节点类型、扫描方式、连接顺序、并行度均无变化，cost相同。重写仅将隐式连接转为显式JOIN并调整了部分条件位置，未带来结构性改进，且无退化信号。由于结构无变化且优化空间有限，按不确定终止处理。",
+  "no_further_optimization": true,
+  "keep_rewrite_sql": true
 }
-```
-💾 正在存储优化案例到向量数据库...
-   - SQL指纹长度: 1415
-   - 规则序列: ['FILTER_REDUCE_EXPRESSIONS', 'JOIN_PUSH_TRANSITIVE_PREDICATES', 'JOIN_CONDITION_PUSH', 'PROJECT_REDUCE_EXPRESSIONS', 'PROJECT_REMOVE']
-   - 优化组别: 谓词简化, 连接优化, 常量折叠, 子查询优化, 投影优化
-   - 估计代价: 原始=94118.31, 重写=94118.31，相对变化: 0.00%
-✅ 成功存储，记录ID: dee58ef5-0979-4357-8c43-8e44118bf7af
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库与 UCT 更新。
 
 ----------------------------------------
 

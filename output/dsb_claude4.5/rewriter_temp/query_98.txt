@@ -2,163 +2,98 @@ Query ID: 98
 ==================================================
 
 Original: select  i_item_desc       ,w_warehouse_name       ,d1.d_week_seq       ,sum(case when p_promo_sk is null then 1 else 0 end) no_promo       ,sum(case when p_promo_sk is not null then 1 else 0 end) promo       ,count(*) total_cnt from catalog_sales join inventory on (cs_item_sk = inv_item_sk) join warehouse on (w_warehouse_sk=inv_warehouse_sk) join item on (i_item_sk = cs_item_sk) join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk) join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk) join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk) join date_dim d2 on (inv_date_sk = d2.d_date_sk) join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk) left outer join promotion on (cs_promo_sk=p_promo_sk) left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number) where d1.d_week_seq = d2.d_week_seq   and inv_quantity_on_hand < cs_quantity   and d3.d_date > d1.d_date + interval '3 day'   and hd_buy_potential = '>10000'   and d1.d_year = 2001   and cd_marital_status = 'W'   and cd_dep_count between 4 and 6   and i_category IN ('Books', 'Home', 'Sports')   and cs_wholesale_cost BETWEEN 17 AND 37 group by i_item_desc,w_warehouse_name,d1.d_week_seq order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq limit 100;
-Rewritten: SELECT i_item_desc, w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt
-FROM (
-  SELECT cs_item_sk, cs_order_number, cs_quantity, cs_sold_date_sk, cs_ship_date_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_promo_sk
-  FROM catalog_sales
-  WHERE cs_wholesale_cost BETWEEN 17 AND 37
-) AS cs
-JOIN (
-  SELECT inv_item_sk, inv_warehouse_sk, inv_date_sk, inv_quantity_on_hand
-  FROM inventory
-) AS inv ON cs.cs_item_sk = inv.inv_item_sk AND inv.inv_quantity_on_hand < cs.cs_quantity
-JOIN (
-  SELECT w_warehouse_sk, w_warehouse_name
-  FROM warehouse
-) AS w ON w.w_warehouse_sk = inv.inv_warehouse_sk
-JOIN (
-  SELECT i_item_sk, i_item_desc
-  FROM item
-  WHERE i_category IN ('Books', 'Home', 'Sports')
-) AS i ON i.i_item_sk = cs.cs_item_sk
-JOIN (
-  SELECT cd_demo_sk
-  FROM customer_demographics
-  WHERE cd_marital_status = 'W' AND cd_dep_count BETWEEN 4 AND 6
-) AS cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk
-JOIN (
-  SELECT hd_demo_sk
-  FROM household_demographics
-  WHERE hd_buy_potential = '>10000'
-) AS hd ON cs.cs_bill_hdemo_sk = hd.hd_demo_sk
-JOIN (
-  SELECT d_date_sk, d_week_seq, d_date
-  FROM date_dim
-  WHERE d_year = 2001
-) AS d1 ON cs.cs_sold_date_sk = d1.d_date_sk
-JOIN (
-  SELECT d_date_sk, d_week_seq
-  FROM date_dim
-) AS d2 ON inv.inv_date_sk = d2.d_date_sk AND d1.d_week_seq = d2.d_week_seq
-JOIN (
-  SELECT d_date_sk, d_date
-  FROM date_dim
-) AS d3 ON cs.cs_ship_date_sk = d3.d_date_sk AND d3.d_date > d1.d_date + INTERVAL '3 day'
-LEFT OUTER JOIN (
-  SELECT p_promo_sk
-  FROM promotion
-) AS p ON cs.cs_promo_sk = p.p_promo_sk
-LEFT OUTER JOIN catalog_returns AS cr ON cr.cr_item_sk = cs.cs_item_sk AND cr.cr_order_number = cs.cs_order_number
-GROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq
-ORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d_week_seq
-LIMIT 100
-Time Cost: 172.68s
-Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将维度表的过滤条件尽早应用，特别是household_demographics(hd_buy_potential='>10000')、customer_demographics(cd_marital_status='W' AND cd_dep_count BETWEEN 4 AND 6)、item(i_category IN ('Books','Home','Sports'))和date_dim(d1.d_year=2001)的条件，这些小表的过滤可以显著减少JOIN的中间结果集大小"}, {'group': '连接优化', 'produced_suggestion': '调整JOIN顺序，优先连接过滤后行数较少的维度表。建议顺序：先连接warehouse(10行)、household_demographics(过滤后很少)、customer_demographics(过滤后较少)、item(过滤后较少)、date_dim d1(过滤后较少)，再连接大表catalog_sales，最后连接inventory和其他表。这样可以利用小表驱动大表的策略'}, {'group': '连接优化', 'produced_suggestion': "将LEFT OUTER JOIN promotion的条件'case when p_promo_sk is null'改写为显式的COALESCE或IS NULL判断，并考虑将其移到最后执行，避免过早引入NULL值处理的开销"}, {'group': '谓词简化', 'produced_suggestion': 'date_dim表被引用3次(d1/d2/d3)，其中d1和d2通过d_week_seq关联。可以考虑先对date_dim按d_year=2001过滤生成临时结果，然后分别作为d1/d2/d3使用，减少重复扫描'}, {'group': '连接优化', 'produced_suggestion': 'catalog_returns的LEFT OUTER JOIN条件包含cr_item_sk和cr_order_number，这与catalog_sales的主键完全匹配。可以考虑使用NOT EXISTS或反半连接来优化，如果业务逻辑允许的话'}, {'group': '谓词简化', 'produced_suggestion': "将'd3.d_date > d1.d_date + interval 3 day'条件改写为'd3.d_date_sk > d1.d_date_sk + 3'（如果d_date_sk是连续的日期键），这样可以利用整数比较代替日期计算，提升性能"}, {'group': '投影优化', 'produced_suggestion': '在最终SELECT之前，尽早裁剪不需要的列。例如在JOIN catalog_sales时只选择必要的列(cs_item_sk, cs_order_number, cs_quantity, cs_wholesale_cost, cs_sold_date_sk, cs_ship_date_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_promo_sk)，避免传递过多数据'}, {'group': '聚合优化', 'produced_suggestion': 'GROUP BY使用了i_item_desc(可能是长文本)、w_warehouse_name、d_week_seq。考虑先按代理键(i_item_sk, w_warehouse_sk, d1.d_date_sk)进行聚合，最后再JOIN回维度表获取描述性字段，这样可以减少GROUP BY的内存消耗和排序开销'}]
+Rewritten: select  i_item_desc       ,w_warehouse_name       ,d1.d_week_seq       ,sum(case when p_promo_sk is null then 1 else 0 end) no_promo       ,sum(case when p_promo_sk is not null then 1 else 0 end) promo       ,count(*) total_cnt from catalog_sales join inventory on (cs_item_sk = inv_item_sk) join warehouse on (w_warehouse_sk=inv_warehouse_sk) join item on (i_item_sk = cs_item_sk) join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk) join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk) join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk) join date_dim d2 on (inv_date_sk = d2.d_date_sk) join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk) left outer join promotion on (cs_promo_sk=p_promo_sk) left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number) where d1.d_week_seq = d2.d_week_seq   and inv_quantity_on_hand < cs_quantity   and d3.d_date > d1.d_date + interval '3 day'   and hd_buy_potential = '>10000'   and d1.d_year = 2001   and cd_marital_status = 'W'   and cd_dep_count between 4 and 6   and i_category IN ('Books', 'Home', 'Sports')   and cs_wholesale_cost BETWEEN 17 AND 37 group by i_item_desc,w_warehouse_name,d1.d_week_seq order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq limit 100;
+Time Cost: 99.75s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将catalog_sales表上的过滤条件cs_wholesale_cost BETWEEN 17 AND 37尽早应用，考虑在catalog_sales表上创建索引或使用物化视图预过滤，减少扫描数据量。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，将过滤后较小的表（如date_dim d1过滤d_year=2001后约365行）作为驱动表，避免大表catalog_sales作为外层循环。考虑将Nested Loop转换为Hash Join。'}, {'group': '谓词简化', 'produced_suggestion': '将条件inv_quantity_on_hand < cs_quantity下推到inventory和catalog_sales的连接中，减少连接数据量。'}, {'group': '聚合优化', 'produced_suggestion': '考虑将聚合操作提前，在连接前对catalog_sales按分组键进行预聚合，减少后续连接和聚合的数据量。'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
-```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示catalog_sales表的全表扫描占总代价95.9%，且该表有1439万行数据。虽然存在主键索引，但WHERE条件中的cs_wholesale_cost字段缺少索引支持。此外，SQL包含10个表的复杂JOIN，存在多个优化机会：1)可以通过谓词下推和连接顺序调整减少中间结果集；2)date_dim表被引用3次(d1/d2/d3)可能存在冗余；3)LEFT OUTER JOIN的promotion和catalog_returns可以通过谓词条件优化；4)多个维度表的过滤条件可以提前应用。",
+  "reason": "执行计划显示catalog_sales表存在全表扫描（Seq Scan），代价占比高达95.9%，且存在Nested Loop连接。SQL结构复杂，涉及多表连接和子查询模式，可通过谓词下推、连接顺序调整等方式优化。",
   "advice": [
     {
       "group": "谓词简化",
-      "produced_suggestion": "将维度表的过滤条件尽早应用，特别是household_demographics(hd_buy_potential='>10000')、customer_demographics(cd_marital_status='W' AND cd_dep_count BETWEEN 4 AND 6)、item(i_category IN ('Books','Home','Sports'))和date_dim(d1.d_year=2001)的条件，这些小表的过滤可以显著减少JOIN的中间结果集大小"
+      "produced_suggestion": "将catalog_sales表上的过滤条件cs_wholesale_cost BETWEEN 17 AND 37尽早应用，考虑在catalog_sales表上创建索引或使用物化视图预过滤，减少扫描数据量。"
     },
     {
       "group": "连接优化",
-      "produced_suggestion": "调整JOIN顺序，优先连接过滤后行数较少的维度表。建议顺序：先连接warehouse(10行)、household_demographics(过滤后很少)、customer_demographics(过滤后较少)、item(过滤后较少)、date_dim d1(过滤后较少)，再连接大表catalog_sales，最后连接inventory和其他表。这样可以利用小表驱动大表的策略"
-    },
-    {
-      "group": "连接优化",
-      "produced_suggestion": "将LEFT OUTER JOIN promotion的条件'case when p_promo_sk is null'改写为显式的COALESCE或IS NULL判断，并考虑将其移到最后执行，避免过早引入NULL值处理的开销"
+      "produced_suggestion": "调整连接顺序，将过滤后较小的表（如date_dim d1过滤d_year=2001后约365行）作为驱动表，避免大表catalog_sales作为外层循环。考虑将Nested Loop转换为Hash Join。"
     },
     {
       "group": "谓词简化",
-      "produced_suggestion": "date_dim表被引用3次(d1/d2/d3)，其中d1和d2通过d_week_seq关联。可以考虑先对date_dim按d_year=2001过滤生成临时结果，然后分别作为d1/d2/d3使用，减少重复扫描"
-    },
-    {
-      "group": "连接优化",
-      "produced_suggestion": "catalog_returns的LEFT OUTER JOIN条件包含cr_item_sk和cr_order_number，这与catalog_sales的主键完全匹配。可以考虑使用NOT EXISTS或反半连接来优化，如果业务逻辑允许的话"
-    },
-    {
-      "group": "谓词简化",
-      "produced_suggestion": "将'd3.d_date > d1.d_date + interval 3 day'条件改写为'd3.d_date_sk > d1.d_date_sk + 3'（如果d_date_sk是连续的日期键），这样可以利用整数比较代替日期计算，提升性能"
-    },
-    {
-      "group": "投影优化",
-      "produced_suggestion": "在最终SELECT之前，尽早裁剪不需要的列。例如在JOIN catalog_sales时只选择必要的列(cs_item_sk, cs_order_number, cs_quantity, cs_wholesale_cost, cs_sold_date_sk, cs_ship_date_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_promo_sk)，避免传递过多数据"
+      "produced_suggestion": "将条件inv_quantity_on_hand < cs_quantity下推到inventory和catalog_sales的连接中，减少连接数据量。"
     },
     {
       "group": "聚合优化",
-      "produced_suggestion": "GROUP BY使用了i_item_desc(可能是长文本)、w_warehouse_name、d_week_seq。考虑先按代理键(i_item_sk, w_warehouse_sk, d1.d_date_sk)进行聚合，最后再JOIN回维度表获取描述性字段，这样可以减少GROUP BY的内存消耗和排序开销"
+      "produced_suggestion": "考虑将聚合操作提前，在连接前对catalog_sales按分组键进行预聚合，减少后续连接和聚合的数据量。"
     }
   ]
 }
-```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 67 rules
+📊 UCT scored 64 rules
    → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.221
    → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
    → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
 {
-  "groups": "聚合优化, 谓词简化, 连接优化, 投影优化",
-  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_PUSH_TRANSITIVE_PREDICATES", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE"],
+  "groups": "聚合优化, 谓词简化, 连接优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_CONDITION_PUSH",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
   "rule_effect_scores": {
-    "FILTER_INTO_JOIN": 0.25,
-    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.25,
-    "JOIN_CONDITION_PUSH": 0.25,
-    "PROJECT_JOIN_TRANSPOSE": 0.25
+    "FILTER_INTO_JOIN": 0.3,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.2,
+    "JOIN_CONDITION_PUSH": 0.2,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.25,
+    "PROJECT_JOIN_TRANSPOSE": 0.05
   },
   "rule_effect_confidence": {
-    "FILTER_INTO_JOIN": 0.437,
-    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.540,
-    "JOIN_CONDITION_PUSH": 0.463,
-    "PROJECT_JOIN_TRANSPOSE": 0.483
+    "FILTER_INTO_JOIN": 0.8,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.7,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.6,
+    "PROJECT_JOIN_TRANSPOSE": 0.9
   }
 }
-✅ 选择了 4 个规则
+✅ 选择了 5 个规则
 🔧 开始SQL重写...
-
-
-```json
 {
-  "groups": "聚合优化, 谓词简化, 连接优化, 投影优化",
-  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_PUSH_TRANSITIVE_PREDICATES", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE"],
-  "rewritten_sql": "SELECT i_item_desc, w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt\nFROM (\n  SELECT cs_item_sk, cs_order_number, cs_quantity, cs_sold_date_sk, cs_ship_date_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_promo_sk\n  FROM catalog_sales\n  WHERE cs_wholesale_cost BETWEEN 17 AND 37\n) AS cs\nJOIN (\n  SELECT inv_item_sk, inv_warehouse_sk, inv_date_sk, inv_quantity_on_hand\n  FROM inventory\n) AS inv ON cs.cs_item_sk = inv.inv_item_sk AND inv.inv_quantity_on_hand < cs.cs_quantity\nJOIN (\n  SELECT w_warehouse_sk, w_warehouse_name\n  FROM warehouse\n) AS w ON w.w_warehouse_sk = inv.inv_warehouse_sk\nJOIN (\n  SELECT i_item_sk, i_item_desc\n  FROM item\n  WHERE i_category IN ('Books', 'Home', 'Sports')\n) AS i ON i.i_item_sk = cs.cs_item_sk\nJOIN (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'W' AND cd_dep_count BETWEEN 4 AND 6\n) AS cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk\nJOIN (\n  SELECT hd_demo_sk\n  FROM household_demographics\n  WHERE hd_buy_potential = '>10000'\n) AS hd ON cs.cs_bill_hdemo_sk = hd.hd_demo_sk\nJOIN (\n  SELECT d_date_sk, d_week_seq, d_date\n  FROM date_dim\n  WHERE d_year = 2001\n) AS d1 ON cs.cs_sold_date_sk = d1.d_date_sk\nJOIN (\n  SELECT d_date_sk, d_week_seq\n  FROM date_dim\n) AS d2 ON inv.inv_date_sk = d2.d_date_sk AND d1.d_week_seq = d2.d_week_seq\nJOIN (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n) AS d3 ON cs.cs_ship_date_sk = d3.d_date_sk AND d3.d_date > d1.d_date + INTERVAL '3 day'\nLEFT OUTER JOIN (\n  SELECT p_promo_sk\n  FROM promotion\n) AS p ON cs.cs_promo_sk = p.p_promo_sk\nLEFT OUTER JOIN catalog_returns AS cr ON cr.cr_item_sk = cs.cs_item_sk AND cr.cr_order_number = cs.cs_order_number\nGROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq\nORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d_week_seq\nLIMIT 100"
+  "groups": "聚合优化, 谓词简化, 连接优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_CONDITION_PUSH",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT i_item_desc, w_warehouse_name, d1.d_week_seq, SUM(no_promo) AS no_promo, SUM(promo) AS promo, SUM(total_cnt) AS total_cnt\nFROM (\n  SELECT cs_item_sk, cs_order_number, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk, cs_quantity, cs_wholesale_cost,\n         SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo,\n         SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo,\n         COUNT(*) AS total_cnt\n  FROM catalog_sales\n  LEFT OUTER JOIN promotion ON (cs_promo_sk = p_promo_sk)\n  WHERE cs_wholesale_cost BETWEEN 17 AND 37\n  GROUP BY cs_item_sk, cs_order_number, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk, cs_quantity, cs_wholesale_cost\n) AS cs_agg\nJOIN inventory ON (cs_agg.cs_item_sk = inv_item_sk AND inv_quantity_on_hand < cs_agg.cs_quantity)\nJOIN warehouse ON (w_warehouse_sk = inv_warehouse_sk)\nJOIN item ON (i_item_sk = cs_agg.cs_item_sk AND i_category IN ('Books', 'Home', 'Sports'))\nJOIN customer_demographics ON (cs_agg.cs_bill_cdemo_sk = cd_demo_sk AND cd_marital_status = 'W' AND cd_dep_count BETWEEN 4 AND 6)\nJOIN household_demographics ON (cs_agg.cs_bill_hdemo_sk = hd_demo_sk AND hd_buy_potential = '>10000')\nJOIN date_dim d1 ON (cs_agg.cs_sold_date_sk = d1.d_date_sk AND d1.d_year = 2001)\nJOIN date_dim d2 ON (inv_date_sk = d2.d_date_sk AND d1.d_week_seq = d2.d_week_seq)\nJOIN date_dim d3 ON (cs_agg.cs_ship_date_sk = d3.d_date_sk AND d3.d_date > d1.d_date + interval '3 day')\nLEFT OUTER JOIN catalog_returns ON (cr_item_sk = cs_agg.cs_item_sk AND cr_order_number = cs_agg.cs_order_number)\nGROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq\nORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d1.d_week_seq\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. 将 catalog_sales 与 promotion 的 LEFT JOIN 及聚合函数（SUM(CASE WHEN p_promo_sk IS NULL...), COUNT(*)）提前到子查询 cs_agg 中，按 cs_item_sk, cs_order_number 等分组，因为原始聚合在最终 GROUP BY 之前，这些聚合仅依赖 cs 和 promotion 表，提前聚合不影响结果。\n2. 将 catalog_sales 上的过滤条件 cs_wholesale_cost BETWEEN 17 AND 37 下推到子查询中，减少参与后续 JOIN 的数据量，等价于原始 WHERE 子句中的该条件。\n3. 将 inventory 上的条件 inv_quantity_on_hand < cs_quantity 推入 JOIN ON 子句，等价于原始 WHERE 条件，且由于 cs_quantity 来自 cs_agg，语义不变。\n4. 将 item 上的 i_category IN ('Books', 'Home', 'Sports')、customer_demographics 上的 cd_marital_status = 'W' AND cd_dep_count BETWEEN 4 AND 6、household_demographics 上的 hd_buy_potential = '>10000'、date_dim d1 上的 d1.d_year = 2001 分别推入对应 JOIN 的 ON 子句，这些条件仅依赖单表，提前过滤等价于原始 WHERE。\n5. 利用等值连接传递性：d1.d_week_seq = d2.d_week_seq 已存在于原始 WHERE，重写后保留在 d2 的 JOIN ON 中；d3.d_date > d1.d_date + interval '3 day' 保留在 d3 的 JOIN ON 中，语义不变。\n6. 最终外层 GROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq 与原始一致，聚合函数 SUM(no_promo), SUM(promo), SUM(total_cnt) 对子查询中已计算的聚合值再次求和，等价于原始直接对明细行聚合，因为子查询分组键包含了所有后续 JOIN 所需的列，且 LEFT JOIN catalog_returns 未引入新的聚合列，不影响计数。\n7. ORDER BY 和 LIMIT 100 保持不变，结果集排序和行数限制与原始查询完全一致。"
 }
-```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
-```json
 {
   "equivalent": true,
-  "message": "重写SQL通过将过滤条件下推至子查询、将部分WHERE条件移至JOIN ON子句、并仅投影必要列，实现了语义等价的优化",
+  "message": "重写SQL通过提前聚合和条件下推，在语义上与原始SQL等价，结果集相同。",
   "differences": []
 }
-```
 ✅ 语义等价
 📊 开始评估优化结果...
-```json
+📐 计划结构: Scan: SeqScan 6->5, index-like 4->5
 {
   "terminate": true,
-  "reason": "重写costs与原始costs相同(478298.06)，重写将所有表改为派生表形式并下推过滤条件，结构上更清晰且投影更紧凑，符合§1多项信号(过滤下推、投影裁剪、JOIN条件更明确)，但已相当干净，剩余优化空间有限(如date_dim多次扫描、聚合键优化)属边角改进，下一轮能否明显降执行时间不确定，按§3默认倾向终止",
-  "保留重写SQL": true
+  "reason": "结构上，enhanced_sql将聚合提前到catalog_sales与promotion连接后，但引入了Hashed Aggregate和额外的Sort，导致执行计划更复杂。虽然索引扫描从4增至5，但总估计行数从147万增至827万，且成本从47.8万升至105万。关键退化：新增Merge Join和Sort，可能增加排序开销；聚合提前未有效减少数据量，反而因分组键过多导致中间结果膨胀。结构信号显示退化，cost也大幅增加，因此判定为恶化。",
+  "no_further_optimization": false,
+  "keep_rewrite_sql": false
 }
-```
-💾 正在存储优化案例到向量数据库...
-   - SQL指纹长度: 1144
-   - 规则序列: ['FILTER_INTO_JOIN', 'JOIN_PUSH_TRANSITIVE_PREDICATES', 'JOIN_CONDITION_PUSH', 'PROJECT_JOIN_TRANSPOSE']
-   - 优化组别: 聚合优化, 谓词简化, 连接优化, 投影优化
-   - 估计代价: 原始=478298.06, 重写=478298.06，相对变化: 0.00%
-✅ 成功存储，记录ID: 70fa83ec-754e-400e-8918-171a33073966
 
 ----------------------------------------
 

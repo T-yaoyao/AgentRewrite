@@ -2,114 +2,117 @@ Query ID: 134
 ==================================================
 
 Original: select           min(cc_call_center_id),         min(cc_name),         min(cc_manager),         min(cr_net_loss),         min(cr_item_sk),         min(cr_order_number) from         call_center,         catalog_returns,         date_dim,         customer,         customer_address,         customer_demographics,         household_demographics where         cr_call_center_sk       = cc_call_center_sk and     cr_returned_date_sk     = d_date_sk and     cr_returning_customer_sk= c_customer_sk and     cd_demo_sk              = c_current_cdemo_sk and     hd_demo_sk              = c_current_hdemo_sk and     ca_address_sk           = c_current_addr_sk and     d_year                  = 2001  and     d_moy                   = 10 and     ( (cd_marital_status       = 'M' and cd_education_status     = 'Unknown')         or(cd_marital_status       = 'W' and cd_education_status     = 'Advanced Degree')) and     hd_buy_potential like 'Unknown%' and     ca_gmt_offset           = -7 ;
-Rewritten: select           min(cc_call_center_id),         min(cc_name),         min(cc_manager),         min(cr_net_loss),         min(cr_item_sk),         min(cr_order_number) from         call_center,         catalog_returns,         date_dim,         customer,         customer_address,         customer_demographics,         household_demographics where         cr_call_center_sk       = cc_call_center_sk and     cr_returned_date_sk     = d_date_sk and     cr_returning_customer_sk= c_customer_sk and     cd_demo_sk              = c_current_cdemo_sk and     hd_demo_sk              = c_current_hdemo_sk and     ca_address_sk           = c_current_addr_sk and     d_year                  = 2001  and     d_moy                   = 10 and     ( (cd_marital_status       = 'M' and cd_education_status     = 'Unknown')         or(cd_marital_status       = 'W' and cd_education_status     = 'Advanced Degree')) and     hd_buy_potential like 'Unknown%' and     ca_gmt_offset           = -7 ;
-Time Cost: 191.86s
-Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将date_dim的过滤条件(d_year=2001 AND d_moy=10)通过索引优化或先过滤后再连接，减少Hash Join的输入数据量'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，优先连接小表和带过滤条件的表(date_dim、customer_demographics、household_demographics、customer_address)，再连接大表catalog_returns，避免笛卡尔积'}, {'group': '谓词简化', 'produced_suggestion': "将customer_demographics的复杂OR条件((cd_marital_status='M' AND cd_education_status='Unknown') OR (cd_marital_status='W' AND cd_education_status='Advanced Degree'))提前过滤，减少连接数据量"}, {'group': '连接优化', 'produced_suggestion': "考虑将维度表过滤条件(hd_buy_potential LIKE 'Unknown%'和ca_gmt_offset=-7)转换为半连接或EXISTS子查询，提前过滤不符合条件的数据"}, {'group': '投影优化', 'produced_suggestion': '由于查询只需要MIN聚合结果，可以在连接前对各表进行列裁剪，只保留连接键和需要聚合的列，减少数据传输量'}]
+Rewritten: WITH date_dim_filtered AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2001 AND d_moy = 10
+),
+customer_demographics_filtered AS (
+  SELECT cd_demo_sk
+  FROM customer_demographics
+  WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')
+     OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')
+),
+household_demographics_filtered AS (
+  SELECT hd_demo_sk
+  FROM household_demographics
+  WHERE hd_buy_potential LIKE 'Unknown%'
+),
+customer_address_filtered AS (
+  SELECT ca_address_sk
+  FROM customer_address
+  WHERE ca_gmt_offset = -7
+),
+customer_filtered AS (
+  SELECT c_customer_sk
+  FROM customer
+  JOIN customer_demographics_filtered ON cd_demo_sk = c_current_cdemo_sk
+  JOIN household_demographics_filtered ON hd_demo_sk = c_current_hdemo_sk
+  JOIN customer_address_filtered ON ca_address_sk = c_current_addr_sk
+)
+SELECT
+  min(cc_call_center_id),
+  min(cc_name),
+  min(cc_manager),
+  min(cr_net_loss),
+  min(cr_item_sk),
+  min(cr_order_number)
+FROM catalog_returns
+JOIN date_dim_filtered ON cr_returned_date_sk = d_date_sk
+JOIN customer_filtered ON cr_returning_customer_sk = c_customer_sk
+JOIN call_center ON cr_call_center_sk = cc_call_center_sk;
+Time Cost: 85.73s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将过滤条件下推到连接之前，特别是对catalog_returns表的过滤条件，减少参与连接的数据量。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，先对date_dim应用d_year和d_moy过滤，再与catalog_returns连接，利用索引减少扫描。'}, {'group': '子查询优化', 'produced_suggestion': '使用CTE预先过滤小表（如date_dim、customer_demographics、household_demographics、customer_address），再与catalog_returns连接。'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
-```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示catalog_returns表全表扫描代价占比90.1%，且存在多表笛卡尔积风险。SQL中7表连接但缺少有效的过滤条件下推，date_dim表也进行了全表扫描(代价3.6%)。可通过谓词下推、连接顺序调整和子查询优化来显著提升性能。",
+  "reason": "执行计划显示catalog_returns表全表扫描代价占比90.1%，且存在多个表连接，可通过谓词下推、连接顺序调整和子查询优化减少数据扫描量。",
   "advice": [
     {
       "group": "谓词简化",
-      "produced_suggestion": "将date_dim的过滤条件(d_year=2001 AND d_moy=10)通过索引优化或先过滤后再连接，减少Hash Join的输入数据量"
+      "produced_suggestion": "将过滤条件下推到连接之前，特别是对catalog_returns表的过滤条件，减少参与连接的数据量。"
     },
     {
       "group": "连接优化",
-      "produced_suggestion": "调整连接顺序，优先连接小表和带过滤条件的表(date_dim、customer_demographics、household_demographics、customer_address)，再连接大表catalog_returns，避免笛卡尔积"
+      "produced_suggestion": "调整连接顺序，先对date_dim应用d_year和d_moy过滤，再与catalog_returns连接，利用索引减少扫描。"
     },
     {
-      "group": "谓词简化",
-      "produced_suggestion": "将customer_demographics的复杂OR条件((cd_marital_status='M' AND cd_education_status='Unknown') OR (cd_marital_status='W' AND cd_education_status='Advanced Degree'))提前过滤，减少连接数据量"
-    },
-    {
-      "group": "连接优化",
-      "produced_suggestion": "考虑将维度表过滤条件(hd_buy_potential LIKE 'Unknown%'和ca_gmt_offset=-7)转换为半连接或EXISTS子查询，提前过滤不符合条件的数据"
-    },
-    {
-      "group": "投影优化",
-      "produced_suggestion": "由于查询只需要MIN聚合结果，可以在连接前对各表进行列裁剪，只保留连接键和需要聚合的列，减少数据传输量"
+      "group": "子查询优化",
+      "produced_suggestion": "使用CTE预先过滤小表（如date_dim、customer_demographics、household_demographics、customer_address），再与catalog_returns连接。"
     }
   ]
 }
-```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 48 rules
+📊 UCT scored 52 rules
    → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
    → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
    → FILTER_VALUES_MERGE: UCT=1.100
 {
-  "groups": "谓词简化, 连接优化, 投影优化",
-  "applied_rules": [
-    "FILTER_INTO_JOIN",
-    "JOIN_ADD_REDUNDANT_SEMI_JOIN",
-    "SEMI_JOIN_JOIN_TRANSPOSE",
-    "JOIN_CONDITION_PUSH",
-    "PROJECT_JOIN_TRANSPOSE",
-    "PROJECT_REMOVE"
-  ],
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_PUSH_TRANSITIVE_PREDICATES", "STRATEGY_CTE_DECOMPOSITION"],
   "rule_effect_scores": {
-    "FILTER_INTO_JOIN": 0.3,
-    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.3,
-    "SEMI_JOIN_JOIN_TRANSPOSE": 0.1,
-    "JOIN_CONDITION_PUSH": 0.1,
-    "PROJECT_JOIN_TRANSPOSE": 0.1,
-    "PROJECT_REMOVE": 0.1
+    "FILTER_INTO_JOIN": 0.4,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.3,
+    "STRATEGY_CTE_DECOMPOSITION": 0.3
   },
   "rule_effect_confidence": {
-    "FILTER_INTO_JOIN": 0.5,
-    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.9,
-    "SEMI_JOIN_JOIN_TRANSPOSE": 0.9,
-    "JOIN_CONDITION_PUSH": 0.6,
-    "PROJECT_JOIN_TRANSPOSE": 0.6,
-    "PROJECT_REMOVE": 0.7
+    "FILTER_INTO_JOIN": 0.85,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.75,
+    "STRATEGY_CTE_DECOMPOSITION": 0.7
   }
 }
-✅ 选择了 6 个规则
+✅ 选择了 3 个规则
 🔧 开始SQL重写...
-```json
 {
-  "groups": "谓词简化, 连接优化, 投影优化",
-  "applied_rules": [
-    "FILTER_INTO_JOIN",
-    "JOIN_ADD_REDUNDANT_SEMI_JOIN",
-    "SEMI_JOIN_JOIN_TRANSPOSE",
-    "JOIN_CONDITION_PUSH",
-    "PROJECT_JOIN_TRANSPOSE",
-    "PROJECT_REMOVE"
-  ],
-  "rewritten_sql": "SELECT\n    MIN(cc_call_center_id),\n    MIN(cc_name),\n    MIN(cc_manager),\n    MIN(cr_net_loss),\n    MIN(cr_item_sk),\n    MIN(cr_order_number)\nFROM\n    call_center\nJOIN\n    (\n        SELECT\n            cr_call_center_sk,\n            cr_returned_date_sk,\n            cr_returning_customer_sk,\n            cr_net_loss,\n            cr_item_sk,\n            cr_order_number\n        FROM\n            catalog_returns\n        WHERE\n            cr_returned_date_sk IN (\n                SELECT d_date_sk\n                FROM date_dim\n                WHERE d_year = 2001 AND d_moy = 10\n            )\n            AND cr_returning_customer_sk IN (\n                SELECT c_customer_sk\n                FROM customer\n                WHERE c_current_cdemo_sk IN (\n                    SELECT cd_demo_sk\n                    FROM customer_demographics\n                    WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n                       OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n                )\n                AND c_current_hdemo_sk IN (\n                    SELECT hd_demo_sk\n                    FROM household_demographics\n                    WHERE hd_buy_potential LIKE 'Unknown%'\n                )\n                AND c_current_addr_sk IN (\n                    SELECT ca_address_sk\n                    FROM customer_address\n                    WHERE ca_gmt_offset = -7\n                )\n            )\n    ) AS filtered_cr ON cr_call_center_sk = cc_call_center_sk\nJOIN\n    (SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_moy = 10) AS filtered_dd\n    ON cr_returned_date_sk = filtered_dd.d_date_sk\nJOIN\n    (\n        SELECT\n            c_customer_sk,\n            c_current_cdemo_sk,\n            c_current_hdemo_sk,\n            c_current_addr_sk\n        FROM customer\n        WHERE c_current_cdemo_sk IN (\n            SELECT cd_demo_sk\n            FROM customer_demographics\n            WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n               OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n        )\n        AND c_current_hdemo_sk IN (\n            SELECT hd_demo_sk\n            FROM household_demographics\n            WHERE hd_buy_potential LIKE 'Unknown%'\n        )\n        AND c_current_addr_sk IN (\n            SELECT ca_address_sk\n            FROM customer_address\n            WHERE ca_gmt_offset = -7\n        )\n    ) AS filtered_c ON cr_returning_customer_sk = filtered_c.c_customer_sk\nJOIN\n    (SELECT cd_demo_sk FROM customer_demographics WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')) AS filtered_cd\n    ON filtered_cd.cd_demo_sk = filtered_c.c_current_cdemo_sk\nJOIN\n    (SELECT hd_demo_sk FROM household_demographics WHERE hd_buy_potential LIKE 'Unknown%') AS filtered_hd\n    ON filtered_hd.hd_demo_sk = filtered_c.c_current_hdemo_sk\nJOIN\n    (SELECT ca_address_sk FROM customer_address WHERE ca_gmt_offset = -7) AS filtered_ca\n    ON filtered_ca.ca_address_sk = filtered_c.c_current_addr_sk"
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_PUSH_TRANSITIVE_PREDICATES", "STRATEGY_CTE_DECOMPOSITION"],
+  "rewritten_sql": "WITH date_dim_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2001 AND d_moy = 10\n),\ncustomer_demographics_filtered AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n     OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n),\nhousehold_demographics_filtered AS (\n  SELECT hd_demo_sk\n  FROM household_demographics\n  WHERE hd_buy_potential LIKE 'Unknown%'\n),\ncustomer_address_filtered AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_gmt_offset = -7\n),\ncustomer_filtered AS (\n  SELECT c_customer_sk\n  FROM customer\n  JOIN customer_demographics_filtered ON cd_demo_sk = c_current_cdemo_sk\n  JOIN household_demographics_filtered ON hd_demo_sk = c_current_hdemo_sk\n  JOIN customer_address_filtered ON ca_address_sk = c_current_addr_sk\n)\nSELECT\n  min(cc_call_center_id),\n  min(cc_name),\n  min(cc_manager),\n  min(cr_net_loss),\n  min(cr_item_sk),\n  min(cr_order_number)\nFROM catalog_returns\nJOIN date_dim_filtered ON cr_returned_date_sk = d_date_sk\nJOIN customer_filtered ON cr_returning_customer_sk = c_customer_sk\nJOIN call_center ON cr_call_center_sk = cc_call_center_sk;",
+  "semantic_correctness_guarantee": "1. 将原查询中分散在 WHERE 子句中对各维度表的过滤条件分别提取到对应的 CTE 中（date_dim_filtered、customer_demographics_filtered、household_demographics_filtered、customer_address_filtered），这些 CTE 仅包含满足条件的代理键，与原查询中直接连接后过滤的效果等价，因为过滤条件仅依赖于单表且无聚合或去重。\n2. 新增 customer_filtered CTE，将 customer 表与上述三个过滤后的维度表进行内连接，仅保留满足所有维度条件的 customer 代理键。原查询中 customer 与这些维度表的连接条件及过滤条件均被保留，且由于连接键均为各表主键，不会产生重复行，因此 customer_filtered 的结果集与原查询中 customer 参与连接后的中间结果一致。\n3. 主查询将 catalog_returns 与 date_dim_filtered、customer_filtered、call_center 依次连接，连接条件与原查询完全一致（cr_returned_date_sk = d_date_sk、cr_returning_customer_sk = c_customer_sk、cr_call_center_sk = cc_call_center_sk），且由于 date_dim_filtered 和 customer_filtered 已预先过滤，连接顺序的调整不影响最终结果集，因为内连接满足交换律和结合律。\n4. 原查询中 call_center 表无额外过滤条件，直接参与连接，重写后仍保持全表连接，语义不变。\n5. 聚合函数 min 作用于相同的列，且由于所有连接均为内连接，过滤条件未改变任何表的行数或值，最终聚合结果与原查询完全一致。\n6. 原查询中 hd_buy_potential LIKE 'Unknown%' 条件在 CTE 中直接应用，LIKE 语义未变；ca_gmt_offset = -7 为精确匹配，推入 CTE 不影响结果。\n7. 重写后的 SQL 未引入任何额外的去重、排序或限制，因此结果集的行数和列值与原查询等价。"
 }
-```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
-
-
-```json
 {
-    "equivalent": true,
-    "message": "两SQL等价。重写引入了冗余JOIN（先在子查询中用IN过滤，再显式JOIN已过滤的表），但不改变最终结果集和聚合值。",
-    "differences": []
+  "equivalent": true,
+  "message": "重写SQL通过CTE将过滤条件提前，连接顺序调整，但所有连接条件、过滤条件与原SQL一致，且聚合函数相同，结果集等价。",
+  "differences": []
 }
-```
 ✅ 语义等价
 📊 开始评估优化结果...
-```json
 {
   "terminate": true,
-  "reason": "重写costs(83507.94)高于原始(57709.81)，且重写引入大量嵌套IN子查询和重复过滤逻辑(filtered_cr中已用IN过滤customer，后续又重复JOIN filtered_c并再次过滤相同条件)，结构复杂度明显增加，不符合§0快捷规则也不满足§1结构优化信号",
-  "保留重写SQL": false
+  "reason": "执行计划结构几乎完全一致（节点类型、扫描方式、连接顺序、索引使用均相同），仅行数估计有微小差异（1行），成本差异极小（57709.81 vs 57710.48）。重写SQL通过CTE预过滤小表，逻辑上更清晰，但未带来实质性结构改进。由于结构无改进且成本接近，按不确定终止处理，保留当前重写SQL。",
+  "no_further_optimization": true,
+  "keep_rewrite_sql": true
 }
-```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库与 UCT 更新。
 
 ----------------------------------------
 

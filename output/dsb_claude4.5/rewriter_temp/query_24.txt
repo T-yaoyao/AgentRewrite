@@ -2,122 +2,179 @@ Query ID: 24
 ==================================================
 
 Original: select  i_item_id,         ca_country,         ca_state,         ca_county,         avg( cast(cs_quantity as decimal(12,2))) agg1,         avg( cast(cs_list_price as decimal(12,2))) agg2,         avg( cast(cs_coupon_amt as decimal(12,2))) agg3,         avg( cast(cs_sales_price as decimal(12,2))) agg4,         avg( cast(cs_net_profit as decimal(12,2))) agg5,         avg( cast(c_birth_year as decimal(12,2))) agg6 from catalog_sales, customer_demographics, customer, customer_address, date_dim, item where cs_sold_date_sk = d_date_sk and       cs_item_sk = i_item_sk and       cs_bill_cdemo_sk = cd_demo_sk and       cs_bill_customer_sk = c_customer_sk and       cd_gender = 'F' and       cd_education_status = 'Secondary' and       c_current_addr_sk = ca_address_sk and       d_year = 2001 and       c_birth_month = 1 and       ca_state in ('MS', 'NY', 'VA')       and cs_wholesale_cost BETWEEN 65 AND 70       AND i_category = 'Women'  group by rollup (i_item_id, ca_country, ca_state, ca_county)  order by ca_country,         ca_state,         ca_county, 	i_item_id  limit 100;
-Rewritten: WITH filtered_cd AS (
-    SELECT cd_demo_sk
-    FROM customer_demographics
-    WHERE cd_gender = 'F' AND cd_education_status = 'Secondary'
-),
-filtered_d AS (
+Rewritten: SELECT i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6
+FROM (
+  SELECT i_item_id, ca_country, ca_state, ca_county,
+         AVG(CAST(cs_quantity AS DECIMAL(12,2))) AS agg1,
+         AVG(CAST(cs_list_price AS DECIMAL(12,2))) AS agg2,
+         AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))) AS agg3,
+         AVG(CAST(cs_sales_price AS DECIMAL(12,2))) AS agg4,
+         AVG(CAST(cs_net_profit AS DECIMAL(12,2))) AS agg5,
+         AVG(CAST(c_birth_year AS DECIMAL(12,2))) AS agg6
+  FROM catalog_sales
+  JOIN LATERAL (
     SELECT d_date_sk
     FROM date_dim
-    WHERE d_year = 2001
-),
-filtered_c AS (
-    SELECT c_customer_sk, c_birth_year, c_current_addr_sk
-    FROM customer
-    WHERE c_birth_month = 1
-),
-filtered_ca AS (
-    SELECT ca_address_sk, ca_country, ca_state, ca_county
-    FROM customer_address
-    WHERE ca_state IN ('MS', 'NY', 'VA')
-),
-filtered_i AS (
+    WHERE d_date_sk = catalog_sales.cs_sold_date_sk
+      AND d_year = 2001
+  ) AS d ON TRUE
+  JOIN LATERAL (
     SELECT i_item_sk, i_item_id
     FROM item
-    WHERE i_category = 'Women'
-)
-SELECT
-    i_item_id,
-    ca_country,
-    ca_state,
-    ca_county,
-    avg(cast(cs_quantity as decimal(12,2))) agg1,
-    avg(cast(cs_list_price as decimal(12,2))) agg2,
-    avg(cast(cs_coupon_amt as decimal(12,2))) agg3,
-    avg(cast(cs_sales_price as decimal(12,2))) agg4,
-    avg(cast(cs_net_profit as decimal(12,2))) agg5,
-    avg(cast(c_birth_year as decimal(12,2))) agg6
-FROM catalog_sales
-JOIN filtered_d ON cs_sold_date_sk = d_date_sk
-JOIN filtered_i ON cs_item_sk = i_item_sk
-JOIN filtered_cd ON cs_bill_cdemo_sk = cd_demo_sk
-JOIN filtered_c ON cs_bill_customer_sk = c_customer_sk
-JOIN filtered_ca ON c_current_addr_sk = ca_address_sk
-WHERE cs_wholesale_cost BETWEEN 65 AND 70
-GROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county)
+    WHERE i_item_sk = catalog_sales.cs_item_sk
+      AND i_category = 'Women'
+  ) AS i ON TRUE
+  JOIN LATERAL (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_demo_sk = catalog_sales.cs_bill_cdemo_sk
+      AND cd_gender = 'F'
+      AND cd_education_status = 'Secondary'
+  ) AS cd ON TRUE
+  JOIN LATERAL (
+    SELECT c_customer_sk, c_birth_year, c_current_addr_sk
+    FROM customer
+    WHERE c_customer_sk = catalog_sales.cs_bill_customer_sk
+      AND c_birth_month = 1
+  ) AS c ON TRUE
+  JOIN LATERAL (
+    SELECT ca_address_sk, ca_country, ca_state, ca_county
+    FROM customer_address
+    WHERE ca_address_sk = c.c_current_addr_sk
+      AND ca_state IN ('MS', 'NY', 'VA')
+  ) AS ca ON TRUE
+  WHERE cs_wholesale_cost BETWEEN 65 AND 70
+  GROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county)
+) AS subq
 ORDER BY ca_country, ca_state, ca_county, i_item_id
-LIMIT 100
-Time Cost: 155.03s
-Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将高选择性的维度表过滤条件提取为CTE，先对customer_demographics（cd_gender='F' AND cd_education_status='Secondary'）、date_dim（d_year=2001）、customer（c_birth_month=1）、customer_address（ca_state IN ('MS','NY','VA')）、item（i_category='Women'）分别构建CTE过滤子集，再与catalog_sales进行JOIN，减少大表扫描后的中间结果集规模。例如：WITH filtered_cd AS (SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender='F' AND cd_education_status='Secondary'), filtered_d AS (SELECT d_date_sk FROM date_dim WHERE d_year=2001), filtered_ca AS (SELECT ca_address_sk, ca_country, ca_state, ca_county FROM customer_address WHERE ca_state IN ('MS','NY','VA')), filtered_c AS (SELECT c_customer_sk, c_birth_year, c_current_addr_sk FROM customer WHERE c_birth_month=1), filtered_i AS (SELECT i_item_sk, i_item_id FROM item WHERE i_category='Women') SELECT ... FROM catalog_sales JOIN filtered_cd ... JOIN filtered_d ... JOIN filtered_c ... JOIN filtered_ca ... JOIN filtered_i ... WHERE cs_wholesale_cost BETWEEN 65 AND 70"}, {'group': '谓词简化', 'produced_suggestion': "将所有维度表的过滤谓词尽量下推到各自表扫描层，确保数据库优化器在扫描各维度表时即应用过滤条件（cd_gender='F'、cd_education_status='Secondary'、d_year=2001、c_birth_month=1、ca_state IN ('MS','NY','VA')、i_category='Women'、cs_wholesale_cost BETWEEN 65 AND 70），优先缩小各维度表结果集，再与catalog_sales进行关联，避免在大表JOIN后才过滤。"}, {'group': '连接优化', 'produced_suggestion': '调整JOIN顺序，优先将选择性最强的维度表（如customer_demographics、date_dim、customer、customer_address、item）相互关联形成小结果集后，再与catalog_sales大表做最终JOIN。建议将catalog_sales放在JOIN链的最后，以Hash Join方式与已经过滤好的维度组合关联，减少Nested Loop或大表驱动带来的性能损耗。'}, {'group': '聚合优化', 'produced_suggestion': 'ROLLUP(i_item_id, ca_country, ca_state, ca_county)会生成多个聚合层次，可考虑先在内层对原始过滤结果做基础聚合（按最细粒度GROUP BY i_item_id, ca_country, ca_state, ca_county），然后在外层通过UNION ALL模拟ROLLUP各层次，避免数据库对全量数据多次扫描聚合，提升大数据量下ROLLUP的执行效率。'}]
+LIMIT 100;
+Time Cost: 202.46s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '考虑在catalog_sales表的cs_wholesale_cost列上创建索引，以加速范围过滤条件cs_wholesale_cost BETWEEN 65 AND 70的评估，避免全表扫描。'}, {'group': '连接优化', 'produced_suggestion': '检查连接顺序，确保过滤性强的表（如customer_demographics、date_dim、item）优先连接，减少后续连接的数据量。'}]
 🔍 开始初始优化可行性检查...
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
-{"can_optimize":true,"reason":"SQL存在明显性能瓶颈：catalog_sales表（约1440万行）进行全表顺序扫描，代价占比高达99.2%。查询涉及6张表的多表JOIN，并使用ROLLUP聚合和ORDER BY排序。根据历史相似案例（相似度1.0），可通过CTE分解、过滤条件下推等方式优化。可以将过滤条件提前，利用CTE预先过滤小结果集，减少大表扫描范围，同时优化连接顺序，先连接选择性高的维度表再与事实表关联。","advice":[{"group":"子查询优化","produced_suggestion":"将高选择性的维度表过滤条件提取为CTE，先对customer_demographics（cd_gender='F' AND cd_education_status='Secondary'）、date_dim（d_year=2001）、customer（c_birth_month=1）、customer_address（ca_state IN ('MS','NY','VA')）、item（i_category='Women'）分别构建CTE过滤子集，再与catalog_sales进行JOIN，减少大表扫描后的中间结果集规模。例如：WITH filtered_cd AS (SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender='F' AND cd_education_status='Secondary'), filtered_d AS (SELECT d_date_sk FROM date_dim WHERE d_year=2001), filtered_ca AS (SELECT ca_address_sk, ca_country, ca_state, ca_county FROM customer_address WHERE ca_state IN ('MS','NY','VA')), filtered_c AS (SELECT c_customer_sk, c_birth_year, c_current_addr_sk FROM customer WHERE c_birth_month=1), filtered_i AS (SELECT i_item_sk, i_item_id FROM item WHERE i_category='Women') SELECT ... FROM catalog_sales JOIN filtered_cd ... JOIN filtered_d ... JOIN filtered_c ... JOIN filtered_ca ... JOIN filtered_i ... WHERE cs_wholesale_cost BETWEEN 65 AND 70"},{"group":"谓词简化","produced_suggestion":"将所有维度表的过滤谓词尽量下推到各自表扫描层，确保数据库优化器在扫描各维度表时即应用过滤条件（cd_gender='F'、cd_education_status='Secondary'、d_year=2001、c_birth_month=1、ca_state IN ('MS','NY','VA')、i_category='Women'、cs_wholesale_cost BETWEEN 65 AND 70），优先缩小各维度表结果集，再与catalog_sales进行关联，避免在大表JOIN后才过滤。"},{"group":"连接优化","produced_suggestion":"调整JOIN顺序，优先将选择性最强的维度表（如customer_demographics、date_dim、customer、customer_address、item）相互关联形成小结果集后，再与catalog_sales大表做最终JOIN。建议将catalog_sales放在JOIN链的最后，以Hash Join方式与已经过滤好的维度组合关联，减少Nested Loop或大表驱动带来的性能损耗。"},{"group":"聚合优化","produced_suggestion":"ROLLUP(i_item_id, ca_country, ca_state, ca_county)会生成多个聚合层次，可考虑先在内层对原始过滤结果做基础聚合（按最细粒度GROUP BY i_item_id, ca_country, ca_state, ca_county），然后在外层通过UNION ALL模拟ROLLUP各层次，避免数据库对全量数据多次扫描聚合，提升大数据量下ROLLUP的执行效率。"}]}
+{
+  "can_optimize": true,
+  "reason": "执行计划中catalog_sales表存在全表扫描（Seq Scan），代价占比高达99.2%，且该表有1439万行数据，过滤条件cs_wholesale_cost BETWEEN 65 AND 70选择性未知但可能较低，导致大量数据扫描。可通过创建索引或调整查询结构优化。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "考虑在catalog_sales表的cs_wholesale_cost列上创建索引，以加速范围过滤条件cs_wholesale_cost BETWEEN 65 AND 70的评估，避免全表扫描。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "检查连接顺序，确保过滤性强的表（如customer_demographics、date_dim、item）优先连接，减少后续连接的数据量。"
+    }
+  ]
+}
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 71 rules
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.218
-   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+📊 UCT scored 45 rules
    → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
 {
-  "groups": "聚合优化, 子查询优化, 谓词简化, 连接优化",
-  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE"],
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH"],
   "rule_effect_scores": {
-    "STRATEGY_CTE_DECOMPOSITION": 0.4,
-    "FILTER_INTO_JOIN": 0.2,
-    "JOIN_CONDITION_PUSH": 0.2,
-    "PROJECT_JOIN_TRANSPOSE": 0.2
+    "FILTER_INTO_JOIN": 0.5,
+    "JOIN_CONDITION_PUSH": 0.5
   },
   "rule_effect_confidence": {
-    "STRATEGY_CTE_DECOMPOSITION": 0.85,
-    "FILTER_INTO_JOIN": 0.9,
-    "JOIN_CONDITION_PUSH": 0.8,
-    "PROJECT_JOIN_TRANSPOSE": 0.7
+    "FILTER_INTO_JOIN": 0.8,
+    "JOIN_CONDITION_PUSH": 0.7
   }
 }
-✅ 选择了 4 个规则
+✅ 选择了 2 个规则
 🔧 开始SQL重写...
-```json
 {
-  "groups": "聚合优化, 子查询优化, 谓词简化, 连接优化",
-  "applied_rules": [
-    "STRATEGY_CTE_DECOMPOSITION",
-    "FILTER_INTO_JOIN",
-    "JOIN_CONDITION_PUSH",
-    "PROJECT_JOIN_TRANSPOSE"
-  ],
-  "rewritten_sql": "WITH filtered_cd AS (\n    SELECT cd_demo_sk\n    FROM customer_demographics\n    WHERE cd_gender = 'F' AND cd_education_status = 'Secondary'\n),\nfiltered_d AS (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 2001\n),\nfiltered_c AS (\n    SELECT c_customer_sk, c_birth_year, c_current_addr_sk\n    FROM customer\n    WHERE c_birth_month = 1\n),\nfiltered_ca AS (\n    SELECT ca_address_sk, ca_country, ca_state, ca_county\n    FROM customer_address\n    WHERE ca_state IN ('MS', 'NY', 'VA')\n),\nfiltered_i AS (\n    SELECT i_item_sk, i_item_id\n    FROM item\n    WHERE i_category = 'Women'\n)\nSELECT\n    i_item_id,\n    ca_country,\n    ca_state,\n    ca_county,\n    avg(cast(cs_quantity as decimal(12,2))) agg1,\n    avg(cast(cs_list_price as decimal(12,2))) agg2,\n    avg(cast(cs_coupon_amt as decimal(12,2))) agg3,\n    avg(cast(cs_sales_price as decimal(12,2))) agg4,\n    avg(cast(cs_net_profit as decimal(12,2))) agg5,\n    avg(cast(c_birth_year as decimal(12,2))) agg6\nFROM catalog_sales\nJOIN filtered_d ON cs_sold_date_sk = d_date_sk\nJOIN filtered_i ON cs_item_sk = i_item_sk\nJOIN filtered_cd ON cs_bill_cdemo_sk = cd_demo_sk\nJOIN filtered_c ON cs_bill_customer_sk = c_customer_sk\nJOIN filtered_ca ON c_current_addr_sk = ca_address_sk\nWHERE cs_wholesale_cost BETWEEN 65 AND 70\nGROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county)\nORDER BY ca_country, ca_state, ca_county, i_item_id\nLIMIT 100"
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH"],
+  "rewritten_sql": "SELECT i_item_id, ca_country, ca_state, ca_county, avg(cast(cs_quantity as decimal(12,2))) agg1, avg(cast(cs_list_price as decimal(12,2))) agg2, avg(cast(cs_coupon_amt as decimal(12,2))) agg3, avg(cast(cs_sales_price as decimal(12,2))) agg4, avg(cast(cs_net_profit as decimal(12,2))) agg5, avg(cast(c_birth_year as decimal(12,2))) agg6 FROM (SELECT * FROM catalog_sales WHERE cs_wholesale_cost BETWEEN 65 AND 70) cs JOIN date_dim d ON cs.cs_sold_date_sk = d.d_date_sk AND d.d_year = 2001 JOIN item i ON cs.cs_item_sk = i.i_item_sk AND i.i_category = 'Women' JOIN customer_demographics cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk AND cd.cd_gender = 'F' AND cd.cd_education_status = 'Secondary' JOIN customer c ON cs.cs_bill_customer_sk = c.c_customer_sk AND c.c_birth_month = 1 JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_state IN ('MS', 'NY', 'VA') GROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county) ORDER BY ca_country, ca_state, ca_county, i_item_id LIMIT 100",
+  "semantic_correctness_guarantee": "1. 将原 WHERE 子句中仅涉及 catalog_sales 表的过滤条件 cs_wholesale_cost BETWEEN 65 AND 70 推入 catalog_sales 的子查询中，提前过滤数据，减少后续连接的数据量。该条件仅依赖 cs 表，推入子查询不改变连接语义。\n2. 将原 WHERE 子句中仅涉及 date_dim 表的过滤条件 d_year = 2001 并入 catalog_sales 与 date_dim 的 JOIN ON 子句中，等价于在连接时即过滤 date_dim 表，不影响结果集。\n3. 将原 WHERE 子句中仅涉及 item 表的过滤条件 i_category = 'Women' 并入 catalog_sales 与 item 的 JOIN ON 子句中，等价于在连接时即过滤 item 表，不影响结果集。\n4. 将原 WHERE 子句中仅涉及 customer_demographics 表的过滤条件 cd_gender = 'F' 和 cd_education_status = 'Secondary' 并入 catalog_sales 与 customer_demographics 的 JOIN ON 子句中，等价于在连接时即过滤 customer_demographics 表，不影响结果集。\n5. 将原 WHERE 子句中仅涉及 customer 表的过滤条件 c_birth_month = 1 并入 catalog_sales 与 customer 的 JOIN ON 子句中，等价于在连接时即过滤 customer 表，不影响结果集。\n6. 将原 WHERE 子句中仅涉及 customer_address 表的过滤条件 ca_state IN ('MS', 'NY', 'VA') 并入 customer 与 customer_address 的 JOIN ON 子句中，等价于在连接时即过滤 customer_address 表，不影响结果集。\n7. 所有过滤条件均保持原逻辑，连接顺序和连接键与原查询一致，GROUP BY ROLLUP、聚合函数、ORDER BY 和 LIMIT 均未改变，因此重写后的 SQL 与原 SQL 在语义上完全等价，返回相同的结果集。"
 }
-```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
-```json
 {
-    "equivalent": true,
-    "message": "重写将维度表过滤提取为CTE并改用显式JOIN语法，但连接条件、过滤谓词、聚合逻辑及输出规格完全一致，结果集等价。",
-    "differences": []
+  "equivalent": true,
+  "message": "重写SQL将各表过滤条件推入JOIN ON或子查询，连接键、聚合、ROLLUP、ORDER BY、LIMIT均与原SQL一致，语义等价。",
+  "differences": []
 }
-```
 ✅ 语义等价
 📊 开始评估优化结果...
-```json
 {
-  "terminate": true,
-  "reason": "重写costs与原始相同(462537.51)，但重写通过CTE将维度表过滤前置、显式JOIN替代隐式逗号连接，结构更清晰且投影更紧凑，符合§1扁平化与过滤下推信号；虽成本未降但结构明显优化，保留重写；当前已相当干净无明显残留低效点，终止续轮",
-  "保留重写SQL": true
+  "terminate": false,
+  "reason": "执行计划结构完全一致（节点类型、行数、成本均相同），重写仅将过滤条件移入JOIN ON子句，未改变执行路径。无结构性改进，但亦未退化。仍有优化空间（如索引、连接顺序调整）。",
+  "no_further_optimization": false,
+  "keep_rewrite_sql": true,
+  "next_step_advice": "建议在catalog_sales的cs_wholesale_cost列上创建索引，并尝试调整连接顺序，将过滤性强的表（如date_dim、customer_demographics）提前，以减少后续连接数据量。"
 }
-```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["PROJECT_JOIN_TRANSPOSE", "JOIN_TO_CORRELATE"],
+  "rule_effect_scores": {
+    "PROJECT_JOIN_TRANSPOSE": 0.4,
+    "JOIN_TO_CORRELATE": 0.6
+  },
+  "rule_effect_confidence": {
+    "PROJECT_JOIN_TRANSPOSE": 0.5,
+    "JOIN_TO_CORRELATE": 0.7
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+{
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["PROJECT_JOIN_TRANSPOSE", "JOIN_TO_CORRELATE"],
+  "rewritten_sql": "SELECT i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6\nFROM (\n  SELECT i_item_id, ca_country, ca_state, ca_county,\n         AVG(CAST(cs_quantity AS DECIMAL(12,2))) AS agg1,\n         AVG(CAST(cs_list_price AS DECIMAL(12,2))) AS agg2,\n         AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))) AS agg3,\n         AVG(CAST(cs_sales_price AS DECIMAL(12,2))) AS agg4,\n         AVG(CAST(cs_net_profit AS DECIMAL(12,2))) AS agg5,\n         AVG(CAST(c_birth_year AS DECIMAL(12,2))) AS agg6\n  FROM catalog_sales\n  JOIN LATERAL (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_date_sk = catalog_sales.cs_sold_date_sk\n      AND d_year = 2001\n  ) AS d ON TRUE\n  JOIN LATERAL (\n    SELECT i_item_sk, i_item_id\n    FROM item\n    WHERE i_item_sk = catalog_sales.cs_item_sk\n      AND i_category = 'Women'\n  ) AS i ON TRUE\n  JOIN LATERAL (\n    SELECT cd_demo_sk\n    FROM customer_demographics\n    WHERE cd_demo_sk = catalog_sales.cs_bill_cdemo_sk\n      AND cd_gender = 'F'\n      AND cd_education_status = 'Secondary'\n  ) AS cd ON TRUE\n  JOIN LATERAL (\n    SELECT c_customer_sk, c_birth_year, c_current_addr_sk\n    FROM customer\n    WHERE c_customer_sk = catalog_sales.cs_bill_customer_sk\n      AND c_birth_month = 1\n  ) AS c ON TRUE\n  JOIN LATERAL (\n    SELECT ca_address_sk, ca_country, ca_state, ca_county\n    FROM customer_address\n    WHERE ca_address_sk = c.c_current_addr_sk\n      AND ca_state IN ('MS', 'NY', 'VA')\n  ) AS ca ON TRUE\n  WHERE cs_wholesale_cost BETWEEN 65 AND 70\n  GROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county)\n) AS subq\nORDER BY ca_country, ca_state, ca_county, i_item_id\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. 将原查询的隐式交叉连接（逗号分隔）显式改写为 JOIN ... ON TRUE 形式，并应用 JOIN_TO_CORRELATE 规则，将每个维度表的过滤条件与连接条件合并为 LATERAL 子查询，子查询内部包含对应表的过滤谓词和与主表 catalog_sales 的连接条件。\n2. 原查询中所有表连接条件（cs_sold_date_sk = d_date_sk 等）和过滤条件（d_year=2001, cd_gender='F' 等）均被保留，且作用域未变：LATERAL 子查询中的 WHERE 条件等价于原 ON 子句加 WHERE 子句的合取。\n3. 原查询的 GROUP BY ROLLUP(i_item_id, ca_country, ca_state, ca_county) 和聚合函数 AVG(CAST(...)) 完全保留，未做任何修改，因此聚合语义不变。\n4. 外层 SELECT 仅选择原查询所需的列和聚合别名，并应用 ORDER BY 和 LIMIT，与原始查询一致。\n5. 由于 LATERAL 子查询对每一行 catalog_sales 执行，且连接条件为等值连接，结果集与原查询的等值连接结果完全相同；所有过滤条件均在连接时生效，不会引入额外行或丢失行。\n6. 原查询中 cs_wholesale_cost BETWEEN 65 AND 70 保留在 catalog_sales 表扫描后的 WHERE 子句中，与原始位置等价。\n7. 重写后 SQL 在标准 SQL 语义下与原查询返回相同的结果集，包括 ROLLUP 产生的分组和聚合值，以及排序和限制行数。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+{
+  "equivalent": true,
+  "message": "重写SQL通过LATERAL子查询保留了所有连接和过滤条件，聚合与ROLLUP语义不变，结果集等价。",
+  "differences": []
+}
+✅ 语义等价
+📊 开始评估优化结果...
+{
+  "terminate": false,
+  "reason": "执行计划结构几乎无变化：连接顺序、扫描方式、索引使用均相同，仅聚合策略从Sorted变为Mixed，但未带来实质性改进。成本几乎不变（462537.51 vs 462537.61）。重写SQL引入LATERAL JOIN，但优化器将其优化为与原始SQL相同的计划，无结构改进。当前重写未恶化，但亦无改进，且仍有优化空间（如索引建议、连接顺序调整）。",
+  "no_further_optimization": false,
+  "keep_rewrite_sql": false,
+  "next_step_advice": "建议回退到原始SQL，并尝试以下优化：1) 在catalog_sales的cs_wholesale_cost列上创建索引以加速过滤；2) 调整连接顺序，将过滤性强的表（如customer_demographics、date_dim）作为驱动表；3) 考虑使用物化视图预聚合或调整GROUP BY ROLLUP的实现方式。"
+}
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 825
-   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH', 'PROJECT_JOIN_TRANSPOSE']
-   - 优化组别: 聚合优化, 子查询优化, 谓词简化, 连接优化
-   - 估计代价: 原始=462537.51, 重写=462537.51，相对变化: 0.00%
-✅ 成功存储，记录ID: 0870236b-1cd0-4435-ab53-f3bb71415ad0
+   - 规则序列: ['PROJECT_JOIN_TRANSPOSE', 'JOIN_TO_CORRELATE']
+   - 优化组别: 谓词简化, 连接优化
+   - 估计代价: 原始=462537.51, 重写=462537.61，相对变化: -0.00%
+✅ 成功存储，记录ID: 12ff6106-ffb0-42ad-8d03-5b6ad7d41684
+
+🎲 UCT Math Update: 2 rules, reward=+0.0250 (cost=-0.0000, rows=+0.0000, depth=+0.0833, oc=462537.5100, rc=462537.6100)
+   结构分细节: rows 140749.0->140748.0 (score=+0.000), depth 12.0->11.0 (score=+0.083)
+✅ UCT Update Complete:
+   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.400, conf=0.50, lambda=0.25, reward=+0.012, count=68, avg=+0.043
+   → JOIN_TO_CORRELATE: P(s,a)=N/A, effect=0.600, conf=0.70, lambda=0.35, reward=+0.013, count=5, avg=+0.055
 
 ----------------------------------------
 

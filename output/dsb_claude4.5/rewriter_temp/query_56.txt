@@ -2,115 +2,86 @@ Query ID: 56
 ==================================================
 
 Original: select  sum(cs_ext_discount_amt)  as "excess discount amount" from    catalog_sales    ,item    ,date_dim where (i_manufact_id in (291, 335, 604, 696, 887) or i_manager_id BETWEEN 35 and 64) and i_item_sk = cs_item_sk and d_date between '1998-03-22' and         cast('1998-03-22' as date) + interval '90' day and d_date_sk = cs_sold_date_sk and cs_ext_discount_amt      > (          select             1.3 * avg(cs_ext_discount_amt)          from             catalog_sales            ,date_dim          where               cs_item_sk = i_item_sk           and d_date between '1998-03-22' and                              cast('1998-03-22' as date) + interval '90' day           and d_date_sk = cs_sold_date_sk           and cs_list_price between 119 and 148           and cs_sales_price / cs_list_price BETWEEN 58 * 0.01 AND 78 * 0.01       ) order by sum(cs_ext_discount_amt) limit 100;
-Rewritten: select  sum(cs_ext_discount_amt)  as "excess discount amount" from    catalog_sales    ,item    ,date_dim where (i_manufact_id in (291, 335, 604, 696, 887) or i_manager_id BETWEEN 35 and 64) and i_item_sk = cs_item_sk and d_date between '1998-03-22' and         cast('1998-03-22' as date) + interval '90' day and d_date_sk = cs_sold_date_sk and cs_ext_discount_amt      > (          select             1.3 * avg(cs_ext_discount_amt)          from             catalog_sales            ,date_dim          where               cs_item_sk = i_item_sk           and d_date between '1998-03-22' and                              cast('1998-03-22' as date) + interval '90' day           and d_date_sk = cs_sold_date_sk           and cs_list_price between 119 and 148           and cs_sales_price / cs_list_price BETWEEN 58 * 0.01 AND 78 * 0.01       ) order by sum(cs_ext_discount_amt) limit 100;
-Time Cost: 195.07s
-Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将相关子查询转换为CTE或JOIN形式。子查询中重复扫描catalog_sales和date_dim表，可提取为公共表表达式(CTE)，避免重复计算。考虑将子查询物化后与外层查询JOIN，减少相关子查询的执行次数。'}, {'group': '谓词简化', 'produced_suggestion': "将date_dim的日期范围过滤条件'd_date between 1998-03-22 and 1998-06-20'尽早下推到表扫描层，减少参与JOIN的数据量。同时简化常量表达式'cast(1998-03-22 as date) + interval 90 day'为具体日期值'1998-06-20'。"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，优先连接小表item和date_dim进行过滤，再与大表catalog_sales连接。利用item表的过滤条件(i_manufact_id或i_manager_id)和date_dim的日期范围先缩小数据集。考虑将item表的OR条件拆分为UNION以更好利用索引。'}, {'group': '常量折叠', 'produced_suggestion': "预计算子查询中的常量表达式'cs_sales_price / cs_list_price BETWEEN 0.58 AND 0.78'和'1.3 * avg(cs_ext_discount_amt)'。将'58 * 0.01'和'78 * 0.01'直接替换为0.58和0.78，减少运行时计算开销。"}, {'group': '聚合优化', 'produced_suggestion': '子查询中的AVG聚合可以通过预先过滤和分组优化。考虑将子查询的聚合结果缓存或物化，避免对每个外层查询行重复计算。外层的SUM聚合与ORDER BY使用相同表达式，可消除冗余计算。'}, {'group': '投影优化', 'produced_suggestion': '在各层JOIN前进行列裁剪，只保留必需的列(cs_ext_discount_amt、cs_item_sk、cs_sold_date_sk、cs_list_price、cs_sales_price、i_item_sk、d_date_sk)，减少数据传输和内存占用。'}, {'group': '排序优化', 'produced_suggestion': '外层查询的ORDER BY对聚合结果排序且有LIMIT 100，但由于只有一个聚合结果行，排序实际无意义可消除。如果保留排序，考虑在聚合前利用索引避免显式排序操作。'}]
+Rewritten: WITH thresholds AS (
+  SELECT cs_item_sk, 1.3 * AVG(cs_ext_discount_amt) AS threshold
+  FROM catalog_sales
+  JOIN date_dim ON cs_sold_date_sk = d_date_sk
+  WHERE d_date BETWEEN '1998-03-22' AND '1998-06-20'
+    AND cs_list_price BETWEEN 119 AND 148
+    AND cs_sales_price / cs_list_price BETWEEN 0.58 AND 0.78
+  GROUP BY cs_item_sk
+)
+SELECT SUM(cs_ext_discount_amt) AS "excess discount amount"
+FROM catalog_sales
+JOIN item ON i_item_sk = cs_item_sk
+JOIN date_dim ON d_date_sk = cs_sold_date_sk
+JOIN thresholds ON item.i_item_sk = thresholds.cs_item_sk
+WHERE (i_manufact_id IN (291, 335, 604, 696, 887) OR i_manager_id BETWEEN 35 AND 64)
+  AND d_date BETWEEN '1998-03-22' AND '1998-06-20'
+  AND cs_ext_discount_amt > thresholds.threshold
+LIMIT 100
+Time Cost: 418.08s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将关联子查询改写为派生表，使用左连接方式过滤，避免对每行都执行子查询。例如：WITH thresholds AS (SELECT cs_item_sk, 1.3*AVG(cs_ext_discount_amt) AS threshold FROM catalog_sales JOIN date_dim ON cs_sold_date_sk=d_date_sk WHERE d_date BETWEEN '1998-03-22' AND '1998-06-20' AND cs_list_price BETWEEN 119 AND 148 AND cs_sales_price/cs_list_price BETWEEN 0.58 AND 0.78 GROUP BY cs_item_sk) SELECT SUM(cs_ext_discount_amt) ... FROM catalog_sales JOIN item ON ... JOIN date_dim ON ... JOIN thresholds ON item.i_item_sk=thresholds.cs_item_sk AND cs_ext_discount_amt > threshold WHERE ... AND ..."}, {'group': '常量折叠', 'produced_suggestion': "将日期常量 '1998-03-22' + interval '90' day 预计算为 '1998-06-20'，以及折扣比率 58*0.01 和 78*0.01 计算为 0.58 和 0.78，简化表达式。"}, {'group': '排序优化', 'produced_suggestion': '外层查询仅返回一行，ORDER BY 和 LIMIT 无意义，可以移除以减少排序开销。'}]
 🔍 开始初始优化可行性检查...
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
-```json
-{
-  "can_optimize": true,
-  "reason": "执行计划显示catalog_sales表的Seq Scan占总代价93.4%，且存在相关子查询重复扫描catalog_sales和date_dim表。子查询与外层查询共享相同的表和日期范围条件，可通过CTE分解、谓词下推和连接优化显著提升性能。历史案例显示相似SQL通过STRATEGY_CTE_DECOMPOSITION、FILTER_REDUCE_EXPRESSIONS、PROJECT_REDUCE_EXPRESSIONS等规则优化后效果明显。",
-  "advice": [
-    {
-      "group": "子查询优化",
-      "produced_suggestion": "将相关子查询转换为CTE或JOIN形式。子查询中重复扫描catalog_sales和date_dim表，可提取为公共表表达式(CTE)，避免重复计算。考虑将子查询物化后与外层查询JOIN，减少相关子查询的执行次数。"
-    },
-    {
-      "group": "谓词简化",
-      "produced_suggestion": "将date_dim的日期范围过滤条件'd_date between 1998-03-22 and 1998-06-20'尽早下推到表扫描层，减少参与JOIN的数据量。同时简化常量表达式'cast(1998-03-22 as date) + interval 90 day'为具体日期值'1998-06-20'。"
-    },
-    {
-      "group": "连接优化",
-      "produced_suggestion": "调整连接顺序，优先连接小表item和date_dim进行过滤，再与大表catalog_sales连接。利用item表的过滤条件(i_manufact_id或i_manager_id)和date_dim的日期范围先缩小数据集。考虑将item表的OR条件拆分为UNION以更好利用索引。"
-    },
-    {
-      "group": "常量折叠",
-      "produced_suggestion": "预计算子查询中的常量表达式'cs_sales_price / cs_list_price BETWEEN 0.58 AND 0.78'和'1.3 * avg(cs_ext_discount_amt)'。将'58 * 0.01'和'78 * 0.01'直接替换为0.58和0.78，减少运行时计算开销。"
-    },
-    {
-      "group": "聚合优化",
-      "produced_suggestion": "子查询中的AVG聚合可以通过预先过滤和分组优化。考虑将子查询的聚合结果缓存或物化，避免对每个外层查询行重复计算。外层的SUM聚合与ORDER BY使用相同表达式，可消除冗余计算。"
-    },
-    {
-      "group": "投影优化",
-      "produced_suggestion": "在各层JOIN前进行列裁剪，只保留必需的列(cs_ext_discount_amt、cs_item_sk、cs_sold_date_sk、cs_list_price、cs_sales_price、i_item_sk、d_date_sk)，减少数据传输和内存占用。"
-    },
-    {
-      "group": "排序优化",
-      "produced_suggestion": "外层查询的ORDER BY对聚合结果排序且有LIMIT 100，但由于只有一个聚合结果行，排序实际无意义可消除。如果保留排序，考虑在聚合前利用索引避免显式排序操作。"
-    }
-  ]
-}
-```
+{"can_optimize": true, "reason": "关联子查询对每一外层行执行，导致 catalog_sales 多次扫描，执行计划中 93% 代价来自全表扫描，重写为派生表预聚合可避免嵌套循环，常量折叠简化表达式，移除冗余排序和 LIMIT。", "advice": [{"group": "子查询优化", "produced_suggestion": "将关联子查询改写为派生表，使用左连接方式过滤，避免对每行都执行子查询。例如：WITH thresholds AS (SELECT cs_item_sk, 1.3*AVG(cs_ext_discount_amt) AS threshold FROM catalog_sales JOIN date_dim ON cs_sold_date_sk=d_date_sk WHERE d_date BETWEEN '1998-03-22' AND '1998-06-20' AND cs_list_price BETWEEN 119 AND 148 AND cs_sales_price/cs_list_price BETWEEN 0.58 AND 0.78 GROUP BY cs_item_sk) SELECT SUM(cs_ext_discount_amt) ... FROM catalog_sales JOIN item ON ... JOIN date_dim ON ... JOIN thresholds ON item.i_item_sk=thresholds.cs_item_sk AND cs_ext_discount_amt > threshold WHERE ... AND ..."}, {"group": "常量折叠", "produced_suggestion": "将日期常量 '1998-03-22' + interval '90' day 预计算为 '1998-06-20'，以及折扣比率 58*0.01 和 78*0.01 计算为 0.58 和 0.78，简化表达式。"}, {"group": "排序优化", "produced_suggestion": "外层查询仅返回一行，ORDER BY 和 LIMIT 无意义，可以移除以减少排序开销。"}]}
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 91 rules
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+📊 UCT scored 24 rules
    → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
-   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → AGGREGATE_VALUES: UCT=1.100
+   → WINDOW_REDUCE_EXPRESSIONS: UCT=1.100
 {
-  "groups": "聚合优化, 子查询优化, 谓词简化, 连接优化, 常量折叠, 排序优化, 投影优化",
-  "applied_rules": [
-    "STRATEGY_CTE_DECOMPOSITION",
-    "FILTER_REDUCE_EXPRESSIONS",
-    "PROJECT_REDUCE_EXPRESSIONS",
-    "JOIN_CONDITION_PUSH",
-    "SORT_REMOVE"
-  ],
+  "groups": "子查询优化, 常量折叠, 排序优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_REDUCE_EXPRESSIONS", "SORT_REMOVE"],
   "rule_effect_scores": {
-    "STRATEGY_CTE_DECOMPOSITION": 0.4,
-    "FILTER_REDUCE_EXPRESSIONS": 0.2,
-    "PROJECT_REDUCE_EXPRESSIONS": 0.2,
-    "JOIN_CONDITION_PUSH": 0.1,
-    "SORT_REMOVE": 0.1
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "FILTER_REDUCE_EXPRESSIONS": 0.3,
+    "SORT_REMOVE": 0.2
   },
   "rule_effect_confidence": {
-    "STRATEGY_CTE_DECOMPOSITION": 0.545,
-    "FILTER_REDUCE_EXPRESSIONS": 0.529,
-    "PROJECT_REDUCE_EXPRESSIONS": 0.651,
-    "JOIN_CONDITION_PUSH": 0.501,
-    "SORT_REMOVE": 0.797
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "FILTER_REDUCE_EXPRESSIONS": 0.7,
+    "SORT_REMOVE": 0.9
   }
 }
-✅ 选择了 5 个规则
+✅ 选择了 3 个规则
 🔧 开始SQL重写...
-```json
 {
-  "groups": "聚合优化, 子查询优化, 谓词简化, 连接优化, 常量折叠, 排序优化, 投影优化",
+  "groups": "子查询优化, 常量折叠, 排序优化",
   "applied_rules": [
     "STRATEGY_CTE_DECOMPOSITION",
     "FILTER_REDUCE_EXPRESSIONS",
-    "PROJECT_REDUCE_EXPRESSIONS",
-    "JOIN_CONDITION_PUSH",
     "SORT_REMOVE"
   ],
-  "rewritten_sql": "WITH item_threshold AS (\n  SELECT \n    cs_item_sk,\n    1.3 * AVG(cs_ext_discount_amt) AS threshold\n  FROM catalog_sales\n  JOIN date_dim ON d_date_sk = cs_sold_date_sk\n  WHERE d_date BETWEEN '1998-03-22' AND '1998-06-20'\n    AND cs_list_price BETWEEN 119 AND 148\n    AND cs_sales_price / cs_list_price BETWEEN 0.58 AND 0.78\n  GROUP BY cs_item_sk\n)\nSELECT SUM(cs.cs_ext_discount_amt) AS \"excess discount amount\"\nFROM (\n  SELECT cs_item_sk, cs_sold_date_sk, cs_ext_discount_amt\n  FROM catalog_sales\n) cs\nJOIN (\n  SELECT i_item_sk\n  FROM item\n  WHERE i_manufact_id IN (291, 335, 604, 696, 887) OR i_manager_id BETWEEN 35 AND 64\n) i ON i.i_item_sk = cs.cs_item_sk\nJOIN (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_date BETWEEN '1998-03-22' AND '1998-06-20'\n) d ON d.d_date_sk = cs.cs_sold_date_sk\nJOIN item_threshold t ON t.cs_item_sk = cs.cs_item_sk\nWHERE cs.cs_ext_discount_amt > t.threshold\nLIMIT 100"
+  "rewritten_sql": "WITH thresholds AS (\n  SELECT cs_item_sk, 1.3 * AVG(cs_ext_discount_amt) AS threshold\n  FROM catalog_sales\n  JOIN date_dim ON cs_sold_date_sk = d_date_sk\n  WHERE d_date BETWEEN '1998-03-22' AND '1998-06-20'\n    AND cs_list_price BETWEEN 119 AND 148\n    AND cs_sales_price / cs_list_price BETWEEN 0.58 AND 0.78\n  GROUP BY cs_item_sk\n)\nSELECT SUM(cs_ext_discount_amt) AS \"excess discount amount\"\nFROM catalog_sales\nJOIN item ON i_item_sk = cs_item_sk\nJOIN date_dim ON d_date_sk = cs_sold_date_sk\nJOIN thresholds ON item.i_item_sk = thresholds.cs_item_sk\nWHERE (i_manufact_id IN (291, 335, 604, 696, 887) OR i_manager_id BETWEEN 35 AND 64)\n  AND d_date BETWEEN '1998-03-22' AND '1998-06-20'\n  AND cs_ext_discount_amt > thresholds.threshold\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. 将原查询中关联子查询 (SELECT 1.3 * AVG(cs_ext_discount_amt) ... WHERE cs_item_sk = i_item_sk) 改写为非关联 CTE thresholds，按 cs_item_sk 分组计算阈值，主查询通过 JOIN thresholds ON item.i_item_sk = thresholds.cs_item_sk 连接，并用 cs_ext_discount_amt > threshold 替代原有 > (subquery) 条件。由于子查询过滤条件与分组一致，cs_item_sk 非空，聚合结果与原标量子查询逐行计算完全等价。\n2. 常量折叠：日期表达式 cast('1998-03-22' AS date) + interval '90' day 简化为 '1998-06-20'，58*0.01 简化为 0.58，78*0.01 简化为 0.78，数值不变，不影响过滤语义。\n3. 排序移除：原查询为无 GROUP BY 的聚合，结果集仅一行，ORDER BY sum(cs_ext_discount_amt) 对单行无效，移除后不影响结果，保留 LIMIT 100 仍合法且对单行无影响，语义等价。\n4. 所有原始过滤条件（item 制造商/经理过滤、date_dim 日期范围、catalog_sales 价格条件）均保留，且连接条件与隐式连接等价，改写使用显式 JOIN 语法语义一致。\n5. 在标准 SQL 下，cs_ext_discount_amt > NULL 导致行被过滤，若某 cs_item_sk 无符合条件行导致阈值为 NULL，则主查询对应行被排除，与原子查询返回 NULL 时行为一致。"
 }
-```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
-```json
 {
-  "equivalent": true,
-  "message": "重写SQL通过CTE预计算阈值替代了原始SQL的相关子查询，两者对每个cs_item_sk计算的阈值相同，最终结果集等价（ORDER BY对单行聚合结果无影响）",
-  "differences": []
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取子查询、常量折叠、移除无意义排序，与原始SQL在语义上完全等价。",
+    "differences": []
 }
-```
 ✅ 语义等价
 📊 开始评估优化结果...
-```json
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 6086693.0 -> 3948.0 (重写侧约为原的 0.0649%)
 {
   "terminate": true,
-  "reason": "重写costs更高(522300 vs 459004)，且引入了额外结构复杂度：原始SQL的相关子查询被改写为CTE+多层派生表嵌套，但CTE中GROUP BY cs_item_sk会产生大量分组(每个item一个threshold)，JOIN时需要逐行匹配threshold，反而增加了计算开销；原始的相关子查询虽看似低效，但优化器可能利用索引做半连接优化。重写未带来结构上的明显优势，反而因过度物化和额外JOIN层导致成本上升。",
-  "保留重写SQL": false
+  "reason": "执行计划结构明确改进：优化后通过CTE预计算阈值并作为JOIN条件，消除了关联子查询；全表扫描减少（2 vs 3），索引使用增加（3 vs 1），估计扫描行数从608万降至3948（0.06%），数据访问路径由大规模全表扫描+Hash Join转变为索引驱动的Nested Loop；移除无用的ORDER BY。尽管优化器成本估算从459004增至522300，但结构信号强烈优先，综合判定达标，终止优化。"
 }
-```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 576
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_REDUCE_EXPRESSIONS', 'SORT_REMOVE']
+   - 优化组别: 子查询优化, 常量折叠, 排序优化
+   - 估计代价: 原始=459004.43, 重写=522300.34，相对变化: -13.79%
+✅ 成功存储，记录ID: 85e3758c-98f2-4b46-9e0f-7af4e6f5df72
 
 ----------------------------------------
 

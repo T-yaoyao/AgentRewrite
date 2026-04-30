@@ -2,60 +2,81 @@ Query ID: 10
 ==================================================
 
 Original: select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1996-01-01' and o_orderdate < date '1996-01-01' + interval '3' month and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;
-Rewritten: select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1996-01-01' and o_orderdate < date '1996-01-01' + interval '3' month and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;
-Time Cost: 227.61s
-Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将EXISTS子查询重写为JOIN，避免相关子查询的重复执行，从而利用连接优化潜力。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序和连接算法，尝试用Hash Join替代Nested Loop Join以提升连接效率，考虑半连接转换。'}, {'group': '谓词简化', 'produced_suggestion': '将订单日期过滤条件尽可能早地下推到连接操作之前，减少中间结果行数。'}, {'group': '投影优化', 'produced_suggestion': '只查询必要列，避免全列扫描带来的I/O和CPU资源浪费。'}]
+Rewritten: SELECT o.o_orderpriority, COUNT(*) AS order_count
+FROM orders o
+INNER JOIN (
+    SELECT DISTINCT l_orderkey
+    FROM lineitem
+    WHERE l_commitdate < l_receiptdate
+) li ON o.o_orderkey = li.l_orderkey
+WHERE o.o_orderdate >= DATE '1996-01-01'
+  AND o.o_orderdate < DATE '1996-04-01'
+GROUP BY o.o_orderpriority
+ORDER BY o.o_orderpriority;
+Time Cost: 421.32s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将EXISTS子查询转换为SEMI JOIN(或INNER JOIN+DISTINCT)：EXISTS子查询会对orders每行触发lineitem扫描，改写为JOIN后可利用Hash Join批量处理，减少重复扫描。建议改写为: SELECT o_orderpriority, COUNT(*) FROM orders INNER JOIN (SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate) li ON o_orderkey = li.l_orderkey WHERE o_orderdate >= '1996-01-01' AND o_orderdate < '1996-04-01' GROUP BY o_orderpriority ORDER BY o_orderpriority"}, {'group': '谓词简化', 'produced_suggestion': "简化日期区间表达式：将'date + interval'转换为常量日期'1996-04-01'，消除运行时计算开销，便于优化器生成更优执行计划和利用分区裁剪(如有分区表)"}, {'group': '连接优化', 'produced_suggestion': '调整连接策略：在子查询转JOIN后，先对lineitem应用过滤条件(l_commitdate < l_receiptdate)并去重得到符合条件的l_orderkey集合(约减少数据量)，再与已按日期过滤的orders表JOIN，利用Hash Join替代当前的逐行EXISTS检查'}]
 🔍 开始初始优化可行性检查...
 🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
+```json
 {
   "can_optimize": true,
-  "reason": "执行计划显示存在两个明显的性能瓶颈：orders表的Seq Scan代价较高，且使用了低效的Nested Loop Semi Join连接orders与lineitem两张大表。SQL语句结构中存在相关子查询（exists），可能通过查询重写优化连接方式改善性能。此外，过滤条件可以尝试下推或利用索引以避免全表扫描。",
+  "reason": "执行计划显示lineitem表全表扫描(Seq Scan)占总代价97.2%，扫描近6000万行数据。当前EXISTS子查询导致orders表每行都需要在lineitem中查找匹配记录，形成低效的关联模式。可通过子查询转JOIN、谓词优化等方式显著降低扫描代价。",
   "advice": [
     {
       "group": "子查询优化",
-      "produced_suggestion": "将EXISTS子查询重写为JOIN，避免相关子查询的重复执行，从而利用连接优化潜力。"
-    },
-    {
-      "group": "连接优化",
-      "produced_suggestion": "调整连接顺序和连接算法，尝试用Hash Join替代Nested Loop Join以提升连接效率，考虑半连接转换。"
+      "produced_suggestion": "将EXISTS子查询转换为SEMI JOIN(或INNER JOIN+DISTINCT)：EXISTS子查询会对orders每行触发lineitem扫描，改写为JOIN后可利用Hash Join批量处理，减少重复扫描。建议改写为: SELECT o_orderpriority, COUNT(*) FROM orders INNER JOIN (SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate) li ON o_orderkey = li.l_orderkey WHERE o_orderdate >= '1996-01-01' AND o_orderdate < '1996-04-01' GROUP BY o_orderpriority ORDER BY o_orderpriority"
     },
     {
       "group": "谓词简化",
-      "produced_suggestion": "将订单日期过滤条件尽可能早地下推到连接操作之前，减少中间结果行数。"
+      "produced_suggestion": "简化日期区间表达式：将'date + interval'转换为常量日期'1996-04-01'，消除运行时计算开销，便于优化器生成更优执行计划和利用分区裁剪(如有分区表)"
     },
     {
-      "group": "投影优化",
-      "produced_suggestion": "只查询必要列，避免全列扫描带来的I/O和CPU资源浪费。"
+      "group": "连接优化",
+      "produced_suggestion": "调整连接策略：在子查询转JOIN后，先对lineitem应用过滤条件(l_commitdate < l_receiptdate)并去重得到符合条件的l_orderkey集合(约减少数据量)，再与已按日期过滤的orders表JOIN，利用Hash Join替代当前的逐行EXISTS检查"
     }
   ]
 }
+```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 55 rules
-   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: UCT=1.209
-   → FILTER_CORRELATE: UCT=1.100
+📊 UCT scored 52 rules
    → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
 {
-  "groups": "连接优化, 子查询优化, 谓词简化, 投影优化",
-  "applied_rules": ["FILTER_INTO_JOIN"],
+  "groups": "子查询优化, 谓词简化, 连接优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"
+  ],
   "rule_effect_scores": {
-    "FILTER_INTO_JOIN": 0.8
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.5,
+    "FILTER_REDUCE_EXPRESSIONS": 0.1,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.4
   },
   "rule_effect_confidence": {
-    "FILTER_INTO_JOIN": 0.9
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.8,
+    "FILTER_REDUCE_EXPRESSIONS": 0.9,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.7
   }
 }
-✅ 选择了 1 个规则
+✅ 选择了 3 个规则
 🔧 开始SQL重写...
+```json
 {
-  "groups": "连接优化, 子查询优化, 谓词简化, 投影优化",
-  "applied_rules": ["FILTER_INTO_JOIN"],
-  "original_sql": "select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1996-01-01' and o_orderdate < date '1996-01-01' + interval '3' month and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;",
-  "rewritten_sql": "select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1996-01-01' and o_orderdate < date '1996-01-01' + interval '3' month and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;",
-  "semantic_check": "由于原始查询中不存在显式JOIN操作，无法应用FILTER_INTO_JOIN规则（该规则要求将过滤条件推入JOIN的ON子句或表子查询中）。重写后的SQL与原始SQL在语法结构和执行逻辑上完全一致，确保返回相同的结果集（包括列名、数据类型、排序顺序），聚合函数和子查询语义保持不变，因此语义等价。"
-}
+  "groups": "子查询优化, 谓词简化, 连接优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"
+  ],
+  "rewritten_sql": "SELECT o.o_orderpriority, COUNT(*) AS order_count\nFROM orders o\nINNER JOIN (\n    SELECT DISTINCT l_orderkey\n    FROM lineitem\n    WHERE l_commitdate < l_receiptdate\n) li ON o.o_orderkey = li.l_orderkey\nWHERE o.o_orderdate >= DATE '1996-01-01'\n  AND o.o_orderdate < DATE '1996-04-01'\nGROUP BY o.o_orderpriority\nORDER BY o.o_orderpriority;",
+  "semantic_correctness_guarantee": "1. 【FILTER_SUB_QUERY_TO_CORRELATE：EXISTS子查询改写为INNER JOIN + DISTINCT】\n原始SQL中 EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate) 是一个相关子查询，对orders每行触发lineitem的逐行扫描。改写后将其转换为先对lineitem按 l_commitdate < l_receiptdate 过滤、再按 l_orderkey 做 DISTINCT 去重，得到子查询 li，然后与orders做 INNER JOIN ON o.o_orderkey = li.l_orderkey。\n等价性保证：EXISTS语义等价于"orders中存在至少一条满足条件的lineitem行"，INNER JOIN + DISTINCT同样保证每个o_orderkey最多匹配一次（DISTINCT消除了lineitem中同一orderkey的多行重复），因此JOIN后orders行不会被重复计数，COUNT(*)结果与原始EXISTS语义完全一致。\n\n2. 【FILTER_REDUCE_EXPRESSIONS：日期区间常量折叠】\n原始SQL中 o_orderdate < DATE '1996-01-01' + INTERVAL '3' MONTH 是一个运行时计算表达式。改写后直接替换为常量 DATE '1996-04-01'（1996-01-01加3个月等于1996-04-01，PostgreSQL标准语义下结果确定）。\n等价性保证：DATE '1996-01-01' + INTERVAL '3' MONTH 在任何执行时刻均等于 DATE '1996-04-01'，属于纯常量折叠，不涉及任何数据相关计算，过滤范围完全不变。\n\n3. 【AGGREGATE_JOIN_TRANSPOSE_EXTENDED：聚合与JOIN的顺序调整】\n原始SQL的聚合 GROUP BY o_orderpriority / COUNT(*) 作用于orders表经EXISTS过滤后的结果集。改写后聚合仍在JOIN之后、对orders行执行，GROUP BY o_orderpriority 和 COUNT(*) 的作用域未发生变化。lineitem侧的DISTINCT仅用于去重orderkey以保证JOIN不产生重复orders行，并非将聚合下推到lineitem侧。\n等价性保证：COUNT(*)统计的是满足日期条件且在lineitem中存在符合条件行的orders行数，按o_orderpriority分组，与原始SQL完全一致。\n\n4. 【NULL与重复行处理】\n lineitem.l_orderkey 是外键，引用 orders.o_orderkey（NOT NULL），且 orders.o_orderkey 是主键（NOT NULL），因此JOIN键两侧均无NULL，不存在NULL导致的JOIN行为差异。DISTINCT作用于l_orderkey，确保每个orderkey只出现一次，INNER JOIN后orders表每行最多匹配一次，COUNT(*)不会因lineitem多行而膨胀。\n\n5. 【ORDER BY与结果集顺序】\n重写SQL保留了 ORDER BY o_orderpriority，与原始SQL完全一致，输出行的排序顺序不变。\n\n6. 【过滤谓词作用域未变】\n日期过滤 o_orderdate >=
+⚠️ 无法解析JSON格式，尝试从响应中提取SQL...
+✅ 成功从响应中提取SQL
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -64,22 +85,35 @@ DBMS_syntax_Tool ends...
 🧠 开始语义等价检查...
 ```json
 {
-  "equivalent": true,
-  "message": "原始SQL与重写SQL语法、谓词、子查询及聚合完全一致，且semantic_check确认语义等价，采纳其主张。",
-  "differences": []
+    "equivalent": true,
+    "message": "重写SQL通过FILTER_SUB_QUERY_TO_CORRELATE规则将EXISTS子查询改写为INNER JOIN + DISTINCT，并应用FILTER_REDUCE_EXPRESSIONS简化日期常量表达式；两者在orders主键约束下返回相同的订单优先级分组计数结果集。",
+    "differences": []
 }
 ```
 ✅ 语义等价
 📊 开始评估优化结果...
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 20291376.0 -> 8332498.0 (重写侧约为原的 41.0642%)
+```json
 {
   "terminate": true,
-  "reason": "第1轮优化后重写SQL成本与原始SQL成本完全相同，未见性能提升，也无结构简化或逻辑优化，且关键瓶颈未缓解。基于当前规则（FILTER_INTO_JOIN）未能改善连接或谓词处理，且成本分析明确显示性能无改进，继续优化空间有限。建议终止优化，保持原始SQL以避免不必要复杂性。",
-  "是否保留重写SQL": false
+  "reason": "结构明确改进：1) 去相关成功：原EXISTS子查询每行触发lineitem扫描已转为INNER JOIN+DISTINCT，消除重复执行；2) 并行增强：引入Parallel Seq Scan(workers=2)和Gather Merge，提升lineitem扫描效率；3) 行数估计求和大幅下降：20291376→8332498(降至41%)，符合高优先级成功信号；4) cost显著降低：1928131.72→1461158.35(降幅24%)。虽增加Unique/Gather Merge节点，但属于去相关后的必要代价，整体结构收益明显，无灾难性退化证据。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
 }
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 269
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE', 'FILTER_REDUCE_EXPRESSIONS', 'AGGREGATE_JOIN_TRANSPOSE_EXTENDED']
+   - 优化组别: 子查询优化, 谓词简化, 连接优化
+   - 估计代价: 原始=1928131.72, 重写=1461158.35，相对变化: 24.22%
+✅ 成功存储，记录ID: ddcd61fa-0ac0-4277-a580-007edd970944
+
+🎲 UCT Math Update: 3 rules, reward=+0.1284 (cost=+0.2422, rows=+0.5894, depth=-0.6000, oc=1928131.7200, rc=1461158.3500)
+   结构分细节: rows 20291376.0->8332498.0 (score=+0.589), depth 5.0->8.0 (score=-0.600)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.500, conf=0.80, lambda=0.40, reward=+0.055, count=53, avg=+0.056
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.100, conf=0.90, lambda=0.45, reward=+0.030, count=67, avg=+0.029
+   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: P(s,a)=N/A, effect=0.400, conf=0.70, lambda=0.35, reward=+0.044, count=47, avg=+0.091
 
 ----------------------------------------
 

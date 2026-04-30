@@ -78,7 +78,8 @@ class TestRewriteMiddleware(unittest.TestCase):
         # Load test SQL from file
         test_sql_path = PROJECT_ROOT / "dataset" / "queries" / "test_sql.sql"
         try:
-            self.test_sql = open(test_sql_path, 'r', encoding='utf-8').read().strip()
+            with open(test_sql_path, 'r', encoding='utf-8') as f:
+                self.test_sql = f.read().strip()
             print(f"Loaded test SQL from: {test_sql_path}")
         except:
             # self.test_sql = "select p_brand, p_type, p_size, count(distinct ps_suppkey) as supplier_cnt from partsupp, part where p_partkey = ps_partkey and p_brand <> 'Brand#43' and p_type not like 'PROMO PLATED%' and p_size in (18, 8, 33, 17, 27, 6, 1, 50) and ps_suppkey not in ( select s_suppkey from supplier where s_comment like '%Customer%Complaints%' ) group by p_brand, p_type, p_size order by supplier_cnt desc, p_brand, p_type, p_size;"
@@ -119,48 +120,51 @@ class TestRewriteMiddleware(unittest.TestCase):
         print(f"The reasoning agent configuration is: {os.getenv('REASONING_MODEL')}, base URL: {os.getenv('REASONING_MODEL_URL')}")
         print(f"The decision agent configuration is: {os.getenv('DECISION_MODEL')}, base URL: {os.getenv('DECISION_MODEL_URL')}")
         print(f"The assistant agent configuration is: {os.getenv('ASSISTANT_MODEL')}, base URL: {os.getenv('ASSISTANT_MODEL_URL')}")
-        Reasoning_Agent = GPT(
-        api_key=os.getenv("REASONING_MODEL_API_KEY"),
-        model=os.getenv("REASONING_MODEL"),
-        base_url=os.getenv("REASONING_MODEL_URL") 
-        )
-        Decision_Agent = GPT(
-        api_key=os.getenv("DECISION_MODEL_API_KEY"),
-        model=os.getenv("DECISION_MODEL"),
-        base_url=os.getenv("DECISION_MODEL_URL") 
-        )
-        Assistant_Agent = GPT(
-        api_key=os.getenv("ASSISTANT_MODEL_API_KEY"),
-        model=os.getenv("ASSISTANT_MODEL"),
-        base_url=os.getenv("ASSISTANT_MODEL_URL")
-        )
-
-        # Test LLM connection
-        try:
-            response = Reasoning_Agent.get_LLM_response(test_prompt)
-            self.assertIsNotNone(response, "LLM response is None")
-            print("✅ Reasoning Agent Connection Test PASSED!")
-        except Exception as e:
-            self.fail(f"❌ Reasoning Agent Connection Test FAILED: {str(e)}")
         
+        llm_configs = [
+            {
+                "name": "Reasoning",
+                "api_key": os.getenv("REASONING_MODEL_API_KEY"),
+                "model": os.getenv("REASONING_MODEL"),
+                "base_url": os.getenv("REASONING_MODEL_URL"),
+            },
+            {
+                "name": "Decision",
+                "api_key": os.getenv("DECISION_MODEL_API_KEY"),
+                "model": os.getenv("DECISION_MODEL"),
+                "base_url": os.getenv("DECISION_MODEL_URL"),
+            },
+            {
+                "name": "Assistant",
+                "api_key": os.getenv("ASSISTANT_MODEL_API_KEY"),
+                "model": os.getenv("ASSISTANT_MODEL"),
+                "base_url": os.getenv("ASSISTANT_MODEL_URL"),
+            },
+        ]
 
-        try:
-            response = Decision_Agent.get_LLM_response(test_prompt)
-            self.assertIsNotNone(response, "LLM response is None")
-            print("✅ Decision Agent Connection Test PASSED!")
-        except Exception as e:
-            self.fail(f"❌ Decision Agent Connection Test FAILED: {str(e)}")
-        
+        tested_count = 0
+        for cfg in llm_configs:
+            if not (cfg["api_key"] and cfg["model"] and cfg["base_url"]):
+                print(f"⚠️ Skip {cfg['name']} Agent: missing env config")
+                continue
 
-        try:
-            response = Assistant_Agent.get_LLM_response(test_prompt)
-            self.assertIsNotNone(response, "LLM response is None")
-            print("✅ Assistant Agent Connection Test PASSED!")
-        except Exception as e:
-            self.fail(f"❌ Assistant Agent Connection Test FAILED: {str(e)}")
-        
+            try:
+                agent = GPT(
+                    api_key=cfg["api_key"],
+                    model=cfg["model"],
+                    base_url=cfg["base_url"],
+                )
+                response = agent.get_LLM_response(test_prompt)
+                self.assertIsNotNone(response, f"{cfg['name']} LLM response is None")
+                print(f"✅ {cfg['name']} Agent Connection Test PASSED!")
+                tested_count += 1
+            except Exception as e:
+                self.fail(f"❌ {cfg['name']} Agent Connection Test FAILED: {str(e)}")
 
-        print("🧪 All LLM Connection Tests PASSED!")
+        if tested_count == 0:
+            self.skipTest("No LLM config found (all agents missing api_key/model/base_url)")
+
+        print(f"🧪 LLM Connection Tests PASSED! ({tested_count} configured agents)")
 
     def test_dbms_data_distribution(self):
         """

@@ -25,6 +25,8 @@ from src.utils.agent_template import MessageContent, Message, MemoryWindow, Mess
 from src.Query_Rewriter.langgraph_rewriter import LangGraphQueryRewriter
 from src.utils.llm_client import GPT
 
+COST_EXPLOSION_PCT_GUARD = 1000.0
+
 def parse_arguments():
     """Parse parameters from command line or use default values"""
     parser = argparse.ArgumentParser(description="QUITE: Query Rewrite System (LLM agents + LangGraph)")
@@ -187,6 +189,33 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
                 "llm_costs": query_llm_cost,
                 "rewrite_suggestion": suggestion if success else "Error occurred during processing",
             }
+
+            # Write-time guard: if cost explodes beyond threshold, fallback to original SQL in output JSON.
+            try:
+                oc = float(tmp.get("original_costs") or 0.0)
+                rc = float(tmp.get("rewrite_costs") or 0.0)
+                cost_increase_pct = ((rc - oc) / oc * 100.0) if oc > 0 else 0.0
+            except (TypeError, ValueError):
+                oc, rc, cost_increase_pct = 0.0, 0.0, 0.0
+            if oc > 0 and cost_increase_pct > COST_EXPLOSION_PCT_GUARD:
+                print(
+                    f"🛡️ 写入防护触发：query {item['id']} cost 增幅 {cost_increase_pct:.1f}% "
+                    f"(> {COST_EXPLOSION_PCT_GUARD:.0f}%)，回退写入 original SQL。"
+                )
+                tmp["rewritten_query"] = initial_sql
+                tmp["rewrite_costs"] = oc
+                tmp["costs_reduction_rate"] = 0
+                tmp["rewrite_rules"] = None
+                if isinstance(tmp.get("rewrite_suggestion"), list):
+                    tmp["rewrite_suggestion"].append(
+                        {
+                            "group": "保护机制",
+                            "produced_suggestion": (
+                                f"写入防护触发：重写 cost 增幅 {cost_increase_pct:.1f}% 超过 "
+                                f"{COST_EXPLOSION_PCT_GUARD:.0f}%，输出已回退到原始 SQL。"
+                            ),
+                        }
+                    )
             # Upsert by id: overwrite existing entry instead of appending duplicates
             item_id = str(tmp.get("id"))
             existing_idx = result_index.get(item_id)

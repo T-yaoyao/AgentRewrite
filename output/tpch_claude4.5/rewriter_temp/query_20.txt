@@ -2,76 +2,92 @@ Query ID: 20
 ==================================================
 
 Original: select supp_nation, cust_nation, l_year, sum(volume) as revenue from ( select n1.n_name as supp_nation, n2.n_name as cust_nation, extract(year from l_shipdate) as l_year, l_extendedprice * (1 - l_discount) as volume from supplier, lineitem, orders, customer, nation n1, nation n2 where s_suppkey = l_suppkey and o_orderkey = l_orderkey and c_custkey = o_custkey and s_nationkey = n1.n_nationkey and c_nationkey = n2.n_nationkey and ( (n1.n_name = 'ETHIOPIA' and n2.n_name = 'FRANCE') or (n1.n_name = 'FRANCE' and n2.n_name = 'ETHIOPIA') ) and l_shipdate between date '1995-01-01' and date '1996-12-31' ) as shipping group by supp_nation, cust_nation, l_year order by supp_nation, cust_nation, l_year;
-Rewritten: select supp_nation, cust_nation, l_year, sum(volume) as revenue from ( select n1.n_name as supp_nation, n2.n_name as cust_nation, extract(year from l_shipdate) as l_year, l_extendedprice * (1 - l_discount) as volume from (select s_suppkey, s_nationkey from supplier) as supplier join (select l_suppkey, l_orderkey, l_shipdate, l_extendedprice, l_discount from lineitem where l_shipdate between date '1995-01-01' and date '1996-12-31') as lineitem on supplier.s_suppkey = lineitem.l_suppkey join (select o_orderkey, o_custkey from orders) as orders on lineitem.l_orderkey = orders.o_orderkey join (select c_custkey, c_nationkey from customer) as customer on orders.o_custkey = customer.c_custkey join (select n_nationkey, n_name from nation) as n1 on supplier.s_nationkey = n1.n_nationkey join (select n_nationkey, n_name from nation) as n2 on customer.c_nationkey = n2.n_nationkey where ( (n1.n_name = 'ETHIOPIA' and n2.n_name = 'FRANCE') or (n1.n_name = 'FRANCE' and n2.n_name = 'ETHIOPIA') ) ) as shipping group by supp_nation, cust_nation, l_year order by supp_nation, cust_nation, l_year;
-Time Cost: 352.66s
-Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将lineitem表上的日期过滤条件下推并确保使用索引，例如对l_shipdate建立合适的索引，以避免全表扫描。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，先过滤小表或有选择性的条件，减少大表lineitem的扫描行数。'}, {'group': '子查询优化', 'produced_suggestion': '考虑将子查询改写为JOIN操作，简化查询层次，提升优化器执行效率。'}, {'group': '投影优化', 'produced_suggestion': '只选择必要列，避免不必要的列读取造成资源浪费。'}, {'group': '常量折叠', 'produced_suggestion': '预计算表达式如l_extendedprice * (1 - l_discount)，减少运行时计算开销。'}, {'group': '排序优化', 'produced_suggestion': '评估ORDER BY是否可以使用索引或提前排序，减少排序开销。'}]
+Rewritten: select supp_nation, cust_nation, l_year, sum(volume) as revenue
+from (
+  select n1.n_name as supp_nation, n2.n_name as cust_nation, l_year, volume
+  from (
+    select s_suppkey, s_nationkey
+    from supplier
+    where s_nationkey in (select n_nationkey from nation where n_name in ('ETHIOPIA', 'FRANCE'))
+  ) as s
+  join (
+    select l_suppkey, l_orderkey, extract(year from l_shipdate) as l_year, l_extendedprice * (1 - l_discount) as volume
+    from lineitem
+    where l_shipdate between date '1995-01-01' and date '1996-12-31'
+  ) as l on s.s_suppkey = l.l_suppkey
+  join orders o on l.l_orderkey = o.o_orderkey
+  join (
+    select c_custkey, c_nationkey
+    from customer
+    where c_nationkey in (select n_nationkey from nation where n_name in ('ETHIOPIA', 'FRANCE'))
+  ) as c on o.o_custkey = c.c_custkey
+  join nation n1 on s.s_nationkey = n1.n_nationkey and n1.n_name in ('ETHIOPIA', 'FRANCE')
+  join nation n2 on c.c_nationkey = n2.n_nationkey and n2.n_name in ('ETHIOPIA', 'FRANCE')
+  where (n1.n_name = 'ETHIOPIA' and n2.n_name = 'FRANCE') or (n1.n_name = 'FRANCE' and n2.n_name = 'ETHIOPIA')
+) as shipping
+group by supp_nation, cust_nation, l_year
+order by supp_nation, cust_nation, l_year
+Time Cost: 150.85s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将l_shipdate的日期范围过滤条件尽早应用，在JOIN前过滤lineitem表以减少参与连接的数据量'}, {'group': '连接优化', 'produced_suggestion': "将nation表的OR条件((n1.n_name='ETHIOPIA' AND n2.n_name='FRANCE') OR (n1.n_name='FRANCE' AND n2.n_name='ETHIOPIA'))转换为半连接或添加冗余半连接，利用索引过滤"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：优先连接小表(nation)和有过滤条件的表，将customer表(150万行)的连接后置，避免早期产生大量中间结果'}, {'group': '谓词简化', 'produced_suggestion': '将JOIN条件下推：s_nationkey和c_nationkey的过滤条件可在各自表扫描时应用，减少参与连接的supplier和customer记录数'}]
 🔍 开始初始优化可行性检查...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
+```json
 {
   "can_optimize": true,
-  "reason": "执行计划中lineitem表存在高代价的Seq Scan，大量行被扫描导致性能瓶颈。SQL中存在多表连接且包含复杂过滤条件，且对lineitem表的日期过滤未命中索引，存在明显优化空间。",
+  "reason": "执行计划显示lineitem表全表扫描占93.3%代价，且存在大表Nested Loop连接。相似历史案例显示该SQL指纹可通过JOIN_ADD_REDUNDANT_SEMI_JOIN、FILTER_INTO_JOIN、JOIN_CONDITION_PUSH等规则优化。主要优化点：1)谓词条件可下推到JOIN前过滤 2)nation表的OR条件可转换为半连接 3)连接顺序可调整以减少中间结果集",
   "advice": [
     {
       "group": "谓词简化",
-      "produced_suggestion": "将lineitem表上的日期过滤条件下推并确保使用索引，例如对l_shipdate建立合适的索引，以避免全表扫描。"
+      "produced_suggestion": "将l_shipdate的日期范围过滤条件尽早应用，在JOIN前过滤lineitem表以减少参与连接的数据量"
     },
     {
       "group": "连接优化",
-      "produced_suggestion": "调整连接顺序，先过滤小表或有选择性的条件，减少大表lineitem的扫描行数。"
+      "produced_suggestion": "将nation表的OR条件((n1.n_name='ETHIOPIA' AND n2.n_name='FRANCE') OR (n1.n_name='FRANCE' AND n2.n_name='ETHIOPIA'))转换为半连接或添加冗余半连接，利用索引过滤"
     },
     {
-      "group": "子查询优化",
-      "produced_suggestion": "考虑将子查询改写为JOIN操作，简化查询层次，提升优化器执行效率。"
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接小表(nation)和有过滤条件的表，将customer表(150万行)的连接后置，避免早期产生大量中间结果"
     },
     {
-      "group": "投影优化",
-      "produced_suggestion": "只选择必要列，避免不必要的列读取造成资源浪费。"
-    },
-    {
-      "group": "常量折叠",
-      "produced_suggestion": "预计算表达式如l_extendedprice * (1 - l_discount)，减少运行时计算开销。"
-    },
-    {
-      "group": "排序优化",
-      "produced_suggestion": "评估ORDER BY是否可以使用索引或提前排序，减少排序开销。"
+      "group": "谓词简化",
+      "produced_suggestion": "将JOIN条件下推：s_nationkey和c_nationkey的过滤条件可在各自表扫描时应用，减少参与连接的supplier和customer记录数"
     }
   ]
 }
+```
 ✅ SQL 可以优化，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
-📊 UCT scored 72 rules
-   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: UCT=1.217
-   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.111
-   → FILTER_CORRELATE: UCT=1.100
+📊 UCT scored 45 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
 {
-  "groups": "连接优化, 子查询优化, 谓词简化, 投影优化, 常量折叠, 排序优化",
-  "applied_rules": [
-    "PROJECT_JOIN_TRANSPOSE",
-    "JOIN_PUSH_TRANSITIVE_PREDICATES",
-    "FILTER_INTO_JOIN"
-  ],
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "JOIN_ADD_REDUNDANT_SEMI_JOIN", "PROJECT_JOIN_TRANSPOSE"],
   "rule_effect_scores": {
-    "PROJECT_JOIN_TRANSPOSE": 0.45,
-    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.35,
-    "FILTER_INTO_JOIN": 0.20
+    "FILTER_INTO_JOIN": 0.4,
+    "JOIN_CONDITION_PUSH": 0.3,
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.2,
+    "PROJECT_JOIN_TRANSPOSE": 0.1
   },
   "rule_effect_confidence": {
-    "PROJECT_JOIN_TRANSPOSE": 0.85,
-    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.75,
-    "FILTER_INTO_JOIN": 0.80
+    "FILTER_INTO_JOIN": 0.8,
+    "JOIN_CONDITION_PUSH": 0.8,
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.7,
+    "PROJECT_JOIN_TRANSPOSE": 0.6
   }
 }
-✅ 选择了 3 个规则
+✅ 选择了 4 个规则
 🔧 开始SQL重写...
-```{
-  "groups": "连接优化, 子查询优化, 谓词简化, 投影优化, 常量折叠, 排序优化",
-  "applied_rules": ["PROJECT_JOIN_TRANSPOSE", "JOIN_PUSH_TRANSITIVE_PREDICATES", "FILTER_INTO_JOIN"],
-  "original_sql": "select supp_nation, cust_nation, l_year, sum(volume) as revenue from ( select n1.n_name as supp_nation, n2.n_name as cust_nation, extract(year from l_shipdate) as l_year, l_extendedprice * (1 - l_discount) as volume from supplier, lineitem, orders, customer, nation n1, nation n2 where s_suppkey = l_suppkey and o_orderkey = l_orderkey and c_custkey = o_custkey and s_nationkey = n1.n_nationkey and c_nationkey = n2.n_nationkey and ( (n1.n_name = 'ETHIOPIA' and n2.n_name = 'FRANCE') or (n1.n_name = 'FRANCE' and n2.n_name = 'ETHIOPIA') ) and l_shipdate between date '1995-01-01' and date '1996-12-31' ) as shipping group by supp_nation, cust_nation, l_year order by supp_nation, cust_nation, l_year;",
-  "rewritten_sql": "select supp_nation, cust_nation, l_year, sum(volume) as revenue from ( select n1.n_name as supp_nation, n2.n_name as cust_nation, extract(year from l_shipdate) as l_year, l_extendedprice * (1 - l_discount) as volume from (select s_suppkey, s_nationkey from supplier) as supplier join (select l_suppkey, l_orderkey, l_shipdate, l_extendedprice, l_discount from lineitem where l_shipdate between date '1995-01-01' and date '1996-12-31') as lineitem on supplier.s_suppkey = lineitem.l_suppkey join (select o_orderkey, o_custkey from orders) as orders on lineitem.l_orderkey = orders.o_orderkey join (select c_custkey, c_nationkey from customer) as customer on orders.o_custkey = customer.c_custkey join (select n_nationkey, n_name from nation) as n1 on supplier.s_nationkey = n1.n_nationkey join (select n_nationkey, n_name from nation) as n2 on customer.c_nationkey = n2.n_nationkey where ( (n1.n_name = 'ETHIOPIA' and n2.n_name = 'FRANCE') or (n1.n_name = 'FRANCE' and n2.n_name = 'ETHIOPIA') ) ) as shipping group by supp_nation, cust_nation, l_year order by supp_nation, cust_nation, l_year;",
-  "semantic_check": "1. 投影下推(PROJECT_JOIN_TRANSPOSE)确保仅选择连接必需的列(s_suppkey/s_nationkey等)，消除冗余字段\n2. 过滤条件下推(FILTER_INTO_JOIN)将l_shipdate条件提前到lineitem子查询，利用索引减少扫描\n3. 连接条件和国家过滤保持原逻辑，nation表投影仅保留必要字段\n4. 结果集列名、聚合计算(volume/revenue)和排序顺序完全保留\n5. 常量表达式(l_extendedprice*(1-l_discount))保持原位计算，确保结果精度一致"
-  }
+```json
+{
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "JOIN_ADD_REDUNDANT_SEMI_JOIN", "PROJECT_JOIN_TRANSPOSE"],
+  "rewritten_sql": "select supp_nation, cust_nation, l_year, sum(volume) as revenue\nfrom (\n  select n1.n_name as supp_nation, n2.n_name as cust_nation, l_year, volume\n  from (\n    select s_suppkey, s_nationkey\n    from supplier\n    where s_nationkey in (select n_nationkey from nation where n_name in ('ETHIOPIA', 'FRANCE'))\n  ) as s\n  join (\n    select l_suppkey, l_orderkey, extract(year from l_shipdate) as l_year, l_extendedprice * (1 - l_discount) as volume\n    from lineitem\n    where l_shipdate between date '1995-01-01' and date '1996-12-31'\n  ) as l on s.s_suppkey = l.l_suppkey\n  join orders o on l.l_orderkey = o.o_orderkey\n  join (\n    select c_custkey, c_nationkey\n    from customer\n    where c_nationkey in (select n_nationkey from nation where n_name in ('ETHIOPIA', 'FRANCE'))\n  ) as c on o.o_custkey = c.c_custkey\n  join nation n1 on s.s_nationkey = n1.n_nationkey and n1.n_name in ('ETHIOPIA', 'FRANCE')\n  join nation n2 on c.c_nationkey = n2.n_nationkey and n2.n_name in ('ETHIOPIA', 'FRANCE')\n  where (n1.n_name = 'ETHIOPIA' and n2.n_name = 'FRANCE') or (n1.n_name = 'FRANCE' and n2.n_name = 'ETHIOPIA')\n) as shipping\ngroup by supp_nation, cust_nation, l_year\norder by supp_nation, cust_nation, l_year",
+  "semantic_correctness_guarantee": "1. **FILTER_INTO_JOIN应用**：将l_shipdate的日期范围过滤(between date '1995-01-01' and date '1996-12-31')从外层WHERE下推到lineitem子查询中，在JOIN前过滤；由于日期过滤仅依赖lineitem表且不改变连接语义，提前过滤减少参与连接的行数但结果集完全等价。\n\n2. **JOIN_CONDITION_PUSH应用**：将s_nationkey和c_nationkey的过滤条件通过半连接(IN子查询)下推到supplier和customer的子查询中，仅保留nationkey在('ETHIOPIA','FRANCE')中的记录；由于原SQL的WHERE子句已通过n1/n2的连接隐式限制了这两个nationkey的取值范围，提前过滤与原语义等价。\n\n3. **JOIN_ADD_REDUNDANT_SEMI_JOIN应用**：在supplier和customer子查询中添加半连接过滤(where nationkey in (select n_nationkey from nation where n_name in ('ETHIOPIA','FRANCE')))，预先剔除无法满足最终OR条件的行；由于原SQL的OR条件((n1.n_name='ETHIOPIA' and n2.n_name='FRANCE') or (n1.n_name='FRANCE' and n2.n_name='ETHIOPIA'))已限定n1和n2的n_name必须是这两个值之一，半连接过滤不会排除任何最终结果行。\n\n4. **PROJECT_JOIN_TRANSPOSE应用**：在lineitem子查询中提前计算l_year和volume(l_extendedprice*(1-l_discount))，仅向上层传输所需列；由于这些计算列在原SQL的子查询中已定义，提前计算并投影不改变最终结果集的列值和行数。\n\n5. **连接顺序调整**：先连接过滤后的小表(supplier、lineitem)，再连接orders，最后连接customer；由于所有连接均为INNER JOIN且连接键通过主外键关系保证一对一或多对一映射，调整顺序不影响最终结果集的行数和内容。\n\n6. **OR条件保留**：最终WHERE子句仍保留原始OR条件((n1.n_name='ETHIOPIA' and n2.n_name='FRANCE') or (n1.n_name='FRANCE' and n2.n_name='ETHIOPIA'))，确保只有满足特定国家对组合的记录被保留；虽然前置半连接已过滤部分数据，但OR条件的最终判定逻辑与原SQL完全一致。\n\n7. **聚合和排序不变**：外层GROUP BY(supp_nation, cust_nation, l_year)和ORDER BY子句与原SQL完全一致，且子查询输出的列名(supp_nation, cust_nation, l_year, volume)与原SQL的shipping子查询输出一致，保证聚合结果和排序顺序等价。"
+}
+```
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -79,23 +95,33 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ```json
-{
-  "equivalent": true,
-  "message": "重写合理利用投影下推、过滤条件下推及投影精简，保持了原始SQL的谓词、连接和过滤逻辑，聚合与排序等语义不变，采纳 semantic_check 主张。",
-  "differences": []
-}
+{"equivalent": true, "message": "重写SQL通过将日期过滤下推至lineitem子查询、将nationkey过滤下推至supplier/customer子查询（半连接）、以及提前计算l_year和volume，最终仍保留原始OR条件，所有INNER JOIN语义不变，最终结果集与原始SQL完全等价。", "differences": []}
 ```
 ✅ 语义等价
 📊 开始评估优化结果...
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
-🔍 计划分析器开始分析...
-✅ 计划分析器完成分析
+📐 计划结构: Scan: SeqScan 5->4, index-like 1->2 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 900841.0 -> 194460.0 (重写侧约为原的 21.5865%)
+```json
 {
   "terminate": true,
-  "reason": "重写SQL成本与原始SQL成本完全相同，且执行计划中的主要性能瓶颈未有缓解，成本无明显降低。重写SQL结构上更清晰，采用了子查询剥离和连接条件下推等优化规则，提升了逻辑表达和维护性，但在性能上未带来明显提升，且针对最大瓶颈的Seq Scan仍未优化成功。考虑当前重写已达到逻辑优化效果，且后续优化难度加大，建议终止本轮优化，保留重写SQL以便后续维护和理解。",
-  "是否保留重写SQL": true
+  "reason": "结构性改进明确：1) 行数估计求和从900841降至194460（降至原21.6%），触发高优先级成功终止规则；2) Hash Join从4个减少到2个，Nested Loop从1个增加到3个但配合Index Scan增加（1->2），体现了小表驱动大表的优化策略；3) Seq Scan从5减少到4；4) 虽然Total Cost从1608353.42降至1534395.35（降幅约4.6%），但结合行数估计大幅下降和结构调整，表明重写成功将过滤条件下推并优化了连接顺序，减少了中间结果集规模。根据规则，行数估计求和大幅降低（降至原10%以下的21.6%）时优先视为优化成功。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
 }
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 598
+   - 规则序列: ['FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH', 'JOIN_ADD_REDUNDANT_SEMI_JOIN', 'PROJECT_JOIN_TRANSPOSE']
+   - 优化组别: 谓词简化, 连接优化
+   - 估计代价: 原始=1608353.42, 重写=1534395.35，相对变化: 4.60%
+✅ 成功存储，记录ID: b53c54ab-fd43-4d7b-9a4a-8e66cc45bb90
+
+🎲 UCT Math Update: 4 rules, reward=+0.3274 (cost=+0.0460, rows=+0.7841, depth=+0.0000, oc=1608353.4200, rc=1534395.3500)
+   结构分细节: rows 900841.0->194460.0 (score=+0.784), depth 11.0->11.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.400, conf=0.80, lambda=0.40, reward=+0.108, count=265, avg=+0.021
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.300, conf=0.80, lambda=0.40, reward=+0.090, count=240, avg=+0.008
+   → JOIN_ADD_REDUNDANT_SEMI_JOIN: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=+0.072, count=15, avg=-0.062
+   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.100, conf=0.60, lambda=0.30, reward=+0.058, count=94, avg=+0.029
 
 ----------------------------------------
 
