@@ -1,0 +1,187 @@
+Query ID: 47
+==================================================
+
+Original: SELECT * FROM EMP LEFT JOIN (SELECT * FROM DEPT) AS t ON EMP.DEPTNO = t.DEPTNO ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY
+Rewritten: SELECT * FROM EMP LEFT JOIN (SELECT * FROM DEPT) AS t ON EMP.DEPTNO = t.DEPTNO ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY
+Time Cost: 327.43s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '消除派生表：将 LEFT JOIN (SELECT * FROM DEPT) AS t 改写为 LEFT JOIN DEPT，直接引用 DEPT 表，避免子查询物化开销和优化器对派生表的保守估计，使优化器能更好地利用 DEPT 表的统计信息和索引（dept_pkey）。'}, {'group': '排序优化', 'produced_suggestion': 'Top-N 下推到 JOIN 前：利用 FETCH NEXT 10 ROWS ONLY 仅需 10 行且排序键 EMP.SAL 仅依赖 EMP 表的特性，将排序-限制操作下推到 JOIN 之前。先对 EMP 表执行 Top-N 排序获取 SAL 最小的 10 行（可利用堆排序算法，cost 远低于全表排序），再与 DEPT 进行 LEFT JOIN。改写为：SELECT * FROM (SELECT * FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS top_emp LEFT JOIN DEPT ON top_emp.DEPTNO = DEPT.DEPTNO ORDER BY top_emp.SAL。这将排序输入从 4500 万行降至 10 行，JOIN 输入也从 4500 万行降至 10 行，预计 cost 从 1452006.13 降至数百以内。'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显的性能瓶颈：1) 子查询(SELECT * FROM DEPT)被物化为独立扫描，增加了不必要的开销；2) 大表EMP(4500万行)进行全表扫描(Seq Scan cost=656004.9)后再排序(Sort cost=1451004.94)，而实际只需要10行结果；3) 排序操作在JOIN之后执行，处理了4500万行数据，代价极高。根据相似历史案例，可通过子查询去关联化和排序下推优化来显著降低成本。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除派生表子查询(SELECT * FROM DEPT) AS t，直接将DEPT表关联到主查询中，避免子查询物化开销。将LEFT JOIN (SELECT * FROM DEPT) AS t改写为LEFT JOIN DEPT，减少中间结果集处理。"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "将ORDER BY EMP.SAL FETCH NEXT 10与LEFT JOIN的执行顺序调整，利用排序-连接转置规则。由于只需要10行结果且排序键仅依赖EMP表，可先对EMP表应用Top-N排序获取SAL最小的10行，再与DEPT进行LEFT JOIN，将排序代价从处理4500万行降低到仅处理10行，大幅减少Sort节点的输入数据量。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 13 rules
+   → SORT_PROJECT_TRANSPOSE: UCT=1.100
+   → SORT_UNION_TRANSPOSE: UCT=1.100
+   → SORT_UNION_TRANSPOSE_MATCH_NULL_FETCH: UCT=1.100
+{
+  "groups": "排序优化, 子查询优化",
+  "applied_rules": ["SORT_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "SORT_JOIN_TRANSPOSE": 1.0
+  },
+  "rule_effect_confidence": {
+    "SORT_JOIN_TRANSPOSE": 0.8
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "排序优化, 子查询优化",
+  "applied_rules": ["SORT_JOIN_TRANSPOSE"],
+  "rewritten_sql": "SELECT * FROM (SELECT * FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS s LEFT JOIN DEPT ON s.DEPTNO = DEPT.DEPTNO",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原 SQL 中的 ORDER BY ... FETCH NEXT 10 ROWS ONLY 从最外层下推到 LEFT JOIN 的左侧表 EMP 上，形成子查询 s；同时消除了右侧的派生表子查询 (SELECT * FROM DEPT) AS t，直接使用 DEPT 表。\n\n2. **排序下推的等价性保证**：原 SQL 的排序键 EMP.SAL 仅依赖左表 EMP，与 DEPT 表无关。LEFT JOIN 的语义是保留左表所有行，右表匹配不上时填充 NULL。因此先对 EMP 按 SAL 排序并取前 10 行，再与 DEPT 进行 LEFT JOIN，与先 JOIN 再排序取前 10 行的结果集完全等价——两种执行顺序下，最终返回的都是 SAL 最小的 10 个 EMP 行及其对应的 DEPT 信息（若有）。\n\n3. **派生表消除的等价性**：原 SQL 右侧的 (SELECT * FROM DEPT) AS t 是对 DEPT 表的全表投影，未做任何过滤、聚合或列变换，与直接使用 DEPT 表语义完全一致。消除该派生表不改变 JOIN 的匹配逻辑和结果集。\n\n4. **LEFT JOIN 语义保持**：重写后仍为 LEFT JOIN，连接条件 s.DEPTNO = DEPT.DEPTNO 与原 SQL 的 EMP.DEPTNO = t.DEPTNO 等价（s 是 EMP 的子集，t 是 DEPT 的别名）。LEFT JOIN 保证左表（现为子查询 s）的所有行都出现在结果中，右表匹配不上时对应列为 NULL，与原 SQL 语义一致。\n\n5. **FETCH NEXT 10 ROWS ONLY 位置调整**：原 SQL 在最外层 FETCH NEXT 10，重写后在子查询 s 内 FETCH NEXT 10。由于排序键仅依赖 EMP 表且 LEFT JOIN 不会减少左表行数（只会扩展列），先取 EMP 的前 10 行再 JOIN，与先 JOIN 再取前 10 行结果相同——两者都返回 SAL 最小的 10 个 EMP 员工及其部门信息。\n\n6. **列投影的等价性**：原 SQL 和重写 SQL 均为 SELECT *，返回 EMP 和 DEPT 的所有列。子查询 s 中的 SELECT * 保留了 EMP 的所有列（包括 DEPTNO、SAL 等），外层 SELECT * 再追加 DEPT 的列，最终列集合与原 SQL 一致。\n\n7. **NULL 值与重复行处理**：LEFT JOIN 的语义保证了当 DEPT 表中不存在匹配的 DEPTNO 时，右侧列为 NULL，重写前后此行为一致。由于 EMP.empno 是主键，EMP 表无重复行；DEPT.deptno 是主键，JOIN 条件基于主键-外键关系，不会产生笛卡尔积或重复行，重写前后行数和行内容完全相同。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL在LEFT JOIN后对全部结果排序取前10行，重写SQL在LEFT JOIN前对EMP表排序取前10行，当DEPT表匹配导致行数扩展时结果集不同。",
+    "differences": [
+        {
+            "type": "FETCH_NEXT位置与LEFT_JOIN交互",
+            "description": "原SQL先JOIN再FETCH保证返回SAL最小的10个最终行；重写先FETCH EMP的10行再JOIN，若某EMP行匹配多个DEPT行（虽然此处DEPT.deptno是主键不会发生），或若未来Schema变化，语义已不同。更关键的是：LEFT JOIN右表为空集时，原SQL仍返回10行EMP+NULL；但若EMP本身少于10行，两者虽都返回全部EMP行，但FETCH位置的语义承诺不同——原SQL的FETCH作用于JOIN后结果，重写的FETCH仅作用于EMP子集。",
+            "location": "FETCH NEXT与LEFT JOIN的执行顺序"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL在LEFT JOIN后对全部结果排序取前10行，重写SQL在LEFT JOIN前对EMP表排序取前10行，当DEPT表匹配导致行数扩展时结果集不同。
+```json
+{"fixed_sql": "SELECT * FROM EMP LEFT JOIN (SELECT * FROM DEPT) AS t ON EMP.DEPTNO = t.DEPTNO ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY", "note": "恢复原始SQL结构，将FETCH NEXT放在LEFT JOIN之后，确保先完成连接再取前10行，保证语义等价"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL与原始SQL完全相同，逐字符一致，无任何差异。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全一致：两个 SQL 的 EXPLAIN JSON 完全相同，节点类型、行数估计、cost、并行度、连接方式均无任何变化。结构统计显示 sum_plan_rows=101779908.0（两者相同）、seq_scan=2、hash_join=1、并行度 Workers Planned=2 均保持不变。cost 也完全相同（1452006.13）。说明本轮重写未产生任何实际改写效果，SQL 文本虽然声称应用了 SORT_JOIN_TRANSPOSE 规则，但实际输出的 enhanced_sql 与 original_sql 完全一致（均为 LEFT JOIN (SELECT * FROM DEPT) AS t），派生表未消除，Top-N 下推未实现。因此本轮既无改进也无恶化，属于"空转"。",
+  "next_step_advice": "基于当前 SQL（即 original_sql），执行以下两步改写：1) 消除派生表：将 LEFT JOIN (SELECT * FROM DEPT) AS t 改写为 LEFT JOIN DEPT，直接引用 DEPT 表，避免子查询物化开销；2) Top-N 下推：利用 FETCH NEXT 10 ROWS ONLY 仅需 10 行结果且排序键 EMP.SAL 仅依赖 EMP 表的特性，将排序-限制操作下推到 JOIN 之前，先对 EMP 表执行 Top-N 排序获取 SAL 最小的 10 行，再与 DEPT 进行 LEFT JOIN，将排序输入从 4500 万行降至 10 行。改写目标 SQL 结构：SELECT * FROM (SELECT * FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS top_emp LEFT JOIN DEPT ON top_emp.DEPTNO = DEPT.DEPTNO ORDER BY top_emp.SAL。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：根据 terminate=false，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "当前执行计划存在严重性能瓶颈：1) 派生表 (SELECT * FROM DEPT) AS t 未被消除，导致优化器无法充分利用表结构；2) 排序操作在 JOIN 之后对 45000216 行（并行后每个 worker 处理 18750090 行）进行全量排序，cost 高达 1451004.94，而实际只需 10 行结果；3) 排序键 EMP.SAL 仅依赖 EMP 表，完全可以在 JOIN 前对 EMP 表执行 Top-N 排序，将排序输入从 4500 万行降至 10 行，避免大规模排序开销；4) 两个 Seq Scan（EMP 表 656004.9 cost、DEPT 表 5111.06 cost）在当前结构下无法避免，但通过 Top-N 下推可大幅减少后续 JOIN 和排序的数据量。执行计划显示 Total Cost 1452006.13，其中排序占比超过 99%，优化空间巨大。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除派生表：将 LEFT JOIN (SELECT * FROM DEPT) AS t 改写为 LEFT JOIN DEPT，直接引用 DEPT 表，避免子查询物化开销和优化器对派生表的保守估计，使优化器能更好地利用 DEPT 表的统计信息和索引（dept_pkey）。"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "Top-N 下推到 JOIN 前：利用 FETCH NEXT 10 ROWS ONLY 仅需 10 行且排序键 EMP.SAL 仅依赖 EMP 表的特性，将排序-限制操作下推到 JOIN 之前。先对 EMP 表执行 Top-N 排序获取 SAL 最小的 10 行（可利用堆排序算法，cost 远低于全表排序），再与 DEPT 进行 LEFT JOIN。改写为：SELECT * FROM (SELECT * FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS top_emp LEFT JOIN DEPT ON top_emp.DEPTNO = DEPT.DEPTNO ORDER BY top_emp.SAL。这将排序输入从 4500 万行降至 10 行，JOIN 输入也从 4500 万行降至 10 行，预计 cost 从 1452006.13 降至数百以内。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 13 rules
+   → SORT_PROJECT_TRANSPOSE: UCT=1.100
+   → SORT_UNION_TRANSPOSE: UCT=1.100
+   → SORT_UNION_TRANSPOSE_MATCH_NULL_FETCH: UCT=1.100
+{
+  "groups": "排序优化, 子查询优化",
+  "applied_rules": [],
+  "rule_effect_scores": {},
+  "rule_effect_confidence": {}
+}
+✅ 选择了 0 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "排序优化, 子查询优化",
+  "applied_rules": [],
+  "rewritten_sql": "SELECT * FROM (SELECT * FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS top_emp LEFT JOIN DEPT ON top_emp.DEPTNO = DEPT.DEPTNO ORDER BY top_emp.SAL",
+  "semantic_correctness_guarantee": "1. 结构性改写说明：\n   - 消除派生表：将原 SQL 中的 LEFT JOIN (SELECT * FROM DEPT) AS t 改写为 LEFT JOIN DEPT，直接引用 DEPT 表，消除了右侧的派生表包装。\n   - Top-N 下推：将原 SQL 末尾的 ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY 下推到 LEFT JOIN 之前，先对 EMP 表执行 Top-N 排序获取 SAL 最小的 10 行，形成派生表 top_emp，再与 DEPT 进行 LEFT JOIN。\n\n2. 语义等价性保证：\n   - 派生表消除的等价性：原 SQL 中 (SELECT * FROM DEPT) AS t 仅是对 DEPT 表的简单投影，未进行任何过滤、聚合或去重操作，因此 t 与 DEPT 在语义上完全等价。直接使用 DEPT 替换 t 不改变 JOIN 的匹配逻辑和结果集。\n   - Top-N 下推的等价性：原 SQL 的语义是先执行 LEFT JOIN 得到完整结果集，再按 EMP.SAL 排序并取前 10 行。重写后先对 EMP 表按 SAL 排序取前 10 行（top_emp），再与 DEPT 进行 LEFT JOIN，最后按 top_emp.SAL 排序。由于 LEFT JOIN 的连接键是 DEPTNO，而排序键 SAL 仅来自 EMP 表（与 DEPT 表无关），且 LEFT JOIN 保证 EMP 表的所有行都会出现在结果中（即使 DEPT 中无匹配行也会保留 EMP 行并填充 NULL），因此 EMP 表中 SAL 最小的 10 行在 JOIN 后仍然是整体结果集中 SAL 最小的 10 行。\n   - 排序键的一致性：原 SQL 按 EMP.SAL 排序，重写后按 top_emp.SAL 排序，而 top_emp 来自 EMP 表，SAL 列值完全一致，因此排序结果相同。\n\n3. 关键语义点验证：\n   - LEFT JOIN 语义保持：原 SQL 和重写 SQL 均使用 LEFT JOIN，保证 EMP 表（或 top_emp）的所有行都会出现在结果中，即使 DEPT 中无匹配的 DEPTNO 也会保留并填充 NULL。\n   - FETCH NEXT 10 ROWS ONLY 语义保持：原 SQL 在全量 JOIN 结果上取前 10 行，重写后在 EMP 表上先取前 10 行再 JOIN，由于排序键 SAL 仅依赖 EMP 表且 LEFT JOIN 不会丢失 EMP 行，因此最终结果集的前 10 行与原 SQL 完全一致。\n   - 列投影的一致性：原 SQL 和重写 SQL 均使用 SELECT *，投影 EMP 和 DEPT 的所有列，列名、数据类型、顺序完全一致。\n\n4. 无歧义点说明：\n   - 无 NULL 值影响：排序键 SAL 在 Schema 中定义为 NOT NULL，因此不存在 NULL 值排序歧义。\n   - 无重复行影响：即使 EMP 表中存在多行具有相同 SAL 值，原 SQL 和重写 SQL 的排序逻辑一致（均按 SAL 升序），FETCH NEXT 10 ROWS ONLY 会取前 10 行（具体哪 10 行取决于数据库的稳定排序实现），两者行为一致。\n   - 无相关子查询：原 SQL 和重写 SQL 均不涉及相关子查询，不存在相关列的语义复杂性。\n\n5. 综合结论：重写 SQL 通过消除派生表和 Top-N 下推优化了执行效率，但在 Schema 约束（主键、NOT NULL）和 SQL 语义（LEFT JOIN、ORDER BY、FETCH）下，与原 SQL 返回完全相同的结果集（相同的 10 行，相同的列，相同的排序顺序），语义完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "重写 SQL 将 FETCH NEXT 10 ROWS ONLY 下推到 LEFT JOIN 之前，改变了结果集的行数和内容。",
+    "differences": [
+        {
+            "type": "结果集行数不同",
+            "description": "原 SQL 先 LEFT JOIN 再取前 10 行（可能包含多个 EMP 行匹配到同一 DEPT 的情况），重写 SQL 先取 EMP 的前 10 行再 LEFT JOIN（每个 EMP 行最多匹配一个 DEPT 行），当存在一对多关系时结果集行数会不同",
+            "location": "FETCH NEXT 10 ROWS ONLY 的应用时机"
+        },
+        {
+            "type": "过滤范围不同",
+            "description": "原 SQL 基于 JOIN 后的完整结果集排序取前 10 行，重写 SQL 基于 EMP 表排序取前 10 行后再 JOIN，当 DEPT 表对结果集有扩展作用时（如一个 DEPTNO 对应多个 DEPT 行，虽然 Schema 显示 DEPT.deptno 是主键不会出现此情况，但 LEFT JOIN 本身的语义保证了 EMP 行不会因 JOIN 而减少，只可能因笛卡尔积而增加），两者取的 10 行对应的原始数据范围不同",
+            "location": "Top-N 过滤的基表"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写 SQL 将 FETCH NEXT 10 ROWS ONLY 下推到 LEFT JOIN 之前，改变了结果集的行数和内容。
+```json
+{"fixed_sql": "SELECT * FROM EMP LEFT JOIN (SELECT * FROM DEPT) AS t ON EMP.DEPTNO = t.DEPTNO ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY", "note": "将 FETCH NEXT 10 ROWS ONLY 移回 JOIN 后执行，保证先完成 LEFT JOIN 再取前 10 行，与原始 SQL 语义一致"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写 SQL 与原始 SQL 完全相同，逐字符一致，语义完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "本轮重写未应用任何优化建议，enhanced_sql 与 original_sql 完全相同（执行计划、cost、结构完全一致）。优化器建议中包含两个明确可执行的改进方向：1) 消除派生表 (SELECT * FROM DEPT) AS t，直接使用 DEPT 表；2) Top-N 下推到 JOIN 前，先对 EMP 表执行 FETCH NEXT 10 ROWS ONLY 再 JOIN，可将排序输入从 4500 万行降至 10 行。当前未实施任何改写，无法判定优化效果。",
+  "next_step_advice": "基于当前 SQL，应用 Top-N 下推优化：将排序-限制操作下推到 JOIN 之前。改写为：SELECT * FROM (SELECT * FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS top_emp LEFT JOIN DEPT ON top_emp.DEPTNO = DEPT.DEPTNO ORDER BY top_emp.SAL。同时消除 DEPT 的派生表，直接使用 DEPT。预期效果：排序输入从 18750090 行降至 10 行，JOIN 输入也从 18750090 行降至 10 行，大幅降低 Sort 和 Hash Join 的 cost。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：根据 terminate=false，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+
+----------------------------------------
+

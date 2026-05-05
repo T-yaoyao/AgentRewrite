@@ -1,0 +1,209 @@
+Query ID: 8
+==================================================
+
+Original: SELECT * FROM (SELECT * FROM EMP WHERE DEPTNO = EMPNO) AS t1 INNER JOIN DEPT AS DEPT0 ON t1.DEPTNO = DEPT0.DEPTNO
+Rewritten: WITH filtered_emp AS (
+  SELECT empno, deptno, ename, job, mgr, hiredate, sal, comm, slacker
+  FROM EMP
+  WHERE DEPTNO = EMPNO
+)
+SELECT 
+  filtered_emp.empno,
+  filtered_emp.deptno,
+  filtered_emp.ename,
+  filtered_emp.job,
+  filtered_emp.mgr,
+  filtered_emp.hiredate,
+  filtered_emp.sal,
+  filtered_emp.comm,
+  filtered_emp.slacker,
+  DEPT.deptno AS dept_deptno,
+  DEPT.name
+FROM filtered_emp
+INNER JOIN DEPT ON filtered_emp.deptno = DEPT.deptno
+Time Cost: 341.34s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '针对DEPTNO=EMPNO高选择性条件(过滤率99.79%)，通过CTE或子查询预过滤强制使用emp_pkey索引扫描：WITH filtered_emp AS (SELECT empno, deptno, ... FROM emp WHERE deptno = empno) 替代直接过滤，引导优化器选择Index Scan而非Seq Scan，预期将EMP扫描成本从702880降至<10000'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：先扫描DEPT表(450K行)利用dept_pkey索引，再与过滤后的EMP(93750行)进行Nested Loop Join + Index Scan on emp_pkey，避免当前Hash Join需构建264706行哈希表的开销。通过STRAIGHT_JOIN提示或CTE物化控制连接顺序'}, {'group': '投影优化', 'produced_suggestion': '消除SELECT *冗余投影：子查询t1仅需DEPTNO列用于连接条件，外层查询根据实际需求列裁剪EMP和DEPT的输出列(当前Plan Width=63字节)，减少Hash Join和Gather节点的数据传输量，预期降低10-15%总成本'}, {'group': '子查询优化', 'produced_suggestion': '将LEFT JOIN LATERAL + WHERE IS NOT NULL的伪外连接模式直接改写为INNER JOIN简化结构：SELECT <需要的列> FROM emp INNER JOIN dept ON emp.deptno = dept.deptno WHERE emp.deptno = emp.empno，消除LATERAL开销并为优化器提供更清晰的连接语义'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示EMP表进行全表扫描(Seq Scan)且代价高达702880.12，过滤条件DEPTNO=EMPNO极其严格(仅93750行/45000000行，选择率0.2%)，但未使用索引。该条件实际上是一个自连接模式的退化形式，可通过谓词简化和连接优化来改写。此外，子查询SELECT *可进行投影优化消除冗余列传递。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "条件DEPTNO=EMPNO是高选择性过滤，应优先利用emp_pkey索引扫描EMPNO，然后通过Index Scan替代Seq Scan，将过滤条件转换为索引查找"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "当前Hash Join基于过滤后的EMP表，可考虑调整连接顺序：先通过DEPT表的索引dept_pkey进行Index Scan，再与EMP表进行Nested Loop Join并利用emp_pkey索引，避免EMP全表扫描"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "子查询中的SELECT *传递了所有列，但连接条件仅需DEPTNO，可裁剪不必要的列投影，减少Hash Join的内存开销和数据传输量"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 48 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化, 投影优化",
+  "applied_rules": ["JOIN_TO_CORRELATE", "JOIN_PUSH_TRANSITIVE_PREDICATES"],
+  "rule_effect_scores": {
+    "JOIN_TO_CORRELATE": 0.6,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.4
+  },
+  "rule_effect_confidence": {
+    "JOIN_TO_CORRELATE": 0.7,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.6
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 投影优化",
+  "applied_rules": ["JOIN_TO_CORRELATE", "JOIN_PUSH_TRANSITIVE_PREDICATES"],
+  "rewritten_sql": "SELECT * FROM (SELECT * FROM EMP WHERE DEPTNO = EMPNO) AS t1 LEFT JOIN LATERAL (SELECT * FROM DEPT WHERE DEPT.DEPTNO = t1.DEPTNO) AS DEPT0 ON TRUE WHERE t1.DEPTNO = t1.EMPNO AND DEPT0.DEPTNO = t1.EMPNO",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原始的 INNER JOIN 改写为 LEFT JOIN LATERAL 形式，DEPT 表作为相关子查询，通过 t1.DEPTNO 进行关联（对应 JOIN_TO_CORRELATE 规则）。\n2. 传递性谓词推导：原始 SQL 中子查询过滤条件 DEPTNO = EMPNO，结合 JOIN 条件 t1.DEPTNO = DEPT0.DEPTNO，通过等值传递性推导出 DEPT0.DEPTNO = t1.EMPNO，并显式添加到 WHERE 子句（对应 JOIN_PUSH_TRANSITIVE_PREDICATES 规则）。\n3. 语义等价性保证：原始 INNER JOIN 要求两表必须匹配才返回结果；改写后的 LEFT JOIN LATERAL 配合 WHERE 子句中的 DEPT0.DEPTNO = t1.EMPNO 条件，实际上过滤掉了所有 DEPT 表不匹配的行（因为 DEPT0.DEPTNO 为 NULL 时条件不成立），因此结果集与 INNER JOIN 完全等价。\n4. 主键与关联列分析：EMP 表主键为 EMPNO，DEPT 表主键为 DEPTNO；子查询过滤 DEPTNO = EMPNO 后，t1.DEPTNO 与 t1.EMPNO 相等；JOIN 条件 t1.DEPTNO = DEPT0.DEPTNO 确保 DEPT 表通过主键匹配；传递性推导 DEPT0.DEPTNO = t1.EMPNO 在逻辑上成立且不改变结果集。\n5. NULL 值处理：LEFT JOIN 可能产生 DEPT0.DEPTNO 为 NULL 的行，但 WHERE 子句中的 DEPT0.DEPTNO = t1.EMPNO 条件会过滤掉这些行，确保只保留两表都匹配的记录，与原始 INNER JOIN 语义一致。\n6. 投影列保持：SELECT * 保留所有列，包括 t1 的所有列和 DEPT0 的所有列，与原始 SQL 的列投影完全一致。\n7. 过滤条件完整性：WHERE 子句中保留了原始子查询的 DEPTNO = EMPNO 条件（表示为 t1.DEPTNO = t1.EMPNO），并添加了传递性推导的 DEPT0.DEPTNO = t1.EMPNO 条件，确保过滤逻辑的完整性和等价性。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在WHERE子句中添加了额外的过滤条件DEPT0.DEPTNO = t1.EMPNO，这会进一步缩小结果集范围，与原始SQL不等价。",
+    "differences": [
+        {
+            "type": "filter_condition",
+            "description": "重写SQL的WHERE子句包含DEPT0.DEPTNO = t1.EMPNO条件，而原始SQL仅要求t1.DEPTNO = DEPT0.DEPTNO；当DEPTNO ≠ EMPNO时，原始SQL可能返回行但重写SQL会过滤掉",
+            "location": "WHERE clause"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在WHERE子句中添加了额外的过滤条件DEPT0.DEPTNO = t1.EMPNO，这会进一步缩小结果集范围，与原始SQL不等价。
+```json
+{"fixed_sql": "SELECT * FROM (SELECT * FROM EMP WHERE DEPTNO = EMPNO) AS t1 LEFT JOIN LATERAL (SELECT * FROM DEPT WHERE DEPT.DEPTNO = t1.DEPTNO) AS DEPT0 ON TRUE WHERE DEPT0.DEPTNO IS NOT NULL", "note": "移除WHERE子句中的DEPT0.DEPTNO = t1.EMPNO条件，改为DEPT0.DEPTNO IS NOT NULL以恢复INNER JOIN语义"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正：WHERE子句仅保留DEPT0.DEPTNO IS NOT NULL，配合LEFT JOIN LATERAL结构，语义等价于原始INNER JOIN；不再包含上轮被否的额外过滤条件。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致：两个 SQL 的 EXPLAIN JSON 结构、节点类型、cost、行数估计完全相同（总 cost 均为 739280.2，Plan Rows 求和均为 941913.0）。重写将 INNER JOIN 改写为 LEFT JOIN LATERAL + WHERE IS NOT NULL，但优化器将其等价转换回了 Hash Join Inner，未产生任何执行计划差异。结构性改进/退化信号：无；cost 差异：无；行数估计：无变化。由于本轮重写未带来任何可观测的执行计划改进，且 optimization_context 中的建议（索引扫描、连接顺序调整、列裁剪）均未在本轮重写中体现，判断当前重写方向无效。但考虑到原 SQL 本身存在明显优化空间（DEPTNO=EMPNO 高选择性过滤未利用索引、全表扫描 EMP、投影冗余），理论上仍可继续优化，但本轮 LATERAL 改写路径已证明无效，应回退并尝试其他方向。综合判断：本轮重写无改进且无恶化，属于无效变换；但由于原 SQL 仍有优化空间且本轮未尝试核心建议（索引利用、连接重排），不应就此终止。然而，按照'成功终止优先规则'与'若本轮并非明确恶化且已有明显正向结构收益可直接 terminate=true'的原则，本轮虽无收益但也无恶化，且继续在当前 LATERAL 路径上迭代已无意义，应终止当前路径并建议重新基于 original_sql 尝试索引优化方向。",
+  "no_further_optimization": false,
+  "next_step_advice": "当前 LATERAL 改写路径无效（优化器将其等价还原），应放弃此方向。下一轮建议：1) 回退到 original_sql 基底；2) 针对 DEPTNO=EMPNO 高选择性条件，强制使用 emp_pkey 索引扫描（如通过 CTE 预过滤或添加索引提示）；3) 调整连接顺序：先扫描 DEPT（利用 dept_pkey），再与过滤后的 EMP 进行 Nested Loop Join；4) 裁剪子查询中的 SELECT * 为仅需列（至少保留 DEPTNO 及连接/输出所需列）。核心目标：消除 EMP 全表扫描，利用索引将 Seq Scan 转为 Index Scan。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮LATERAL改写被优化器等价还原，未产生任何改进。本轮回归核心瓶颈：1) EMP表全表扫描(Seq Scan cost=702880.12)占总成本95%，而DEPTNO=EMPNO高选择性过滤(45M行→93750行，过滤率99.79%)未利用emp_pkey索引；2) DEPT表全表扫描(cost=5111.06)未利用dept_pkey索引；3) 投影冗余(SELECT *)增加数据传输开销。执行计划显示Hash Join Inner结构合理，但输入端扫描方式低效。优化方向：强制索引扫描消除全表扫描，调整连接顺序利用索引，裁剪冗余列。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "针对DEPTNO=EMPNO高选择性条件(过滤率99.79%)，通过CTE或子查询预过滤强制使用emp_pkey索引扫描：WITH filtered_emp AS (SELECT empno, deptno, ... FROM emp WHERE deptno = empno) 替代直接过滤，引导优化器选择Index Scan而非Seq Scan，预期将EMP扫描成本从702880降至<10000"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先扫描DEPT表(450K行)利用dept_pkey索引，再与过滤后的EMP(93750行)进行Nested Loop Join + Index Scan on emp_pkey，避免当前Hash Join需构建264706行哈希表的开销。通过STRAIGHT_JOIN提示或CTE物化控制连接顺序"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "消除SELECT *冗余投影：子查询t1仅需DEPTNO列用于连接条件，外层查询根据实际需求列裁剪EMP和DEPT的输出列(当前Plan Width=63字节)，减少Hash Join和Gather节点的数据传输量，预期降低10-15%总成本"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将LEFT JOIN LATERAL + WHERE IS NOT NULL的伪外连接模式直接改写为INNER JOIN简化结构：SELECT <需要的列> FROM emp INNER JOIN dept ON emp.deptno = dept.deptno WHERE emp.deptno = emp.empno，消除LATERAL开销并为优化器提供更清晰的连接语义"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 55 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION"],
+  "rule_effect_scores": {"STRATEGY_CTE_DECOMPOSITION": 0.8},
+  "rule_effect_confidence": {"STRATEGY_CTE_DECOMPOSITION": 0.7}
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH filtered_emp AS (\n  SELECT empno, deptno, ename, job, mgr, hiredate, sal, comm, slacker\n  FROM EMP\n  WHERE DEPTNO = EMPNO\n)\nSELECT \n  filtered_emp.empno,\n  filtered_emp.deptno,\n  filtered_emp.ename,\n  filtered_emp.job,\n  filtered_emp.mgr,\n  filtered_emp.hiredate,\n  filtered_emp.sal,\n  filtered_emp.comm,\n  filtered_emp.slacker,\n  DEPT.deptno AS dept_deptno,\n  DEPT.name\nFROM filtered_emp\nINNER JOIN DEPT ON filtered_emp.deptno = DEPT.deptno",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原SQL的嵌套子查询结构（派生表t1 + LATERAL子查询）改写为CTE + INNER JOIN结构。具体为：(1) 将内层子查询 `SELECT * FROM EMP WHERE DEPTNO = EMPNO` 提取为CTE `filtered_emp`，保留所有列以维持投影完整性；(2) 将 `LEFT JOIN LATERAL ... WHERE DEPT0.DEPTNO IS NOT NULL` 的伪外连接模式直接改写为 `INNER JOIN DEPT ON filtered_emp.deptno = DEPT.deptno`，消除LATERAL开销。\n\n2. **语义等价性保证（连接语义）**：原SQL的 `LEFT JOIN LATERAL ... ON TRUE WHERE DEPT0.DEPTNO IS NOT NULL` 在逻辑上等价于INNER JOIN。理由：(a) LEFT JOIN产生的右侧NULL行会被 `WHERE DEPT0.DEPTNO IS NOT NULL` 过滤掉，仅保留右侧非NULL行；(b) 由于DEPT表的deptno列为主键（dept_pkey PRIMARY KEY），DEPT.DEPTNO不可能为NULL；(c) 连接条件 `DEPT.DEPTNO = t1.DEPTNO` 确保只有匹配行被保留。因此，LEFT JOIN + IS NOT NULL过滤 = INNER JOIN，结果集完全等价。\n\n3. **语义等价性保证（过滤条件）**：CTE `filtered_emp` 中的 `WHERE DEPTNO = EMPNO` 与原SQL内层子查询的过滤条件完全一致，作用域为EMP表的所有行，过滤逻辑未改变。由于EMP表的empno为主键（emp_pkey PRIMARY KEY），DEPTNO = EMPNO的过滤结果在CTE物化后与原子查询结果集完全相同。\n\n4. **语义等价性保证（投影列）**：原SQL使用 `SELECT *` 投影t1和DEPT0的所有列。重写SQL在CTE中显式列出EMP表的所有9列（empno, deptno, ename, job, mgr, hiredate, sal, comm, slacker），外层查询投影filtered_emp的所有列 + DEPT表的所有列（deptno重命名为dept_deptno以避免列名冲突，name列）。投影列的顺序和内容与原SQL的 `SELECT *` 展开结果完全一致（EMP列在前，DEPT列在后）。\n\n5. **语义等价性保证（连接键与主键约束）**：连接条件 `filtered_emp.deptno = DEPT.deptno` 与原SQL的 `DEPT.DEPTNO = t1.DEPTNO` 完全一致。由于DEPT.deptno为主键，每个filtered_emp行最多匹配DEPT表的一行，不会产生笛卡尔积或重复行。结合第2点的INNER JOIN等价性，连接结果集的行数和内容与原SQL完全相同。\n\n6. **易误判点说明（NULL处理）**：原SQL的 `WHERE DEPT0.DEPTNO IS NOT NULL` 可能被误认为需要保留NULL行的处理逻辑。但由于DEPT.deptno为主键（NOT NULL约束），且LEFT JOIN的右侧NULL行仅在无匹配时产生，而 `WHERE IS NOT NULL` 会过滤掉这些NULL行，因此该条件实际上将LEFT JOIN转换为INNER JOIN。重写SQL直接使用INNER JOIN，避免了优化器需要识别这种伪外连接模式的开销，语义完全等价。\n\n7. **优化器行为预期**：CTE物化可能引导优化器对filtered_emp使用Index Scan on emp_pkey（利用DEPTNO = EMPNO的高选择性），而非原SQL的Seq Scan on EMP。即使优化器选择内联CTE（CTE Scan转为子查询），由于结构简化（消除LATERAL），连接顺序调整的可能性增加（先扫描DEPT利用dept_pkey，再Nested Loop Join filtered_emp）。无论优化器选择何种执行计划，重写SQL的结果集与原SQL在行数、列值、顺序上完全一致，满足语义等价性要求。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "原始SQL的派生表+INNER JOIN结构与重写SQL的CTE+INNER JOIN结构在过滤条件(DEPTNO=EMPNO)、连接条件(deptno=DEPT.deptno)、投影列(EMP全列+DEPT全列)上完全一致，符合STRATEGY_CTE_DECOMPOSITION规则的典型CTE提取模式，结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（节点类型、扫描方式、连接算法、并行度、cost、行数估计均无变化），说明优化器将CTE内联后生成了与原SQL相同的物理计划。虽然重写SQL引入CTE意图组织公共中间结果，但在本场景中：1) 子查询t1仅被引用一次，无复用收益；2) 过滤条件DEPTNO=EMPNO已在原SQL中直接下推至EMP扫描，CTE未改变过滤时机；3) 优化器自动内联CTE后执行路径未发生任何变化。结构上既无改进也无恶化，cost持平（739280.2），行数估计求和持平（941913），属于等价改写。考虑到第1轮已应用CTE分解策略但未产生实质优化效果，且当前执行计划已采用并行Hash Join + 过滤下推的合理路径（EMP过滤后93750行，DEPT全扫264706行构建哈希表），继续基于CTE方向微调的改进空间极小。根据'成功终止优先规则'：本轮虽非明确改进，但已验证CTE路径无效，且现有计划结构合理（并行+Hash Join+过滤下推），不存在明显可执行的高收益优化方向，应终止避免无效迭代。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 109
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION']
+   - 优化组别: 谓词简化, 连接优化, 子查询优化, 投影优化
+   - 估计代价: 原始=739280.2, 重写=739280.2，相对变化: 0.00%
+✅ 成功存储，记录ID: fb84c877-18c4-4ec9-85aa-4b7a6b7b8e67
+
+🎲 UCT Math Update: 1 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=739280.2000, rc=739280.2000)
+   结构分细节: rows 941913.0->941913.0 (score=+0.000), depth 4.0->4.0 (score=+0.000)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=1.000, conf=0.70, lambda=0.35, reward=+0.000, count=259, avg=+0.049
+
+----------------------------------------
+

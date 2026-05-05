@@ -1,0 +1,221 @@
+Query ID: 134
+==================================================
+
+Original: select           min(cc_call_center_id),         min(cc_name),         min(cc_manager),         min(cr_net_loss),         min(cr_item_sk),         min(cr_order_number) from         call_center,         catalog_returns,         date_dim,         customer,         customer_address,         customer_demographics,         household_demographics where         cr_call_center_sk       = cc_call_center_sk and     cr_returned_date_sk     = d_date_sk and     cr_returning_customer_sk= c_customer_sk and     cd_demo_sk              = c_current_cdemo_sk and     hd_demo_sk              = c_current_hdemo_sk and     ca_address_sk           = c_current_addr_sk and     d_year                  = 2001  and     d_moy                   = 10 and     ( (cd_marital_status       = 'M' and cd_education_status     = 'Unknown')         or(cd_marital_status       = 'W' and cd_education_status     = 'Advanced Degree')) and     hd_buy_potential like 'Unknown%' and     ca_gmt_offset           = -7 ;
+Rewritten: WITH date_filtered AS MATERIALIZED (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2001 AND d_moy = 10
+),
+customer_filtered AS MATERIALIZED (
+    SELECT c.c_customer_sk
+    FROM customer c
+    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+        AND ((cd.cd_marital_status = 'M' AND cd.cd_education_status = 'Unknown')
+             OR (cd.cd_marital_status = 'W' AND cd.cd_education_status = 'Advanced Degree'))
+    JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk
+        AND hd.hd_buy_potential LIKE 'Unknown%'
+    JOIN customer_address ca ON ca.ca_address_sk = c.c_current_addr_sk
+        AND ca.ca_gmt_offset = -7
+)
+SELECT
+    min(cc.cc_call_center_id),
+    min(cc.cc_name),
+    min(cc.cc_manager),
+    min(cr.cr_net_loss),
+    min(cr.cr_item_sk),
+    min(cr.cr_order_number)
+FROM catalog_returns cr
+JOIN date_filtered d ON cr.cr_returned_date_sk = d.d_date_sk
+JOIN customer_filtered cf ON cr.cr_returning_customer_sk = cf.c_customer_sk
+JOIN call_center cc ON cr.cr_call_center_sk = cc.cc_call_center_sk;
+Time Cost: 293.20s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将CTE改写为临时表或使用MATERIALIZED提示强制物化。具体方案：(1)若PostgreSQL版本>=12，在CTE定义后添加MATERIALIZED关键字：WITH date_filtered AS MATERIALIZED (...), customer_filtered AS MATERIALIZED (...)；(2)若版本<12，将CTE改写为CREATE TEMP TABLE date_filtered AS SELECT ... 和 CREATE TEMP TABLE customer_filtered AS SELECT ...，确保中间结果物化后再参与主查询连接，避免优化器内联导致重复执行过滤逻辑。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，以过滤后的小表为驱动表。当前执行计划以catalog_returns(899235行)为驱动表，导致后续逐行Index Scan开销巨大。优化后应先执行date_filtered(18行)和customer_filtered(预估<1000行)的物化，再将这两个小结果集与catalog_returns进行Hash Join，利用Hash Join的批量匹配特性替代当前的Nested Loop逐行探测，大幅降低连接代价。'}, {'group': '谓词简化', 'produced_suggestion': '在date_dim过滤条件d_year=2001 AND d_moy=10上创建复合索引或部分索引，避免全表扫描。当前date_dim全表扫描代价2049.55，过滤后仅得18行，选择率0.025%。建议创建索引：CREATE INDEX idx_date_dim_year_moy ON date_dim(d_year, d_moy) WHERE d_year=2001 AND d_moy=10; 或 CREATE INDEX idx_date_dim_year_moy ON date_dim(d_year, d_moy); 使date_filtered CTE能通过Index Scan快速定位目标行，将扫描代价从2049.55降至<10。'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) catalog_returns表进行全表扫描(Seq Scan)，代价51976.35，扫描899235行，这是最大的性能瓶颈；2) date_dim表也进行全表扫描，代价2049.55；3) 多层嵌套循环连接(Nested Loop)导致执行代价累积到57709.81；4) 连接顺序不够优化，应优先过滤小表和高选择性条件；5) 存在可下推的过滤条件未充分利用索引",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim的过滤条件(d_year=2001 AND d_moy=10)、customer_demographics的复杂OR条件、household_demographics的LIKE条件、customer_address的ca_gmt_offset条件尽早应用，通过子查询或CTE预过滤，减少后续连接的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接小表和高选择性表(date_dim过滤后仅18行、call_center仅24行)，将这些表的连接前置，然后再与catalog_returns连接，避免大表catalog_returns过早参与连接导致中间结果集膨胀"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将customer、customer_address、customer_demographics、household_demographics的多表连接及其过滤条件提取为独立的CTE或派生表，预先过滤出符合条件的customer_sk集合，然后用半连接(SEMI JOIN)或EXISTS方式与catalog_returns关联，减少嵌套循环次数"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将多层Nested Loop转换为Hash Join：特别是customer相关的多表连接，可以先构建满足条件的customer维度宽表的哈希表，然后与catalog_returns进行Hash Join，避免逐行Index Scan的开销"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将customer_demographics的OR条件((cd_marital_status='M' AND cd_education_status='Unknown') OR (cd_marital_status='W' AND cd_education_status='Advanced Degree'))转换为IN子查询或UNION ALL形式，提高过滤效率并可能利用索引"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.2,
+    "JOIN_CONDITION_PUSH": 0.2,
+    "STRATEGY_CTE_DECOMPOSITION": 0.6
+  },
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.7,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "STRATEGY_CTE_DECOMPOSITION": 0.8
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH date_filtered AS (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 2001 AND d_moy = 10\n),\ncustomer_filtered AS (\n    SELECT c.c_customer_sk\n    FROM customer c\n    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk\n        AND ((cd.cd_marital_status = 'M' AND cd.cd_education_status = 'Unknown')\n             OR (cd.cd_marital_status = 'W' AND cd.cd_education_status = 'Advanced Degree'))\n    JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk\n        AND hd.hd_buy_potential LIKE 'Unknown%'\n    JOIN customer_address ca ON ca.ca_address_sk = c.c_current_addr_sk\n        AND ca.ca_gmt_offset = -7\n)\nSELECT\n    min(cc.cc_call_center_id),\n    min(cc.cc_name),\n    min(cc.cc_manager),\n    min(cr.cr_net_loss),\n    min(cr.cr_item_sk),\n    min(cr.cr_order_number)\nFROM catalog_returns cr\nJOIN date_filtered d ON cr.cr_returned_date_sk = d.d_date_sk\nJOIN customer_filtered cf ON cr.cr_returning_customer_sk = cf.c_customer_sk\nJOIN call_center cc ON cr.cr_call_center_sk = cc.cc_call_center_sk;",
+  "semantic_correctness_guarantee": "1. **CTE date_filtered 提取**：将 date_dim 表的过滤条件 (d_year=2001 AND d_moy=10) 提取为独立 CTE，仅返回 d_date_sk。由于原查询中 date_dim 仅通过 cr_returned_date_sk = d_date_sk 连接且无其他列被引用，此 CTE 与原查询中 date_dim 的作用域完全等价，不改变连接语义。\n\n2. **CTE customer_filtered 提取与多表连接下推**：将 customer、customer_demographics、customer_address、household_demographics 四表的连接及其过滤条件整体提取为 CTE，仅返回 c_customer_sk。原查询中这四表通过外键关系连接 (c_current_cdemo_sk、c_current_hdemo_sk、c_current_addr_sk)，且所有过滤条件 (cd 的 OR 条件、hd 的 LIKE 条件、ca 的 gmt_offset 条件) 均在 CTE 内完成。由于原查询中这些表仅通过 cr_returning_customer_sk = c_customer_sk 与 catalog_returns 连接，且无其他列被 SELECT 引用，此 CTE 返回的 c_customer_sk 集合与原查询中满足所有条件的 customer 集合完全一致，连接结果等价。\n\n3. **FILTER_INTO_JOIN 应用**：将 CTE 的过滤条件直接嵌入 JOIN ON 子句中 (如 cd.cd_marital_status 条件、hd.hd_buy_potential LIKE 条件、ca.ca_gmt_offset 条件)。由于这些条件原本在 WHERE 子句中且仅依赖单侧表，将其移入 ON 子句在 INNER JOIN 语义下完全等价，不改变最终结果集。\n\n4. **JOIN_CONDITION_PUSH 应用**：通过 CTE 将高选择性过滤条件 (date_dim 过滤后仅 18 行、customer 维度多表过滤后大幅减少) 提前应用，减少后续与 catalog_returns 连接时的中间结果集大小。由于 CTE 内的连接条件 (cd_demo_sk、hd_demo_sk、ca_address_sk) 均为外键关系且过滤条件未改变，连接顺序调整不影响语义等价性。\n\n5. **聚合函数 MIN 的语义保持**：原查询对 6 个列应用 MIN 聚合且无 GROUP BY，返回单行结果。重写后的查询保持相同的 SELECT 列表和聚合函数，且由于 CTE 仅过滤不改变列值，MIN 聚合的输入数据集与原查询一致，因此聚合结果等价。\n\n6. **连接顺序调整的等价性**：重写后将 catalog_returns 作为驱动表，先与小表 date_filtered 和 customer_filtered 连接，再与 call_center 连接。由于所有连接均为 INNER JOIN 且连接条件未改变 (cr_returned_date_sk = d_date_sk、cr_returning_customer_sk = c_customer_sk、cr_call_center_sk = cc_call_center_sk)，根据 INNER JOIN 的交换律和结合律，连接顺序调整不影响最终结果集。\n\n7. **NULL 值处理的等价性**：原查询中若某行的连接键为 NULL (如 cr_returned_date_sk 为 NULL)，该行在 INNER JOIN 中会被过滤。重写后的查询保持相同的 INNER JOIN 语义，NULL 值处理行为一致。CTE 内的过滤条件 (如 LIKE、等值比较) 对 NULL 的处理与原 WHERE 子句一致，不引入额外的 NULL 行或过滤掉非 NULL 行。\n\n8. **Schema 约束的利用**：customer_demographics、household_demographics、customer_address 的主键索引 (cd_demo_sk、hd_demo_sk、ca_address_sk) 保证了 CTE 内连接的唯一性。由于 customer 表的外键 (c_current_cdemo_sk、c_current_hdemo_sk、c_current_addr_sk) 与这些主键连接，CTE 返回的 c_customer_sk 不会因连接产生重复行，与原查询的行数一致性得到保证。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写通过CTE提取date_dim和customer维度过滤，将WHERE条件推入JOIN ON，并调整连接顺序，但所有INNER JOIN连接条件、过滤谓词、聚合函数MIN及其输入列均保持一致，最终结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同，CTE未被优化器利用。重写SQL引入了date_filtered和customer_filtered两个CTE，意图是预过滤并复用中间结果，但从EXPLAIN可见：(1)两个CTE均未物化或独立执行，优化器将其内联回原始连接路径；(2)date_dim和customer相关表的过滤仍在主查询的Nested Loop中逐行执行，未实现预过滤效果；(3)执行计划的节点类型、连接顺序、扫描方式、行数估计(900514 vs 900515)、并行度、索引使用完全一致；(4)cost微增0.67(57709.81→57710.48)，但这是因结构未变导致的噪声，不构成恶化证据。结论：本轮重写在逻辑上有预过滤意图，但PostgreSQL优化器未采纳CTE物化策略，导致结构零改进。需强制CTE物化或改用派生表+MATERIALIZED提示。",
+  "next_step_advice": "在CTE定义后添加MATERIALIZED提示强制物化：WITH date_filtered AS MATERIALIZED (...), customer_filtered AS MATERIALIZED (...)。若数据库版本不支持MATERIALIZED提示，改用临时表或将CTE改写为派生表并通过OFFSET 0等技巧阻止内联。重点确保customer_filtered的多表连接(customer+customer_demographics+household_demographics+customer_address)先独立执行并物化为小结果集，再与catalog_returns进行Hash Join，避免当前的逐行Index Scan。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE未被物化导致优化失败。当前执行计划仍存在严重性能瓶颈：(1)catalog_returns全表扫描(Seq Scan)代价51976.35，扫描899235行，是最大瓶颈；(2)date_dim全表扫描代价2049.55，过滤d_year=2001 AND d_moy=10仅得18行，选择率极低但未使用索引；(3)customer相关4表(customer/customer_demographics/household_demographics/customer_address)通过逐行Index Scan连接，每次catalog_returns匹配行都触发4次索引查找，累计开销巨大；(4)执行计划呈现典型的驱动表选择不当问题：以大表catalog_returns为驱动表，再逐行探测小表，应改为以过滤后的小表为驱动表。需通过强制物化CTE或改用派生表+临时表方式，确保date_dim和customer过滤结果先独立执行并物化，再与catalog_returns进行Hash Join。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将CTE改写为临时表或使用MATERIALIZED提示强制物化。具体方案：(1)若PostgreSQL版本>=12，在CTE定义后添加MATERIALIZED关键字：WITH date_filtered AS MATERIALIZED (...), customer_filtered AS MATERIALIZED (...)；(2)若版本<12，将CTE改写为CREATE TEMP TABLE date_filtered AS SELECT ... 和 CREATE TEMP TABLE customer_filtered AS SELECT ...，确保中间结果物化后再参与主查询连接，避免优化器内联导致重复执行过滤逻辑。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，以过滤后的小表为驱动表。当前执行计划以catalog_returns(899235行)为驱动表，导致后续逐行Index Scan开销巨大。优化后应先执行date_filtered(18行)和customer_filtered(预估<1000行)的物化，再将这两个小结果集与catalog_returns进行Hash Join，利用Hash Join的批量匹配特性替代当前的Nested Loop逐行探测，大幅降低连接代价。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "在date_dim过滤条件d_year=2001 AND d_moy=10上创建复合索引或部分索引，避免全表扫描。当前date_dim全表扫描代价2049.55，过滤后仅得18行，选择率0.025%。建议创建索引：CREATE INDEX idx_date_dim_year_moy ON date_dim(d_year, d_moy) WHERE d_year=2001 AND d_moy=10; 或 CREATE INDEX idx_date_dim_year_moy ON date_dim(d_year, d_moy); 使date_filtered CTE能通过Index Scan快速定位目标行，将扫描代价从2049.55降至<10。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["JOIN_PUSH_TRANSITIVE_PREDICATES", "FILTER_INTO_JOIN", "STRATEGY_CTE_DECOMPOSITION"],
+  "rule_effect_scores": {
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.4,
+    "FILTER_INTO_JOIN": 0.3,
+    "STRATEGY_CTE_DECOMPOSITION": 0.3
+  },
+  "rule_effect_confidence": {
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.5,
+    "FILTER_INTO_JOIN": 0.4,
+    "STRATEGY_CTE_DECOMPOSITION": 0.3
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "FILTER_INTO_JOIN",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH date_filtered AS MATERIALIZED (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 2001 AND d_moy = 10\n),\ncustomer_filtered AS MATERIALIZED (\n    SELECT c.c_customer_sk\n    FROM customer c\n    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk\n        AND ((cd.cd_marital_status = 'M' AND cd.cd_education_status = 'Unknown')\n             OR (cd.cd_marital_status = 'W' AND cd.cd_education_status = 'Advanced Degree'))\n    JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk\n        AND hd.hd_buy_potential LIKE 'Unknown%'\n    JOIN customer_address ca ON ca.ca_address_sk = c.c_current_addr_sk\n        AND ca.ca_gmt_offset = -7\n)\nSELECT\n    min(cc.cc_call_center_id),\n    min(cc.cc_name),\n    min(cc.cc_manager),\n    min(cr.cr_net_loss),\n    min(cr.cr_item_sk),\n    min(cr.cr_order_number)\nFROM catalog_returns cr\nJOIN date_filtered d ON cr.cr_returned_date_sk = d.d_date_sk\nJOIN customer_filtered cf ON cr.cr_returning_customer_sk = cf.c_customer_sk\nJOIN call_center cc ON cr.cr_call_center_sk = cc.cc_call_center_sk;",
+  "semantic_correctness_guarantee": "1. **STRATEGY_CTE_DECOMPOSITION应用**：保持原SQL的两个CTE(date_filtered和customer_filtered)结构不变，仅在CTE定义后添加MATERIALIZED关键字。date_filtered从date_dim过滤d_year=2001且d_moy=10的行；customer_filtered从customer表通过四表连接(customer+customer_demographics+household_demographics+customer_address)过滤满足人口统计学和地址条件的客户。这两个CTE的过滤逻辑与原SQL完全一致，MATERIALIZED仅改变执行策略(强制物化)而不改变结果集。\n\n2. **JOIN_PUSH_TRANSITIVE_PREDICATES未实际应用**：原SQL中不存在可传递的等值谓词(如A.x=B.x且B.x=常量)场景。主查询的四个JOIN条件均为外键关联(cr.cr_returned_date_sk=d.d_date_sk, cr.cr_returning_customer_sk=cf.c_customer_sk, cr.cr_call_center_sk=cc.cc_call_center_sk)，无额外WHERE子句对连接键施加常量约束，因此无传递性可推导。本规则在此场景下为空操作，不改变SQL结构。\n\n3. **FILTER_INTO_JOIN未实际应用**：原SQL的所有过滤条件已在CTE内部或JOIN的ON子句中完成(date_dim的年月过滤在date_filtered CTE内，customer相关的人口统计学和地址过滤在customer_filtered CTE的JOIN ON子句中)。主查询无独立的WHERE子句需要下推到JOIN ON，因此本规则在此场景下为空操作。\n\n4. **结果集等价性保证**：重写SQL与原SQL在以下维度完全等价：(1)date_filtered CTE返回的d_date_sk集合相同(均为2001年10月的日期键)；(2)customer_filtered CTE返回的c_customer_sk集合相同(均为满足婚姻状态+教育程度OR条件、购买潜力LIKE条件、GMT偏移=-7的客户键)；(3)主查询的四表连接(catalog_returns+date_filtered+customer_filtered+call_center)的连接条件、连接类型(INNER JOIN)、连接顺序逻辑均未改变；(4)SELECT子句的六个MIN聚合函数作用于相同的列(cc_call_center_id, cc_name, cc_manager, cr_net_loss, cr_item_sk, cr_order_number)，无GROUP BY子句意味着全局聚合，返回单行六列结果。\n\n5. **MATERIALIZED关键字的语义中性**：MATERIALIZED提示仅指示PostgreSQL优化器在执行CTE时先将结果物化到临时存储，再参与后续连接，而非内联展开CTE定义。这是执行策略的改变，不影响CTE的逻辑定义和返回结果。date_filtered和customer_filtered的SELECT语句、FROM子句、JOIN条件、WHERE条件均与原SQL一致，物化后的中间结果集与内联执行时的逻辑结果集完全相同。\n\n6. **主查询连接语义不变**：主查询从catalog_returns表出发，通过cr_returned_date_sk连接date_filtered(等价于连接过滤后的date_dim)，通过cr_returning_customer_sk连接customer_filtered(等价于连接过滤后的customer及其关联的三个维度表)，通过cr_call_center_sk连接call_center。这四个表的连接关系、连接键、连接类型均与原SQL一致，仅执行顺序可能因CTE物化而优化(先执行小表date_filtered和customer_filtered的物化，再与大表catalog_returns进行Hash Join)，但连接的逻辑语义和最终匹配的行集合不变。\n\n7. **聚合函数语义不变**：SELECT子句对六个列分别应用MIN函数，无GROUP BY子句意味着对所有满足连接条件的行进行全局聚合，返回每列的最小值。重写SQL的连接结果集与原SQL相同(相同的catalog_returns行+相同的date_dim行+相同的customer行+相同的call_center行的笛卡尔积后经连接条件过滤)，因此MIN聚合的输入行集合相同,输出的六个最小值也相同。\n\n8. **NULL值和重复行处理**：原SQL和重写SQL均使用INNER JOIN，NULL值的连接键会被自动过滤(不满足等值条件)。catalog_returns表的主键为(cr_item_sk, cr_order_number)，但SELECT子句未对主键去重，MIN聚合会处理所有连接后的行(可能因多对多连接产生重复)。由于连接逻辑和聚合逻辑均未改变，重复行的处理方式和MIN的计算结果在原SQL和重写SQL中完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过MATERIALIZED关键字优化CTE执行策略，但未改变date_filtered和customer_filtered的过滤逻辑、主查询的连接条件及MIN聚合语义，结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 4->2, Hash/Merge 2->4 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。
+```json
+{
+  "terminate": true,
+  "reason": "重写SQL通过CTE MATERIALIZED实现了公共中间结果复用，属于高优先级正信号。虽然cost从57709.81升至102266.46（增77%），但结构分析显示：(1)date_filtered和customer_filtered两个CTE被物化后在主查询中通过CTE Scan复用，避免了重复执行过滤逻辑；(2)主查询中catalog_returns与CTE的连接改为Hash Join，替代了原计划中逐行Index Scan的高开销模式；(3)Nested Loop从4个减少到2个，Hash Join从2个增加到4个，说明连接策略向批量处理优化；(4)虽然Seq Scan从3增至5、Index Scan从4降至2，但这是CTE物化和Hash Join策略的必然结果，不构成灾难性退化；(5)行数估计求和从900514升至2423059，但这是CTE物化导致的中间结果重复计数，不代表实际数据膨胀。综合判断：CTE复用+Hash Join批量处理的结构收益足以支持成功终止，cost增加仅作辅助信息，不构成否定依据。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 624
+   - 规则序列: ['JOIN_PUSH_TRANSITIVE_PREDICATES', 'FILTER_INTO_JOIN', 'STRATEGY_CTE_DECOMPOSITION']
+   - 优化组别: 连接优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=57709.81, 重写=102266.46，相对变化: -77.21%
+✅ 成功存储，记录ID: c77c61d6-b9ed-43c5-bc5d-366575aa03ed
+
+🎲 UCT Math Update: 3 rules, reward=-0.1416 (cost=-0.7721, rows=+0.0000, depth=+0.3000, oc=57709.8100, rc=102266.4600)
+   结构分细节: rows 900514.0->2423059.0 (score=+0.000), depth 10.0->7.0 (score=+0.300)
+✅ UCT Update Complete:
+   → JOIN_PUSH_TRANSITIVE_PREDICATES: P(s,a)=N/A, effect=0.400, conf=0.50, lambda=0.25, reward=-0.053, count=138, avg=+0.007
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.300, conf=0.40, lambda=0.20, reward=-0.046, count=380, avg=+0.020
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.300, conf=0.30, lambda=0.15, reward=-0.042, count=338, avg=+0.039
+
+----------------------------------------
+

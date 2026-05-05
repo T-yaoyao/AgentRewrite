@@ -1,0 +1,163 @@
+Query ID: 16
+==================================================
+
+Original: SELECT * FROM (SELECT DEPTNO, NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT DEPTNO FROM EMP) AS t4 WHERE DEPTNO = t4.DEPTNO) ORDER BY DEPTNO) AS t3 ORDER BY DEPTNO OFFSET 2 ROWS FETCH NEXT 10 ROWS ONLY
+Rewritten: SELECT * FROM (SELECT DEPTNO, NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT DEPTNO FROM EMP) AS t4 WHERE DEPTNO = t4.DEPTNO) ORDER BY DEPTNO) AS t3 ORDER BY DEPTNO OFFSET 2 ROWS FETCH NEXT 10 ROWS ONLY
+Time Cost: 451.04s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "回退上一轮将 IN 子查询改写为 INNER JOIN 的操作。保持原始 'WHERE DEPTNO IN (SELECT DISTINCT DEPTNO FROM EMP)' 的 Semi Join 语义，让 PostgreSQL 优化器选择 Hash Semi Join，避免 EMP 表全扫描 + 排序 + Merge Join 的高成本管道。Semi Join 只需对 EMP.DEPTNO 做 HashAggregate 去重后构建哈希表，DEPT 侧探测即可，无需排序与 Gather Merge。"}, {'group': '排序优化', 'produced_suggestion': '移除上一轮引入的 EMP 侧排序需求。原始 SQL 的 ORDER BY DEPTNO 仅需对 DEPT 最终结果集（最多 450000 行，实际经 Semi Join 过滤后更少）排序，而当前计划在 EMP 侧（4500万行）先排序再 Unique，成本极高。恢复 Semi Join 后，排序仅作用于 DEPT 过滤后的小结果集。'}, {'group': '连接优化', 'produced_suggestion': '避免 Merge Join 路径。当前 Merge Join 要求 EMP 侧预先排序（cost 1862547.51），而 Hash Semi Join 无此要求，仅需 EMP.DEPTNO 的 HashAggregate（原始计划 cost 约 0.5）+ DEPT 侧哈希探测。回退 JOIN 改写，让优化器重新选择 Hash Semi Join。'}, {'group': '保护机制', 'produced_suggestion': '写入防护触发：重写 cost 增幅 227262332.9% 超过 1000%，输出已回退到原始 SQL。'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) InitPlan中对emp表进行全表扫描(Seq Scan)，代价高达918506.16，扫描4500万行仅为检查deptno是否存在；2) EXISTS子查询被转换为InitPlan执行，但内部嵌套了冗余派生表；3) 外层和内层都对DEPTNO排序造成冗余；4) SELECT *投影可能包含不必要的列。可通过子查询优化、谓词简化、排序优化和投影优化显著提升性能。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS子查询转换为SEMI JOIN（IN或EXISTS直接关联），消除内层冗余派生表(SELECT DEPTNO FROM EMP)，改写为：SELECT DEPTNO, NAME FROM DEPT WHERE DEPTNO IN (SELECT DEPTNO FROM EMP WHERE DEPTNO IS NOT NULL)，利用emp表的deptno索引（如存在）或Hash Semi Join避免全表扫描"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "EXISTS条件中的派生表t4无实际作用，直接简化为EXISTS (SELECT 1 FROM EMP WHERE EMP.DEPTNO = DEPT.DEPTNO)，减少子查询层级；同时将IS NOT NULL过滤条件前置到子查询中以减少匹配行数"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "消除冗余排序：外层ORDER BY DEPTNO与内层ORDER BY DEPTNO重复，且OFFSET/FETCH已在外层，可移除内层派生表t3及其ORDER BY，直接在最外层应用排序和分页，利用dept_pkey索引的有序性避免显式排序"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "将SELECT *改为显式列投影SELECT DEPTNO, NAME，避免传输和处理不必要的列数据；若后续只需这两列，可减少I/O和内存开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 35 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 排序优化, 子查询优化, 投影优化",
+  "applied_rules": ["FILTER_CORRELATE", "SORT_REMOVE", "FILTER_SUB_QUERY_TO_CORRELATE", "PROJECT_REMOVE"],
+  "rule_effect_scores": {
+    "FILTER_CORRELATE": 0.254,
+    "SORT_REMOVE": 0.278,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.233,
+    "PROJECT_REMOVE": 0.235
+  },
+  "rule_effect_confidence": {
+    "FILTER_CORRELATE": 0.619,
+    "SORT_REMOVE": 0.676,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.567,
+    "PROJECT_REMOVE": 0.571
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 排序优化, 子查询优化, 投影优化",
+  "applied_rules": [
+    "FILTER_CORRELATE",
+    "SORT_REMOVE",
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "PROJECT_REMOVE"
+  ],
+  "rewritten_sql": "SELECT DEPTNO, NAME\nFROM DEPT\nWHERE DEPTNO IN (SELECT DISTINCT DEPTNO FROM EMP)\nORDER BY DEPTNO\nOFFSET 2 ROWS FETCH NEXT 10 ROWS ONLY",
+  "semantic_correctness_guarantee": "1. 结构性改写说明：将原始SQL中的EXISTS相关子查询改写为IN + DISTINCT半连接形式；消除了内层冗余派生表t4(SELECT DEPTNO FROM EMP)；移除了内层派生表t3及其ORDER BY；将SELECT *改为显式列投影SELECT DEPTNO, NAME。\n\n2. 子查询去相关化等价性：原EXISTS (SELECT 1 FROM (SELECT DEPTNO FROM EMP) AS t4 WHERE DEPTNO = t4.DEPTNO)语义为"存在至少一条EMP记录的DEPTNO与当前DEPT.DEPTNO相等"；改写为DEPTNO IN (SELECT DISTINCT DEPTNO FROM EMP)在集合语义上完全等价——两者均筛选出在EMP表中存在对应DEPTNO的DEPT行；DISTINCT确保IN子查询返回唯一值集合，与EXISTS的存在性判断一致，不会产生重复行。\n\n3. 排序优化等价性：原SQL内层ORDER BY DEPTNO与外层ORDER BY DEPTNO重复；由于OFFSET/FETCH仅在最外层生效，内层排序对最终结果集无影响；移除内层排序及派生表t3后，直接在基表DEPT上应用外层ORDER BY DEPTNO + OFFSET/FETCH，结果集顺序与分页范围完全一致；dept_pkey主键索引(deptno)可支持有序扫描。\n\n4. 投影优化等价性：原SELECT *在当前Schema下等价于SELECT DEPTNO, NAME(DEPT表仅有这两列)；显式投影不改变结果集内容，仅减少传输开销。\n\n5. 过滤条件等价性：原WHERE EXISTS子查询的相关条件DEPTNO = t4.DEPTNO已通过IN (SELECT DISTINCT DEPTNO FROM EMP)完整表达；无额外过滤条件被遗漏或错误下推；EMP.DEPTNO为NOT NULL列(根据DDL)，无需额外NULL处理。\n\n6. 分页语义保证：OFFSET 2 ROWS FETCH NEXT 10 ROWS ONLY在改写前后均作用于最外层ORDER BY DEPTNO的结果集；由于内层排序已被证明冗余，改写后的分页逻辑与原SQL完全一致——跳过前2行，取接下来10行。\n\n7. 易误判点说明：EXISTS与IN的语义差异在于重复行处理，但由于DEPT.DEPTNO为主键(唯一且非空)，即使EMP中同一DEPTNO出现多次，IN + DISTINCT也仅返回唯一匹配的DEPT行，不会产生笛卡尔积或重复行；最终结果集行数与列值与原SQL严格一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过将EXISTS相关子查询改写为IN + DISTINCT半连接、消除冗余派生表和内层排序、显式投影列，在Schema约束下与原始SQL等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 45900226.0 -> 22045911.0 (重写侧约为原的 48.0301%) | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。
+⚠️ 检测到成本爆炸：重写 cost 增幅 227262332.9% (> 1000%)，判定当前重写性能更差，进入下一轮优化。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮重写导致 cost 从 0.82 暴增至 1863551.95（增幅 227262332.9%），根本原因是引入了 EMP 全表扫描（Seq Scan，cost 656004.9）+ 并行排序 + Gather Merge + Unique + Merge Join 的复杂管道，而原始 SQL 仅需 HashAggregate + Hash Semi Join 即可完成。当前执行计划显示：1) EMP 表（4500万行）被并行全扫描后做 HashAggregate 去重，再排序、Gather Merge、Unique，最后与 DEPT 做 Merge Join；2) DEPT 虽走索引扫描但需等待 EMP 侧巨大中间结果；3) LIMIT/OFFSET 在最外层无法提前截断内层开销。需立即回退上一轮的 CTE/JOIN 改写，恢复原始 Semi Join 语义（IN + DISTINCT 子查询），让优化器选择 Hash Semi Join + HashAggregate 的低成本路径，避免 EMP 全表排序。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "回退上一轮将 IN 子查询改写为 INNER JOIN 的操作。保持原始 'WHERE DEPTNO IN (SELECT DISTINCT DEPTNO FROM EMP)' 的 Semi Join 语义，让 PostgreSQL 优化器选择 Hash Semi Join，避免 EMP 表全扫描 + 排序 + Merge Join 的高成本管道。Semi Join 只需对 EMP.DEPTNO 做 HashAggregate 去重后构建哈希表，DEPT 侧探测即可，无需排序与 Gather Merge。"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "移除上一轮引入的 EMP 侧排序需求。原始 SQL 的 ORDER BY DEPTNO 仅需对 DEPT 最终结果集（最多 450000 行，实际经 Semi Join 过滤后更少）排序，而当前计划在 EMP 侧（4500万行）先排序再 Unique，成本极高。恢复 Semi Join 后，排序仅作用于 DEPT 过滤后的小结果集。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "避免 Merge Join 路径。当前 Merge Join 要求 EMP 侧预先排序（cost 1862547.51），而 Hash Semi Join 无此要求，仅需 EMP.DEPTNO 的 HashAggregate（原始计划 cost 约 0.5）+ DEPT 侧哈希探测。回退 JOIN 改写，让优化器重新选择 Hash Semi Join。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 39 rules
+   → SORT_PROJECT_TRANSPOSE: UCT=1.100
+   → SORT_UNION_TRANSPOSE: UCT=1.100
+   → SORT_UNION_TRANSPOSE_MATCH_NULL_FETCH: UCT=1.100
+{
+  "groups": "排序优化, 连接优化, 子查询优化",
+  "applied_rules": [],
+  "rule_effect_scores": {},
+  "rule_effect_confidence": {}
+}
+✅ 选择了 0 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "排序优化, 连接优化, 子查询优化",
+  "applied_rules": [],
+  "rewritten_sql": "SELECT DEPTNO, NAME\nFROM DEPT\nWHERE DEPTNO IN (SELECT DISTINCT DEPTNO FROM EMP)\nORDER BY DEPTNO\nOFFSET 2 ROWS FETCH NEXT 10 ROWS ONLY",
+  "semantic_correctness_guarantee": "1. **结构性改写**：本轮未做任何结构性改写，完全保持原始 SQL 的 IN 子查询形式。上一轮将 IN 子查询改写为 INNER JOIN 导致成本爆炸（227262332.9% 增幅），本轮按评估反馈回退该改写，恢复原始 Semi Join 语义。\n\n2. **Semi Join 语义等价性**：原始 SQL 的 'WHERE DEPTNO IN (SELECT DISTINCT DEPTNO FROM EMP)' 是标准 Semi Join 语义，仅保留 DEPT 中存在于 EMP.DEPTNO 的行，不产生笛卡尔积。PostgreSQL 优化器会选择 Hash Semi Join：对 EMP.DEPTNO 做 HashAggregate 去重后构建哈希表（约 0.5 cost），DEPT 侧探测（450000 行），无需 EMP 全表排序。\n\n3. **主键与去重保证**：DEPT.DEPTNO 是主键（dept_pkey），保证 DEPT 侧无重复行。子查询中的 DISTINCT 仅作用于 EMP.DEPTNO（非主键但会被 HashAggregate 去重），Semi Join 本身只需匹配存在性，不会因 EMP 中同一 DEPTNO 的多行而重复返回 DEPT 行。\n\n4. **排序与分页语义**：ORDER BY DEPTNO 仅作用于 DEPT 过滤后的结果集（最多 450000 行，实际经 Semi Join 过滤后更少），OFFSET 2 FETCH NEXT 10 在排序后的结果集上截取第 3-12 行，与原始 SQL 完全一致。\n\n5. **回退理由**：上一轮改写为 'INNER JOIN (SELECT DISTINCT DEPTNO FROM EMP) subq ON DEPT.DEPTNO = subq.DEPTNO' 后，优化器选择了 Merge Join 路径，要求 EMP 侧先排序 4500 万行（cost 1862547.51），导致成本爆炸。原始 IN 子查询形式让优化器自然选择 Hash Semi Join，避免排序开销。\n\n6. **NULL 处理**：EMP.DEPTNO 定义为 NOT NULL，DEPT.DEPTNO 为主键（NOT NULL），IN 子查询不涉及 NULL 匹配歧义，Semi Join 语义清晰。\n\n7. **索引利用**：当前 Schema 中 EMP 表仅有 empno 主键索引，无 deptno 索引，Hash Semi Join 通过顺序扫描 EMP 并哈希 DEPTNO 列（成本可控），优于上一轮 Merge Join 的排序需求。DEPT 侧可能利用 dept_pkey 索引扫描或顺序扫描后排序（结果集小，成本低）。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL在子查询外层有嵌套的ORDER BY和分页，重写SQL消除了外层排序但保留了分页语义，两者在逻辑上等价；但原始SQL使用EXISTS相关子查询，重写SQL改为IN + DISTINCT子查询，虽然Semi Join语义相同，但这属于子查询形式的改写而非结构保持，且原始SQL的内层子查询未去```json
+{
+    "equivalent": false,
+    "message": "原始SQL在子查询外层有嵌套的ORDER BY和分页，重写SQL消除了外层排序但保留了分页语义，两者在逻辑上等价；但原始SQL使用EXISTS相关子查询，重写SQL改为IN + DISTINCT子查询，虽然Semi Join语义相同，但这属于子查询形式的改写而非结构保持，且原始SQL的内层子查询未去重，重写SQL显式DISTINCT——在当前Schema下两者结果集相同，判定等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 45900226.0 -> 22045911.0 (重写侧约为原的 48.0301%) | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。
+⚠️ 检测到成本爆炸：重写 cost 增幅 227262332.9% (> 1000%)，达到最大轮次后终止。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 202
+   - 规则序列: []
+   - 优化组别: 排序优化, 连接优化, 子查询优化
+   - 估计代价: 原始=0.82, 重写=1863551.95，相对变化: -227262332.93%
+✅ 成功存储，记录ID: f233c0d7-b0d3-46ee-a486-2a9031ef2472
+
+----------------------------------------
+

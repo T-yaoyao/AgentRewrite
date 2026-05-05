@@ -1,0 +1,104 @@
+Query ID: 42
+==================================================
+
+Original: select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1997-03-01' and l_shipdate < date '1997-03-01' + interval '1' month;
+Rewritten: SELECT 100.00 * sum_promo / sum_total AS promo_revenue
+FROM (
+  SELECT 
+    SUM(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%') AS sum_promo,
+    SUM(l_extendedprice * (1 - l_discount)) AS sum_total
+  FROM lineitem
+  JOIN part ON l_partkey = p_partkey
+  WHERE l_shipdate >= DATE '1997-03-01' 
+    AND l_shipdate < DATE '1997-03-01' + INTERVAL '1' month
+) AS s;
+Time Cost: 147.39s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': "将CASE WHEN条件转换为FILTER子句：sum(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%')，避免全量计算CASE表达式"}, {'group': '谓词简化', 'produced_suggestion': '将l_shipdate日期范围条件下推到JOIN前过滤，减少JOIN输入行数；考虑在lineitem.l_shipdate和lineitem.l_partkey上创建复合索引以消除Seq Scan'}, {'group': '连接优化', 'produced_suggestion': "调整JOIN顺序，先对part表按p_type LIKE 'PROMO%'过滤后再与lineitem JOIN，减少Hash表构建代价和JOIN匹配次数"}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显优化空间：1) lineitem表全表扫描(Seq Scan)代价高达1500056.82，过滤后仅得124971行，过滤率低；2) part表全表扫描代价49325.33，未利用索引；3) CASE WHEN聚合可转换为FILTER子句提升性能；4) 历史案例显示相同SQL指纹通过PROJECT_JOIN_TRANSPOSE和AGGREGATE_CASE_TO_FILTER规则优化成功，命中3次",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将CASE WHEN条件转换为FILTER子句：sum(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%')，避免全量计算CASE表达式"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将l_shipdate日期范围条件下推到JOIN前过滤，减少JOIN输入行数；考虑在lineitem.l_shipdate和lineitem.l_partkey上创建复合索引以消除Seq Scan"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序，先对part表按p_type LIKE 'PROMO%'过滤后再与lineitem JOIN，减少Hash表构建代价和JOIN匹配次数"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 64 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.211
+   → AGGREGATE_VALUES: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+{
+  "groups": "聚合优化, 谓词简化, 连接优化",
+  "applied_rules": ["AGGREGATE_CASE_TO_FILTER", "PROJECT_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "AGGREGATE_CASE_TO_FILTER": 0.5,
+    "PROJECT_JOIN_TRANSPOSE": 0.5
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_CASE_TO_FILTER": 0.8,
+    "PROJECT_JOIN_TRANSPOSE": 0.9
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 谓词简化, 连接优化",
+  "applied_rules": ["AGGREGATE_CASE_TO_FILTER", "PROJECT_JOIN_TRANSPOSE"],
+  "rewritten_sql": "SELECT 100.00 * sum_promo / sum_total AS promo_revenue\nFROM (\n  SELECT \n    SUM(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%') AS sum_promo,\n    SUM(l_extendedprice * (1 - l_discount)) AS sum_total\n  FROM lineitem\n  JOIN part ON l_partkey = p_partkey\n  WHERE l_shipdate >= DATE '1997-03-01' \n    AND l_shipdate < DATE '1997-03-01' + INTERVAL '1' month\n) AS s;",
+  "semantic_correctness_guarantee": "1. **AGGREGATE_CASE_TO_FILTER 改写**：将原 SQL 中的 `SUM(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0 END)` 改写为 `SUM(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%')`。FILTER 子句在 SQL 标准中与 CASE WHEN...ELSE 0 在聚合语义上完全等价：仅对满足条件的行累加非零值，不满足条件的行被排除（等同于累加 0）。\n\n2. **PROJECT_JOIN_TRANSPOSE 改写**：将除法运算 `100.00 * sum_promo / sum_total` 从内层 SELECT 提升到外层子查询，内层仅计算两个 SUM 聚合并命名为 sum_promo 和 sum_total。这是纯投影变换，不改变聚合范围、分组键（无 GROUP BY）或过滤条件，仅改变计算表达式的层次结构。\n\n3. **聚合作用域不变**：原 SQL 和重写 SQL 均对 lineitem 与 part 内连接后、经 WHERE 过滤的结果集进行全局聚合（无 GROUP BY），聚合函数作用于相同的行集合。\n\n4. **JOIN 与过滤条件不变**：保持 `lineitem JOIN part ON l_partkey = p_partkey` 和 `WHERE l_shipdate >= DATE '1997-03-01' AND l_shipdate < DATE '1997-03-01' + INTERVAL '1' month` 完全一致，JOIN 类型（INNER JOIN）、连接键、日期范围谓词均未改变，因此参与聚合的行集合与原 SQL 相同。\n\n5. **除法与 NULL 处理**：原 SQL 在分母为 0 时会产生除零错误或 NULL；重写 SQL 保持相同行为（sum_total 为 0 时除法同样报错或返回 NULL）。由于 l_extendedprice 和 l_discount 在 Schema 中为 NOT NULL，且过滤条件不引入 NULL，分子分母的 NULL 语义与原 SQL 一致。\n\n6. **结果列名与类型**：原 SQL 输出列名为 promo_revenue，重写 SQL 通过外层 `AS promo_revenue` 保持列名一致；数值类型（decimal 运算结果）在 PostgreSQL 中保持一致。\n\n7. **无易误判点**：无 GROUP BY、HAVING、ORDER BY、LIMIT、DISTINCT、相关子查询或窗口函数，聚合作用域明确为全表（过滤后），FILTER 子句与 CASE WHEN 在此场景下语义完全等价，投影层次调整不影响最终计算结果。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "两 SQL 等价：FILTER 子句与 CASE WHEN...ELSE 0 在聚合语义上完全一致，投影层次调整不改变最终结果集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（cost 1576662.12，并行 Hash Join + Gather，扫描方式、连接算法、并行度均无变化）。重写仅将 CASE WHEN 改为 FILTER 子句并增加派生表包装，但优化器生成了相同的物理计划，说明该改写在逻辑等价性上成功，且未引入任何结构退化。虽然无明显性能提升，但已达到「无恶化 + 语义清晰化」目标，且进一步优化空间有限（需索引或物化视图等 DDL 层面改动，超出 SQL 重写范畴）。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 243
+   - 规则序列: ['AGGREGATE_CASE_TO_FILTER', 'PROJECT_JOIN_TRANSPOSE']
+   - 优化组别: 聚合优化, 谓词简化, 连接优化
+   - 估计代价: 原始=1576662.12, 重写=1576662.12，相对变化: 0.00%
+✅ 成功存储，记录ID: 8ea4802f-5cae-4b21-882c-3c1b7c7ce2e4
+
+🎲 UCT Math Update: 2 rules, reward=-0.0500 (cost=+0.0000, rows=+0.0000, depth=-0.1667, oc=1576662.1200, rc=1576662.1200)
+   结构分细节: rows 1916612.0->1916613.0 (score=+0.000), depth 6.0->7.0 (score=-0.167)
+✅ UCT Update Complete:
+   → AGGREGATE_CASE_TO_FILTER: P(s,a)=N/A, effect=0.500, conf=0.80, lambda=0.40, reward=-0.026, count=11, avg=-0.004
+   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.500, conf=0.90, lambda=0.45, reward=-0.024, count=108, avg=+0.027
+
+----------------------------------------
+

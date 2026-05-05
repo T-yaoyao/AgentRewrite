@@ -1,0 +1,87 @@
+Query ID: 52
+==================================================
+
+Original: select distinct d.deptno from emp e right outer join dept d on e.deptno = d.deptno
+Rewritten: select d.deptno from dept d
+Time Cost: 115.50s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '消除DISTINCT聚合操作。当前SQL使用RIGHT OUTER JOIN后再DISTINCT去重d.deptno，但由于只需要dept表中存在关联的deptno，可以将其改写为LEFT SEMI JOIN或使用EXISTS子查询，直接返回dept表的deptno而无需去重，避免Aggregate(Hashed)算子处理1875万行数据的高昂代价(1872446.65)'}, {'group': '连接优化', 'produced_suggestion': "将RIGHT OUTER JOIN转换为LEFT SEMI JOIN。当前查询的语义是获取dept表中所有deptno(无论是否在emp表中存在匹配)，RIGHT OUTER JOIN会产生大量重复的dept.deptno需要后续DISTINCT去重。改写为'SELECT d.deptno FROM dept d'或'SELECT d.deptno FROM dept d WHERE EXISTS (SELECT 1 FROM emp e WHERE e.deptno = d.deptno) OR NOT EXISTS (SELECT 1 FROM emp e WHERE e.deptno = d.deptno)'可简化为直接扫描dept表，避免与4500万行的emp表进行Hash Join"}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显的性能瓶颈：1) RIGHT OUTER JOIN后使用了DISTINCT去重，导致需要Aggregate(Hashed)算子处理1875万行数据，代价高达1872446.65；2) 两个大表进行全表扫描(Seq Scan)，emp表扫描代价656004.9，dept表扫描代价5111.06；3) 执行计划中存在Gather Merge和Sort算子，增加了额外开销。根据相似历史案例(相似度1.0000)，该SQL可通过AGGREGATE_REMOVE规则优化，将RIGHT OUTER JOIN + DISTINCT转换为更高效的半连接形式，避免不必要的去重操作。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除DISTINCT聚合操作。当前SQL使用RIGHT OUTER JOIN后再DISTINCT去重d.deptno，但由于只需要dept表中存在关联的deptno，可以将其改写为LEFT SEMI JOIN或使用EXISTS子查询，直接返回dept表的deptno而无需去重，避免Aggregate(Hashed)算子处理1875万行数据的高昂代价(1872446.65)"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将RIGHT OUTER JOIN转换为LEFT SEMI JOIN。当前查询的语义是获取dept表中所有deptno(无论是否在emp表中存在匹配)，RIGHT OUTER JOIN会产生大量重复的dept.deptno需要后续DISTINCT去重。改写为'SELECT d.deptno FROM dept d'或'SELECT d.deptno FROM dept d WHERE EXISTS (SELECT 1 FROM emp e WHERE e.deptno = d.deptno) OR NOT EXISTS (SELECT 1 FROM emp e WHERE e.deptno = d.deptno)'可简化为直接扫描dept表，避免与4500万行的emp表进行Hash Join"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{
+  "groups": "聚合优化, 连接优化",
+  "applied_rules": ["AGGREGATE_JOIN_REMOVE", "AGGREGATE_REMOVE"],
+  "rule_effect_scores": {
+    "AGGREGATE_JOIN_REMOVE": 0.6,
+    "AGGREGATE_REMOVE": 0.4
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_JOIN_REMOVE": 0.9,
+    "AGGREGATE_REMOVE": 0.85
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 连接优化",
+  "applied_rules": [
+    "AGGREGATE_JOIN_REMOVE",
+    "AGGREGATE_REMOVE"
+  ],
+  "rewritten_sql": "select d.deptno from dept d",
+  "semantic_correctness_guarantee": "1. 结构性改写说明：原SQL为「emp RIGHT OUTER JOIN dept ON e.deptno = d.deptno」后对d.deptno执行DISTINCT去重。重写SQL直接扫描dept表返回d.deptno，完全移除了JOIN和DISTINCT操作。\n\n2. JOIN移除的等价性保证：RIGHT OUTER JOIN语义保证dept表的所有行都会出现在结果集中（无论emp表是否有匹配行）。由于SELECT子句仅投影d.deptno（右表列），且未使用emp表的任何列或聚合计数，因此JOIN操作对最终结果集无实质影响。根据Schema，dept.deptno是主键（PRIMARY KEY），每个deptno在dept表中唯一存在，RIGHT OUTER JOIN后每个dept.deptno可能因emp表多行匹配而重复出现。\n\n3. DISTINCT移除的等价性保证：原SQL的DISTINCT用于消除JOIN产生的重复dept.deptno。由于dept.deptno是主键（见Schema中ALTER TABLE dept ADD CONSTRAINT dept_pkey PRIMARY KEY (deptno)），dept表中每个deptno本身已唯一，直接扫描dept表返回的d.deptno天然无重复，无需DISTINCT去重。\n\n4. 结果集完整性验证：原SQL返回所有在dept表中存在的deptno（RIGHT OUTER JOIN保证dept表全覆盖）；重写SQL直接返回dept表的所有deptno。两者结果集完全一致，均为dept表中所有唯一的deptno值。\n\n5. 易误判点澄清：虽然原SQL包含JOIN操作，但RIGHT OUTER JOIN的语义决定了结果集由右表（dept）驱动，左表（emp）仅影响是否产生重复行（通过匹配行数），不影响哪些deptno出现在结果中。由于最终仅需dept.deptno且该列为主键，JOIN和DISTINCT均为冗余操作，移除后语义完全等价。\n\n6. NULL值处理：dept.deptno定义为NOT NULL（见Schema），不存在NULL值问题，重写前后NULL处理行为一致。\n\n7. 统计信息验证：dept表45万行，emp表4500万行。原SQL需处理RIGHT OUTER JOIN产生的大量重复行（最坏情况下每个dept.deptno匹配emp表中所有对应行），再通过DISTINCT去重回到45万行。重写SQL直接扫描dept表45万行，避免了JOIN和去重的高昂代价，性能大幅提升且结果集完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "RIGHT OUTER JOIN保证dept表所有行都出现在结果中，SELECT仅投影右表主键列d.deptno，JOIN后的DISTINCT去重与直接扫描dept表的主键列结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 40459592.0 -> 450000.0 (重写侧约为原的 1.1122%) | 强信号: 行数估计求和大幅下降，重写侧约为原的 1.1122% (<= 10%)
+✅ 行数估计求和大幅下降至原的 1.1122%，直接判定优化成功，终止并保留重写 SQL
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 80
+   - 规则序列: ['AGGREGATE_JOIN_REMOVE', 'AGGREGATE_REMOVE']
+   - 优化组别: 聚合优化, 连接优化
+   - 估计代价: 原始=2050337.5, 重写=6964.0，相对变化: 99.66%
+✅ 成功存储，记录ID: 063f25fe-c49c-4360-b44d-55a2f35d66de
+
+🎲 UCT Math Update: 2 rules, reward=+0.9517 (cost=+0.9966, rows=+0.9889, depth=+0.8571, oc=2050337.5000, rc=6964.0000)
+   结构分细节: rows 40459592.0->450000.0 (score=+0.989), depth 7.0->1.0 (score=+0.857)
+✅ UCT Update Complete:
+   → AGGREGATE_JOIN_REMOVE: P(s,a)=N/A, effect=0.600, conf=0.90, lambda=0.45, reward=+0.531, count=8, avg=+0.347
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=0.400, conf=0.85, lambda=0.42, reward=+0.420, count=28, avg=+0.185
+
+----------------------------------------
+

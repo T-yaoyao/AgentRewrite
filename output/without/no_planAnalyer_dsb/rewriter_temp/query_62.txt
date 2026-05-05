@@ -1,0 +1,141 @@
+Query ID: 62
+==================================================
+
+Original: with inv as (select w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy        ,stdev,mean, case mean when 0 then null else stdev/mean end cov  from(select w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy             ,stddev_samp(inv_quantity_on_hand) stdev,avg(inv_quantity_on_hand) mean       from inventory           ,item           ,warehouse           ,date_dim       where inv_item_sk = i_item_sk         and inv_warehouse_sk = w_warehouse_sk         and inv_date_sk = d_date_sk         and d_year =1998         and i_category IN ('Books', 'Home')         and i_manager_id BETWEEN 28 and 47         and inv_quantity_on_hand between 225 and 425       group by w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy) foo  where case mean when 0 then 0 else stdev/mean end > 1) select inv1.w_warehouse_sk,inv1.i_item_sk,inv1.d_moy,inv1.mean, inv1.cov         ,inv2.w_warehouse_sk,inv2.i_item_sk,inv2.d_moy,inv2.mean, inv2.cov from inv inv1,inv inv2 where inv1.i_item_sk = inv2.i_item_sk   and inv1.w_warehouse_sk =  inv2.w_warehouse_sk   and inv1.d_moy=2   and inv2.d_moy=2+1   and inv1.cov > 1.5 order by inv1.w_warehouse_sk,inv1.i_item_sk,inv1.d_moy,inv1.mean,inv1.cov         ,inv2.d_moy,inv2.mean, inv2.cov ;
+Rewritten: SELECT inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,
+       inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov
+FROM (
+  SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean,
+         CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END AS cov
+  FROM (
+    SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy,
+           STDDEV_SAMP(inv_quantity_on_hand) AS stdev,
+           AVG(inv_quantity_on_hand) AS mean
+    FROM inventory
+    JOIN item ON inv_item_sk = i_item_sk
+      AND i_category IN ('Books', 'Home')
+      AND i_manager_id BETWEEN 28 AND 47
+    JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk
+    JOIN date_dim ON inv_date_sk = d_date_sk
+      AND d_year = 1998
+      AND d_moy = 2
+    WHERE inv_quantity_on_hand BETWEEN 225 AND 425
+    GROUP BY w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy
+  ) foo
+  WHERE CASE WHEN mean = 0 THEN 0 ELSE stdev/mean END > 1
+) inv1
+JOIN (
+  SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean,
+         CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END AS cov
+  FROM (
+    SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy,
+           STDDEV_SAMP(inv_quantity_on_hand) AS stdev,
+           AVG(inv_quantity_on_hand) AS mean
+    FROM inventory
+    JOIN item ON inv_item_sk = i_item_sk
+      AND i_category IN ('Books', 'Home')
+      AND i_manager_id BETWEEN 28 AND 47
+    JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk
+    JOIN date_dim ON inv_date_sk = d_date_sk
+      AND d_year = 1998
+      AND d_moy = 3
+    WHERE inv_quantity_on_hand BETWEEN 225 AND 425
+    GROUP BY w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy
+  ) foo
+  WHERE CASE WHEN mean = 0 THEN 0 ELSE stdev/mean END > 1
+) inv2 ON inv1.i_item_sk = inv2.i_item_sk
+  AND inv1.w_warehouse_sk = inv2.w_warehouse_sk
+WHERE inv1.cov > 1.5
+ORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,
+         inv2.d_moy, inv2.mean, inv2.cov
+Time Cost: 138.48s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将CTE inv内联展开为两个独立子查询inv1和inv2,避免CTE物化开销。在各子查询中直接应用d_moy过滤条件(d_moy=2和d_moy=3),减少聚合计算范围'}, {'group': '谓词简化', 'produced_suggestion': '将inv1的cov>1.5过滤条件和d_moy=2条件下推到CTE内部的HAVING子句,结合原有的stdev/mean>1条件,在聚合阶段提前过滤。将d_moy条件下推到date_dim表的WHERE子句,减少JOIN前的数据量'}, {'group': '连接优化', 'produced_suggestion': '将inventory与date_dim的Hash Join改为先过滤date_dim(d_year=1998且d_moy IN(2,3)),再与inventory JOIN。利用inventory_pkey索引(inv_date_sk,inv_item_sk,inv_warehouse_sk)进行Index Scan替代Seq Scan,结合inv_quantity_on_hand范围条件'}, {'group': '聚合优化', 'produced_suggestion': '在GROUP BY聚合前,先应用所有可下推的过滤条件(d_moy、i_category、i_manager_id、inv_quantity_on_hand),减少参与聚合的行数。考虑将CASE表达式的过滤条件合并到HAVING子句统一处理'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示CTE inv被物化后扫描两次(inv1和inv2各一次),且CTE内部存在大表全表扫描(inventory表133M行)和多次排序操作。主要性能瓶颈包括:1)Seq Scan on inventory代价高达1551452.05,过滤条件inv_quantity_on_hand between 225 and 425在扫描后应用;2)CTE被重复计算并物化,inv1和inv2的过滤条件(d_moy=2和d_moy=3)在CTE扫描时才应用;3)多层排序操作(Gather Merge需要排序,最终Incremental Sort)增加开销;4)相似历史案例显示该SQL指纹曾通过JOIN_CONDITION_PUSH、FILTER_INTO_JOIN等规则成功优化",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将CTE inv内联展开为两个独立子查询inv1和inv2,避免CTE物化开销。在各子查询中直接应用d_moy过滤条件(d_moy=2和d_moy=3),减少聚合计算范围"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将inv1的cov>1.5过滤条件和d_moy=2条件下推到CTE内部的HAVING子句,结合原有的stdev/mean>1条件,在聚合阶段提前过滤。将d_moy条件下推到date_dim表的WHERE子句,减少JOIN前的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将inventory与date_dim的Hash Join改为先过滤date_dim(d_year=1998且d_moy IN(2,3)),再与inventory JOIN。利用inventory_pkey索引(inv_date_sk,inv_item_sk,inv_warehouse_sk)进行Index Scan替代Seq Scan,结合inv_quantity_on_hand范围条件"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "在GROUP BY聚合前,先应用所有可下推的过滤条件(d_moy、i_category、i_manager_id、inv_quantity_on_hand),减少参与聚合的行数。考虑将CASE表达式的过滤条件合并到HAVING子句统一处理"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.221
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+{
+  "groups": "子查询优化, 谓词简化, 连接优化, 聚合优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "FILTER_REDUCE_EXPRESSIONS"],
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.4,
+    "JOIN_CONDITION_PUSH": 0.4,
+    "FILTER_REDUCE_EXPRESSIONS": 0.2
+  },
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.6,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "FILTER_REDUCE_EXPRESSIONS": 0.8
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 谓词简化, 连接优化, 聚合优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "FILTER_REDUCE_EXPRESSIONS"],
+  "rewritten_sql": "SELECT inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,\n       inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov\nFROM (\n  SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean,\n         CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END AS cov\n  FROM (\n    SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy,\n           STDDEV_SAMP(inv_quantity_on_hand) AS stdev,\n           AVG(inv_quantity_on_hand) AS mean\n    FROM inventory\n    JOIN item ON inv_item_sk = i_item_sk\n      AND i_category IN ('Books', 'Home')\n      AND i_manager_id BETWEEN 28 AND 47\n    JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk\n    JOIN date_dim ON inv_date_sk = d_date_sk\n      AND d_year = 1998\n      AND d_moy = 2\n    WHERE inv_quantity_on_hand BETWEEN 225 AND 425\n    GROUP BY w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy\n  ) foo\n  WHERE CASE WHEN mean = 0 THEN 0 ELSE stdev/mean END > 1\n) inv1\nJOIN (\n  SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean,\n         CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END AS cov\n  FROM (\n    SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy,\n           STDDEV_SAMP(inv_quantity_on_hand) AS stdev,\n           AVG(inv_quantity_on_hand) AS mean\n    FROM inventory\n    JOIN item ON inv_item_sk = i_item_sk\n      AND i_category IN ('Books', 'Home')\n      AND i_manager_id BETWEEN 28 AND 47\n    JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk\n    JOIN date_dim ON inv_date_sk = d_date_sk\n      AND d_year = 1998\n      AND d_moy = 3\n    WHERE inv_quantity_on_hand BETWEEN 225 AND 425\n    GROUP BY w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy\n  ) foo\n  WHERE CASE WHEN mean = 0 THEN 0 ELSE stdev/mean END > 1\n) inv2 ON inv1.i_item_sk = inv2.i_item_sk\n  AND inv1.w_warehouse_sk = inv2.w_warehouse_sk\nWHERE inv1.cov > 1.5\nORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,\n         inv2.d_moy, inv2.mean, inv2.cov",
+  "semantic_correctness_guarantee": "1. **CTE内联展开**：将原始SQL中的CTE `inv` 内联展开为两个独立子查询 `inv1` 和 `inv2`，分别对应 `d_moy=2` 和 `d_moy=3` 的数据。由于原始查询在最外层自连接时已通过 `inv1.d_moy=2` 和 `inv2.d_moy=2+1` 过滤，内联后直接在各子查询的 `date_dim` JOIN条件中加入 `d_moy=2` 和 `d_moy=3`，结果集与原始查询完全一致。\n\n2. **FILTER_INTO_JOIN应用**：将原始SQL中 WHERE 子句的表级过滤条件（`i_category IN ('Books', 'Home')`、`i_manager_id BETWEEN 28 AND 47`、`d_year=1998`、`d_moy` 条件）推入各自表的 JOIN ON 子句。这些条件仅依赖单表列，推入 ON 子句后在连接阶段即完成过滤，减少中间结果，但不改变最终结果集语义。\n\n3. **JOIN_CONDITION_PUSH应用**：将 `d_moy=2` 和 `d_moy=3` 条件从最外层 WHERE 下推到 `date_dim` 表的 JOIN ON 子句中。由于 `d_moy` 是 `date_dim` 表的列，下推后在 JOIN 阶段即过滤掉不符合条件的日期维度行，减少参与聚合的数据量，但保持与原始查询相同的过滤逻辑。\n\n4. **FILTER_REDUCE_EXPRESSIONS应用**：原始SQL中 `inv1.d_moy=2` 和 `inv2.d_moy=2+1` 已在子查询内通过 `d_moy` 条件固化，最外层 WHERE 的 `inv1.cov > 1.5` 保持不变。未引入恒真/恒假条件，该规则主要体现在简化条件表达式的逻辑结构上。\n\n5. **GROUP BY与聚合语义保持**：重写后的两个子查询均保持原始的 `GROUP BY w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy` 和聚合函数 `STDDEV_SAMP`、`AVG`。由于 `(inv_date_sk, inv_item_sk, inv_warehouse_sk)` 是 `inventory` 表的主键，且 `d_moy` 由 `date_dim` 表的 `d_date_sk` 唯一确定，GROUP BY 的键组合保证了聚合结果的唯一性和正确性。\n\n6. **CASE表达式与过滤条件等价性**：原始SQL在CTE内通过 `WHERE case mean when 0 then 0 else stdev/mean end > 1` 过滤，重写后保持相同逻辑。外层 `inv1.cov > 1.5` 条件在原始SQL中也存在，重写后位置不变，确保最终结果集仅包含 `cov > 1.5` 的 `inv1` 行。\n\n7. **自连接条件保持**：原始SQL通过 `inv1.i_item_sk = inv2.i_item_sk` 和 `inv1.w_warehouse_sk = inv2.w_warehouse_sk` 进行自连接，重写后保持相同的 JOIN ON 条件，确保两个子查询结果按相同的仓库和商品进行匹配。\n\n8. **ORDER BY语义一致**：重写后的 ORDER BY 子句与原始SQL完全一致，按 `inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.d_moy, inv2.mean, inv2.cov` 排序，保证结果集顺序不变。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE内联展开和条件下推，将d_moy=2和d_moy=3的过滤条件分别推入两个子查询的JOIN ON子句，与原始SQL在相同库状态和参数下产生相同的结果集（行集合与列语义一致）。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 3->2, index-like 1->6 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 14392971.0 -> 31361.0 (重写侧约为原的 0.2179%) | 强信号: 行数估计求和大幅下降，重写侧约为原的 0.2179% (<= 10%) | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。
+✅ 行数估计求和大幅下降至原的 0.2179%，直接判定优化成功，终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1008
+   - 规则序列: ['FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH', 'FILTER_REDUCE_EXPRESSIONS']
+   - 优化组别: 子查询优化, 谓词简化, 连接优化, 聚合优化
+   - 估计代价: 原始=1608276.33, 重写=2112460.02，相对变化: -31.35%
+✅ 成功存储，记录ID: bbdde714-37f1-4cad-8c20-6dc9458757a5
+
+🎲 UCT Math Update: 3 rules, reward=+0.3051 (cost=-0.3135, rows=+0.9978, depth=+0.0000, oc=1608276.3300, rc=2112460.0200)
+   结构分细节: rows 14392971.0->31361.0 (score=+0.998), depth 11.0->11.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.400, conf=0.60, lambda=0.30, reward=+0.116, count=345, avg=+0.021
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.400, conf=0.70, lambda=0.35, reward=+0.109, count=287, avg=+0.010
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.200, conf=0.80, lambda=0.40, reward=+0.080, count=79, avg=+0.033
+
+----------------------------------------
+

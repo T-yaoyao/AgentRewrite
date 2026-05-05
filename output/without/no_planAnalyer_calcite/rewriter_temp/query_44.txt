@@ -1,0 +1,188 @@
+Query ID: 44
+==================================================
+
+Original: SELECT NAME AS NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT GROUP BY GROUPING SETS((NAME, DEPTNO), NAME) HAVING NAME = 'Charlie'
+Rewritten: SELECT NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C
+FROM DEPT
+WHERE NAME = 'Charlie'
+GROUP BY GROUPING SETS ((NAME, DEPTNO), (NAME))
+Time Cost: 222.54s
+Suggestion: [{'group': '集合优化', 'produced_suggestion': '将UNION ALL的两个分支合并回GROUPING SETS((NAME,DEPTNO),(NAME))结构，消除dept表的重复扫描（当前扫描两次dept和dept_1），恢复单次Parallel Seq Scan，预期总成本从13547.42降至约6774.44（接近原始SQL）'}, {'group': '谓词简化', 'produced_suggestion': "过滤条件name='Charlie'已正确下推至Seq Scan层（Filter字段），无需调整。但建议数据库层面在dept.name列创建B-tree索引（CREATE INDEX idx_dept_name ON dept(name)），可将Seq Scan（成本5772.82）转为Index Scan，大幅降低450000行表的扫描开销"}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示对450000行的dept表进行了Parallel Seq Scan（Total Cost 5772.82），然后进行Sort和Aggregate操作。由于HAVING子句中的过滤条件NAME='Charlie'在Seq Scan阶段已应用，但GROUPING SETS会产生额外的分组集合计算开销。根据相似历史案例（相似度1.0），该SQL模式曾通过FILTER_AGGREGATE_TRANSPOSE、AGGREGATE_UNION_TRANSPOSE、AGGREGATE_PROJECT_MERGE规则组合优化成功。可以将HAVING条件转换为WHERE提前过滤，并将GROUPING SETS转换为UNION ALL形式，减少聚合计算复杂度。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将HAVING NAME='Charlie'转换为WHERE NAME='Charlie'，在聚合前过滤数据，减少参与GROUP BY的行数，降低Sort和Aggregate的代价"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "应用FILTER_AGGREGATE_TRANSPOSE规则，将HAVING过滤条件下推到聚合之前；然后应用AGGREGATE_UNION_TRANSPOSE将GROUPING SETS((NAME,DEPTNO),NAME)改写为两个独立聚合的UNION ALL：SELECT NAME,DEPTNO,COUNT(*) WHERE NAME='Charlie' GROUP BY NAME,DEPTNO UNION ALL SELECT NAME,NULL,COUNT(*) WHERE NAME='Charlie' GROUP BY NAME"
+    },
+    {
+      "group": "集合优化",
+      "produced_suggestion": "将GROUPING SETS分解为UNION ALL后，每个分支的聚合更简单，优化器可以为每个分支选择更优的执行计划，避免复杂的多级分组集合计算开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 47 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+{
+  "groups": "谓词简化, 聚合优化, 集合优化",
+  "applied_rules": [
+    "FILTER_AGGREGATE_TRANSPOSE",
+    "AGGREGATE_UNION_TRANSPOSE"
+  ],
+  "rule_effect_scores": {
+    "FILTER_AGGREGATE_TRANSPOSE": 0.3,
+    "AGGREGATE_UNION_TRANSPOSE": 0.7
+  },
+  "rule_effect_confidence": {
+    "FILTER_AGGREGATE_TRANSPOSE": 0.9,
+    "AGGREGATE_UNION_TRANSPOSE": 0.8
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 聚合优化, 集合优化",
+  "applied_rules": [
+    "FILTER_AGGREGATE_TRANSPOSE",
+    "AGGREGATE_UNION_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT NAME, DDEPTNO, SUM(C) AS C\nFROM (\n  SELECT NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C\n  FROM (SELECT * FROM DEPT WHERE NAME = 'Charlie') AS filtered\n  GROUP BY NAME, DEPTNO\n  UNION ALL\n  SELECT NAME, NULL AS DDEPTNO, COUNT(*) AS C\n  FROM (SELECT * FROM DEPT WHERE NAME = 'Charlie') AS filtered\n  GROUP BY NAME\n) AS s\nGROUP BY NAME, DDEPTNO",
+  "semantic_correctness_guarantee": "1. **HAVING下推为WHERE过滤**：原SQL在聚合后通过HAVING NAME='Charlie'过滤；重写后将此条件下推到聚合前的WHERE子句。由于NAME是分组键且GROUPING SETS中所有分组集都包含NAME列（(NAME,DEPTNO)和NAME），在聚合前过滤NAME='Charlie'与聚合后过滤语义完全等价，不会改变结果集。\n\n2. **GROUPING SETS分解为UNION ALL**：原SQL的GROUPING SETS((NAME,DEPTNO),NAME)生成两个分组集：(NAME,DEPTNO)和(NAME)。重写后将其分解为两个独立的GROUP BY查询通过UNION ALL连接：第一个分支按NAME,DEPTNO分组，第二个分支仅按NAME分组。根据GROUPING SETS语义，这两种改写方式产生的行集完全一致，仅是实现方式不同。\n\n3. **NULL值处理的等价性**：原SQL中GROUPING SETS的第二个分组集(NAME)会在DEPTNO列位置产生NULL（表示该列未参与分组）。重写后第二个UNION ALL分支显式使用NULL AS DDEPTNO，与原SQL的GROUPING SETS语义完全一致，保证了NULL值的正确生成位置和含义。\n\n4. **聚合函数的等价转换**：原SQL直接对全表执行COUNT(*)并按GROUPING SETS分组；重写后先在各分支内执行COUNT(*)，再在外层用SUM(C)汇总。由于COUNT(*)是可加性聚合函数，SUM(COUNT(*))等价于对合并后数据集的COUNT(*)，且WHERE过滤保证了两个分支处理的都是NAME='Charlie'的行，不存在重复计数或遗漏。\n\n5. **列别名与输出结构一致性**：原SQL输出列为NAME, DDEPTNO(DEPTNO的别名), C(COUNT(*)的别名)；重写后保持相同的列名和别名结构，外层查询的SELECT NAME, DDEPTNO, SUM(C) AS C确保输出列名、顺序、数据类型与原SQL完全一致。\n\n6. **分组键的完整性**：原SQL的两个分组集分别是(NAME,DEPTNO)和(NAME)；重写后第一个UNION ALL分支GROUP BY NAME,DEPTNO对应第一个分组集，第二个分支GROUP BY NAME对应第二个分组集，外层再按NAME,DDEPTNO分组以保持结果结构。由于内层已完成实际聚合，外层的GROUP BY仅起到结构化作用，不会改变聚合结果。\n\n7. **易误判点说明**：可能担心WHERE下推会影响GROUPING SETS中NULL的生成逻辑，但实际上GROUPING SETS的NULL是由分组集定义决定的（未参与分组的列显示NULL），与数据过滤无关；WHERE NAME='Charlie'仅减少输入行数，不影响分组集的结构语义。另外，UNION ALL不会去重，保证了两个分组集的行完整保留，与原SQL的多集语义一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": false,
+  "message": "重写SQL在外层对已聚合结果再次GROUP BY NAME, DDEPTNO会改变结果集行数和语义。",
+  "differences": [
+    {
+      "type": "aggregation_semantics",
+      "description": "原SQL的GROUPING SETS直接产生两行（一行按NAME+DEPTNO分组，一行按NAME分组且DEPTNO为NULL）；重写SQL的外层GROUP BY NAME, DDEPTNO会将内层UNION ALL的两行（一行DDEPTNO有值，一行DDEPTNO为NULL）视为不同分组键，不会合并，但SUM(C)对单行求和无意义且结构与原SQL不符",
+      "location": "外层SELECT的GROUP BY NAME, DDEPTNO子句"
+    },
+    {
+      "type": "result_set_structure",
+      "description": "原SQL对NAME='Charlie'产生2行（若该NAME有n个不同DEPTNO，则n+1行）；重写SQL外层GROUP BY后仍保持内层UNION ALL的行数，但这不是GROUPING SETS的正确展开——GROUPING SETS的两个分组集应直接对应两个结果行，而非先UNION ALL再GROUP BY",
+      "location": "整体查询结构"
+    }
+  ]
+}
+```
+❌ 语义不等价: 重写SQL在外层对已聚合结果再次GROUP BY NAME, DDEPTNO会改变结果集行数和语义。
+```json
+{
+  "fixed_sql": "SELECT NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY NAME, DEPTNO UNION ALL SELECT NAME, NULL AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY NAME",
+  "note": "移除外层无意义的GROUP BY和SUM，直接用UNION ALL连接两个分组集，保持GROUPING SETS的原始语义"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已移除外层GROUP BY，直接通过UNION ALL连接两个分支，与原SQL的GROUPING SETS语义完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写将 GROUPING SETS 展开为 UNION ALL + 两次独立聚合，成功将 HAVING 下推为 WHERE，过滤前移符合预期。但执行计划显示：1) 原 SQL 仅扫描 dept 表一次（Parallel Seq Scan，Plan Rows=6），重写后扫描两次（dept 和 dept_1 各一次，每次 Plan Rows=6），总扫描行数从 6 增至 12；2) 重写引入 Append 节点和额外的 Gather Merge/Sort 开销，节点复杂度明显上升（Aggregate 从 1 增至 4）；3) 行数估计求和从 50 上升至 61（增幅 22%），未达到"大幅下降"标准；4) cost 从 6774 增至 13547（翻倍），虽 cost 仅为弱信号，但结合重复扫描和节点增多，佐证了结构退化。核心问题：GROUPING SETS 本应由优化器在单次扫描中完成多级分组，重写后变为两次独立扫描 + UNION ALL，丧失了共享扫描的优势。未检测到去相关、子计划减少或公共结果复用等高优先级正信号。结论：结构上明确恶化（重复扫描同一大表、节点复杂度上升、无补偿收益），不符合终止条件。",
+  "next_step_advice": "回退到 original_sql 的 GROUPING SETS 结构，保留 HAVING 下推为 WHERE 的优化（即 WHERE NAME='Charlie' GROUP BY GROUPING SETS((NAME,DEPTNO),NAME)），避免 UNION ALL 导致的重复扫描；或探索是否可通过 CTE 物化过滤后的中间结果（WITH filtered AS (SELECT * FROM DEPT WHERE NAME='Charlie') SELECT ... FROM filtered GROUP BY GROUPING SETS...），在单次扫描基础上复用过滤结果。"
+}
+```
+ℹ️ 本轮未改进/恶化：根据 terminate=false，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮将GROUPING SETS展开为UNION ALL导致dept表扫描两次（总成本从6774.44升至13547.42，增幅100%），且引入额外的Append/Gather Merge开销。当前SQL已是展开后的UNION ALL形式，应回退至原始GROUPING SETS结构以恢复单次扫描。同时，name='Charlie'过滤条件在两个分支中重复执行Seq Scan（每次Plan Rows=6），但dept表无name列索引，450000行全表扫描代价高（5772.82*2）。优化方向：1）合并UNION ALL为GROUPING SETS消除重复扫描；2）建议在name列创建索引将Seq Scan转为Index Scan；3）若无法建索引，保持当前结构但确保过滤条件最优（已下推至Scan层，无需调整）。核心修正：避免重复上轮的UNION ALL展开，优先恢复紧凑结构。",
+  "advice": [
+    {
+      "group": "集合优化",
+      "produced_suggestion": "将UNION ALL的两个分支合并回GROUPING SETS((NAME,DEPTNO),(NAME))结构，消除dept表的重复扫描（当前扫描两次dept和dept_1），恢复单次Parallel Seq Scan，预期总成本从13547.42降至约6774.44（接近原始SQL）"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "过滤条件name='Charlie'已正确下推至Seq Scan层（Filter字段），无需调整。但建议数据库层面在dept.name列创建B-tree索引（CREATE INDEX idx_dept_name ON dept(name)），可将Seq Scan（成本5772.82）转为Index Scan，大幅降低450000行表的扫描开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 28 rules
+   → AGGREGATE_UNION_AGGREGATE_FIRST: UCT=1.100
+   → AGGREGATE_UNION_AGGREGATE_SECOND: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+{
+  "groups": "集合优化, 谓词简化",
+  "applied_rules": [],
+  "rule_effect_scores": {},
+  "rule_effect_confidence": {}
+}
+✅ 选择了 0 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "集合优化, 谓词简化",
+  "applied_rules": [],
+  "rewritten_sql": "SELECT NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C\nFROM DEPT\nWHERE NAME = 'Charlie'\nGROUP BY GROUPING SETS ((NAME, DEPTNO), (NAME))",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原 SQL 中的 UNION ALL 两分支（第一分支按 NAME+DEPTNO 分组，第二分支按 NAME 分组并将 DEPTNO 置为 NULL）合并回单次扫描的 GROUPING SETS((NAME, DEPTNO), (NAME)) 结构，消除 dept 表的重复扫描。\n\n2. 语义等价性保证：GROUPING SETS((NAME, DEPTNO), (NAME)) 在 SQL 标准与 PostgreSQL 语义下等价于两个独立 GROUP BY 的 UNION ALL：第一组生成 (NAME, DEPTNO, COUNT(*))，第二组生成 (NAME, NULL, COUNT(*))。由于原 SQL 两分支均过滤 NAME='Charlie' 且无其他谓词差异，合并后的 WHERE NAME='Charlie' 作用于 GROUPING SETS 前，与分别在两分支中过滤结果集完全一致。\n\n3. 列投影与 NULL 处理：GROUPING SETS 第二组 (NAME) 自动将非分组列 DEPTNO 置为 NULL，与原 SQL 第二分支的 NULL AS DDEPTNO 语义相同；列名 DDEPTNO 通过 AS 别名保持一致。\n\n4. 聚合函数与计数：两种写法的 COUNT(*) 作用域相同（第一组按 NAME+DEPTNO 分组计数，第二组按 NAME 分组计数），dept 表主键为 deptno，NAME 非唯一，分组逻辑无歧义。\n\n5. 结果集顺序与重复行：原 SQL 使用 UNION ALL 保留重复行且不排序，GROUPING SETS 同样保留所有分组结果且不强制排序（除非显式 ORDER BY），两者结果集行数与内容完全一致（仅物理顺序可能因执行计划差异而不同，但 SQL 语义不保证 UNION ALL 顺序）。\n\n6. 性能优化依据：合并后仅扫描 dept 表一次（Parallel Seq Scan），消除原重写中 dept 和 dept_1 的双重扫描，执行计划从 Append(两个 Aggregate) 简化为单个 MixedAggregate，预期总成本从 13547.42 降至约 6774.44，与原始 SQL 成本持平。\n\n7. 易误判点说明：GROUPING SETS 展开为 UNION ALL 是标准等价变换（Calcite 规则 AGGREGATE_UNION_TRANSPOSE 的逆操作），本次重写是将上一轮错误展开的结构恢复为原始高效形式，不存在语义风险；WHERE 条件在 GROUPING SETS 前过滤与在两个 UNION ALL 分支中分别过滤完全等价（因两分支过滤条件相同且无相关子查询）。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "两 SQL 等价。GROUPING SETS((NAME, DEPTNO), (NAME)) 标准语义等价于两个 GROUP BY 的 UNION ALL（第二组自动将 DEPTNO 置 NULL），WHERE NAME='Charlie' 在 GROUPING SETS 前过滤与分别在两分支过滤结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致：两个SQL的EXPLAIN JSON结构、节点类型、成本（6774.44）、行数估计（50.0）、并行度（Workers Planned=1）、过滤条件下推（Filter在Seq Scan层）均完全相同。重写SQL仅将HAVING子句中的过滤条件name='Charlie'前移至WHERE子句，这是标准的谓词下推优化，但优化器已自动将该过滤下推至扫描层（两个计划的Filter字段一致），因此逻辑等价且执行计划无差异。结构上无改进也无恶化，成本持平。虽然本轮未产生实质性执行计划变化，但重写SQL在SQL逻辑层面更规范（WHERE优于HAVING用于非聚合过滤），且不存在任何结构退化信号，符合终止条件a（结构无恶化且逻辑改进）。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 117
+   - 规则序列: []
+   - 优化组别: 集合优化, 谓词简化
+   - 估计代价: 原始=6774.44, 重写=6774.44，相对变化: 0.00%
+✅ 成功存储，记录ID: 3a182f17-d16b-4195-b6b9-58dd880efbf0
+
+----------------------------------------
+

@@ -1,0 +1,107 @@
+Query ID: 56
+==================================================
+
+Original: select * from emp where empno > ANY (  select deptno from dept where emp.job = dept.name);
+Rewritten: SELECT emp.* 
+FROM emp 
+WHERE EXISTS (
+  SELECT 1 
+  FROM dept 
+  WHERE emp.job = dept.name 
+    AND emp.empno > dept.deptno
+)
+Time Cost: 134.51s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将ANY子查询转换为Semi Join已完成，但可进一步优化：将相关条件emp.job = dept.name提前到子查询内部，形成独立子查询，减少关联复杂度。考虑CTE分解策略，先物化满足job匹配的dept.deptno集合，再与emp表进行范围比较。'}, {'group': '谓词简化', 'produced_suggestion': '将Join Filter中的empno > deptno条件下推优化：由于ANY语义要求存在至少一个deptno满足条件，可改写为EXISTS子查询形式，使PostgreSQL能更早应用过滤条件。具体改写为：EXISTS (SELECT 1 FROM dept WHERE emp.job = dept.name AND emp.empno > dept.deptno)，利用索引dept_pkey加速deptno范围查找。'}, {'group': '连接优化', 'produced_suggestion': '当前Hash Join在连接后才应用empno > deptno过滤，导致4500万行emp记录全部参与Hash探测。优化方向：1) 调整连接顺序，先对dept表按name分组取MIN(deptno)，减少连接基数；2) 将范围条件转换为Nested Loop + Index Scan on emp_pkey，利用empno索引快速定位满足条件的行。'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示Hash Semi Join的Total Cost高达2278896.74，且存在以下性能瓶颈：1) emp表全表扫描(Seq Scan)代价918506.16，扫描4500万行；2) Join Filter条件(emp.empno > dept.deptno)在Hash Join后执行，导致大量无效行参与连接；3) 相关子查询中的emp.job = dept.name关联条件与ANY谓词的empno > deptno混合，未充分利用索引。历史案例显示相似SQL通过JOIN_SUB_QUERY_TO_CORRELATE、FILTER_INTO_JOIN、STRATEGY_CTE_DECOMPOSITION规则组合优化效果显著。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将ANY子查询转换为Semi Join已完成，但可进一步优化：将相关条件emp.job = dept.name提前到子查询内部，形成独立子查询，减少关联复杂度。考虑CTE分解策略，先物化满足job匹配的dept.deptno集合，再与emp表进行范围比较。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将Join Filter中的empno > deptno条件下推优化：由于ANY语义要求存在至少一个deptno满足条件，可改写为EXISTS子查询形式，使PostgreSQL能更早应用过滤条件。具体改写为：EXISTS (SELECT 1 FROM dept WHERE emp.job = dept.name AND emp.empno > dept.deptno)，利用索引dept_pkey加速deptno范围查找。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "当前Hash Join在连接后才应用empno > deptno过滤，导致4500万行emp记录全部参与Hash探测。优化方向：1) 调整连接顺序，先对dept表按name分组取MIN(deptno)，减少连接基数；2) 将范围条件转换为Nested Loop + Index Scan on emp_pkey，利用empno索引快速定位满足条件的行。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": [
+    "SEMI_JOIN_FILTER_TRANSPOSE",
+    "FILTER_INTO_JOIN"
+  ],
+  "rule_effect_scores": {
+    "SEMI_JOIN_FILTER_TRANSPOSE": 0.6,
+    "FILTER_INTO_JOIN": 0.4
+  },
+  "rule_effect_confidence": {
+    "SEMI_JOIN_FILTER_TRANSPOSE": 0.7,
+    "FILTER_INTO_JOIN": 0.6
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": [
+    "SEMI_JOIN_FILTER_TRANSPOSE",
+    "FILTER_INTO_JOIN"
+  ],
+  "rewritten_sql": "SELECT emp.* \nFROM emp \nWHERE EXISTS (\n  SELECT 1 \n  FROM dept \n  WHERE emp.job = dept.name \n    AND emp.empno > dept.deptno\n)",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原始SQL中的 `empno > ANY (select deptno from dept where emp.job = dept.name)` 改写为 `EXISTS (SELECT 1 FROM dept WHERE emp.job = dept.name AND emp.empno > dept.deptno)`。ANY子查询转换为EXISTS相关子查询，并将外层谓词 `empno > deptno` 下推到EXISTS子查询内部的WHERE条件中。\n\n2. **ANY与EXISTS语义等价性**：原SQL的 `empno > ANY (subquery)` 语义为"存在至少一个dept.deptno使得emp.empno > dept.deptno且emp.job = dept.name"。改写后的EXISTS子查询语义为"存在至少一条dept记录满足emp.job = dept.name且emp.empno > dept.deptno"。两者在逻辑上完全等价，均要求存在性量词（∃）满足相同的复合条件。\n\n3. **相关列与作用域保持**：原SQL中相关条件 `emp.job = dept.name` 在子查询WHERE中引用外层emp表的job列；改写后该相关条件保持在EXISTS子查询的WHERE中，作用域未变。比较条件 `emp.empno > dept.deptno` 同样保持对外层emp.empno的引用，相关性语义不变。\n\n4. **结果集等价性**：原SQL返回emp表中所有满足"存在匹配dept记录"的行的全部列（SELECT *）。改写后SELECT emp.*同样返回emp表的全部列，且EXISTS过滤条件与原ANY条件逻辑等价，因此返回的行集合完全相同，列顺序、数据类型、NULL处理均一致。\n\n5. **NULL值处理一致性**：ANY比较在SQL标准中当子查询返回空集时结果为FALSE，当存在NULL时遵循三值逻辑。EXISTS在子查询无匹配行时返回FALSE，有匹配行时返回TRUE。由于改写后的EXISTS子查询内部已包含完整的比较条件（emp.empno > dept.deptno AND emp.job = dept.name），NULL值的过滤行为与原ANY子查询一致：若dept.deptno或dept.name为NULL导致比较结果为UNKNOWN，该行不会被EXISTS选中，与ANY的三值逻辑结果相同。\n\n6. **规则应用说明**：应用SEMI_JOIN_FILTER_TRANSPOSE将外层过滤条件empno > deptno转置到半连接（ANY转EXISTS）内部；应用FILTER_INTO_JOIN将相关条件emp.job = dept.name与范围条件emp.empno > dept.deptno合并到EXISTS子查询的WHERE中，形成联合过滤条件，使数据库能在连接阶段提前过滤，减少中间结果集。\n\n7. **无歧义点确认**：原SQL无GROUP BY、HAVING、ORDER BY、LIMIT，不涉及聚合或排序语义变更风险。emp表主键为empno，SELECT * 返回完整行，不存在重复行消除问题。相关子查询的相关列（emp.job、emp.empno）在改写前后的引用位置和逻辑关系保持不变，不会产生笛卡尔积或错误的行过滤。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "原始SQL的 `empno > ANY (subquery)` 与重写SQL的 `EXISTS (subquery with empno > deptno in WHERE)` 在语义上完全等价，均表示存在至少一条dept记录满足emp.job=dept.name且emp.empno>dept.deptno；相关条件与比较条件的作用域、NULL处理、结果集均保持一致。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（Hash Join Semi + 两次Seq Scan，cost 2278896.74，行数估计 13952129），说明 PostgreSQL 优化器已将 ANY 子查询与 EXISTS 改写识别为等价形式并生成相同物理计划。结构层面：两者均实现去相关（decorrelation），将相关子查询转换为 Semi Join，消除了逐行执行子查询的开销；Hash Join 策略合理（大表 emp 作外表，小表 dept 构建哈希表），Join Filter 在哈希探测后应用符合优化器选择。cost 与行数估计无差异，无结构退化信号。虽然 Join Filter 未下推至扫描阶段，但这是优化器基于统计信息的合理决策（empno > deptno 选择性可能不高，提前过滤收益有限）。当前改写已达到优化器能力上限，继续手动调整（如 CTE 物化、MIN 聚合）可能引入额外物化开销而无实质收益。综合判断：本轮改写在语义等价前提下已实现去相关优化，执行计划无恶化，满足终止条件 b（去相关 + 无灾难性退化）。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 84
+   - 规则序列: ['SEMI_JOIN_FILTER_TRANSPOSE', 'FILTER_INTO_JOIN']
+   - 优化组别: 谓词简化, 连接优化, 子查询优化
+   - 估计代价: 原始=2278896.74, 重写=2278896.74，相对变化: 0.00%
+✅ 成功存储，记录ID: 79e278a2-9ea1-4fa3-a96d-af0ccd92c51f
+
+🎲 UCT Math Update: 2 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=2278896.7400, rc=2278896.7400)
+   结构分细节: rows 59852345.0->59852345.0 (score=+0.000), depth 3.0->3.0 (score=+0.000)
+✅ UCT Update Complete:
+   → SEMI_JOIN_FILTER_TRANSPOSE: P(s,a)=N/A, effect=0.600, conf=0.70, lambda=0.35, reward=+0.000, count=6, avg=+0.028
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.400, conf=0.60, lambda=0.30, reward=+0.000, count=307, avg=+0.022
+
+----------------------------------------
+

@@ -1,0 +1,103 @@
+Query ID: 41
+==================================================
+
+Original: select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1997-10-01' and l_shipdate < date '1997-10-01' + interval '1' month;
+Rewritten: SELECT 100.00 * promo_sum / total_sum AS promo_revenue
+FROM (
+  SELECT
+    SUM(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%') AS promo_sum,
+    SUM(l_extendedprice * (1 - l_discount)) AS total_sum
+  FROM (
+    SELECT l_extendedprice, l_discount, p_type
+    FROM lineitem
+    JOIN part ON l_partkey = p_partkey
+    WHERE l_shipdate >= DATE '1997-10-01'
+      AND l_shipdate < DATE '1997-10-01' + INTERVAL '1' month
+  ) AS filtered_join
+) AS aggregated
+Time Cost: 70.23s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': "将CASE WHEN聚合转换为FILTER聚合：sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end)可改写为sum(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type like 'PROMO%')，减少条件判断开销"}, {'group': '投影优化', 'produced_suggestion': '应用PROJECT_JOIN_TRANSPOSE规则，将投影操作下推到JOIN之前，仅保留JOIN和聚合所需的列(l_partkey, l_extendedprice, l_discount, l_shipdate, p_partkey, p_type)，减少数据传输量'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表进行了全表扫描(Seq Scan)，代价高达1500056.82，且part表也进行了全表扫描(代价49325.33)。SQL中存在CASE WHEN聚合模式，可通过AGGREGATE_CASE_TO_FILTER规则将条件聚合转换为过滤聚合以提升性能。历史案例显示相似SQL通过PROJECT_JOIN_TRANSPOSE和AGGREGATE_CASE_TO_FILTER规则优化成功。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将CASE WHEN聚合转换为FILTER聚合：sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end)可改写为sum(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type like 'PROMO%')，减少条件判断开销"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "应用PROJECT_JOIN_TRANSPOSE规则，将投影操作下推到JOIN之前，仅保留JOIN和聚合所需的列(l_partkey, l_extendedprice, l_discount, l_shipdate, p_partkey, p_type)，减少数据传输量"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 22 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.213
+   → AGGREGATE_VALUES: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+{
+  "groups": "聚合优化, 投影优化",
+  "applied_rules": ["PROJECT_JOIN_TRANSPOSE", "AGGREGATE_CASE_TO_FILTER"],
+  "rule_effect_scores": {
+    "PROJECT_JOIN_TRANSPOSE": 0.6,
+    "AGGREGATE_CASE_TO_FILTER": 0.4
+  },
+  "rule_effect_confidence": {
+    "PROJECT_JOIN_TRANSPOSE": 0.9,
+    "AGGREGATE_CASE_TO_FILTER": 0.7
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 投影优化",
+  "applied_rules": ["PROJECT_JOIN_TRANSPOSE", "AGGREGATE_CASE_TO_FILTER"],
+  "rewritten_sql": "SELECT 100.00 * promo_sum / total_sum AS promo_revenue\nFROM (\n  SELECT\n    SUM(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%') AS promo_sum,\n    SUM(l_extendedprice * (1 - l_discount)) AS total_sum\n  FROM (\n    SELECT l_extendedprice, l_discount, p_type\n    FROM lineitem\n    JOIN part ON l_partkey = p_partkey\n    WHERE l_shipdate >= DATE '1997-10-01'\n      AND l_shipdate < DATE '1997-10-01' + INTERVAL '1' month\n  ) AS filtered_join\n) AS aggregated",
+  "semantic_correctness_guarantee": "1. **投影下推（PROJECT_JOIN_TRANSPOSE）**：在 JOIN 之后立即投影出后续聚合所需的三列 (l_extendedprice, l_discount, p_type)，减少数据传输量。由于原 SQL 最终只使用这三列进行计算，投影不会丢失任何必要信息，结果集等价。\n\n2. **CASE WHEN 转 FILTER（AGGREGATE_CASE_TO_FILTER）**：原 SQL 中 `SUM(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0 END)` 改写为 `SUM(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%')`。两者语义完全等价：CASE WHEN 对不满足条件的行返回 0（对 SUM 无贡献），FILTER 直接排除不满足条件的行，结果相同。\n\n3. **分子分母分离计算**：原 SQL 在单个 SELECT 中计算比值，重写后先在子查询中分别计算分子 (promo_sum) 和分母 (total_sum)，再在外层计算比值。由于 SUM 聚合在相同的行集上执行，且 WHERE 条件完全一致，两个 SUM 的输入行集相同，因此比值结果等价。\n\n4. **JOIN 条件与 WHERE 过滤保持不变**：`l_partkey = p_partkey` 的 JOIN 条件和日期范围过滤 `l_shipdate >= DATE '1997-10-01' AND l_shipdate < DATE '1997-10-01' + INTERVAL '1' month` 在重写后完全保留，确保参与聚合的行集与原 SQL 一致。\n\n5. **NULL 值处理**：l_extendedprice 和 l_discount 在 Schema 中定义为 NOT NULL，不存在 NULL 导致的语义差异。p_type 的 LIKE 判断在 FILTER 中与 CASE WHEN 中行为一致（NULL 不匹配 LIKE 模式）。\n\n6. **聚合作用域不变**：原 SQL 对整个 JOIN 结果集进行全局聚合（无 GROUP BY），重写后同样对过滤后的 JOIN 结果集进行全局聚合，作用域一致，返回单行结果。\n\n7. **最终投影列名与类型**：原 SQL 返回列名 promo_revenue，类型为 NUMERIC；重写后外层 SELECT 同样返回 promo_revenue，计算逻辑 `100.00 * promo_sum / total_sum` 与原 SQL `100.00 * sum(...) / sum(...)` 完全等价，类型与精度一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL与原始SQL等价：CASE WHEN转FILTER、投影下推、分子分母分离计算均为标准等价变换，JOIN条件与WHERE过滤完全一致，聚合作用域相同，返回单行结果集语义不变。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致：两者均采用并行Hash Join(Parallel Aware=true, Workers=2)，扫描方式(Seq Scan on lineitem/part)、连接算法、聚合策略(Partial→Finalize)、并行度均无变化；cost完全相同(1576662.12)；行数估计求和几乎相同(1916612 vs 1916613)。重写仅在SQL逻辑层面应用了FILTER聚合和派生表封装，但未触发优化器生成不同执行计划，属于语义等价改写。虽无结构性改进，但也无恶化，且已应用目标优化规则(AGGREGATE_CASE_TO_FILTER、PROJECT_JOIN_TRANSPOSE)，优化器未识别出进一步改进空间。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 243
+   - 规则序列: ['PROJECT_JOIN_TRANSPOSE', 'AGGREGATE_CASE_TO_FILTER']
+   - 优化组别: 聚合优化, 投影优化
+   - 估计代价: 原始=1576662.12, 重写=1576662.12，相对变化: 0.00%
+✅ 成功存储，记录ID: 6893c1b7-93d8-48a0-ac1a-32102b443feb
+
+🎲 UCT Math Update: 2 rules, reward=-0.0500 (cost=+0.0000, rows=+0.0000, depth=-0.1667, oc=1576662.1200, rc=1576662.1200)
+   结构分细节: rows 1916612.0->1916613.0 (score=+0.000), depth 6.0->7.0 (score=-0.167)
+✅ UCT Update Complete:
+   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.600, conf=0.90, lambda=0.45, reward=-0.028, count=107, avg=+0.028
+   → AGGREGATE_CASE_TO_FILTER: P(s,a)=N/A, effect=0.400, conf=0.70, lambda=0.35, reward=-0.022, count=10, avg=-0.002
+
+----------------------------------------
+

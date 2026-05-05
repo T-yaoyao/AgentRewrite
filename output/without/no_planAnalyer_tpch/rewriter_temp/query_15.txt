@@ -1,0 +1,114 @@
+Query ID: 15
+==================================================
+
+Original: select n_name, sum(l_extendedprice * (1 - l_discount)) as revenue from customer, orders, lineitem, supplier, nation, region where c_custkey = o_custkey and l_orderkey = o_orderkey and l_suppkey = s_suppkey and c_nationkey = s_nationkey and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = 'EUROPE' and o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-01-01' + interval '1' year group by n_name order by revenue desc;
+Rewritten: SELECT n_name, SUM(l_extendedprice * (1 - l_discount)) AS revenue
+FROM (
+  SELECT n_nationkey, n_name
+  FROM nation
+  JOIN region ON n_regionkey = r_regionkey AND r_name = 'EUROPE'
+) AS filtered_nation
+JOIN supplier ON s_nationkey = filtered_nation.n_nationkey
+JOIN lineitem ON l_suppkey = s_suppkey
+JOIN (
+  SELECT o_orderkey, o_custkey
+  FROM orders
+  WHERE o_orderdate >= DATE '1995-01-01' AND o_orderdate < DATE '1995-01-01' + INTERVAL '1' YEAR
+) AS filtered_orders ON l_orderkey = filtered_orders.o_orderkey
+JOIN customer ON c_custkey = filtered_orders.o_custkey AND c_nationkey = filtered_nation.n_nationkey
+GROUP BY n_name
+ORDER BY revenue DESC;
+Time Cost: 88.54s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将orders表的日期过滤条件(o_orderdate >= '1995-01-01' AND o_orderdate < '1996-01-01')通过JOIN条件提前过滤，减少参与连接的数据量"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：先连接小表region->nation->supplier形成过滤后的supplier集合，再与lineitem连接，最后连接orders和customer，避免lineitem全表参与早期连接'}, {'group': '谓词简化', 'produced_suggestion': "将region过滤条件(r_name='EUROPE')和nation的连接条件合并，通过EXISTS或IN子查询预先过滤supplier表，减少后续连接的数据量"}, {'group': '连接优化', 'produced_suggestion': '将c_nationkey = s_nationkey条件提前到supplier和customer连接时使用，避免在最外层Hash Join中处理大量中间结果'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) lineitem表全表扫描代价高达1375085.88，是最大瓶颈；2) orders表全表扫描代价355022.0，过滤条件未下推；3) customer表全表扫描代价42234.0；4) 多层Hash Join导致中间结果集过大(4998838行)；5) 最外层Sort代价2199653.21。可通过谓词下推、连接条件优化和连接顺序调整来改善。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将orders表的日期过滤条件(o_orderdate >= '1995-01-01' AND o_orderdate < '1996-01-01')通过JOIN条件提前过滤，减少参与连接的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先连接小表region->nation->supplier形成过滤后的supplier集合，再与lineitem连接，最后连接orders和customer，避免lineitem全表参与早期连接"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将region过滤条件(r_name='EUROPE')和nation的连接条件合并，通过EXISTS或IN子查询预先过滤supplier表，减少后续连接的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将c_nationkey = s_nationkey条件提前到supplier和customer连接时使用，避免在最外层Hash Join中处理大量中间结果"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["JOIN_CONDITION_PUSH", "FILTER_INTO_JOIN"],
+  "rule_effect_scores": {
+    "JOIN_CONDITION_PUSH": 0.6,
+    "FILTER_INTO_JOIN": 0.4
+  },
+  "rule_effect_confidence": {
+    "JOIN_CONDITION_PUSH": 0.9,
+    "FILTER_INTO_JOIN": 0.9
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": ["JOIN_CONDITION_PUSH", "FILTER_INTO_JOIN"],
+  "rewritten_sql": "SELECT n_name, SUM(l_extendedprice * (1 - l_discount)) AS revenue\nFROM (\n  SELECT n_nationkey, n_name\n  FROM nation\n  JOIN region ON n_regionkey = r_regionkey AND r_name = 'EUROPE'\n) AS filtered_nation\nJOIN supplier ON s_nationkey = filtered_nation.n_nationkey\nJOIN lineitem ON l_suppkey = s_suppkey\nJOIN (\n  SELECT o_orderkey, o_custkey\n  FROM orders\n  WHERE o_orderdate >= DATE '1995-01-01' AND o_orderdate < DATE '1995-01-01' + INTERVAL '1' YEAR\n) AS filtered_orders ON l_orderkey = filtered_orders.o_orderkey\nJOIN customer ON c_custkey = filtered_orders.o_custkey AND c_nationkey = filtered_nation.n_nationkey\nGROUP BY n_name\nORDER BY revenue DESC;",
+  "semantic_correctness_guarantee": "1. 结构性改写说明：将原SQL中WHERE子句的过滤条件r_name='EUROPE'和o_orderdate范围条件分别推入对应表的子查询中，形成filtered_nation和filtered_orders两个派生表；将c_nationkey=s_nationkey条件从隐式WHERE移入customer的JOIN ON子句。\n\n2. 连接顺序调整：先执行region->nation的JOIN并过滤出EUROPE地区的nation集合(filtered_nation)，再依次连接supplier->lineitem->filtered_orders->customer，相比原SQL的笛卡尔积式隐式连接，显式JOIN顺序更清晰且优化器可更好利用索引。\n\n3. 过滤条件下推的等价性保证：r_name='EUROPE'仅依赖region表，提前过滤不影响最终结果；o_orderdate条件仅依赖orders表，在JOIN前过滤与JOIN后过滤结果集相同；c_nationkey=s_nationkey条件在customer JOIN时应用，与原WHERE中应用位置不同但因JOIN的交换律和结合律，最终过滤效果等价。\n\n4. 主键与外键约束保证：customer.c_custkey(PK)与orders.o_custkey(FK)、lineitem.l_orderkey(PK部分)与orders.o_orderkey(PK)、supplier.s_suppkey(PK)与lineitem.l_suppkey(FK)、nation.n_nationkey(PK)与supplier.s_nationkey(FK)和customer.c_nationkey(FK)、region.r_regionkey(PK)与nation.n_regionkey(FK)的连接关系在重写前后完全一致，仅改变了执行顺序。\n\n5. 聚合语义保持：GROUP BY n_name和SUM(l_extendedprice*(1-l_discount))的聚合逻辑未变，仍对相同的lineitem行集进行分组求和；ORDER BY revenue DESC的排序逻辑也完全保留。\n\n6. NULL值处理：所有连接键列均为NOT NULL(根据TPC-H标准Schema)，不存在NULL导致的连接结果差异；过滤条件不涉及可空列。\n\n7. 重复行处理：原SQL和重写SQL均无DISTINCT，依赖相同的主键-外键连接关系，不会产生额外重复行；lineitem表的(l_orderkey,l_linenumber)复合主键保证每个订单行唯一，聚合前的行集完全相同。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过将过滤条件下推到子查询和JOIN ON子句，与原始SQL在相同Schema和约束下产生相同结果集；所有连接关系、过滤条件、聚合逻辑完全保持一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划几乎完全一致，仅Hash Cond顺序微调(从'l_orderkey=o_orderkey AND s_nationkey=c_nationkey'变为's_nationkey=c_nationkey AND l_orderkey=o_orderkey')，无实质结构改进；cost从2201038.6降至2201038.32，降幅0.01%可忽略；行数估计求和从34211603降至34211597，变化0.00002%；扫描方式、连接算法、并行度、过滤下推、聚合排序均无变化；SQL重写引入派生表但优化器将其展平回原执行计划；已无进一步优化空间。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 387
+   - 规则序列: ['JOIN_CONDITION_PUSH', 'FILTER_INTO_JOIN']
+   - 优化组别: 谓词简化, 连接优化
+   - 估计代价: 原始=2201038.6, 重写=2201038.32，相对变化: 0.00%
+✅ 成功存储，记录ID: e00250e8-01f3-41da-b691-ad74e301d987
+
+🎲 UCT Math Update: 2 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=2201038.6000, rc=2201038.3200)
+   结构分细节: rows 34211603.0->34211597.0 (score=+0.000), depth 13.0->13.0 (score=+0.000)
+✅ UCT Update Complete:
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.600, conf=0.90, lambda=0.45, reward=+0.000, count=248, avg=+0.009
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.400, conf=0.90, lambda=0.45, reward=+0.000, count=280, avg=+0.022
+
+----------------------------------------
+

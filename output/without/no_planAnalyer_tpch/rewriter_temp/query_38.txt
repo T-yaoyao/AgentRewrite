@@ -1,0 +1,107 @@
+Query ID: 38
+==================================================
+
+Original: select c_count, count(*) as custdist from ( select c_custkey, count(o_orderkey) from customer left outer join orders on c_custkey = o_custkey and o_comment not like '%unusual%deposits%' group by c_custkey ) as c_orders (c_custkey, c_count) group by c_count order by custdist desc, c_count desc;
+Rewritten: SELECT c_count, COUNT(*) AS custdist
+FROM (
+  SELECT c.c_custkey, COALESCE(o_agg.order_count, 0) AS c_count
+  FROM customer c
+  LEFT OUTER JOIN (
+    SELECT o_custkey, COUNT(o_orderkey) AS order_count
+    FROM orders
+    WHERE o_comment NOT LIKE '%unusual%deposits%'
+    GROUP BY o_custkey
+  ) o_agg ON c.c_custkey = o_agg.o_custkey
+) AS c_orders
+GROUP BY c_count
+ORDER BY custdist DESC, c_count DESC;
+Time Cost: 101.10s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将LEFT OUTER JOIN的ON条件中的过滤谓词o_comment not like '%unusual%deposits%'下推，转换为WHERE子句或在JOIN前过滤orders表，减少JOIN时的数据量，避免全表扫描1500万行后再过滤"}, {'group': '聚合优化', 'produced_suggestion': '应用AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则，将内层GROUP BY c_custkey的聚合操作与LEFT OUTER JOIN交换顺序，先对orders按o_custkey分组聚合后再与customer关联，减少JOIN后的聚合数据量'}, {'group': '连接优化', 'produced_suggestion': '应用FILTER_INTO_JOIN规则，将过滤条件提前应用到orders表，考虑将LEFT OUTER JOIN转换为普通JOIN(如果业务允许)或优化JOIN顺序，利用customer_pkey索引减少Hash Join代价'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) orders表全表扫描(Seq Scan)代价339397.0，过滤条件o_comment not like '%unusual%deposits%'在扫描后应用，导致扫描1500万行；2) 三层聚合嵌套(Partial->Finalize->Hashed)代价高达1508890.73；3) LEFT OUTER JOIN后立即GROUP BY c_custkey再次GROUP BY c_count，存在聚合冗余。历史案例显示相同SQL指纹通过FILTER_INTO_JOIN和AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则可优化。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将LEFT OUTER JOIN的ON条件中的过滤谓词o_comment not like '%unusual%deposits%'下推，转换为WHERE子句或在JOIN前过滤orders表，减少JOIN时的数据量，避免全表扫描1500万行后再过滤"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "应用AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则，将内层GROUP BY c_custkey的聚合操作与LEFT OUTER JOIN交换顺序，先对orders按o_custkey分组聚合后再与customer关联，减少JOIN后的聚合数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "应用FILTER_INTO_JOIN规则，将过滤条件提前应用到orders表，考虑将LEFT OUTER JOIN转换为普通JOIN(如果业务允许)或优化JOIN顺序，利用customer_pkey索引减少Hash Join代价"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 64 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+{
+  "groups": "聚合优化, 谓词简化, 连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"],
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.4,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.6
+  },
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.9,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.8
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 谓词简化, 连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"],
+  "rewritten_sql": "SELECT c_count, COUNT(*) AS custdist\nFROM (\n  SELECT c.c_custkey, COALESCE(o_agg.order_count, 0) AS c_count\n  FROM customer c\n  LEFT OUTER JOIN (\n    SELECT o_custkey, COUNT(o_orderkey) AS order_count\n    FROM orders\n    WHERE o_comment NOT LIKE '%unusual%deposits%'\n    GROUP BY o_custkey\n  ) o_agg ON c.c_custkey = o_agg.o_custkey\n) AS c_orders\nGROUP BY c_count\nORDER BY custdist DESC, c_count DESC;",
+  "semantic_correctness_guarantee": "1. **FILTER_INTO_JOIN规则应用**：将原ON子句中的过滤条件 `o_comment NOT LIKE '%unusual%deposits%'` 下推到orders表的子查询WHERE子句中。由于LEFT OUTER JOIN语义要求保留左表所有行，过滤条件仅作用于右表orders，下推到右表子查询不改变最终结果集：未匹配的customer行仍保留且c_count为NULL（后续处理为0）。\n\n2. **AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则应用**：将原本在JOIN后对orders.o_orderkey的COUNT聚合操作，提前到JOIN前在orders子查询中按o_custkey分组聚合。由于orders.o_orderkey是主键（orders_pkey），COUNT(o_orderkey)等价于COUNT(*)，按o_custkey分组后再JOIN与先JOIN再按c_custkey分组结果等价（c_custkey与o_custkey通过外键关联一对多）。\n\n3. **NULL值处理等价性**：原SQL中LEFT OUTER JOIN未匹配行的o_orderkey为NULL，COUNT(o_orderkey)结果为0；重写SQL中使用COALESCE(o_agg.order_count, 0)将未匹配行的NULL转换为0，保持语义一致。\n\n4. **分组键等价性**：原SQL外层按c_count分组，c_count来自内层子查询的COUNT(o_orderkey)结果；重写SQL中c_count同样来自聚合结果（通过COALESCE处理），外层分组键保持一致。\n\n5. **结果集完整性**：customer表所有行通过LEFT OUTER JOIN保留，每个c_custkey对应的订单计数（排除特定comment的订单）通过子查询预聚合得到，最终按订单数分组统计客户分布，与原SQL逻辑完全等价。\n\n6. **排序与聚合顺序**：外层GROUP BY c_count和ORDER BY custdist DESC, c_count DESC的执行顺序和语义与原SQL一致，仅内部数据流优化（先过滤、先聚合、再JOIN）不影响最终输出。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "两SQL等价：重写将orders过滤与聚合提前到子查询，再LEFT JOIN并用COALESCE处理NULL，与原SQL先JOIN再聚合的结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 21597876.0 -> 13614648.0 (重写侧约为原的 63.0370%)
+```json
+{
+  "terminate": true,
+  "reason": "结构明确改进：1) 过滤下推成功，orders表在JOIN前先按o_custkey预聚合(831K行)，避免原方案JOIN后再聚合1500万行；2) Hash Join改为Merge Join，利用索引有序性；3) 行数估计求和从2160万降至1361万(降幅37%)，数据流显著收窄；4) cost从150.9万降至115.7万(降幅23%)；5) 聚合前置+JOIN重排实现了高优先级结构优化(预聚合复用、减少中间数据膨胀)，无灾难性退化证据。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 265
+   - 规则序列: ['FILTER_INTO_JOIN', 'AGGREGATE_JOIN_TRANSPOSE_EXTENDED']
+   - 优化组别: 聚合优化, 谓词简化, 连接优化
+   - 估计代价: 原始=1508890.73, 重写=1156729.4，相对变化: 23.34%
+✅ 成功存储，记录ID: fb52e797-70e9-4633-8b26-556b0761f75b
+
+🎲 UCT Math Update: 2 rules, reward=+0.2512 (cost=+0.2334, rows=+0.3696, depth=+0.1111, oc=1508890.7300, rc=1156729.4000)
+   结构分细节: rows 21597876.0->13614648.0 (score=+0.370), depth 9.0->8.0 (score=+0.111)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.400, conf=0.90, lambda=0.45, reward=+0.119, count=298, avg=+0.023
+   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: P(s,a)=N/A, effect=0.600, conf=0.80, lambda=0.40, reward=+0.133, count=54, avg=+0.091
+
+----------------------------------------
+

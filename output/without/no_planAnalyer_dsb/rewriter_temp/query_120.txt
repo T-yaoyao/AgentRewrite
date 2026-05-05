@@ -1,0 +1,218 @@
+Query ID: 120
+==================================================
+
+Original: select min(c_customer_id),     min(sr_ticket_number),     min(sr_item_sk)  from customer      ,customer_address      ,customer_demographics      ,household_demographics      ,income_band      ,store_returns  where ca_city	        =  'Pleasant Hill'    and c_current_addr_sk = ca_address_sk    and ib_lower_bound   >=  7 * 10000    and ib_upper_bound   <=  7 * 10000 + 50000    and ib_income_band_sk = hd_income_band_sk    and cd_demo_sk = c_current_cdemo_sk    and hd_demo_sk = c_current_hdemo_sk    and sr_cdemo_sk = cd_demo_sk  ;
+Rewritten: SELECT min(c.c_customer_id) AS min_customer_id, min(sr.sr_ticket_number) AS min_ticket_number, min(sr.sr_item_sk) AS min_item_sk FROM store_returns sr JOIN (SELECT c.c_customer_id, c.c_current_cdemo_sk FROM customer c WHERE c.c_current_addr_sk IN (SELECT ca_address_sk FROM customer_address WHERE ca_city = 'Pleasant Hill') AND c.c_current_hdemo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_income_band_sk IN (SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 70000 AND ib_upper_bound <= 120000)) AND c.c_current_cdemo_sk IS NOT NULL) c ON sr.sr_cdemo_sk = c.c_current_cdemo_sk WHERE EXISTS (SELECT 1 FROM customer_demographics cd WHERE cd.cd_demo_sk = sr.sr_cdemo_sk)
+Time Cost: 348.27s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将所有CTE改为派生表(inline view)形式，让优化器自主决定物化策略和连接顺序。具体：将filtered_ca/filtered_hd/filtered_cd/filtered_sr全部改为FROM子句中的派生表，避免强制物化导致并行度丢失。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：先用小表filtered_ca(467行)和filtered_hd(2880行)通过Hash Join过滤customer，再将过滤后的customer与store_returns做Hash Semi Join，避免当前Nested Loop导致的14764次循环。将sr_cdemo_sk的过滤条件直接作为Semi Join条件，而非先物化filtered_sr。'}, {'group': '谓词简化', 'produced_suggestion': '简化filtered_cd的构建逻辑：将当前三层嵌套(filtered_cd -> customer -> filtered_ca/filtered_hd)改为单层EXISTS子查询，直接在customer_demographics上过滤cd_demo_sk IN (SELECT c_current_cdemo_sk FROM customer WHERE ...)，减少中间聚合步骤。'}, {'group': '连接优化', 'produced_suggestion': '将store_returns的过滤改为：FROM store_returns sr WHERE EXISTS (SELECT 1 FROM customer c JOIN ... WHERE sr.sr_cdemo_sk = c.c_current_cdemo_sk)，利用Semi Join的短路特性和索引(customer_demographics_pkey)加速过滤，避免全表扫描719万行。'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) store_returns表全表扫描(Seq Scan)代价高达148910.03，是最大瓶颈；2) customer表全表扫描代价15912.33；3) 连接顺序不合理，先扫描大表store_returns再与小结果集连接；4) 存在多层嵌套循环连接(Nested Loop)，且最外层Hash Join需要处理299万行数据。根据相似历史案例，该SQL模式曾通过SEMI_JOIN_JOIN_TRANSPOSE和JOIN_PUSH_TRANSITIVE_PREDICATES成功优化。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先连接选择性高的小表(income_band过滤后8行、customer_address过滤后195行)，将过滤条件尽早应用，避免先扫描store_returns大表(299万行)。建议将customer_address和income_band的过滤条件先与维度表连接，形成小结果集后再与store_returns连接。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将传递性谓词下推到store_returns表，通过sr_cdemo_sk与已过滤的customer_demographics结果集关联，可以在扫描store_returns时提前过滤。同时将ca_city='Pleasant Hill'和income_band范围条件的传递约束应用到连接条件中。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑将维度表过滤条件(customer_address、income_band、household_demographics、customer_demographics)转换为半连接(SEMI JOIN)，先构建符合条件的cd_demo_sk集合，再与store_returns进行EXISTS子查询形式的半连接，避免笛卡尔积扩大中间结果集。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在连接早期阶段进行列裁剪，只保留必要的连接键和最终输出列(c_customer_id、sr_ticket_number、sr_item_sk)，减少Hash表大小和数据传输量，特别是在customer和store_returns的扫描阶段。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 55 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化, 子查询优化, 投影优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "SEMI_JOIN_JOIN_TRANSPOSE", "JOIN_PUSH_TRANSITIVE_PREDICATES", "PROJECT_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.3,
+    "SEMI_JOIN_JOIN_TRANSPOSE": 0.3,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.2,
+    "PROJECT_JOIN_TRANSPOSE": 0.2
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "SEMI_JOIN_JOIN_TRANSPOSE": 0.6,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.5,
+    "PROJECT_JOIN_TRANSPOSE": 0.5
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "SEMI_JOIN_JOIN_TRANSPOSE",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "WITH filtered_ca AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_city = 'Pleasant Hill'\n),\nfiltered_ib AS (\n  SELECT ib_income_band_sk\n  FROM income_band\n  WHERE ib_lower_bound >= 70000\n    AND ib_upper_bound <= 120000\n),\nfiltered_hd AS (\n  SELECT hd_demo_sk, hd_income_band_sk\n  FROM household_demographics\n  WHERE hd_income_band_sk IN (SELECT ib_income_band_sk FROM filtered_ib)\n),\nfiltered_cd AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_demo_sk IN (\n    SELECT c_current_cdemo_sk\n    FROM customer\n    WHERE c_current_addr_sk IN (SELECT ca_address_sk FROM filtered_ca)\n      AND c_current_hdemo_sk IN (SELECT hd_demo_sk FROM filtered_hd)\n      AND c_current_cdemo_sk IS NOT NULL\n  )\n),\nfiltered_sr AS (\n  SELECT sr_ticket_number, sr_item_sk, sr_cdemo_sk\n  FROM store_returns\n  WHERE sr_cdemo_sk IN (SELECT cd_demo_sk FROM filtered_cd)\n)\nSELECT \n  min(c.c_customer_id) AS min_customer_id,\n  min(sr.sr_ticket_number) AS min_ticket_number,\n  min(sr.sr_item_sk) AS min_item_sk\nFROM customer c\nJOIN filtered_ca ca ON c.c_current_addr_sk = ca.ca_address_sk\nJOIN filtered_cd cd ON c.c_current_cdemo_sk = cd.cd_demo_sk\nJOIN filtered_hd hd ON c.c_current_hdemo_sk = hd.hd_demo_sk\nJOIN filtered_sr sr ON sr.sr_cdemo_sk = cd.cd_demo_sk;",
+  "semantic_correctness_guarantee": "1. **CTE提取与过滤下推**：将customer_address、income_band、household_demographics、customer_demographics、store_returns的过滤条件提取为独立CTE，每个CTE仅保留后续JOIN所需的键列(ca_address_sk、ib_income_band_sk、hd_demo_sk、cd_demo_sk、sr相关列)，这些过滤条件与原SQL的WHERE子句完全对应，未改变过滤逻辑。\n\n2. **半连接转换(SEMI_JOIN_JOIN_TRANSPOSE)**：将原SQL中通过多表JOIN隐式形成的过滤关系转换为显式的IN子查询半连接。例如filtered_hd使用IN (SELECT ib_income_band_sk FROM filtered_ib)确保hd_income_band_sk满足income_band的范围条件；filtered_cd使用IN子查询确保cd_demo_sk来自满足地址和家庭人口统计条件的customer；filtered_sr使用IN (SELECT cd_demo_sk FROM filtered_cd)确保sr_cdemo_sk满足所有维度表过滤条件。这些半连接在TPC-DS Schema下与原SQL的等值JOIN + WHERE过滤语义等价，因为主键约束保证了唯一性，IN子查询不会产生重复行。\n\n3. **传递性谓词推导(JOIN_PUSH_TRANSITIVE_PREDICATES)**：原SQL中ib_income_band_sk = hd_income_band_sk且ib_lower_bound >= 70000、ib_upper_bound <= 120000，通过传递性将income_band的范围条件推导到household_demographics的过滤中(filtered_hd的IN子查询)；同理，cd_demo_sk = c_current_cdemo_sk且c表满足地址和家庭人口统计条件，将这些条件传递到customer_demographics的过滤中(filtered_cd的IN子查询)；sr_cdemo_sk = cd_demo_sk且cd_demo_sk满足所有维度表条件，将条件传递到store_returns的过滤中(filtered_sr的IN子查询)。这些传递性推导在等值连接下保持结果集不变。\n\n4. **投影优化(PROJECT_JOIN_TRANSPOSE)**：每个CTE仅投影后续JOIN所需的键列和最终输出列，避免传输冗余列。最终SELECT子句投影min(c_customer_id)、min(sr_ticket_number)、min(sr_item_sk)，与原SQL的投影列表完全一致。由于原SQL对所有表进行笛卡尔积式JOIN后再聚合，而重写SQL通过半连接和CTE过滤后再JOIN，两者在满足所有WHERE条件的行集合上执行相同的MIN聚合，结果等价。\n\n5. **JOIN顺序调整与语义等价性**：原SQL使用隐式逗号连接(笛卡尔积)加WHERE过滤，重写SQL将过滤条件前置到CTE中，然后通过显式JOIN连接已过滤的小结果集。由于所有JOIN条件(c_current_addr_sk = ca_address_sk、c_current_cdemo_sk = cd_demo_sk、c_current_hdemo_sk = hd_demo_sk、sr_cdemo_sk = cd_demo_sk)与原SQL的WHERE子句中的等值条件一致，且CTE中的过滤条件与原SQL的WHERE子句中的非等值条件一致，因此重写SQL与原SQL在逻辑上等价，仅改变了执行顺序。\n\n6. **NULL值处理**：原SQL中若c_current_cdemo_sk、c_current_hdemo_sk、c_current_addr_sk为NULL，则对应的等值连接条件不成立，该行被过滤。重写SQL中filtered_cd的IN子查询包含c_current_cdemo_sk IS NOT NULL条件，确保NULL值被正确过滤；其他外键列的NULL值在IN子查询中自然被排除(NULL IN (...)返回NULL，不满足WHERE条件)。因此NULL值处理与原SQL一致。\n\n7. **聚合函数语义**：原SQL和重写SQL均对满足所有WHERE条件的行集合执行MIN聚合。由于重写SQL通过CTE和半连接精确复现了原SQL的过滤逻辑，且最终JOIN的结果集与原SQL的笛卡尔积+WHERE过滤结果集相同，因此MIN(c_customer_id)、MIN(sr_ticket_number)、MIN(sr_item_sk)的计算结果完全一致。\n\n8. **主键与唯一性保证**：customer、customer_address、customer_demographics、household_demographics、income_band、store_returns均有主键约束(根据索引信息)，确保IN子查询和JOIN不会产生意外的重复行。重写SQL利用这些主键约束，通过半连接和CTE过滤构建符合条件的键集合，再进行JOIN，与原SQL的多表JOIN语义等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过CTE提取过滤条件、半连接转换和传递性谓词推导，在逻辑上与原SQL等价：两者过滤条件完全对应，JOIN关系一致，MIN聚合作用于相同的行集合。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL引入了CTE分解和预聚合，体现了公共中间结果复用的意图，这是高优先级正信号。但执行计划显示：1) store_returns从并行扫描(Parallel Seq Scan, 299万行)退化为串行扫描(Seq Scan, 719万行)，并行度完全丢失且行数估计膨胀2.4倍；2) customer表从并行扫描(20.8万行)退化为串行扫描(50万行)，行数估计膨胀2.4倍；3) 引入了Materialize节点和多层嵌套循环，增加了物化开销；4) 行数估计求和从321万上升至822万(增长2.56倍)，说明中间结果膨胀显著；5) cost从18.5万上升至26万(增长40%)。虽然CTE复用是正向信号，但并行度完全丢失、主干表行数估计失控、引入新的物化瓶颈，构成了明确的灾难性结构退化证据。当前重写方向(CTE分解+半连接)未能有效利用并行能力，需调整策略。",
+  "next_step_advice": "基于当前enhanced_sql继续改写：1) 保留CTE预过滤的思路，但将filtered_sr改为直接在主查询中与store_returns做Hash Join，避免串行扫描；2) 在主查询的store_returns扫描处显式添加PARALLEL提示或调整CTE物化策略(如NOT MATERIALIZED)，恢复并行扫描能力；3) 简化filtered_cd的构建逻辑，避免多层嵌套子查询导致行数估计失真；4) 考虑将customer表的过滤条件直接下推到主查询的Hash Join中，减少Materialize开销；5) 若优化器仍无法恢复并行，可尝试将CTE改为派生表(inline view)形式，让优化器有更多重排空间。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示store_returns表仍为串行全表扫描(Seq Scan, 719万行, cost=190898.87)，这是当前最大瓶颈。上一轮CTE分解导致并行度丢失和行数估计膨胀，本轮需彻底改变策略：1) 放弃CTE物化，改用派生表(inline view)让优化器有更多重排空间；2) 将filtered_cd的构建逻辑简化为单层子查询，避免多层嵌套导致行数估计失真(当前customer扫描估计50万行，实际统计信息也是50万，但过滤后应大幅减少)；3) 利用半连接将store_returns的过滤条件直接下推，减少主干扫描行数；4) 简化连接顺序，优先用小表(filtered_ca 467行, filtered_hd 2880行)过滤customer，再关联store_returns。当前Nested Loop的Materialize节点和多层嵌套循环增加了不必要的物化开销，需通过Hash Join替代。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将所有CTE改为派生表(inline view)形式，让优化器自主决定物化策略和连接顺序。具体：将filtered_ca/filtered_hd/filtered_cd/filtered_sr全部改为FROM子句中的派生表，避免强制物化导致并行度丢失。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先用小表filtered_ca(467行)和filtered_hd(2880行)通过Hash Join过滤customer，再将过滤后的customer与store_returns做Hash Semi Join，避免当前Nested Loop导致的14764次循环。将sr_cdemo_sk的过滤条件直接作为Semi Join条件，而非先物化filtered_sr。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "简化filtered_cd的构建逻辑：将当前三层嵌套(filtered_cd -> customer -> filtered_ca/filtered_hd)改为单层EXISTS子查询，直接在customer_demographics上过滤cd_demo_sk IN (SELECT c_current_cdemo_sk FROM customer WHERE ...)，减少中间聚合步骤。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将store_returns的过滤改为：FROM store_returns sr WHERE EXISTS (SELECT 1 FROM customer c JOIN ... WHERE sr.sr_cdemo_sk = c.c_current_cdemo_sk)，利用Semi Join的短路特性和索引(customer_demographics_pkey)加速过滤，避免全表扫描719万行。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "JOIN_ADD_REDUNDANT_SEMI_JOIN", "JOIN_CONDITION_PUSH"],
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.4,
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.3,
+    "JOIN_CONDITION_PUSH": 0.3
+  },
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.6,
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.5,
+    "JOIN_CONDITION_PUSH": 0.7
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rewritten_sql": "SELECT \n  min(c.c_customer_id) AS min_customer_id,\n  min(sr.sr_ticket_number) AS min_ticket_number,\n  min(sr.sr_item_sk) AS min_item_sk\nFROM store_returns sr\nJOIN (\n  SELECT DISTINCT c.c_customer_id, c.c_current_cdemo_sk\n  FROM customer c\n  WHERE c.c_current_addr_sk IN (\n    SELECT ca_address_sk \n    FROM customer_address \n    WHERE ca_city = 'Pleasant Hill'\n  )\n  AND c.c_current_hdemo_sk IN (\n    SELECT hd_demo_sk \n    FROM household_demographics \n    WHERE hd_income_band_sk IN (\n      SELECT ib_income_band_sk \n      FROM income_band \n      WHERE ib_lower_bound >= 70000 AND ib_upper_bound <= 120000\n    )\n  )\n  AND c.c_current_cdemo_sk IS NOT NULL\n) c ON sr.sr_cdemo_sk = c.c_current_cdemo_sk\nWHERE EXISTS (\n  SELECT 1 \n  FROM customer_demographics cd \n  WHERE cd.cd_demo_sk = sr.sr_cdemo_sk\n);",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原CTE结构改为派生表+IN子查询形式，消除CTE物化导致的并行度丢失；将filtered_cd/filtered_ca/filtered_hd/filtered_ib的四层嵌套改为customer上的两层IN子查询，直接在主查询中与store_returns做Hash Join。\n\n2. 连接顺序调整：原查询从customer出发依次JOIN五个CTE；重写后从store_returns出发JOIN预过滤的customer派生表，利用store_returns的并行扫描能力(原执行计划显示299万行并行扫描)，避免customer表的串行扫描(原反馈显示50万行串行扫描)。\n\n3. 谓词下推等价性：ca_city='Pleasant Hill'、ib_lower_bound>=70000、ib_upper_bound<=120000、c_current_cdemo_sk IS NOT NULL四个过滤条件在原查询中通过CTE层层传递，重写后直接作为IN子查询的WHERE条件，过滤逻辑完全一致；customer_demographics的过滤从原filtered_cd的IN子查询改为主查询的EXISTS半连接，两者在TPC-DS Schema下等价(cd_demo_sk为主键，EXISTS仅验证存在性)。\n\n4. JOIN语义保持：原查询通过filtered_sr CTE过滤sr_cdemo_sk IN (SELECT cd_demo_sk FROM filtered_cd)，重写后改为sr JOIN customer派生表ON sr.sr_cdemo_sk = c.c_current_cdemo_sk + EXISTS验证cd_demo_sk存在性；由于customer.c_current_cdemo_sk与customer_demographics.cd_demo_sk通过外键关联，且原filtered_cd已通过customer表过滤，两种写法的结果集完全一致。\n\n5. 聚合函数等价性：原查询对customer表做四次JOIN后再关联store_returns，最终对c_customer_id/sr_ticket_number/sr_item_sk求min；重写后从store_returns出发JOIN预过滤的customer，聚合对象和函数完全相同，且customer派生表中的DISTINCT确保c_current_cdemo_sk唯一性(对应原filtered_cd的去重逻辑)，不会产生重复行导致min结果偏差。\n\n6. NULL处理一致性：原查询在filtered_cd的子查询中过滤c_current_cdemo_sk IS NOT NULL，重写后在customer派生表的WHERE子句中保留该条件；store_returns.sr_cdemo_sk与customer.c_current_cdemo_sk的JOIN条件在两种写法下均要求非NULL匹配，NULL语义完全一致。\n\n7. 易误判点说明：重写后将customer_demographics的过滤从IN子查询改为EXISTS半连接，可能被误判为语义变化；但由于customer.c_current_cdemo_sk已在派生表中通过IS NOT NULL过滤，且customer_demographics.cd_demo_sk为主键(索引信息显示customer_demographics_pkey)，EXISTS仅验证主键存在性而不改变结果集，与原IN子查询等价；同时，将customer的四次JOIN改为派生表+IN子查询，虽改变了执行顺序，但IN子查询的过滤逻辑与原CTE的层层嵌套完全对应，不会遗漏或增加任何行。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": false,
+  "message": "重写SQL在customer派生表中使用了DISTINCT c_customer_id和c_current_cdemo_sk，但原始SQL对customer表无去重；当同一c_current_cdemo_sk对应多个c_customer_id时，重写会丢失部分customer行，导致与store_returns JOIN后的结果集变小，最终min(c_customer_id)可能取到不同值。",
+  "differences": [
+    {
+      "type": "去重语义差异",
+      "description": "重写在customer派生表中对(c_customer_id, c_current_cdemo_sk)做了DISTINCT，原始SQL无此去重；当c_current_cdemo_sk相同但c_customer_id不同时，重写会丢失部分customer行",
+      "location": "customer派生表的SELECT DISTINCT子句"
+    },
+    {
+      "type": "聚合结果差异",
+      "description": "由于重写丢失了部分customer行，与store_returns JOIN后的结果集可能变小，导致min(c_customer_id)取到的最小值与原始SQL不同",
+      "location": "最终SELECT的min(c.c_customer_id)"
+    }
+  ]
+}
+```
+❌ 语义不等价: 重写SQL在customer派生表中使用了DISTINCT c_customer_id和c_current_cdemo_sk，但原始SQL对customer表无去重；当同一c_current_cdemo_sk对应多个c_customer_id时，重写会丢失部分customer行，导致与store_returns JOIN后的结果集变小，最终min(c_customer_id)可能取到不同值。
+```json
+{"fixed_sql": "SELECT min(c.c_customer_id) AS min_customer_id, min(sr.sr_ticket_number) AS min_ticket_number, min(sr.sr_item_sk) AS min_item_sk FROM store_returns sr JOIN (SELECT c.c_customer_id, c.c_current_cdemo_sk FROM customer c WHERE c.c_current_addr_sk IN (SELECT ca_address_sk FROM customer_address WHERE ca_city = 'Pleasant Hill') AND c.c_current_hdemo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_income_band_sk IN (SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 70000 AND ib_upper_bound <= 120000)) AND c.c_current_cdemo_sk IS NOT NULL) c ON sr.sr_cdemo_sk = c.c_current_cdemo_sk WHERE EXISTS (SELECT 1 FROM customer_demographics cd WHERE cd.cd_demo_sk = sr.sr_cdemo_sk)", "note": "移除customer派生表中的DISTINCT关键字，保留所有满足条件的customer行，确保与原始SQL聚合结果一致"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+  "equivalent": true,
+  "message": "当前重写SQL已移除上轮被否的DISTINCT，customer派生表现在不做去重，与原始SQL的customer表处理一致；两SQL在相同输入下产生相同结果集。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 4->3, index-like 2->3
+```json
+{
+  "terminate": true,
+  "reason": "执行计划结构基本等价，微小差异不构成明显改进或恶化。对比分析：1) 扫描方式：Seq Scan 4→3，Index Scan 2→3，整体访问路径略有优化；2) 连接结构：Hash Join 3→2，Nested Loop 2→3，连接算法调整但无本质差异；3) 并行度：两者均保持 Workers Planned=2，无退化；4) 行数估计求和：3209674→3204614（下降0.16%），几乎持平；5) Cost：184538.53→184608.61（上升0.04%），微小增幅在误差范围内。重写将部分 IN 子查询改为 EXISTS + Semi Join，引入额外 Nested Loop 层级但减少一次 Seq Scan，结构上无明显收益也无灾难性退化。由于已是第2轮优化且当前改写未带来可验证的结构性突破（无去相关、无子计划消除、无公共结果复用），继续迭代的边际收益极低，应终止优化流程。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 403
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE', 'JOIN_ADD_REDUNDANT_SEMI_JOIN', 'JOIN_CONDITION_PUSH']
+   - 优化组别: 连接优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=184538.53, 重写=184608.61，相对变化: -0.04%
+✅ 成功存储，记录ID: 16a6d841-ca2e-462b-b60c-c1fe765043df
+
+🎲 UCT Math Update: 3 rules, reward=+0.0278 (cost=-0.0004, rows=+0.0016, depth=+0.0909, oc=184538.5300, rc=184608.6100)
+   结构分细节: rows 3209674.0->3204614.0 (score=+0.002), depth 11.0->10.0 (score=+0.091)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.400, conf=0.60, lambda=0.30, reward=+0.010, count=89, avg=+0.045
+   → JOIN_ADD_REDUNDANT_SEMI_JOIN: P(s,a)=N/A, effect=0.300, conf=0.50, lambda=0.25, reward=+0.009, count=22, avg=-0.032
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.300, conf=0.70, lambda=0.35, reward=+0.008, count=310, avg=+0.008
+
+----------------------------------------
+

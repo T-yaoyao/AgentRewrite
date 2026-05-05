@@ -1,0 +1,196 @@
+Query ID: 10
+==================================================
+
+Original: SELECT SUM(100) OVER (PARTITION BY DEPTNO, SAL ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL1, SUM(100) OVER (PARTITION BY SAL ORDER BY DEPTNO RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL2, SUM(SAL) OVER (PARTITION BY DEPTNO ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL3 FROM EMP WHERE SAL = 5000
+Rewritten: WITH filtered_emp AS (
+  SELECT DEPTNO, SAL
+  FROM EMP
+  WHERE SAL = 5000
+),
+sorted_base AS (
+  SELECT DEPTNO, SAL
+  FROM filtered_emp
+  ORDER BY DEPTNO, SAL
+)
+SELECT 
+  100 * COUNT(*) OVER (PARTITION BY DEPTNO, SAL) AS COL1,
+  100 * COUNT(*) OVER (PARTITION BY SAL ORDER BY DEPTNO RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL2,
+  SUM(SAL) OVER (PARTITION BY DEPTNO, SAL) AS COL3
+FROM sorted_base
+Time Cost: 245.02s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '使用 CTE 预计算过滤结果：WITH filtered_emp AS (SELECT DEPTNO, SAL FROM EMP WHERE SAL = 5000 ORDER BY DEPTNO, SAL)，将过滤和排序逻辑前置，后续窗口函数直接基于 CTE 计算，避免在窗口计算阶段重复排序'}, {'group': '排序优化', 'produced_suggestion': '统一窗口函数排序键：将 w1 (PARTITION BY DEPTNO, SAL ORDER BY SAL) 和 w2 (PARTITION BY DEPTNO ORDER BY SAL) 的排序键统一为 (DEPTNO, SAL)，利用 CTE 中的预排序结果，减少 WindowAgg 节点的排序开销。w3 (PARTITION BY SAL ORDER BY DEPTNO) 因排序键不同需单独处理，但可基于 CTE 的过滤结果减少数据量'}, {'group': '聚合优化', 'produced_suggestion': '窗口函数语义等价改写：COL1 的窗口定义 PARTITION BY DEPTNO, SAL ORDER BY SAL 中，ORDER BY SAL 在 PARTITION BY 已包含 SAL 时冗余（同分区内 SAL 相同），可简化为 PARTITION BY DEPTNO, SAL，与 w2 共享分区键，增加优化器合并窗口计算的可能性'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) 对4500万行的emp表进行全表扫描(Seq Scan)，cost高达702880.12；2) 窗口函数中存在冗余计算，SUM(100)实际是常量聚合可预先计算；3) 三个窗口函数定义存在部分重叠的分区和排序逻辑，但未能合并；4) WHERE SAL=5000的过滤条件缺少索引支持，导致全表扫描后仅过滤出46319行(选择率约0.1%)，存在巨大的IO浪费",
+  "advice": [
+    {
+      "group": "常量折叠",
+      "produced_suggestion": "将SUM(100) OVER (...)常量窗口函数替换为100 * COUNT(*) OVER (...)，避免对常量进行无意义的累加计算，减少窗口函数执行开销"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "WHERE SAL=5000是高选择性过滤条件(选择率0.1%)，建议在物理优化阶段对SAL列创建索引(CREATE INDEX idx_emp_sal ON emp(sal))，将Seq Scan转换为Index Scan，大幅降低扫描成本"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "分析三个窗口函数的分区和排序键：w1和w2共享相同的PARTITION BY DEPTNO, ORDER BY SAL，可考虑合并为单次排序；w3使用ORDER BY DEPTNO，与前两者排序键不同但可利用已排序的DEPTNO减少排序开销"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "当前查询仅需要DEPTNO和SAL两列用于窗口计算和过滤，确保执行计划中的Seq Scan仅投影这两列，避免读取emp表的其他列(如EMPNO, ENAME等)造成额外IO"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 39 rules
+   → FILTER_VALUES_MERGE: UCT=1.100
+   → PROJECT_VALUES_MERGE: UCT=1.100
+   → UNION_PULL_UP_CONSTANTS: UCT=1.100
+{
+  "groups": "常量折叠, 谓词简化, 排序优化, 投影优化",
+  "applied_rules": [
+    "WINDOW_REDUCE_EXPRESSIONS"
+  ],
+  "rule_effect_scores": {
+    "WINDOW_REDUCE_EXPRESSIONS": 1.0
+  },
+  "rule_effect_confidence": {
+    "WINDOW_REDUCE_EXPRESSIONS": 0.9
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "常量折叠, 谓词简化, 排序优化, 投影优化",
+  "applied_rules": ["WINDOW_REDUCE_EXPRESSIONS"],
+  "rewritten_sql": "SELECT 100 * COUNT(*) OVER (PARTITION BY DEPTNO, SAL ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL1, 100 * COUNT(*) OVER (PARTITION BY SAL ORDER BY DEPTNO RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL2, SUM(SAL) OVER (PARTITION BY DEPTNO ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL3 FROM EMP WHERE SAL = 5000",
+  "semantic_correctness_guarantee": "1. 结构性改写：将 COL1 和 COL2 中的 SUM(100) 窗口函数改写为 100 * COUNT(*)，这是常量折叠优化。原 SQL 对常量 100 进行累加求和，改写后通过计数乘以常量得到相同结果。COL3 的 SUM(SAL) 保持不变。\n\n2. 语义等价性论证：\n   - 对于 SUM(100) OVER (...)：在窗口帧内对常量 100 求和，等价于 100 * 窗口帧内的行数。COUNT(*) OVER (...) 计算窗口帧内的行数，因此 SUM(100) = 100 * COUNT(*) 在数学上完全等价。\n   - WHERE SAL = 5000 过滤条件保持不变，确保输入数据集相同。\n   - 三个窗口函数的 PARTITION BY、ORDER BY 和 RANGE 子句完全保持不变，窗口帧定义相同，因此窗口计算的作用域和顺序完全一致。\n\n3. 窗口函数语义保证：\n   - COL1：PARTITION BY DEPTNO, SAL ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW。由于 PARTITION BY 已包含 SAL，每个分区内 SAL 值相同，ORDER BY SAL 在分区内无实际排序效果，RANGE 帧包含从分区开始到当前行的所有行。SUM(100) 累加分区内所有行的 100，等价于 100 * 分区内行数。\n   - COL2：PARTITION BY SAL ORDER BY DEPTNO RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW。由于 WHERE SAL = 5000，所有行的 SAL 都是 5000，PARTITION BY SAL 将所有行放入同一分区。ORDER BY DEPTNO 按 DEPTNO 排序，RANGE 帧从分区开始到当前 DEPTNO 值的所有行。SUM(100) 等价于 100 * 当前帧内行数。\n   - COL3：保持原样，SUM(SAL) 对 SAL 列求和，由于 SAL = 5000，结果为 5000 * 窗口帧内行数，语义未改变。\n\n4. NULL 值处理：COUNT(*) 计数所有行（包括 NULL），SUM(100) 对非 NULL 常量求和也计数所有行，两者在常量场景下行为一致。由于 100 是常量非 NULL，不存在 NULL 传播问题。\n\n5. 重复行处理：窗口函数在 RANGE 模式下，相同排序键值的行属于同一帧。SUM(100) 和 100 * COUNT(*) 对重复行的处理完全一致，都是累加/计数所有行。\n\n6. 结果集列名和类型：COL1、COL2、COL3 列名保持不变。SUM(100) 返回数值类型，100 * COUNT(*) 也返回数值类型，类型兼容。\n\n7. 易误判点说明：有人可能认为 SUM(100) 与 100 * COUNT(*) 在窗口函数中不等价，但在常量场景下，SUM(常量) 本质就是 常量 * 行数，这是数学恒等式。WINDOW_REDUCE_EXPRESSIONS 规则正是利用这一点进行常量折叠优化，不改变语义。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "SUM(100) 在窗口帧内对常量求和，数学上等价于 100 * COUNT(*)；三个窗口函数的分区、排序、帧定义完全一致，WHERE 条件相同，结果集完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（节点类型、顺序、并行度、扫描方式均无变化），仅将 SUM(100) 改写为 100*COUNT(*)，属于常量折叠优化，但未触发执行计划层面的结构改进。cost 微增 0.03%（712964.51→713196.11）属于优化器估算误差范围，可忽略。当前重写未解决核心瓶颈：1) Seq Scan 未转为 Index Scan（SAL=5000 高选择性过滤未利用索引）；2) 三次 WindowAgg 未合并排序（w1/w2 共享 PARTITION BY DEPTNO, ORDER BY SAL 但未复用排序结果）；3) Gather Merge 排序成本占主导（704253.93 startup cost）。结构无改进且存在明确优化空间，需继续改写。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 enhanced_sql 继续优化：1) 物理层面建议创建索引 CREATE INDEX idx_emp_sal ON emp(sal) 将 Seq Scan 转为 Index Scan（本轮 SQL 改写无法直接实现，需 DBA 配合）；2) SQL 层面尝试通过 CTE 预计算并复用排序结果，将三个窗口函数的公共排序键（DEPTNO, SAL）提取到 CTE 中一次性排序，后续窗口函数基于已排序数据计算，减少重复排序开销；3) 若无法通过 CTE 优化，考虑拆分为两阶段查询：第一阶段过滤+排序，第二阶段窗口计算，显式控制排序次数。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮常量折叠优化未触发执行计划结构改进。当前执行计划存在三个核心瓶颈：1) Seq Scan on emp (cost=702880.12) 未利用索引过滤 SAL=5000；2) 三次独立 WindowAgg 节点分别计算窗口函数，未复用排序结果；3) Gather Merge 的排序成本占主导 (startup=704253.93)。本轮优化策略：通过 CTE 预计算过滤结果并显式排序，将三个窗口函数的公共排序键 (DEPTNO, SAL) 提取到 CTE 中一次性排序，后续窗口函数基于已排序数据计算，减少重复排序开销。同时通过窗口函数语义等价改写，将 w1 和 w2 的 PARTITION BY + ORDER BY 合并为相同排序键，增加优化器复用排序结果的可能性。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用 CTE 预计算过滤结果：WITH filtered_emp AS (SELECT DEPTNO, SAL FROM EMP WHERE SAL = 5000 ORDER BY DEPTNO, SAL)，将过滤和排序逻辑前置，后续窗口函数直接基于 CTE 计算，避免在窗口计算阶段重复排序"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "统一窗口函数排序键：将 w1 (PARTITION BY DEPTNO, SAL ORDER BY SAL) 和 w2 (PARTITION BY DEPTNO ORDER BY SAL) 的排序键统一为 (DEPTNO, SAL)，利用 CTE 中的预排序结果，减少 WindowAgg 节点的排序开销。w3 (PARTITION BY SAL ORDER BY DEPTNO) 因排序键不同需单独处理，但可基于 CTE 的过滤结果减少数据量"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "窗口函数语义等价改写：COL1 的窗口定义 PARTITION BY DEPTNO, SAL ORDER BY SAL 中，ORDER BY SAL 在 PARTITION BY 已包含 SAL 时冗余（同分区内 SAL 相同），可简化为 PARTITION BY DEPTNO, SAL，与 w2 共享分区键，增加优化器合并窗口计算的可能性"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 32 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.221
+   → SORT_PROJECT_TRANSPOSE: UCT=1.100
+   → SORT_UNION_TRANSPOSE: UCT=1.100
+{
+  "groups": "聚合优化, 排序优化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "WINDOW_REDUCE_EXPRESSIONS"],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "WINDOW_REDUCE_EXPRESSIONS": 0.3
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "WINDOW_REDUCE_EXPRESSIONS": 0.7
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 排序优化, 子查询优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "WINDOW_REDUCE_EXPRESSIONS"
+  ],
+  "rewritten_sql": "WITH filtered_emp AS (\n  SELECT DEPTNO, SAL\n  FROM EMP\n  WHERE SAL = 5000\n),\nsorted_base AS (\n  SELECT DEPTNO, SAL\n  FROM filtered_emp\n  ORDER BY DEPTNO, SAL\n)\nSELECT \n  100 * COUNT(*) OVER (PARTITION BY DEPTNO, SAL) AS COL1,\n  100 * COUNT(*) OVER (PARTITION BY SAL ORDER BY DEPTNO RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL2,\n  SUM(SAL) OVER (PARTITION BY DEPTNO, SAL) AS COL3\nFROM sorted_base",
+  "semantic_correctness_guarantee": "1. **CTE 提取过滤逻辑（STRATEGY_CTE_DECOMPOSITION）**：将 WHERE SAL = 5000 提取到 filtered_emp CTE 中，仅保留 DEPTNO 和 SAL 两列（查询所需的全部列），过滤结果与原 SQL 的 WHERE 子句完全等价，未改变数据范围。\n\n2. **CTE 预排序优化（STRATEGY_CTE_DECOMPOSITION）**：在 sorted_base CTE 中对 filtered_emp 按 (DEPTNO, SAL) 排序，为后续窗口函数提供预排序数据。由于 SAL = 5000 为等值过滤，filtered_emp 中所有行的 SAL 值相同（均为 5000），因此 ORDER BY DEPTNO, SAL 实际等价于 ORDER BY DEPTNO（SAL 作为次要排序键不影响结果）。\n\n3. **窗口函数 COL1 简化（WINDOW_REDUCE_EXPRESSIONS + 语义等价改写）**：原 SQL 中 COL1 定义为 PARTITION BY DEPTNO, SAL ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW。由于 SAL = 5000 过滤后所有行 SAL 值相同，PARTITION BY DEPTNO, SAL 将数据按 (DEPTNO, 5000) 分区，每个分区内 SAL 值恒定，ORDER BY SAL 无实际排序效果（所有行 SAL 相等，排序键无区分度）。RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW 在 SAL 值相同时，窗口范围覆盖整个分区（因所有行 SAL 值相等，CURRENT ROW 的 SAL 值与分区内所有行相同，RANGE 语义下窗口包含所有行）。因此 COL1 等价于 COUNT(*) OVER (PARTITION BY DEPTNO, SAL)，即统计每个 (DEPTNO, 5000) 分区的总行数，乘以 100。\n\n4. **窗口函数 COL2 保持不变**：COL2 定义为 PARTITION BY SAL ORDER BY DEPTNO RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW。由于 SAL = 5000 过滤后所有行 SAL 值相同，PARTITION BY SAL 将所有数据归入单一分区（SAL = 5000）。ORDER BY DEPTNO 在该分区内按 DEPTNO 排序，RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW 计算从分区起始到当前行 DEPTNO 值（含相等值）的累积计数。此窗口函数语义与原 SQL 完全一致，未做改写。\n\n5. **窗口函数 COL3 简化（语义等价改写）**：原 SQL 中 COL3 定义为 SUM(SAL) OVER (PARTITION BY DEPTNO ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)。由于 SAL = 5000 过滤后所有行 SAL 值相同，PARTITION BY DEPTNO 按 DEPTNO 分区，ORDER BY SAL 在每个分区内无实际排序效果（SAL 值恒定）。RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW 在 SAL 值相同时，窗口范围覆盖整个分区（理由同 COL1）。因此 COL3 等价于 SUM(SAL) OVER (PARTITION BY DEPTNO, SAL)，即计算每个 (DEPTNO, 5000) 分区的 SAL 总和（等于 5000 * 该分区行数）。由于 PARTITION BY DEPTNO, SAL 与 COL1 共享分区键，可复用分区结果。\n\n6. **结果集等价性保证**：重写后 SQL 返回三列 (COL1, COL2, COL3)，数据类型、列名、计算逻辑与原 SQL 完全一致。COL1 和 COL3 通过去除冗余的 ORDER BY 和 RANGE 子句简化为基于 PARTITION BY DEPTNO, SAL 的窗口函数，语义等价性基于 SAL = 5000 等值过滤后分区内 SAL 值恒定的事实。COL2 未改写，保持原语义。CTE 的过滤和排序逻辑不改变最终结果集的行数、列值或顺序（外层 SELECT 未指定 ORDER BY，结果集顺序由窗口函数计算顺序决定，与原 SQL 一致）。\n\n7. **NULL 值处理**：EMP 表 Schema 中 SAL 列定义为 NOT NULL，WHERE SAL = 5000 过滤不涉及 NULL 值处理。窗口函数 COUNT(*) 和 SUM(SAL) 对 NULL 值的处理与原 SQL 一致（COUNT(*) 统计所有行，SUM(SAL) 忽略 NULL 值，但 SAL 列无 NULL）。\n\n8. **优化目标与执行计划改进**：通过 CTE 预排序和窗口函数简化，期望优化器识别 COL1 和 COL3 共享 PARTITION BY DEPTNO, SAL 分区键，复用分区和排序结果，减少 WindowAgg 节点的重复排序开销。sorted_base CTE 的 ORDER BY DEPTNO, SAL 为 COL1 和 COL3 提供预排序数据，COL2 的 ORDER BY DEPTNO 可基于 CTE 的部分排序结果优化（DEPTNO 已排序，SAL 恒定）。此改写响应上一轮反馈中「通过 CTE 预计算并复用排序结果」的建议，在 SQL 层面尽可能减少排序次数。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "两SQL等价。WHERE SAL=5000过滤后所有行SAL值恒为5000，原SQL中COL1的ORDER BY SAL与RANGE窗口在SAL恒定时覆盖整个(DEPTNO,SAL)分区，等价于重写的COUNT(*) OVER (PARTITION BY DEPTNO, SAL)；COL3同理；COL2未改写；CTE仅做结构重组不改变结果集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划对比：1) 原计划：3个WindowAgg节点，1次Gather Merge并行扫描，1次Sort；重写计划：2个WindowAgg节点，但新增2次额外Sort（总计3次Sort），并行扫描保持不变。2) 结构信号：重写引入CTE（filtered_emp、sorted_base）试图复用中间结果，但EXPLAIN显示CTE未被物化或复用，仅作为内联子查询展开，未产生实际复用收益；WindowAgg从3个减少到2个，但新增的2次Sort抵消了窗口函数合并的收益。3) 改进点：窗口函数从3个减少到2个（COL1和COL3共享PARTITION BY DEPTNO, SAL），体现了语义等价简化的正向意图。4) 退化信号：新增2次Sort节点（分别对应w1和w2的不同排序键需求），导致排序开销增加；CTE未实现物化复用，反而引入额外的逻辑层次。5) cost分析（辅助）：enhanced_sql costs从712964.51上升至720491.04（+1.06%），微幅上升与新增Sort节点一致。6) 行数估计求和：从223876上升至270195（+20.7%），但该指标在窗口函数场景下失真严重，不作为主要依据。7) 最终结论：本轮重写在窗口函数合并上取得局部进展（3→2个WindowAgg），但CTE未实现预期的物化复用，且新增的Sort开销抵消了窗口合并收益，整体结构未明确改进。虽未出现灾难性退化，但距离'明确改进'或'无进一步优化空间'仍有距离，应继续优化。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改进：1) 移除CTE层次，直接在主查询中完成过滤和窗口计算，避免CTE内联展开的额外逻辑开销；2) 进一步统一窗口函数排序键：将COL2的窗口定义从'PARTITION BY SAL ORDER BY DEPTNO'调整为与COL1/COL3一致的'PARTITION BY DEPTNO, SAL'（若语义允许），或探索通过子查询预排序后复用排序结果；3) 若COL2的窗口语义无法统一，考虑将其拆分为独立子查询，避免强制全局重排序；4) 验证优化器是否支持窗口函数合并（如PostgreSQL的window function pushdown），若不支持则回退到原始SQL的3窗口结构可能更优。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 339
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'WINDOW_REDUCE_EXPRESSIONS']
+   - 优化组别: 聚合优化, 排序优化, 子查询优化
+   - 估计代价: 原始=712964.51, 重写=720491.04，相对变化: -1.06%
+✅ 成功存储，记录ID: 79f087d5-239f-42b2-bac0-d680294198e0
+
+🎲 UCT Math Update: 2 rules, reward=-0.0532 (cost=-0.0106, rows=+0.0000, depth=-0.1667, oc=712964.5100, rc=720491.0400)
+   结构分细节: rows 223876.0->270195.0 (score=+0.000), depth 6.0->7.0 (score=-0.167)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.700, conf=0.80, lambda=0.40, reward=-0.031, count=260, avg=+0.049
+   → WINDOW_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.300, conf=0.70, lambda=0.35, reward=-0.022, count=2, avg=-0.011
+
+----------------------------------------
+

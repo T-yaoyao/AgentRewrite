@@ -1,0 +1,112 @@
+Query ID: 26
+==================================================
+
+Original: select nation, o_year, sum(amount) as sum_profit from ( select n_name as nation, extract(year from o_orderdate) as o_year, l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount from part, supplier, lineitem, partsupp, orders, nation where s_suppkey = l_suppkey and ps_suppkey = l_suppkey and ps_partkey = l_partkey and p_partkey = l_partkey and o_orderkey = l_orderkey and s_nationkey = n_nationkey and p_name like '%chocolate%' ) as profit group by nation, o_year order by nation, o_year desc;
+Rewritten: select nation, o_year, sum(amount) as sum_profit
+from (
+  select n_name as nation,
+         extract(year from o_orderdate) as o_year,
+         l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
+  from part
+  join partsupp on p_partkey = ps_partkey and p_name like '%chocolate%'
+  join supplier on ps_suppkey = s_suppkey
+  join lineitem on s_suppkey = l_suppkey and ps_suppkey = l_suppkey and ps_partkey = l_partkey
+  join orders on o_orderkey = l_orderkey
+  join nation on s_nationkey = n_nationkey
+) as profit
+group by nation, o_year
+order by nation, o_year desc
+Time Cost: 123.95s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将part表的过滤条件p_name like '%chocolate%'尽早应用，减少后续连接的数据量"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，优先连接小表(nation、supplier)和过滤后的part表，减少中间结果集大小'}, {'group': '子查询优化', 'produced_suggestion': '将子查询展开为直接JOIN形式，消除派生表profit，减少物化开销'}, {'group': '投影优化', 'produced_suggestion': '在连接早期阶段裁剪不必要的列，只保留计算amount和分组所需的列'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) part表全表扫描(Seq Scan)代价51408.67，过滤条件p_name like '%chocolate%'选择性低(25252/2000000)；2) lineitem、partsupp、orders、supplier表均为全表扫描，代价高；3) 多层Hash Join嵌套，总代价2540353.46；4) 子查询可以通过谓词下推和连接顺序调整优化",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将part表的过滤条件p_name like '%chocolate%'尽早应用，减少后续连接的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先连接小表(nation、supplier)和过滤后的part表，减少中间结果集大小"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将子查询展开为直接JOIN形式，消除派生表profit，减少物化开销"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在连接早期阶段裁剪不必要的列，只保留计算amount和分组所需的列"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 55 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "PROJECT_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.6,
+    "PROJECT_JOIN_TRANSPOSE": 0.4
+  },
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.8,
+    "PROJECT_JOIN_TRANSPOSE": 0.7
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "PROJECT_JOIN_TRANSPOSE"],
+  "rewritten_sql": "select nation, o_year, sum(amount) as sum_profit\nfrom (\n  select n_name as nation,\n         extract(year from o_orderdate) as o_year,\n         l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount\n  from part\n  join partsupp on p_partkey = ps_partkey and p_name like '%chocolate%'\n  join supplier on ps_suppkey = s_suppkey\n  join lineitem on s_suppkey = l_suppkey and ps_suppkey = l_suppkey and ps_partkey = l_partkey\n  join orders on o_orderkey = l_orderkey\n  join nation on s_nationkey = n_nationkey\n) as profit\ngroup by nation, o_year\norder by nation, o_year desc",
+  "semantic_correctness_guarantee": "1. **FILTER_INTO_JOIN应用**：将part表的过滤条件`p_name like '%chocolate%'`从原WHERE子句移入JOIN ON子句（part与partsupp的连接条件中），使过滤在连接阶段即生效，减少后续连接的数据量。由于part表有主键p_partkey，partsupp通过ps_partkey关联，过滤条件仅依赖part表列，提前应用不改变最终结果集。\n\n2. **连接顺序调整**：原SQL在WHERE中列出所有连接条件，重写后显式指定JOIN顺序（part→partsupp→supplier→lineitem→orders→nation）。由于所有连接均为INNER JOIN且连接键基于主键/外键关系（p_partkey=ps_partkey, ps_suppkey=s_suppkey=l_suppkey, o_orderkey=l_orderkey, s_nationkey=n_nationkey），连接顺序调整不影响结果集的完整性和正确性。\n\n3. **投影列保持一致**：子查询profit中仍投影nation(n_name)、o_year(extract(year from o_orderdate))、amount(l_extendedprice*(1-l_discount)-ps_supplycost*l_quantity)三列，外层GROUP BY和ORDER BY的列与原SQL完全一致，聚合函数sum(amount)语义不变。\n\n4. **连接条件完整性**：重写后保留了原SQL所有连接条件（s_suppkey=l_suppkey, ps_suppkey=l_suppkey, ps_partkey=l_partkey, p_partkey=l_partkey, o_orderkey=l_orderkey, s_nationkey=n_nationkey），仅将它们从WHERE子句移至对应的JOIN ON子句中，连接语义等价。\n\n5. **过滤条件位置变更的等价性**：原SQL在WHERE中应用`p_name like '%chocolate%'`，重写后在part与partsupp的JOIN ON中应用。由于INNER JOIN的特性，ON条件与WHERE条件对结果集的过滤效果等价（均要求条件为真才保留行），且该条件仅涉及part表，不影响其他表的连接结果。\n\n6. **GROUP BY和ORDER BY语义保持**：外层查询的GROUP BY nation, o_year和ORDER BY nation, o_year desc与原SQL完全一致，分组和排序逻辑未改变，最终输出的sum_profit聚合结果与原SQL等价。\n\n7. **无NULL值影响**：所有连接键列（p_partkey, ps_partkey, ps_suppkey, s_suppkey, l_suppkey, o_orderkey, s_nationkey, n_nationkey）均为主键或外键且定义为NOT NULL，LIKE条件应用于p_name(NOT NULL列)，不存在NULL值导致的语义差异。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL将WHERE中的过滤条件p_name like '%chocolate%'移入JOIN ON子句，并将隐式连接改为显式INNER JOIN；这些变换在INNER JOIN语义下等价，不改变结果集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致：两个SQL的EXPLAIN JSON完全相同，节点类型、扫描方式、连接顺序、并行度、cost、行数估计均无任何差异。重写仅将隐式JOIN改写为显式JOIN语法，并调整了JOIN顺序的书写形式，但优化器生成的实际执行计划未发生任何变化。由于执行计划结构无改进也无恶化，且cost相同(2540353.46)，判定为语法等价重写，无实质优化效果。考虑到已应用FILTER_INTO_JOIN和PROJECT_JOIN_TRANSPOSE规则但未产生计划变化，说明优化器已自动完成相关优化，继续在此基础上重写难以产生进一步改进。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 467
+   - 规则序列: ['FILTER_INTO_JOIN', 'PROJECT_JOIN_TRANSPOSE']
+   - 优化组别: 谓词简化, 连接优化, 子查询优化, 投影优化
+   - 估计代价: 原始=2540353.46, 重写=2540353.46，相对变化: 0.00%
+✅ 成功存储，记录ID: f3bffca5-1815-48e5-b3f7-078e2ef1c45e
+
+🎲 UCT Math Update: 2 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=2540353.4600, rc=2540353.4600)
+   结构分细节: rows 49138110.0->49138110.0 (score=+0.000), depth 11.0->11.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.600, conf=0.80, lambda=0.40, reward=+0.000, count=288, avg=+0.022
+   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.400, conf=0.70, lambda=0.35, reward=+0.000, count=103, avg=+0.028
+
+----------------------------------------
+

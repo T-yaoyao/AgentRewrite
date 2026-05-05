@@ -21,7 +21,6 @@ load_project_env()
 
 from src.Rewrite_Middleware.middleware import (
     DBMS,
-    DBMS_EXPLAIN_Tool,
     DBMS_RAW_EXPLAIN_JSON_Tool,
     DBMS_Syntax_Tool,
     _normalize_sql_text,
@@ -79,7 +78,6 @@ class RewriteState(TypedDict, total=False):
     initial_explain_info: str
     evaluation_reason: str
     evaluation_terminate: bool
-    evaluation_no_further_optimization: bool
     evaluation_next_step_advice: str
 
     original_cost: float
@@ -733,8 +731,9 @@ class LangGraphQueryRewriter:
                     print(
                         f"🧊 历史案例相似度较低，不使用 few-shot"
                     )
+            # Raw EXPLAIN (FORMAT JSON) for agents — no PlanAnalyzer text report.
             async with self.db_semaphore:
-                explain_info = await DBMS_EXPLAIN_Tool(self.dbms, base_sql)
+                explain_info = await DBMS_RAW_EXPLAIN_JSON_Tool(self.dbms, base_sql)
             base_cost = self._extract_cost_from_explain(explain_info)
             stats = _stats_str(state["data_statistics"])
             idx = state.get("index_info") or self.index_info
@@ -810,7 +809,7 @@ class LangGraphQueryRewriter:
             explain_info = state.get("initial_explain_info", "")
             if not explain_info:
                 async with self.db_semaphore:
-                    explain = await DBMS_EXPLAIN_Tool(self.dbms, base_sql)
+                    explain = await DBMS_RAW_EXPLAIN_JSON_Tool(self.dbms, base_sql)
                 explain_info = (
                     json.dumps(explain, ensure_ascii=False)
                     if not isinstance(explain, str)
@@ -1132,7 +1131,6 @@ class LangGraphQueryRewriter:
                             f"重写 SQL 的估计 cost 增幅达到 {cost_increase_pct:.1f}%（超过 {self.COST_EXPLOSION_PCT:.0f}% 阈值），"
                             "按强负规则判定当前重写性能更差，需要继续优化。"
                         ),
-                        "no_further_optimization": False,
                         "next_step_advice": (
                             "下一轮请回退激进改写，优先恢复关键过滤与连接路径，"
                             "避免引入导致中间结果爆炸的 CTE/JOIN 结构。"
@@ -1149,7 +1147,6 @@ class LangGraphQueryRewriter:
                             f"重写 SQL 的估计 cost 增幅达到 {cost_increase_pct:.1f}%（超过 {self.COST_EXPLOSION_PCT:.0f}% 阈值），"
                             "判定当前重写性能显著更差；已达到最大轮次，终止优化。"
                         ),
-                        "no_further_optimization": True,
                         "next_step_advice": "无需下一步优化。",
                     }
                 trace.append(
@@ -1173,7 +1170,6 @@ class LangGraphQueryRewriter:
                         f"行数估计求和（Plan Rows累加）大幅下降，重写侧约为原的 {row_pct:.4f}%，"
                         "按强规则直接判定为优化成功：终止多轮优化并保留本轮重写 SQL。"
                     ),
-                    "no_further_optimization": True,
                     "next_step_advice": "无需下一步优化。",
                 }
                 trace.append(
@@ -1201,7 +1197,6 @@ class LangGraphQueryRewriter:
                         f"估计代价降幅 {pct:.1f}% 超过 {thr_pct:.0f}%，"
                         "按规则跳过模型评估：直接终止多轮优化并保留本轮重写 SQL。"
                     ),
-                    "no_further_optimization": True,
                     "next_step_advice": "无需下一步优化。",
                 }
                 trace.append(
@@ -1235,8 +1230,7 @@ class LangGraphQueryRewriter:
                         "plan_structure_analysis": plan_struct,
                     }
                 )
-            terminate = ev.get("terminate", True)
-            no_further_optimization = bool(ev.get("no_further_optimization", False))
+            terminate = bool(ev.get("terminate", True))
             eval_reason = str(ev.get("reason", "") or "")
             next_step_advice = str(ev.get("next_step_advice", "") or "").strip()
             uncertain_markers = (
@@ -1264,20 +1258,18 @@ class LangGraphQueryRewriter:
                 )
             )
             not_improved_or_degraded = not improved_now
-            if not_improved_or_degraded and not no_further_optimization and rnd < self.MAX_ITERATION_LOOP:
-                terminate = False
-                ev["terminate"] = False
-                if not next_step_advice:
-                    reasons = plan_struct.get("reasons") if isinstance(plan_struct, dict) else []
-                    reasons_text = "；".join(reasons[:3]) if reasons else ""
-                    next_step_advice = (
-                        "下一轮请优先修复导致未改进/恶化的关键结构："
-                        "尽量恢复或增强索引访问路径，减少大范围扫描/高开销算子，"
-                        "并针对相关子查询与JOIN顺序做更保守改写。"
-                        + (f" 参考当前结构线索：{reasons_text}" if reasons_text else "")
-                    )
+            if not terminate and not next_step_advice:
+                reasons = plan_struct.get("reasons") if isinstance(plan_struct, dict) else []
+                reasons_text = "；".join(reasons[:3]) if reasons else ""
+                next_step_advice = (
+                    "下一轮请优先修复导致未改进/恶化的关键结构："
+                    "尽量恢复或增强索引访问路径，减少大范围扫描/高开销算子，"
+                    "并针对相关子查询与JOIN顺序做更保守改写。"
+                    + (f" 参考当前结构线索：{reasons_text}" if reasons_text else "")
+                )
                 ev["next_step_advice"] = next_step_advice
-                print("ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。")
+            if not terminate and not_improved_or_degraded:
+                print("ℹ️ 本轮未改进/恶化：根据 terminate=false，进入下一轮重写。")
 
             # Explicitly carry the cost-explosion signal forward for next-round agents.
             if cost_exploded:
@@ -1285,7 +1277,7 @@ class LangGraphQueryRewriter:
                 ev["cost_increase_pct"] = round(cost_increase_pct, 2)
                 ev["cost_explosion_threshold_pct"] = self.COST_EXPLOSION_PCT
 
-            # 仅当「明确下一轮有望降低执行时间」时才续轮：未保留本轮重写时不允许进入下一轮
+            # 是否继续完全由 terminate 控制。
             if not terminate:
                 print("ℹ️ 评估建议继续下一轮优化（terminate=false）")
 
@@ -1311,7 +1303,6 @@ class LangGraphQueryRewriter:
                 "best_groups": best_groups,
                 "evaluation_reason": ev.get("reason", "") or "",
                 "evaluation_terminate": terminate,
-                "evaluation_no_further_optimization": no_further_optimization,
                 "evaluation_next_step_advice": next_step_advice,
                 "agent_trace": trace,
                 "current_sql": rw,
@@ -1506,7 +1497,6 @@ class LangGraphQueryRewriter:
             "initial_explain_info": "",
             "evaluation_reason": "",
             "evaluation_terminate": True,
-            "evaluation_no_further_optimization": False,
             "evaluation_next_step_advice": "",
             "original_cost": 0.0,
             "current_cost": 0.0,

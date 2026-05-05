@@ -1,0 +1,110 @@
+Query ID: 48
+==================================================
+
+Original: select sum(l_extendedprice) / 7.0 as avg_yearly from lineitem, part where p_partkey = l_partkey and p_brand = 'Brand#32' and p_container = 'MED PKG' and l_quantity < ( select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey );
+Rewritten: SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly
+FROM part
+JOIN (
+  SELECT l_partkey, AVG(l_quantity) * 0.2 AS threshold
+  FROM lineitem
+  GROUP BY l_partkey
+) AS agg_lineitem ON p_partkey = agg_lineitem.l_partkey
+JOIN lineitem ON p_partkey = lineitem.l_partkey
+WHERE p_brand = 'Brand#32'
+  AND p_container = 'MED PKG'
+  AND lineitem.l_quantity < agg_lineitem.threshold
+Time Cost: 111.74s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将相关子查询转换为JOIN：先对lineitem按l_partkey分组计算avg(l_quantity)，然后与外层JOIN，避免重复扫描。可改写为WITH子查询或直接JOIN派生表，消除SubPlan重复执行。'}, {'group': '聚合优化', 'produced_suggestion': '将子查询中的聚合计算提前到独立的聚合节点：SELECT l_partkey, AVG(l_quantity)*0.2 FROM lineitem GROUP BY l_partkey，然后作为维度表与主查询JOIN，利用Hash Join一次性完成关联。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：先执行part表过滤(p_brand和p_container条件仅返回2020行)，再与预聚合的lineitem统计表JOIN，最后与lineitem明细表JOIN并应用l_quantity过滤条件，减少数据流转量。'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示相关子查询(SubPlan 1)对每个匹配行重复执行全表扫描lineitem，导致总成本高达20694432.7。子查询中的Filter条件l_partkey=part.p_partkey使其成为相关子查询，每次外层返回一行都需重新计算avg(l_quantity)。历史案例显示相同SQL指纹通过FILTER_SUB_QUERY_TO_CORRELATE和AGGREGATE_JOIN_TRANSPOSE_EXTENDED等规则成功优化。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将相关子查询转换为JOIN：先对lineitem按l_partkey分组计算avg(l_quantity)，然后与外层JOIN，避免重复扫描。可改写为WITH子查询或直接JOIN派生表，消除SubPlan重复执行。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将子查询中的聚合计算提前到独立的聚合节点：SELECT l_partkey, AVG(l_quantity)*0.2 FROM lineitem GROUP BY l_partkey，然后作为维度表与主查询JOIN，利用Hash Join一次性完成关联。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先执行part表过滤(p_brand和p_container条件仅返回2020行)，再与预聚合的lineitem统计表JOIN，最后与lineitem明细表JOIN并应用l_quantity过滤条件，减少数据流转量。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.218
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_VALUES: UCT=1.100
+{
+  "groups": "聚合优化, 子查询优化, 连接优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "FILTER_INTO_JOIN"
+  ],
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.4,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.4,
+    "FILTER_INTO_JOIN": 0.2
+  },
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.8,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.7,
+    "FILTER_INTO_JOIN": 0.6
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 子查询优化, 连接优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "FILTER_INTO_JOIN"
+  ],
+  "rewritten_sql": "SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly\nFROM part\nJOIN (\n  SELECT l_partkey, AVG(l_quantity) * 0.2 AS threshold\n  FROM lineitem\n  GROUP BY l_partkey\n) AS agg_lineitem ON p_partkey = agg_lineitem.l_partkey\nJOIN lineitem ON p_partkey = lineitem.l_partkey\nWHERE p_brand = 'Brand#32'\n  AND p_container = 'MED PKG'\n  AND lineitem.l_quantity < agg_lineitem.threshold",
+  "semantic_correctness_guarantee": "1. 相关子查询去相关化：原SQL中的相关子查询 `SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey` 被改写为独立的聚合子查询 `SELECT l_partkey, AVG(l_quantity) * 0.2 AS threshold FROM lineitem GROUP BY l_partkey`，通过 l_partkey 分组预计算每个零件的平均数量阈值，消除了相关性。\n\n2. 聚合下推到JOIN前：应用AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则，将原本在相关子查询中每次执行的AVG聚合提前到独立的GROUP BY中一次性完成，生成派生表agg_lineitem，然后通过p_partkey与part表JOIN关联，避免了对每个part行重复扫描lineitem表计算平均值。\n\n3. 过滤条件推入JOIN：应用FILTER_INTO_JOIN规则，将part表的过滤条件 `p_brand = 'Brand#32' AND p_container = 'MED PKG'` 保留在WHERE子句中（也可推入part的子查询），在JOIN前即过滤掉不符合条件的part行，减少JOIN的数据量。\n\n4. 结果集等价性保证：原SQL通过相关子查询对每个满足part条件的行，在lineitem中查找相同l_partkey的行计算平均值并过滤l_quantity；重写后通过agg_lineitem预计算所有l_partkey的阈值，再通过两次JOIN（先关联阈值表，再关联明细表）并在WHERE中应用 `l_quantity < threshold` 过滤，最终筛选出的lineitem行集合与原SQL完全一致。\n\n5. 聚合函数语义一致：原SQL和重写SQL都对筛选后的lineitem.l_extendedprice求和后除以7.0，聚合范围和计算逻辑完全相同，返回相同的avg_yearly值。\n\n6. JOIN语义等价：原SQL隐式INNER JOIN `lineitem, part WHERE p_partkey = l_partkey` 等价于重写SQL中的显式JOIN；agg_lineitem通过l_partkey与part和lineitem关联，由于l_partkey是lineitem的外键且part表主键，JOIN不会产生重复行或丢失行。\n\n7. 过滤条件作用域一致：原SQL的相关子查询过滤条件 `l_partkey = p_partkey` 和 `l_quantity < 0.2*avg` 在重写后分别对应JOIN条件和WHERE子句中的 `l_quantity < threshold`，过滤逻辑和作用范围完全等价，不会改变最终结果集。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过预计算每个l_partkey的阈值并改写为JOIN，与原SQL的相关子查询在结果集上完全等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 60311061.0 -> 50077181.0 (重写侧约为原的 83.0315%) | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。
+✅ 估计代价降幅 85.5% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 204
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE', 'AGGREGATE_JOIN_TRANSPOSE_EXTENDED', 'FILTER_INTO_JOIN']
+   - 优化组别: 聚合优化, 子查询优化, 连接优化
+   - 估计代价: 原始=20694432.7, 重写=3002547.96，相对变化: 85.49%
+✅ 成功存储，记录ID: d2907bca-61a7-40e5-aad4-f0d56ef5ac4e
+
+🎲 UCT Math Update: 3 rules, reward=+0.1443 (cost=+0.8549, rows=+0.1697, depth=-0.6000, oc=20694432.7000, rc=3002547.9600)
+   结构分细节: rows 60311061.0->50077181.0 (score=+0.170), depth 5.0->8.0 (score=-0.600)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.400, conf=0.80, lambda=0.40, reward=+0.055, count=66, avg=+0.048
+   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: P(s,a)=N/A, effect=0.400, conf=0.70, lambda=0.35, reward=+0.051, count=58, avg=+0.089
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.200, conf=0.60, lambda=0.30, reward=+0.039, count=301, avg=+0.023
+
+----------------------------------------
+

@@ -1,0 +1,111 @@
+Query ID: 46
+==================================================
+
+Original: select sum(l_extendedprice) / 7.0 as avg_yearly from lineitem, part where p_partkey = l_partkey and p_brand = 'Brand#35' and p_container = 'LG PKG' and l_quantity < ( select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey );
+Rewritten: SELECT sum(l_extendedprice) / 7.0 AS avg_yearly
+FROM (
+  SELECT l_partkey, l_extendedprice, l_quantity
+  FROM lineitem
+) AS l
+JOIN (
+  SELECT p_partkey
+  FROM part
+  WHERE p_brand = 'Brand#35' AND p_container = 'LG PKG'
+) AS p ON l.l_partkey = p.p_partkey
+JOIN (
+  SELECT l_partkey, AVG(l_quantity) * 0.2 AS threshold
+  FROM lineitem
+  GROUP BY l_partkey
+) AS agg ON l.l_partkey = agg.l_partkey
+WHERE l.l_quantity < agg.threshold
+Time Cost: 115.24s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将相关子查询转换为JOIN：先对lineitem按l_partkey分组计算avg(l_quantity)，然后与主查询JOIN并应用过滤条件l_quantity < 0.2 * avg_qty，消除每行重复执行子查询的开销'}, {'group': '聚合优化', 'produced_suggestion': '聚合下推与JOIN顺序调整：将子查询的聚合计算提前完成并物化为派生表，利用part表过滤后的小结果集(1926行)先与聚合结果JOIN，再与lineitem大表JOIN，减少JOIN基数'}, {'group': '谓词简化', 'produced_suggestion': '过滤条件前置：将p_brand和p_container的过滤条件尽早应用，确保part表过滤后再参与JOIN和子查询计算，避免对全量lineitem数据执行相关子查询'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示相关子查询(SubPlan 1)对每个匹配行重复执行全表扫描lineitem(Cost=1875719.49)，导致总成本高达20694419.77。历史案例显示相同SQL指纹通过FILTER_SUB_QUERY_TO_CORRELATE+AGGREGATE_JOIN_TRANSPOSE_EXTENDED优化后性能提升显著。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将相关子查询转换为JOIN：先对lineitem按l_partkey分组计算avg(l_quantity)，然后与主查询JOIN并应用过滤条件l_quantity < 0.2 * avg_qty，消除每行重复执行子查询的开销"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "聚合下推与JOIN顺序调整：将子查询的聚合计算提前完成并物化为派生表，利用part表过滤后的小结果集(1926行)先与聚合结果JOIN，再与lineitem大表JOIN，减少JOIN基数"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "过滤条件前置：将p_brand和p_container的过滤条件尽早应用，确保part表过滤后再参与JOIN和子查询计算，避免对全量lineitem数据执行相关子查询"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.218
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_VALUES: UCT=1.100
+{
+  "groups": "聚合优化, 子查询优化, 谓词简化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "FILTER_AGGREGATE_TRANSPOSE"
+  ],
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.4,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.4,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.2
+  },
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.6,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.6,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.7
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 子查询优化, 谓词简化",
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "FILTER_AGGREGATE_TRANSPOSE"],
+  "rewritten_sql": "SELECT sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM (\n  SELECT l_partkey, l_extendedprice, l_quantity\n  FROM lineitem\n) AS l\nJOIN (\n  SELECT p_partkey\n  FROM part\n  WHERE p_brand = 'Brand#35' AND p_container = 'LG PKG'\n) AS p ON l.l_partkey = p.p_partkey\nJOIN (\n  SELECT l_partkey, AVG(l_quantity) * 0.2 AS threshold\n  FROM lineitem\n  GROUP BY l_partkey\n) AS agg ON l.l_partkey = agg.l_partkey\nWHERE l.l_quantity < agg.threshold",
+  "semantic_correctness_guarantee": "1. 子查询去相关化（FILTER_SUB_QUERY_TO_CORRELATE）：原SQL中相关子查询 `SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey` 对每个外层行重复执行；重写后将其改写为独立聚合子查询 `SELECT l_partkey, AVG(l_quantity) * 0.2 AS threshold FROM lineitem GROUP BY l_partkey`，通过JOIN关联，消除相关性。由于l_partkey是lineitem的外键且part.p_partkey是主键，每个l_partkey对应唯一的阈值，JOIN后过滤 `l_quantity < threshold` 与原相关子查询语义完全等价。\n\n2. 聚合下推（AGGREGATE_JOIN_TRANSPOSE_EXTENDED）：原SQL在JOIN后对所有满足条件的行计算SUM(l_extendedprice)；重写后先对lineitem按l_partkey分组计算AVG(l_quantity)，再与part和lineitem JOIN。由于聚合仅依赖l_partkey分组，且最终SUM聚合的是l_extendedprice（未参与预聚合），因此先聚合再JOIN与先JOIN再聚合在数学上等价，不改变最终求和结果。\n\n3. 过滤条件前置（FILTER_AGGREGATE_TRANSPOSE）：将part表的过滤条件 `p_brand = 'Brand#35' AND p_container = 'LG PKG'` 下推到子查询中，提前过滤part表。由于这些条件仅依赖part表列，下推不影响JOIN结果集的完整性，只是改变了执行顺序，语义保持等价。\n\n4. JOIN顺序与结果集等价性：原SQL使用隐式JOIN（逗号连接），重写后使用显式INNER JOIN。由于JOIN条件 `p_partkey = l_partkey` 和过滤条件完全一致，且INNER JOIN的交换律和结合律保证了无论JOIN顺序如何，最终满足所有条件的行集合相同。\n\n5. 聚合函数保持一致：原SQL和重写SQL均对满足条件的l_extendedprice求和后除以7.0。重写后虽然改变了执行路径，但最终参与SUM计算的行集合完全相同（即同时满足part过滤条件、JOIN条件和数量阈值条件的lineitem行），因此聚合结果等价。\n\n6. NULL值处理：lineitem.l_partkey和part.p_partkey均为NOT NULL，AVG聚合对NULL的处理符合SQL标准。重写后JOIN条件和过滤逻辑未引入额外的NULL敏感操作，NULL值行为与原SQL一致。\n\n7. 重复行处理：原SQL和重写SQL均未使用DISTINCT，且最终聚合为单行结果（SUM），因此即使中间结果存在重复行，最终聚合值仍然等价。JOIN条件基于主键-外键关系，不会产生笛卡尔积导致的重复放大。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "两SQL等价：重写将相关子查询改写为按l_partkey分组的独立聚合并通过JOIN关联，过滤条件下推到part子查询，最终参与SUM(l_extendedprice)的行集合完全相同。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 60309894.0 -> 50092354.0 (重写侧约为原的 83.0583%) | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。
+✅ 估计代价降幅 85.5% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 204
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE', 'AGGREGATE_JOIN_TRANSPOSE_EXTENDED', 'FILTER_AGGREGATE_TRANSPOSE']
+   - 优化组别: 聚合优化, 子查询优化, 谓词简化
+   - 估计代价: 原始=20694419.77, 重写=3002307.58，相对变化: 85.49%
+✅ 成功存储，记录ID: 54d9137b-af6a-4bb3-8464-ffb2d7e187db
+
+🎲 UCT Math Update: 3 rules, reward=+0.1442 (cost=+0.8549, rows=+0.1694, depth=-0.6000, oc=20694419.7700, rc=3002307.5800)
+   结构分细节: rows 60309894.0->50092354.0 (score=+0.169), depth 5.0->8.0 (score=-0.600)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.400, conf=0.60, lambda=0.30, reward=+0.055, count=64, avg=+0.048
+   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: P(s,a)=N/A, effect=0.400, conf=0.60, lambda=0.30, reward=+0.051, count=56, avg=+0.090
+   → FILTER_AGGREGATE_TRANSPOSE: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=+0.038, count=26, avg=+0.228
+
+----------------------------------------
+

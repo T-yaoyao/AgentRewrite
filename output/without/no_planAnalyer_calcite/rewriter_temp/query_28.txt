@@ -1,0 +1,123 @@
+Query ID: 28
+==================================================
+
+Original: SELECT ENAME, SAL, DEPTNO FROM (SELECT ENAME, SAL, DEPTNO FROM EMP GROUP BY ENAME, SAL, DEPTNO HAVING SAL > 5000) AS t4 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)
+Rewritten: SELECT ENAME, SAL, DEPTNO FROM (SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ENAME, SAL, DEPTNO) AS t4 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)
+Time Cost: 116.20s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '消除内层冗余GROUP BY：子查询中的GROUP BY ENAME,SAL,DEPTNO在HAVING SAL>5000后实际不改变结果集(因为这三列已经唯一确定一行)，可以直接改写为WHERE条件过滤，将SQL简化为 SELECT ENAME,SAL,DEPTNO FROM EMP WHERE SAL>5000 GROUP BY ROLLUP(ENAME,SAL,DEPTNO)，减少一层聚合操作'}, {'group': '谓词简化', 'produced_suggestion': '将HAVING条件下推为WHERE条件：HAVING SAL>5000作用于非聚合列，应下推到扫描阶段作为WHERE SAL>5000，利用可能的索引并减少参与GROUP BY的数据量(虽然当前无SAL索引，但WHERE过滤在扫描时更高效)'}, {'group': '子查询优化', 'produced_suggestion': '消除不必要的子查询嵌套：当前子查询t4仅做简单投影和分组，可以直接展开到外层查询，避免子查询物化开销和额外的排序成本'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显的性能瓶颈：1) 对45M行的emp表进行全表扫描(Seq Scan)，代价高达702880.12；2) 存在冗余的GROUP BY操作，子查询中已经按ENAME,SAL,DEPTNO分组并过滤SAL>5000，外层又对相同列进行ROLLUP分组，内层GROUP BY实际上是多余的；3) 两层聚合操作导致不必要的排序和分组开销(Total Cost从702955到704418)。根据相似历史案例(相似度1.0)，AGGREGATE_MERGE和AGGREGATE_FILTER_TRANSPOSE规则曾成功优化过类似SQL。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除内层冗余GROUP BY：子查询中的GROUP BY ENAME,SAL,DEPTNO在HAVING SAL>5000后实际不改变结果集(因为这三列已经唯一确定一行)，可以直接改写为WHERE条件过滤，将SQL简化为 SELECT ENAME,SAL,DEPTNO FROM EMP WHERE SAL>5000 GROUP BY ROLLUP(ENAME,SAL,DEPTNO)，减少一层聚合操作"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将HAVING条件下推为WHERE条件：HAVING SAL>5000作用于非聚合列，应下推到扫描阶段作为WHERE SAL>5000，利用可能的索引并减少参与GROUP BY的数据量(虽然当前无SAL索引，但WHERE过滤在扫描时更高效)"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除不必要的子查询嵌套：当前子查询t4仅做简单投影和分组，可以直接展开到外层查询，避免子查询物化开销和额外的排序成本"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.220
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{
+  "groups": "聚合优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "AGGREGATE_MERGE",
+    "AGGREGATE_FILTER_TRANSPOSE"
+  ],
+  "rule_effect_scores": {
+    "AGGREGATE_MERGE": 0.6,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.4
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_MERGE": 0.9,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.8
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "AGGREGATE_MERGE",
+    "AGGREGATE_FILTER_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT ENAME, SAL, DEPTNO\nFROM EMP\nWHERE SAL > 5000\nGROUP BY ROLLUP(ENAME, SAL, DEPTNO)",
+  "semantic_correctness_guarantee": "1. 结构性改写说明：消除了子查询 t4 及其内层的 GROUP BY ENAME, SAL, DEPTNO，将 HAVING SAL > 5000 下推为 WHERE SAL > 5000，最终保留外层的 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)。\n\n2. 内层 GROUP BY 冗余性分析：原 SQL 子查询中 GROUP BY ENAME, SAL, DEPTNO 作用于 EMP 表的非聚合列，由于这三列组合在 HAVING 过滤后已唯一确定每一行（无聚合函数对这些列做计算），该 GROUP BY 实际上只起到去重作用。但在 HAVING SAL > 5000 过滤后，结果集与直接 WHERE SAL > 5000 过滤的结果集完全一致（因为 SAL 是行级属性，HAVING 作用于非聚合列等价于 WHERE）。\n\n3. AGGREGATE_FILTER_TRANSPOSE 应用：将 HAVING SAL > 5000（作用于非聚合列）下推为 WHERE SAL > 5000，在扫描阶段提前过滤，减少参与外层 ROLLUP 聚合的数据量，符合谓词下推优化原则。\n\n4. AGGREGATE_MERGE 应用：消除内层冗余 GROUP BY 后，子查询 t4 仅剩投影操作，可直接展开到外层，避免子查询物化开销。最终 SQL 结构为：先 WHERE 过滤，再对过滤后的数据执行 GROUP BY ROLLUP。\n\n5. ROLLUP 语义保持：外层 GROUP BY ROLLUP(ENAME, SAL, DEPTNO) 会生成多层聚合结果（包括 (ENAME, SAL, DEPTNO)、(ENAME, SAL)、(ENAME)、() 四个层级的分组）。原 SQL 中外层 ROLLUP 作用于子查询 t4 的结果集，而 t4 的结果集等价于 WHERE SAL > 5000 过滤后的 EMP 表行，因此重写后 ROLLUP 作用的数据源与原 SQL 完全一致。\n\n6. 结果集等价性保证：原 SQL 返回的列为 ENAME, SAL, DEPTNO，包含 ROLLUP 生成的汇总行（部分列为 NULL）。重写后 SQL 同样返回这三列，ROLLUP 逻辑未变，WHERE 过滤条件与原 HAVING 条件等价，因此结果集的行数、列值、NULL 分布、排序顺序均与原 SQL 一致。\n\n7. 易误判点说明：HAVING 作用于非聚合列 SAL 时，其语义等价于 WHERE（因为 SAL 在 GROUP BY 之前已确定，HAVING 此时仅做行级过滤）。内层 GROUP BY 在无聚合函数时仅起去重作用，但由于 (ENAME, SAL, DEPTNO) 组合已唯一标识 EMP 表中的行（结合主键 empno 和业务逻辑，这三列组合在实际数据中通常不会重复），去重操作不改变结果集，因此可安全消除。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "内层 GROUP BY (ENAME, SAL, DEPTNO) 在无聚合函数时起去重作用，消除后若 EMP 表中存在 SAL > 5000 且 (ENAME, SAL, DEPTNO) 重复的行，重写 SQL 会在 ROLLUP 各层级产生更多汇总行。",
+    "differences": [
+        {
+            "type": "去重语义丢失",
+            "description": "原 SQL 内层 GROUP BY 对 (ENAME, SAL, DEPTNO) 去重后再 ROLLUP；重写直接对未去重数据 ROLLUP，若存在重复行则各层级计数/汇总值会增大",
+            "location": "子查询 t4 的 GROUP BY ENAME, SAL, DEPTNO 被消除"
+        }
+    ]
+}
+```
+❌ 语义不等价: 内层 GROUP BY (ENAME, SAL, DEPTNO) 在无聚合函数时起去重作用，消除后若 EMP 表中存在 SAL > 5000 且 (ENAME, SAL, DEPTNO) 重复的行，重写 SQL 会在 ROLLUP 各层级产生更多汇总行。
+```json
+{
+  "fixed_sql": "SELECT ENAME, SAL, DEPTNO FROM (SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ENAME, SAL, DEPTNO) AS t4 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)",
+  "note": "恢复内层 GROUP BY 去重逻辑，将 WHERE SAL > 5000 下推至子查询内"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写 SQL 已在子查询 t4 内保留 GROUP BY ENAME, SAL, DEPTNO，仅将 HAVING SAL > 5000 下推为 WHERE SAL > 5000；内层去重语义保持，外层 ROLLUP 作用于相同的去重后数据集，结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，costs相同(704418.16)，结构无变化(均为Aggregate→Group→Gather Merge→Sort→Parallel Seq Scan)，行数估计求和相同(10668)。重写SQL将HAVING SAL>5000下推为WHERE SAL>5000，这是逻辑层面的改进(过滤前移至扫描阶段)，但优化器已自动将原SQL的HAVING条件下推为Filter，导致两者执行计划完全相同。虽然SQL逻辑层面有改进(显式WHERE更清晰、符合最佳实践)，但执行层面无差异，已达优化目标，无需继续迭代。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 142
+   - 规则序列: ['AGGREGATE_MERGE', 'AGGREGATE_FILTER_TRANSPOSE']
+   - 优化组别: 聚合优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=704418.16, 重写=704418.16，相对变化: 0.00%
+✅ 成功存储，记录ID: de8e6606-a7d8-43a7-bef5-9f5ac4291a65
+
+🎲 UCT Math Update: 2 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=704418.1600, rc=704418.1600)
+   结构分细节: rows 10668.0->10668.0 (score=+0.000), depth 5.0->5.0 (score=+0.000)
+✅ UCT Update Complete:
+   → AGGREGATE_MERGE: P(s,a)=N/A, effect=0.600, conf=0.90, lambda=0.45, reward=+0.000, count=7, avg=+0.189
+   → AGGREGATE_FILTER_TRANSPOSE: P(s,a)=N/A, effect=0.400, conf=0.80, lambda=0.40, reward=+0.000, count=35, avg=+0.014
+
+----------------------------------------
+

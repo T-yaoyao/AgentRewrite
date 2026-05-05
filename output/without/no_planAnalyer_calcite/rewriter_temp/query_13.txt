@@ -1,0 +1,233 @@
+Query ID: 13
+==================================================
+
+Original: SELECT t8.NAME FROM (SELECT JOB, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A' GROUP BY JOB, DEPTNO + EMPNO) AS t6 LEFT JOIN (SELECT NAME, DEPTNO + 5 AS f2 FROM DEPT GROUP BY NAME, DEPTNO + 5) AS t8 ON t6.JOB = t8.NAME AND t6.f9 = t8.f2 GROUP BY t8.NAME
+Rewritten: WITH emp_filtered AS (
+  SELECT DISTINCT JOB, DEPTNO + EMPNO AS f9
+  FROM EMP
+  WHERE ENAME = 'A'
+),
+dept_filtered AS (
+  SELECT DISTINCT NAME, DEPTNO + 5 AS f2
+  FROM DEPT
+)
+SELECT DISTINCT dept_filtered.NAME
+FROM emp_filtered
+LEFT JOIN dept_filtered ON emp_filtered.JOB = dept_filtered.NAME AND emp_filtered.f9 = dept_filtered.f2
+Time Cost: 305.52s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '移除子查询t6中的冗余GROUP BY JOB, DEPTNO+EMPNO，因JOIN条件和最外层GROUP BY已隐含去重逻辑，可直接使用SELECT DISTINCT或依赖JOIN的唯一性约束'}, {'group': '聚合优化', 'produced_suggestion': '移除子查询t8中的冗余GROUP BY NAME, DEPTNO+5，DEPT表的NAME列若具有唯一性或业务语义不需要分组，可直接投影；若需去重可在最外层统一处理'}, {'group': '投影优化', 'produced_suggestion': '将计算列f9(DEPTNO+EMPNO)和f2(DEPTNO+5)内联到JOIN条件中，消除中间列的物化开销，改写为ON t6.JOB=t8.NAME AND (EMP.DEPTNO+EMP.EMPNO)=(DEPT.DEPTNO+5)'}, {'group': '子查询优化', 'produced_suggestion': '将子查询t6和t8展开为直接的表引用，消除派生表的物化成本，改写为FROM EMP LEFT JOIN DEPT ON条件，并在最外层保留必要的DISTINCT或GROUP BY'}, {'group': '谓词简化', 'produced_suggestion': '在EMP.ENAME列上创建索引(CREATE INDEX idx_emp_ename ON EMP(ENAME))以消除4500万行的全表扫描，将过滤成本从702880降至索引查找级别'}, {'group': '聚合优化', 'produced_suggestion': '评估最外层GROUP BY t8.NAME的必要性：若LEFT JOIN右表为空时需保留NULL分组则保留，否则改为SELECT DISTINCT t8.NAME以减少排序开销'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) EMP表(4500万行)进行全表扫描(Seq Scan)且代价高达702880.23，过滤条件ENAME='A'选择性极低(仅99行)但未使用索引；2) 子查询t6和t8中存在冗余的GROUP BY操作，t6的GROUP BY在JOIN前执行但JOIN条件已包含分组键，t8的GROUP BY同样冗余；3) 最外层还有一个GROUP BY t8.NAME的冗余聚合操作；4) DEPT表(45万行)也进行全表扫描并哈希聚合(代价46936.66)。结合相似历史案例(相似度1.0和0.9159)均成功应用AGGREGATE_REMOVE规则，当前SQL可通过消除冗余聚合、谓词优化和连接优化显著提升性能。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除冗余的GROUP BY操作：子查询t6中的'GROUP BY JOB, DEPTNO+EMPNO'在LEFT JOIN后被外层GROUP BY t8.NAME覆盖，且JOIN条件已保证唯一性，可直接移除；子查询t8中的'GROUP BY NAME, DEPTNO+5'同样冗余，因为最外层已按t8.NAME分组；最外层的'GROUP BY t8.NAME'在LEFT JOIN语义下也可能冗余，需结合业务语义评估是否可用DISTINCT替代或直接移除"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "针对EMP表的ENAME='A'过滤条件(选择性极高，仅99/45000000行)，建议在ENAME列上创建索引以避免全表扫描，或将过滤条件与JOIN条件结合重写为EXISTS子查询，利用索引快速定位"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "当前执行计划使用Hash Join且EMP表为内表(99行)、DEPT表为外表(45万行)，但实际代价分布不均(EMP扫描70万+ vs DEPT哈希4.6万)。考虑将过滤后的EMP结果(99行)作为驱动表，通过Nested Loop Join配合DEPT索引查找，可能比当前Hash Join更高效"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "子查询t6计算了f9(DEPTNO+EMPNO)但仅用于JOIN条件，子查询t8计算了f2(DEPTNO+5)同样仅用于JOIN条件，可将这些计算表达式直接内联到JOIN条件中，减少中间结果集的列数和计算开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 67 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{
+  "groups": "聚合优化, 谓词简化, 连接优化, 投影优化",
+  "applied_rules": ["AGGREGATE_REMOVE"],
+  "rule_effect_scores": {
+    "AGGREGATE_REMOVE": 1.0
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_REMOVE": 0.8
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 谓词简化, 连接优化, 投影优化",
+  "applied_rules": ["AGGREGATE_REMOVE"],
+  "rewritten_sql": "SELECT t8.NAME\nFROM (\n  SELECT JOB, DEPTNO + EMPNO AS f9\n  FROM EMP\n  WHERE ENAME = 'A'\n) AS t6\nLEFT JOIN (\n  SELECT NAME, DEPTNO + 5 AS f2\n  FROM DEPT\n) AS t8\nON t6.JOB = t8.NAME AND t6.f9 = t8.f2\nGROUP BY t8.NAME",
+  "semantic_correctness_guarantee": "1. **子查询 t6 的 GROUP BY 移除**：原 SQL 中 t6 对 (JOB, DEPTNO+EMPNO) 分组。由于 EMP 表的主键是 empno，DEPTNO+EMPNO 在过滤 ENAME='A' 后的结果集中对每个 (JOB, DEPTNO+EMPNO) 组合最多产生一行（empno 唯一性保证 DEPTNO+EMPNO 在同一 JOB 下不会重复）。因此 GROUP BY 不会改变结果集的行数和内容，可安全移除。\n\n2. **子查询 t8 的 GROUP BY 移除**：原 SQL 中 t8 对 (NAME, DEPTNO+5) 分组。DEPT 表的主键是 deptno，每个 deptno 对应唯一的 NAME（根据 Schema，NAME 为 NOT NULL 且在实际业务中通常与 deptno 一一对应）。因此对 (NAME, DEPTNO+5) 分组不会产生聚合效果，每个 (NAME, DEPTNO+5) 组合在原表中已是唯一的，移除 GROUP BY 不改变结果集。\n\n3. **外层 GROUP BY t8.NAME 保留**：虽然 t6 和 t8 的 GROUP BY 被移除，但外层的 GROUP BY t8.NAME 必须保留。原因是 LEFT JOIN 可能产生多行相同的 t8.NAME（当 t6 中多行匹配同一个 t8.NAME 时）。外层 GROUP BY 确保最终结果集中每个 t8.NAME 只出现一次，这是原 SQL 的语义要求。\n\n4. **JOIN 条件与结果集等价性**：JOIN 条件 t6.JOB = t8.NAME AND t6.f9 = t8.f2 在移除子查询 GROUP BY 后保持不变。由于 t6 和 t8 的行集合未改变（只是去掉了冗余的分组操作），JOIN 的匹配逻辑完全一致，LEFT JOIN 产生的结果集（包括未匹配行的 NULL 值）与原 SQL 相同。\n\n5. **NULL 值处理**：LEFT JOIN 在 t6 无匹配行时会产生 t8.NAME 为 NULL 的行。外层 GROUP BY t8.NAME 会将这些 NULL 行聚合为一行（SQL 标准中 NULL 在 GROUP BY 中被视为相同值）。移除子查询 GROUP BY 不影响 NULL 的产生和聚合逻辑。\n\n6. **最终投影列 t8.NAME**：原 SQL 和重写 SQL 都只投影 t8.NAME，且外层 GROUP BY 确保每个 NAME 值唯一。移除子查询 GROUP BY 不改变最终投影列的值域和顺序。\n\n7. **Schema 约束验证**：EMP 表的 empno 主键和 DEPT 表的 deptno 主键保证了子查询中计算列 f9 和 f2 的唯一性逻辑。移除 GROUP BY 后，这些约束仍然有效，不会引入重复行或改变 JOIN 匹配结果。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL在子查询t6和t8中都有GROUP BY，这些GROUP BY会对可能的重复行进行去重；重写SQL移除了这些GROUP BY，导致t6和t8可能产生重复行，进而影响LEFT JOIN的匹配次数和最终结果集的行数。",
+    "differences": [
+        {
+            "type": "aggregation_semantics",
+            "description": "t6子查询：原始SQL的GROUP BY (JOB, DEPTNO+EMPNO)会去重，但empno主键不能保证(JOB, DEPTNO+EMPNO)组合唯一（不同empno可能有相同JOB和相同DEPTNO+EMPNO值）",
+            "location": "子查询t6"
+        },
+        {
+            "type": "aggregation_semantics",
+            "description": "t8子查询：原始SQL的GROUP BY (NAME, DEPTNO+5)会去重，但deptno主键不能保证(NAME, DEPTNO+5)组合唯一（不同deptno可能计算出相同DEPTNO+5值且对应相同NAME）",
+            "location": "子查询t8"
+        },
+        {
+            "type": "join_cardinality",
+            "description": "移除子查询GROUP BY后，t6和t8可能包含重复行，LEFT JOIN会对这些重复行分别匹配，导致JOIN结果集行数增加，即使外层有GROUP BY t8.NAME也无法完全抵消这种差异",
+            "location": "LEFT JOIN及整体结果集"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL在子查询t6和t8中都有GROUP BY，这些GROUP BY会对可能的重复行进行去重；重写SQL移除了这些GROUP BY，导致t6和t8可能产生重复行，进而影响LEFT JOIN的匹配次数和最终结果集的行数。
+```json
+{"fixed_sql": "SELECT t8.NAME FROM (SELECT JOB, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A' GROUP BY JOB, DEPTNO + EMPNO) AS t6 LEFT JOIN (SELECT NAME, DEPTNO + 5 AS f2 FROM DEPT GROUP BY NAME, DEPTNO + 5) AS t8 ON t6.JOB = t8.NAME AND t6.f9 = t8.f2 GROUP BY t8.NAME", "note": "恢复t6和t8子查询中的GROUP BY子句以保证去重语义，避免JOIN结果集行数膨胀"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已在子查询t6和t8中恢复GROUP BY，与原始SQL完全一致，两者等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "original_sql 与 enhanced_sql 完全相同，执行计划完全一致（cost、节点类型、行数估计、扫描方式、连接算法均无差异）。applied_rules 显示仅应用了 AGGREGATE_REMOVE 规则，但实际 SQL 文本未发生任何改写。结构统计显示 structural_improvement=false，rows_ratio=1.0，所有指标均无变化。由于本轮未产生任何实质性改写，无法评估优化效果，但根据 optimization_advice 仍存在明确可执行的优化方向（消除冗余 GROUP BY、添加索引、调整 JOIN 策略、内联计算表达式），因此不应终止。然而，考虑到 applied_rules 已尝试 AGGREGATE_REMOVE 但未生效，可能存在规则应用失败或条件不满足的情况，需在下一轮明确基于当前 SQL 结构重新尝试优化建议中的其他方向。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 SQL，下一轮应尝试：1) 手动移除子查询 t6 和 t8 中的冗余 GROUP BY（因 AGGREGATE_REMOVE 规则未生效），直接在 FROM 子句中使用 DISTINCT 或依赖 JOIN 条件的唯一性；2) 将计算列 f9 和 f2 内联到 JOIN 条件中，消除中间列；3) 评估是否可将最外层 GROUP BY t8.NAME 改为 DISTINCT 或完全移除（需确认业务语义）；4) 若 ENAME 列无索引，建议在优化建议中明确标注需创建索引以支持高选择性过滤。优先尝试移除冗余聚合和内联计算表达式，这两项改写不依赖索引即可执行。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个严重性能瓶颈：1) EMP表全表扫描(Seq Scan cost=702880.23)且过滤条件ENAME='A'选择性极高但无索引支持，导致扫描4500万行；2) 两个子查询中的GROUP BY操作完全冗余，t6和t8的分组键在后续JOIN中未被利用且最外层再次GROUP BY；3) 计算列f9和f2作为中间列传递增加物化开销；4) Hash Join的右表(t6)仅99行但需先完成昂贵的并行排序和分组(cost=703881.35)；5) DEPT表全表扫描后进行无意义的聚合(cost=46936.66)。上一轮AGGREGATE_REMOVE规则未生效，本轮需手动移除冗余聚合并内联计算表达式，同时强烈建议在ENAME列创建索引以消除全表扫描瓶颈。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "移除子查询t6中的冗余GROUP BY JOB, DEPTNO+EMPNO，因JOIN条件和最外层GROUP BY已隐含去重逻辑，可直接使用SELECT DISTINCT或依赖JOIN的唯一性约束"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "移除子查询t8中的冗余GROUP BY NAME, DEPTNO+5，DEPT表的NAME列若具有唯一性或业务语义不需要分组，可直接投影；若需去重可在最外层统一处理"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "将计算列f9(DEPTNO+EMPNO)和f2(DEPTNO+5)内联到JOIN条件中，消除中间列的物化开销，改写为ON t6.JOB=t8.NAME AND (EMP.DEPTNO+EMP.EMPNO)=(DEPT.DEPTNO+5)"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将子查询t6和t8展开为直接的表引用，消除派生表的物化成本，改写为FROM EMP LEFT JOIN DEPT ON条件，并在最外层保留必要的DISTINCT或GROUP BY"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "在EMP.ENAME列上创建索引(CREATE INDEX idx_emp_ename ON EMP(ENAME))以消除4500万行的全表扫描，将过滤成本从702880降至索引查找级别"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "评估最外层GROUP BY t8.NAME的必要性：若LEFT JOIN右表为空时需保留NULL分组则保留，否则改为SELECT DISTINCT t8.NAME以减少排序开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 48 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{
+  "groups": "聚合优化, 谓词简化, 子查询优化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "AGGREGATE_REMOVE"
+  ],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.3,
+    "AGGREGATE_REMOVE": 0.7
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "AGGREGATE_REMOVE": 0.6
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 谓词简化, 子查询优化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "AGGREGATE_REMOVE"
+  ],
+  "rewritten_sql": "WITH emp_filtered AS (\n  SELECT DISTINCT JOB, DEPTNO + EMPNO AS f9\n  FROM EMP\n  WHERE ENAME = 'A'\n),\ndept_filtered AS (\n  SELECT DISTINCT NAME, DEPTNO + 5 AS f2\n  FROM DEPT\n)\nSELECT DISTINCT dept_filtered.NAME\nFROM emp_filtered\nLEFT JOIN dept_filtered ON emp_filtered.JOB = dept_filtered.NAME AND emp_filtered.f9 = dept_filtered.f2",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原 SQL 中的两个内联派生表 t6 和 t8 提取为 CTE（emp_filtered 和 dept_filtered），应用 STRATEGY_CTE_DECOMPOSITION 规则，降低嵌套层级并提升可读性。\n\n2. **聚合消除**：移除子查询 t6 中的 GROUP BY JOB, DEPTNO+EMPNO，改为 SELECT DISTINCT；移除子查询 t8 中的 GROUP BY NAME, DEPTNO+5，改为 SELECT DISTINCT；移除最外层的 GROUP BY t8.NAME，改为 SELECT DISTINCT。应用 AGGREGATE_REMOVE 规则。这些 GROUP BY 子句在原 SQL 中仅起去重作用，不涉及聚合函数（如 SUM/COUNT/AVG），因此用 DISTINCT 替换在语义上完全等价。\n\n3. **等价性保证 - 子查询 t6**：原 SQL 中 t6 对 (JOB, DEPTNO+EMPNO) 进行 GROUP BY，由于 EMP 表的主键是 empno（根据 Schema），且 DEPTNO+EMPNO 包含主键 empno，因此 (JOB, DEPTNO+EMPNO) 组合在过滤后的结果集中已具有唯一性约束（每个 empno 唯一，加上 DEPTNO 后仍唯一）。GROUP BY 实际上只是去重操作，改为 DISTINCT 后结果集完全一致。\n\n4. **等价性保证 - 子查询 t8**：原 SQL 中 t8 对 (NAME, DEPTNO+5) 进行 GROUP BY。虽然 DEPT 表的主键是 deptno，但 NAME 列在 Schema 中定义为 NOT NULL，且业务语义上通常部门名称具有唯一性（即使 Schema 未显式约束）。即使 NAME 不唯一，GROUP BY (NAME, DEPTNO+5) 的作用仍是去重，改为 DISTINCT 后对于相同的 (NAME, DEPTNO+5) 组合只保留一行，与 GROUP BY 语义完全一致。\n\n5. **等价性保证 - 最外层聚合**：原 SQL 最外层对 t8.NAME 进行 GROUP BY，由于 SELECT 子句中只有 t8.NAME 一列，且无聚合函数，该 GROUP BY 仅起去重作用。LEFT JOIN 后可能产生重复的 t8.NAME 值（当 emp_filtered 中多行匹配同一 dept_filtered.NAME 时），最外层 GROUP BY 将这些重复行合并为一行。改为 SELECT DISTINCT 后，同样对结果集去重，语义完全等价。\n\n6. **LEFT JOIN 语义保持**：原 SQL 使用 LEFT JOIN，当 emp_filtered 中某行在 dept_filtered 中无匹配时，t8.NAME 为 NULL。最外层 GROUP BY t8.NAME 会将所有 NULL 值合并为一个分组（SQL 标准中 GROUP BY 将 NULL 视为相同值）。改为 SELECT DISTINCT 后，DISTINCT 同样将多个 NULL 合并为一个 NULL 行，语义一致。\n\n7. **易误判点说明 - NULL 处理**：LEFT JOIN 右表无匹配时产生 NULL，原 SQL 的 GROUP BY 和改写后的 DISTINCT 对 NULL 的处理逻辑一致（均将多个 NULL 合并为一个），不会改变结果集中 NULL 的出现次数。\n\n8. **易误判点说明 - 重复行**：原 SQL 通过三层 GROUP BY 逐步去重（子查询内两次，最外层一次），改写后通过两次 DISTINCT（CTE 内）和一次最外层 DISTINCT 实现相同的去重效果。由于 DISTINCT 和 GROUP BY（无聚合函数时）在去重语义上完全等价，最终结果集的行数和内容完全一致。\n\n9. **计算列保持**：f9 (DEPTNO+EMPNO) 和 f2 (DEPTNO+5) 的计算逻辑在改写前后完全一致，JOIN 条件 emp_filtered.JOB = dept_filtered.NAME AND emp_filtered.f9 = dept_filtered.f2 与原 SQL 的 t6.JOB = t8.NAME AND t6.f9 = t8.f2 完全对应，过滤逻辑未改变。\n\n10. **结果集验证**：改写后的 SQL 返回的列为 dept_filtered.NAME（对应原 SQL 的 t8.NAME），数据类型为 VARCHAR，排序顺序未指定（原 SQL 也未指定 ORDER BY），因此排序顺序的不确定性在改写前后一致。最终结果集为所有满足 JOIN 条件的唯一 NAME 值（包括可能的 NULL），与原 SQL 完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "原始SQL中三层GROUP BY均无聚合函数仅做去重，重写为DISTINCT后语义完全等价；LEFT JOIN的NULL处理、连接条件、计算列逻辑均保持一致，最终结果集相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划结构几乎完全一致，仅在去重实现方式上有微小差异：原SQL使用GROUP BY实现去重，重写SQL使用DISTINCT+Unique节点实现去重，两者在PostgreSQL中语义等价且成本相近（75325634 vs 753255.41，差异0.0001%）。核心执行路径完全相同：并行扫描EMP表（过滤ENAME='A'）→排序→Unique去重→Hash→与DEPT表的Hash聚合结果进行Hash Join→排序→最终去重。重写SQL通过CTE显式组织中间结果，提升可读性和维护性，但未改变物理执行计划。由于已应用AGGREGATE_REMOVE规则且执行计划已收敛至稳定状态，继续优化空间极小。cost几乎持平，结构无恶化，判定为优化达标。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 235
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'AGGREGATE_REMOVE']
+   - 优化组别: 聚合优化, 谓词简化, 子查询优化, 投影优化
+   - 估计代价: 原始=753256.34, 重写=753255.41，相对变化: 0.00%
+✅ 成功存储，记录ID: bf31d885-72fc-4e0d-a92f-0a9ef21132b6
+
+🎲 UCT Math Update: 2 rules, reward=-0.0375 (cost=+0.0000, rows=+0.0000, depth=-0.1250, oc=753256.3400, rc=753255.4100)
+   结构分细节: rows 902807.0->902821.0 (score=+0.000), depth 8.0->9.0 (score=-0.125)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.300, conf=0.50, lambda=0.25, reward=-0.017, count=261, avg=+0.049
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=0.700, conf=0.60, lambda=0.30, reward=-0.020, count=18, avg=+0.200
+
+----------------------------------------
+

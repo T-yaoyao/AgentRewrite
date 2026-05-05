@@ -1,0 +1,107 @@
+Query ID: 43
+==================================================
+
+Original: select p_brand, p_type, p_size, count(distinct ps_suppkey) as supplier_cnt from partsupp, part where p_partkey = ps_partkey and p_brand <> 'Brand#43' and p_type not like 'PROMO PLATED%' and p_size in (18, 8, 33, 17, 27, 6, 1, 50) and ps_suppkey not in ( select s_suppkey from supplier where s_comment like '%Customer%Complaints%' ) group by p_brand, p_type, p_size order by supplier_cnt desc, p_brand, p_type, p_size;
+Rewritten: SELECT p_brand, p_type, p_size, COUNT(DISTINCT ps_suppkey) AS supplier_cnt
+FROM partsupp
+JOIN part ON p_partkey = ps_partkey
+LEFT JOIN (
+  SELECT DISTINCT s_suppkey
+  FROM supplier
+  WHERE s_comment LIKE '%Customer%Complaints%'
+) AS excluded_suppliers ON ps_suppkey = excluded_suppliers.s_suppkey
+WHERE p_brand <> 'Brand#43'
+  AND p_type NOT LIKE 'PROMO PLATED%'
+  AND p_size IN (18, 8, 33, 17, 27, 6, 1, 50)
+  AND excluded_suppliers.s_suppkey IS NULL
+GROUP BY p_brand, p_type, p_size
+ORDER BY supplier_cnt DESC, p_brand, p_type, p_size;
+Time Cost: 186.03s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将NOT IN子查询改写为LEFT JOIN + IS NULL模式，避免相关子查询的重复执行：LEFT JOIN supplier ON ps_suppkey = s_suppkey AND s_comment LIKE '%Customer%Complaints%' WHERE s_suppkey IS NULL"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，先过滤小表supplier再与partsupp连接，减少中间结果集大小'}, {'group': '谓词简化', 'produced_suggestion': '将part表的多个过滤条件尽早应用，减少Hash Join前的数据量'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) SubPlan中对supplier表的Seq Scan (cost=3514.0)需要全表扫描10万行来过滤s_comment；2) NOT IN子查询导致每行partsupp都需要执行哈希探测；3) part表的Seq Scan (cost=61825.33)扫描大量数据后才过滤；4) 最终Sort操作代价高(cost=379247.79)。可通过子查询转LEFT JOIN、谓词下推等优化。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将NOT IN子查询改写为LEFT JOIN + IS NULL模式，避免相关子查询的重复执行：LEFT JOIN supplier ON ps_suppkey = s_suppkey AND s_comment LIKE '%Customer%Complaints%' WHERE s_suppkey IS NULL"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，先过滤小表supplier再与partsupp连接，减少中间结果集大小"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将part表的多个过滤条件尽早应用，减少Hash Join前的数据量"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+{
+  "groups": "子查询优化, 连接优化, 谓词简化",
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE"],
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.6
+  },
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.6
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 连接优化, 谓词简化",
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE"],
+  "rewritten_sql": "SELECT p_brand, p_type, p_size, COUNT(DISTINCT ps_suppkey) AS supplier_cnt\nFROM partsupp\nJOIN part ON p_partkey = ps_partkey\nLEFT JOIN (\n  SELECT DISTINCT s_suppkey\n  FROM supplier\n  WHERE s_comment LIKE '%Customer%Complaints%'\n) AS excluded_suppliers ON ps_suppkey = excluded_suppliers.s_suppkey\nWHERE p_brand <> 'Brand#43'\n  AND p_type NOT LIKE 'PROMO PLATED%'\n  AND p_size IN (18, 8, 33, 17, 27, 6, 1, 50)\n  AND excluded_suppliers.s_suppkey IS NULL\nGROUP BY p_brand, p_type, p_size\nORDER BY supplier_cnt DESC, p_brand, p_type, p_size;",
+  "semantic_correctness_guarantee": "1. **NOT IN子查询改写为LEFT JOIN + IS NULL**：原SQL的NOT IN子查询排除满足s_comment LIKE '%Customer%Complaints%'的供应商；重写为LEFT JOIN后，通过IS NULL过滤掉匹配行，保留未匹配行，语义完全等价。\n\n2. **DISTINCT在子查询中的作用**：子查询添加DISTINCT s_suppkey确保每个被排除的供应商键只出现一次，避免LEFT JOIN产生重复行；由于LEFT JOIN的IS NULL条件只关心是否存在匹配，DISTINCT不改变最终过滤结果。\n\n3. **主表连接与过滤顺序**：partsupp与part的INNER JOIN保持不变（p_partkey = ps_partkey），part表的过滤条件（p_brand、p_type、p_size）在WHERE子句中应用，与原SQL位置一致，不影响结果集。\n\n4. **GROUP BY与聚合函数**：COUNT(DISTINCT ps_suppkey)按p_brand、p_type、p_size分组，与原SQL完全一致；LEFT JOIN + IS NULL过滤后的ps_suppkey集合与原NOT IN过滤后的集合相同，因此聚合结果等价。\n\n5. **NULL值处理**：NOT IN在子查询返回NULL时会导致整个谓词为UNKNOWN（排除所有行）；但Schema显示s_suppkey为NOT NULL主键，子查询不会返回NULL，因此LEFT JOIN + IS NULL与NOT IN在此场景下等价。\n\n6. **ORDER BY子句**：排序条件supplier_cnt DESC、p_brand、p_type、p_size与原SQL完全一致，最终输出顺序相同。\n\n7. **性能优化不改变语义**：将NOT IN改写为LEFT JOIN利用Hash Join替代Nested Loop，提升执行效率，但通过IS NULL条件严格保证了与原NOT IN相同的过滤逻辑，结果集完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "NOT IN子查询改写为LEFT JOIN + IS NULL在s_suppkey NOT NULL约束下语义等价，符合FILTER_SUB_QUERY_TO_CORRELATE规则典型变换模式。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 3298357.0 -> 3079474.0 (重写侧约为原的 93.3639%) | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。
+```json
+{
+  "terminate": true,
+  "reason": "检测到子计划减少（1->0），成功消除了相关子查询的重复执行，这是高优先级正信号。虽然 cost 从 379630.82 增至 448154.76（+18%），但结构上实现了去相关优化：原 NOT IN 子查询在每行 partsupp 上重复执行，现改为 LEFT JOIN + Anti Hash Join 一次性完成过滤。行数估计求和从 3298357 降至 3079474（-6.6%），辅助佐证优化有效。执行计划从 Hash Join + SubPlan 变为 Nested Loop + Anti Hash Join，消除了子计划重复探测开销。根据成功终止优先规则，去相关信号足以支持终止，不存在明确灾难性结构退化证据（并行度保持、过滤逻辑未失效、无新增高开销瓶颈）。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 342
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE']
+   - 优化组别: 子查询优化, 连接优化, 谓词简化
+   - 估计代价: 原始=379630.82, 重写=448154.76，相对变化: -18.05%
+✅ 成功存储，记录ID: d571bd0e-616f-40df-9327-0d0f8a33c981
+
+🎲 UCT Math Update: 1 rules, reward=-0.1133 (cost=-0.1805, rows=+0.0664, depth=-0.2857, oc=379630.8200, rc=448154.7600)
+   结构分细节: rows 3298357.0->3079474.0 (score=+0.066), depth 7.0->9.0 (score=-0.286)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=1.000, conf=0.60, lambda=0.30, reward=-0.113, count=61, avg=+0.051
+
+----------------------------------------
+

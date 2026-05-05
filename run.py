@@ -60,14 +60,14 @@ def parse_arguments():
 def setup_directories(output_dir: str, enable_rewriter: bool):
     """Set up output directories for the query rewriter."""
     output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
+    output_path.mkdir(parents=True, exist_ok=True)
     
     directories = {}
     
     if enable_rewriter:
         # QueryRewriter tmp 
         rewriter_temp_dir = output_path / "rewriter_temp"
-        rewriter_temp_dir.mkdir(exist_ok=True)
+        rewriter_temp_dir.mkdir(parents=True, exist_ok=True)
         directories['rewriter_temp'] = rewriter_temp_dir
     
     directories['output'] = output_path

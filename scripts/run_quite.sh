@@ -7,9 +7,10 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "$SCRIPT_DIR/setup_env.sh"
 
 # Path variables (now using PROJECT_ROOT from setup_env.sh)
-INPUT_QUERIES="${PROJECT_ROOT}/dataset/queries/tpch_test.json"
-SCHEMA_FILE="${PROJECT_ROOT}/dataset/schemas/tpch_schemas.sql"
-OUTPUT_DIR="${PROJECT_ROOT}/output/tpch_claude4.5"
+INPUT_QUERIES="${PROJECT_ROOT}/dataset/queries/dsb_test.json"
+SCHEMA_FILE="${PROJECT_ROOT}/dataset/schemas/dsb_schemas.sql"
+# Must be a directory; run.py writes rewritten_queries.json inside it.
+OUTPUT_DIR="${PROJECT_ROOT}/output/without/no_planAnalyer_dsb"
 
 # Feature flags
 ENABLE_REWRITER="--enable_rewriter"

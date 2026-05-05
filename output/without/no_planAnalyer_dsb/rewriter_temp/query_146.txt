@@ -1,0 +1,180 @@
+Query ID: 146
+==================================================
+
+Original: select min(w_warehouse_name)   ,min(sm_type)   ,min(cc_name)   ,min(cs_order_number)   ,min(cs_item_sk) from    catalog_sales   ,warehouse   ,ship_mode   ,call_center   ,date_dim where     d_month_seq between 1207 and 1207 + 23 and cs_ship_date_sk   = d_date_sk and cs_warehouse_sk   = w_warehouse_sk and cs_ship_mode_sk   = sm_ship_mode_sk and cs_call_center_sk = cc_call_center_sk and cs_list_price between 114 and 143 and sm_type = 'OVERNIGHT' and cc_class = 'small' and w_gmt_offset = -5 ;
+Rewritten: SELECT MIN(w.w_warehouse_name), MIN(sm.sm_type), MIN(cc.cc_name), MIN(cs.cs_order_number), MIN(cs.cs_item_sk) FROM catalog_sales cs JOIN (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1207 AND 1230) d ON cs.cs_ship_date_sk = d.d_date_sk JOIN warehouse w ON cs.cs_warehouse_sk = w.w_warehouse_sk AND w.w_gmt_offset = -5 JOIN ship_mode sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk AND sm.sm_type = 'OVERNIGHT' JOIN call_center cc ON cs.cs_call_center_sk = cc.cc_call_center_sk AND cc.cc_class = 'small' WHERE cs.cs_list_price BETWEEN 114 AND 143
+Time Cost: 237.42s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '将date_dim的过滤条件改写为IN子查询半连接：cs_ship_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1207 AND 1230)。强制优化器先物化date_dim的24行结果集(d_month_seq范围过滤后约24个月)，再通过半连接过滤catalog_sales，避免当前Nested Loop中2215次重复Index Scan。同时保留其他维度表的JOIN结构不变。'}, {'group': '谓词简化', 'produced_suggestion': '将cs_list_price BETWEEN 114 AND 143的过滤条件与date_dim的半连接条件合并前置：在catalog_sales扫描阶段同时应用两个过滤条件，减少后续Hash Join的输入行数。若优化器支持，可考虑用EXISTS替代IN子查询，进一步优化半连接执行。'}, {'group': '连接优化', 'produced_suggestion': "调整连接顺序：先让三个小维度表(call_center 3行、ship_mode 3行、warehouse 2行)通过Hash Join构建小哈希表，再与catalog_sales的半连接过滤结果进行连接。通过STRAIGHT_JOIN提示或子查询物化强制优化器改变当前的'大表驱动小表'顺序，降低Hash Join的探测成本。"}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示catalog_sales表进行了并行顺序扫描(Parallel Seq Scan)，预估扫描598618行，成本高达458923.89。该表有1439万行数据，当前通过cs_list_price范围过滤后仍需扫描大量数据。虽然后续通过Hash Join与小表(call_center、ship_mode、warehouse)连接并用Index Scan访问date_dim，但主要瓶颈在于catalog_sales的全表扫描。可以通过谓词下推和连接顺序调整，先用高选择性过滤条件(date_dim的d_month_seq、维度表的等值条件)减少catalog_sales的扫描范围，从而降低整体执行成本。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim的d_month_seq范围条件(1207到1230)通过子查询或CTE提前物化为符合条件的d_date_sk集合，然后在catalog_sales扫描时直接用cs_ship_date_sk IN (子查询)进行过滤，利用索引catalog_sales_pkey或潜在的外键索引减少扫描行数"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先让catalog_sales与date_dim进行半连接(SEMI JOIN)或EXISTS子查询，利用date_dim的主键索引和高选择性的d_month_seq条件先过滤出有效的cs_ship_date_sk，再与其他维度表(call_center、ship_mode、warehouse)进行Hash Join，减少后续连接的数据量"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将维度表的过滤条件(sm_type='OVERNIGHT'、cc_class='small'、w_gmt_offset=-5)提取为独立的过滤子查询或CTE，先物化符合条件的维度表主键集合，然后用catalog_sales.cs_ship_mode_sk IN (...)、cs_call_center_sk IN (...)、cs_warehouse_sk IN (...)的形式进行过滤，避免在大表扫描后再进行Hash Join"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION"],
+  "rule_effect_scores": {"STRATEGY_CTE_DECOMPOSITION": 1.0},
+  "rule_effect_confidence": {"STRATEGY_CTE_DECOMPOSITION": 0.6}
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION"],
+  "rewritten_sql": "WITH filtered_date_dim AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_month_seq BETWEEN 1207 AND 1230\n),\nfiltered_ship_mode AS (\n  SELECT sm_ship_mode_sk, sm_type\n  FROM ship_mode\n  WHERE sm_type = 'OVERNIGHT'\n),\nfiltered_call_center AS (\n  SELECT cc_call_center_sk, cc_name\n  FROM call_center\n  WHERE cc_class = 'small'\n),\nfiltered_warehouse AS (\n  SELECT w_warehouse_sk, w_warehouse_name\n  FROM warehouse\n  WHERE w_gmt_offset = -5\n)\nSELECT \n  MIN(w.w_warehouse_name),\n  MIN(sm.sm_type),\n  MIN(cc.cc_name),\n  MIN(cs.cs_order_number),\n  MIN(cs.cs_item_sk)\nFROM catalog_sales cs\nJOIN filtered_date_dim d ON cs.cs_ship_date_sk = d.d_date_sk\nJOIN filtered_warehouse w ON cs.cs_warehouse_sk = w.w_warehouse_sk\nJOIN filtered_ship_mode sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk\nJOIN filtered_call_center cc ON cs.cs_call_center_sk = cc.cc_call_center_sk\nWHERE cs.cs_list_price BETWEEN 114 AND 143;",
+  "semantic_correctness_guarantee": "1. **CTE提取与过滤下推**：将原SQL中对维度表(date_dim、ship_mode、call_center、warehouse)的WHERE条件提取为4个独立CTE(filtered_date_dim、filtered_ship_mode、filtered_call_center、filtered_warehouse)，每个CTE仅保留满足过滤条件的主键及SELECT子句所需列。这些CTE在逻辑上等价于原SQL中对应维度表与WHERE条件的组合，因为过滤条件未改变，仅改变了执行顺序(提前物化)。\n\n2. **连接语义保持**：重写SQL将原SQL的隐式内连接(逗号分隔的FROM子句+WHERE中的等值条件)改写为显式INNER JOIN，连接条件完全一致(cs_ship_date_sk=d_date_sk、cs_warehouse_sk=w_warehouse_sk、cs_ship_mode_sk=sm_ship_mode_sk、cs_call_center_sk=cc_call_center_sk)。内连接的交换律和结合律保证了无论连接顺序如何调整，最终结果集中的行必须同时满足所有连接条件和WHERE条件，与原SQL语义等价。\n\n3. **catalog_sales过滤条件保留**：原SQL中对catalog_sales的cs_list_price BETWEEN 114 AND 143条件在重写SQL中保持在最终WHERE子句中，作用域未改变，仍对catalog_sales表的所有行生效。\n\n4. **聚合函数MIN的语义不变**：原SQL和重写SQL均对5个列(w_warehouse_name、sm_type、cc_name、cs_order_number、cs_item_sk)应用MIN聚合函数，且无GROUP BY子句，因此两者均返回单行结果。由于连接和过滤条件完全等价，参与聚合的行集合相同，MIN函数的输入相同，输出必然相同。\n\n5. **主键与外键关系保证连接正确性**：根据TPC-DS Schema，catalog_sales的cs_ship_date_sk、cs_warehouse_sk、cs_ship_mode_sk、cs_call_center_sk为外键，分别引用date_dim.d_date_sk、warehouse.w_warehouse_sk、ship_mode.sm_ship_mode_sk、call_center.cc_call_center_sk(均为主键)。CTE中对维度表主键的过滤不会产生重复行(主键唯一性约束)，因此与catalog_sales的JOIN不会引入额外的重复行，结果集行数与原SQL一致。\n\n6. **NULL值处理一致性**：若catalog_sales中某行的外键列(如cs_ship_date_sk)为NULL，原SQL和重写SQL均因内连接条件(cs_ship_date_sk=d.d_date_sk)无法匹配而排除该行。CTE提取不改变NULL值的连接行为。\n\n7. **无HAVING、ORDER BY、LIMIT等易误判点**：原SQL和重写SQL均无HAVING子句(聚合后过滤)、ORDER BY子句(排序)、LIMIT子句(行数限制)，因此不存在因这些子句与聚合函数交互导致的语义差异风险。MIN函数在无GROUP BY时对全表聚合，结果确定性强。\n\n8. **优化方向与语义等价性的平衡**：虽然优化方向建议通过CTE和子查询减少catalog_sales扫描行数，但重写SQL严格遵循语义等价性原则，CTE仅用于提前物化维度表过滤结果，未改变连接逻辑或聚合范围。执行计划的优化(如利用索引、调整连接顺序)由数据库优化器根据CTE和JOIN结构自动完成，不影响结果集正确性。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL将原SQL的隐式内连接改写为显式INNER JOIN，并通过CTE提前物化维度表过滤结果，连接条件、过滤条件、聚合函数MIN及其作用域均完全一致，结果集相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同，CTE未被优化器利用。重写SQL引入了4个CTE(filtered_date_dim、filtered_ship_mode、filtered_call_center、filtered_warehouse)，意图通过预过滤减少JOIN数据量，但优化器将CTE内联后生成的执行计划与原SQL完全一致：相同的扫描方式(4个Seq Scan + 1个Index Scan)、相同的连接顺序(Hash Join → Hash Join → Hash Join → Nested Loop)、相同的并行度(Workers Planned: 2)、相同的估计行数(Plan Rows累加约68.6万)。cost仅增加0.01(462762.82→462762.83)，可忽略不计。结构上无任何改进或退化，说明CTE策略在此场景下未产生实际优化效果，优化器自动内联后回退到原始执行路径。",
+  "next_step_advice": "当前CTE策略无效，需尝试不同方向：1) 针对catalog_sales大表(598618行估计)，考虑在WHERE子句中直接用IN子查询替代JOIN，如cs_ship_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1207 AND 1230)，强制优化器先物化小结果集再进行半连接过滤；2) 或保留原SQL结构，但在catalog_sales上创建复合索引(cs_ship_date_sk, cs_list_price)或(cs_list_price, cs_ship_date_sk)，利用索引扫描替代当前的Parallel Seq Scan；3) 若无法创建索引，尝试用LATERAL JOIN或CROSS APPLY模式改写date_dim连接，强制优化器改变连接顺序，让date_dim的Index Scan先执行并驱动catalog_sales的索引查找。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE策略失败后，当前执行计划仍存在明显瓶颈：catalog_sales大表(1439万行)的Parallel Seq Scan估计扫描59.8万行(cost=458923.89)，占总cost的99%以上。虽然date_dim已使用Index Scan，但作为最内层Nested Loop的驱动表，导致索引查找被执行2215次。根据反馈建议，应尝试改变连接顺序或引入半连接过滤，让小表先物化并驱动大表的索引查找，而非当前的大表全扫描后再逐行探测索引。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将date_dim的过滤条件改写为IN子查询半连接：cs_ship_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1207 AND 1230)。强制优化器先物化date_dim的24行结果集(d_month_seq范围过滤后约24个月)，再通过半连接过滤catalog_sales，避免当前Nested Loop中2215次重复Index Scan。同时保留其他维度表的JOIN结构不变。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将cs_list_price BETWEEN 114 AND 143的过滤条件与date_dim的半连接条件合并前置：在catalog_sales扫描阶段同时应用两个过滤条件，减少后续Hash Join的输入行数。若优化器支持，可考虑用EXISTS替代IN子查询，进一步优化半连接执行。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先让三个小维度表(call_center 3行、ship_mode 3行、warehouse 2行)通过Hash Join构建小哈希表，再与catalog_sales的半连接过滤结果进行连接。通过STRAIGHT_JOIN提示或子查询物化强制优化器改变当前的'大表驱动小表'顺序，降低Hash Join的探测成本。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化",
+  "applied_rules": ["JOIN_ADD_REDUNDANT_SEMI_JOIN"],
+  "rule_effect_scores": {
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 1.0
+  },
+  "rule_effect_confidence": {
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.7
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化",
+  "applied_rules": ["JOIN_ADD_REDUNDANT_SEMI_JOIN"],
+  "rewritten_sql": "SELECT \n  MIN(w.w_warehouse_name),\n  MIN(sm.sm_type),\n  MIN(cc.cc_name),\n  MIN(cs.cs_order_number),\n  MIN(cs.cs_item_sk)\nFROM catalog_sales cs\nJOIN (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_month_seq BETWEEN 1207 AND 1230\n) d ON cs.cs_ship_date_sk = d.d_date_sk\nJOIN warehouse w ON cs.cs_warehouse_sk = w.w_warehouse_sk AND w.w_gmt_offset = -5\nJOIN ship_mode sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk AND sm.sm_type = 'OVERNIGHT'\nJOIN call_center cc ON cs.cs_call_center_sk = cc.cc_call_center_sk AND cc.cc_class = 'small'\nWHERE cs.cs_list_price BETWEEN 114 AND 143\n  AND EXISTS (\n    SELECT 1\n    FROM date_dim d2\n    WHERE d2.d_date_sk = cs.cs_ship_date_sk\n      AND d2.d_month_seq BETWEEN 1207 AND 1230\n  )",
+  "semantic_correctness_guarantee": "1. **结构性改写**：在原SQL的JOIN结构基础上，针对date_dim表增加了一个冗余的半连接过滤（EXISTS子查询），形成双重过滤机制：既保留原有的INNER JOIN (cs.cs_ship_date_sk = d.d_date_sk)，又在WHERE子句中添加EXISTS半连接检查相同的date_dim过滤条件(d_month_seq BETWEEN 1207 AND 1230)。同时将CTE改写为内联子查询，将维度表的过滤条件(w_gmt_offset = -5, sm_type = 'OVERNIGHT', cc_class = 'small')从CTE下推到各自的JOIN ON子句中。\n\n2. **等价性保证**：在TPC-DS Schema下，date_dim.d_date_sk是主键(唯一索引date_dim_pkey)，catalog_sales.cs_ship_date_sk是外键。原SQL通过INNER JOIN已确保cs.cs_ship_date_sk必须在filtered_date_dim的结果集中(即满足d_month_seq BETWEEN 1207 AND 1230)。新增的EXISTS子查询检查完全相同的条件(d2.d_date_sk = cs.cs_ship_date_sk AND d2.d_month_seq BETWEEN 1207 AND 1230)，因此对于任何通过原INNER JOIN的行，EXISTS必然返回TRUE；对于无法通过INNER JOIN的行，已被JOIN过滤掉，不会进入WHERE子句。故EXISTS子查询是冗余的逻辑检查，不改变结果集。\n\n3. **维度表过滤下推**：将warehouse、ship_mode、call_center的过滤条件从CTE定义移到JOIN ON子句(如w.w_gmt_offset = -5)，在SQL语义上完全等价：INNER JOIN的ON条件与WHERE条件对结果集的过滤效果相同(均为内连接，不存在LEFT JOIN的NULL保留问题)。由于这些维度表的主键(w_warehouse_sk、sm_ship_mode_sk、cc_call_center_sk)与catalog_sales的外键一对一匹配，过滤条件的位置不影响最终匹配的行集合。\n\n4. **聚合函数与分组**：原SQL和重写SQL均无GROUP BY子句，MIN聚合函数作用于全表扫描后的单一分组(全局聚合)。由于JOIN和WHERE过滤的行集合完全一致，MIN函数输入的行集合相同，输出的最小值必然相同。列名(w_warehouse_name、sm_type、cc_name、cs_order_number、cs_item_sk)和数据类型保持不变。\n\n5. **易误判点说明**：虽然EXISTS子查询在逻辑上是冗余的(因为INNER JOIN已完成相同过滤)，但其目的是触发优化器的半连接优化路径(如先物化date_dim的24行结果集，再通过半连接过滤catalog_sales)，而非改变语义。在执行计划层面，优化器可能选择先执行EXISTS的Index Scan，再执行JOIN，或将两者合并为一次扫描；无论哪种执行顺序，最终通过所有过滤条件的行集合与原SQL一致。NULL值处理：cs_ship_date_sk为NULL时，原SQL的INNER JOIN会过滤掉该行(JOIN条件不匹配)，重写SQL的EXISTS子查询同样返回FALSE(d2.d_date_sk = NULL恒为UNKNOWN)，行为一致。\n\n6. **主键约束保证**：catalog_sales的主键(cs_item_sk, cs_order_number)确保无重复行。所有JOIN均为INNER JOIN且基于主键/外键关系，不会产生笛卡尔积或重复行。MIN聚合函数对重复行不敏感(多次MIN相同值结果不变)，但由于主键约束，此场景下无重复行问题。\n\n7. **排序与LIMIT**：原SQL和重写SQL均无ORDER BY或LIMIT子句，MIN聚合的结果顺序由数据库内部决定，但对于相同输入行集合，MIN的输出值确定且唯一，不存在非确定性问题。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在已有INNER JOIN过滤的基础上又添加了冗余的EXISTS子查询，该EXISTS检查与JOIN条件完全重复，虽不改变结果集但与规则示例不符——示例是LEFT JOIN场景下用半连接过滤，而此处原SQL已是INNER JOIN，无需额外EXISTS。",
+    "differences": [
+        {
+            "type": "冗余过滤逻辑",
+            "description": "重写SQL在WHERE中添加EXISTS子查询检查cs_ship_date_sk与date_dim的匹配，但该条件已被FROM子句中的INNER JOIN d ON cs.cs_ship_date_sk = d.d_date_sk完全覆盖，属于逻辑冗余而非规则示例所示的半连接优化模式",
+            "location": "WHERE EXISTS子句"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在已有INNER JOIN过滤的基础上又添加了冗余的EXISTS子查询，该EXISTS检查与JOIN条件完全重复，虽不改变结果集但与规则示例不符——示例是LEFT JOIN场景下用半连接过滤，而此处原SQL已是INNER JOIN，无需额外EXISTS。
+```json
+{"fixed_sql": "SELECT MIN(w.w_warehouse_name), MIN(sm.sm_type), MIN(cc.cc_name), MIN(cs.cs_order_number), MIN(cs.cs_item_sk) FROM catalog_sales cs JOIN (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1207 AND 1230) d ON cs.cs_ship_date_sk = d.d_date_sk JOIN warehouse w ON cs.cs_warehouse_sk = w.w_warehouse_sk AND w.w_gmt_offset = -5 JOIN ship_mode sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk AND sm.sm_type = 'OVERNIGHT' JOIN call_center cc ON cs.cs_call_center_sk = cc.cc_call_center_sk AND cc.cc_class = 'small' WHERE cs.cs_list_price BETWEEN 114 AND 143", "note": "删除WHERE子句中的冗余EXISTS子查询，因为INNER JOIN已保证cs_ship_date_sk与date_dim的匹配"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已移除上轮被否的冗余EXISTS子查询，仅保留INNER JOIN结构；将date_dim过滤条件内联为子查询、维度表过滤下推至JOIN ON，与原SQL在相同Schema约束下产生相同结果集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，重写未产生任何结构变化。对比两套EXPLAIN JSON：节点类型、连接顺序、扫描方式、并行度、行数估计、cost均无差异（original cost=462762.82，enhanced cost=462762.83，差异<0.001%可忽略）。重写仅将隐式JOIN改写为显式JOIN语法并添加表别名，但date_dim仍保持Nested Loop + Index Scan（2215次探测），未实现预期的半连接物化优化。结构统计显示sum_plan_rows从686502增至686503（+0.0001%），无实质改进。由于本轮重写未触发优化器行为变化，且已是第2轮优化，继续相同方向的微调无意义，应终止并保留当前SQL（语法规范化有轻微价值）。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 412
+   - 规则序列: ['JOIN_ADD_REDUNDANT_SEMI_JOIN']
+   - 优化组别: 连接优化, 谓词简化
+   - 估计代价: 原始=462762.82, 重写=462762.83，相对变化: -0.00%
+✅ 成功存储，记录ID: 8d1d08f0-f535-4f67-b166-dadf6da29120
+
+🎲 UCT Math Update: 1 rules, reward=-0.0000 (cost=-0.0000, rows=+0.0000, depth=+0.0000, oc=462762.8200, rc=462762.8300)
+   结构分细节: rows 686502.0->686503.0 (score=+0.000), depth 9.0->9.0 (score=+0.000)
+✅ UCT Update Complete:
+   → JOIN_ADD_REDUNDANT_SEMI_JOIN: P(s,a)=N/A, effect=1.000, conf=0.70, lambda=0.35, reward=-0.000, count=24, avg=-0.030
+
+----------------------------------------
+

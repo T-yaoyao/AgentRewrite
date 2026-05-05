@@ -1,0 +1,77 @@
+Query ID: 58
+==================================================
+
+Original: select coalesce(sum(count_comm), 0) from (   select deptno, count(comm) as count_comm   from emp   group by deptno, mgr) t
+Rewritten: SELECT COALESCE(COUNT(comm), 0) FROM emp
+Time Cost: 67.21s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '消除子查询中的冗余GROUP BY聚合层。当前SQL先按(deptno,mgr)分组统计count(comm)，再对结果求和。由于外层只需count(comm)的总和而不关心各分组明细，可将两层聚合合并为单层：直接统计emp表中comm非空记录数。建议改写为：SELECT COALESCE(COUNT(comm), 0) FROM emp，避免先生成450万分组再聚合的低效模式，消除Gather和多阶段Hash Aggregate开销。'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多层聚合操作（Partial Aggregate -> Finalize Aggregate -> Plain Aggregate），且基于4500万行的大表进行全表扫描（Seq Scan cost=656004.9）。子查询中的GROUP BY deptno, mgr产生450万个分组，外层再对count(comm)求和。根据相似历史案例（相似度1.0，应用AGGREGATE_REMOVE规则），该SQL存在冗余聚合层次，可通过聚合优化消除内层不必要的分组聚合，直接在单层聚合中完成计算，减少中间结果集和多阶段聚合开销。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除子查询中的冗余GROUP BY聚合层。当前SQL先按(deptno,mgr)分组统计count(comm)，再对结果求和。由于外层只需count(comm)的总和而不关心各分组明细，可将两层聚合合并为单层：直接统计emp表中comm非空记录数。建议改写为：SELECT COALESCE(COUNT(comm), 0) FROM emp，避免先生成450万分组再聚合的低效模式，消除Gather和多阶段Hash Aggregate开销。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 19 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.221
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{
+  "groups": "聚合优化",
+  "applied_rules": ["AGGREGATE_REMOVE"],
+  "rule_effect_scores": {
+    "AGGREGATE_REMOVE": 1.0
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_REMOVE": 0.9
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化",
+  "applied_rules": ["AGGREGATE_REMOVE"],
+  "rewritten_sql": "SELECT COALESCE(COUNT(comm), 0) FROM emp",
+  "semantic_correctness_guarantee": "1. 结构性改写说明：原SQL包含两层聚合结构——内层子查询按(deptno, mgr)分组并计算count(comm)，外层对所有分组结果的count_comm求和。重写后消除了子查询和GROUP BY，直接在emp表上执行COUNT(comm)。\n\n2. 语义等价性论证：COUNT(comm)是聚合函数，统计非NULL的comm值数量。原SQL的逻辑是：先按(deptno, mgr)分组统计每组的count(comm)，再将所有分组的计数值相加。根据COUNT的可加性原理，∑count(comm_i) = count(comm_total)，即分组后再求和等价于直接对全表统计。因为COUNT函数对分区的计数之和等于对全集的计数。\n\n3. COALESCE处理的等价性：原SQL外层使用COALESCE(SUM(count_comm), 0)处理空结果集。当emp表为空时，原SQL子查询返回空集，SUM返回NULL，COALESCE转为0；重写后COUNT(comm)在空表上返回0（COUNT的标准行为），无需COALESCE也能保证返回0。但为保持完全一致的NULL处理语义，重写SQL保留了COALESCE包装。\n\n4. GROUP BY消除的合理性：原SQL的GROUP BY (deptno, mgr)仅用于分组计数，外层立即将所有分组结果聚合为单个值。由于外层不依赖分组键(deptno, mgr)的具体值，只需各组count(comm)的总和，因此分组操作是冗余的。根据AGGREGATE_REMOVE规则，当GROUP BY不产生实际的分组语义价值（即上层立即再聚合且不使用分组键）时可安全消除。\n\n5. comm列的NULL处理：COUNT(comm)只统计comm列非NULL的行数，这与原SQL中每个分组内的count(comm)行为一致。无论是分组后统计再求和，还是直接全表统计，对NULL值的处理逻辑完全相同——均被排除在计数之外。\n\n6. 结果集验证：原SQL返回单行单列的数值（所有分组的count_comm之和），重写SQL同样返回单行单列的数值（全表comm非NULL计数）。两者在任何数据分布下结果必然相等，因为数学上 ∑(按组统计) = 全局统计。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "两层聚合折叠：原SQL内层按(deptno,mgr)分组COUNT(comm)，外层SUM所有分组计数；重写为直接COUNT(comm)。根据COUNT可加性，∑count(comm_i)=count(comm_total)，且SUM(COUNT(v))->COUNT(v)满足两层聚合折叠规则，结果集完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 38550188.0 -> 18750094.0 (重写侧约为原的 48.6381%)
+✅ 估计代价降幅 83.0% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 111
+   - 规则序列: ['AGGREGATE_REMOVE']
+   - 优化组别: 聚合优化
+   - 估计代价: 原始=4138767.94, 重写=703880.35，相对变化: 82.99%
+✅ 成功存储，记录ID: b91f7cf4-ff48-4165-b275-63438496ca7f
+
+🎲 UCT Math Update: 1 rules, reward=+0.5144 (cost=+0.8299, rows=+0.5136, depth=+0.2000, oc=4138767.9400, rc=703880.3500)
+   结构分细节: rows 38550188.0->18750094.0 (score=+0.514), depth 5.0->4.0 (score=+0.200)
+✅ UCT Update Complete:
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=1.000, conf=0.90, lambda=0.45, reward=+0.514, count=29, avg=+0.196
+
+----------------------------------------
+

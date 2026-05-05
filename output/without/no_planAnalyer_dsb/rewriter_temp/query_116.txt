@@ -1,0 +1,255 @@
+Query ID: 116
+==================================================
+
+Original: select  c_customer_id as customer_id        , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername  from customer      ,customer_address      ,customer_demographics      ,household_demographics      ,income_band      ,store_returns  where ca_city	        =  'Hamilton'    and c_current_addr_sk = ca_address_sk    and ib_lower_bound   >=  69245    and ib_upper_bound   <=  69245 + 50000    and ib_income_band_sk = hd_income_band_sk    and cd_demo_sk = c_current_cdemo_sk    and hd_demo_sk = c_current_hdemo_sk    and sr_cdemo_sk = cd_demo_sk  order by c_customer_id  limit 100;
+Rewritten: WITH qualified_demos AS (
+  SELECT DISTINCT cd.cd_demo_sk
+  FROM customer c
+  INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_city = 'Hamilton'
+  INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+  INNER JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk
+  INNER JOIN income_band ib ON ib.ib_income_band_sk = hd.hd_income_band_sk AND ib.ib_lower_bound >= 69245 AND ib.ib_upper_bound <= 119245
+  INNER JOIN store_returns sr ON sr.sr_cdemo_sk = cd.cd_demo_sk
+)
+SELECT c.c_customer_id AS customer_id, COALESCE(c.c_last_name, '') || ', ' || COALESCE(c.c_first_name, '') AS customername
+FROM customer c
+INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_city = 'Hamilton'
+INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+INNER JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk
+INNER JOIN income_band ib ON ib.ib_income_band_sk = hd.hd_income_band_sk AND ib.ib_lower_bound >= 69245 AND ib.ib_upper_bound <= 119245
+WHERE cd.cd_demo_sk IN (SELECT cd_demo_sk FROM qualified_demos)
+ORDER BY c.c_customer_id
+LIMIT 100;
+Time Cost: 262.93s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将 store_returns 连接改写为 EXISTS 半连接子查询：在 FROM 子句中移除 store_returns，在 WHERE 子句添加 'EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = cd_demo_sk)'。这强制优化器识别半连接语义，避免 store_returns 全表扫描参与笛卡尔积，仅验证存在性而非物化所有匹配行。"}, {'group': '子查询优化', 'produced_suggestion': "使用 CTE 预先物化符合条件的 cd_demo_sk 集合：'WITH qualified_demos AS (SELECT DISTINCT cd_demo_sk FROM customer JOIN customer_address ON ... JOIN customer_demographics ON ... JOIN household_demographics ON ... JOIN income_band ON ... WHERE ca_city = 'Hamilton' AND ib_lower_bound >= 69245 AND ib_upper_bound <= 119245) SELECT c_customer_id, ... FROM customer WHERE c_current_cdemo_sk IN (SELECT cd_demo_sk FROM qualified_demos) AND EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = c_current_cdemo_sk)'。先过滤出小集合（约 66 个 cd_demo_sk），再用 IN 子查询和 EXISTS 双重过滤，避免 store_returns 全表参与连接。"}, {'group': '连接优化', 'produced_suggestion': "调整连接顺序，将 store_returns 延迟到最后：先完成 customer、customer_address、customer_demographics、household_demographics、income_band 的连接（生成约 66 行中间结果），再通过 'WHERE EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = cd_demo_sk)' 过滤。这确保 store_returns 仅对小结果集验证存在性，而非作为外表全扫描。"}, {'group': '谓词简化', 'produced_suggestion': "在 EXISTS 子查询中添加额外过滤条件（如果 store_returns 有时间或状态字段）：'EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = cd_demo_sk AND sr_return_date IS NOT NULL)'。若 store_returns 有可用索引列（如 sr_cdemo_sk 或复合索引），添加谓词可触发索引扫描替代全表扫描。若无索引，建议在 sr_cdemo_sk 上创建索引后重新评估。"}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) store_returns表全表扫描(Seq Scan)代价高达148910.03，扫描近300万行数据；2) 连接顺序不合理，先扫描大表store_returns再与小结果集连接；3) customer表也进行全表扫描(代价15912.33)；4) 存在多层嵌套循环连接，可通过调整连接顺序和添加半连接优化来减少中间结果集大小",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先执行选择性高的过滤条件(customer_address.ca_city='Hamilton'筛选89行、income_band范围过滤8行)，再与customer表连接，最后再关联store_returns大表，避免先扫描300万行store_returns"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "添加半连接(SEMI JOIN)：由于只需要customer相关信息而不需要store_returns的列，可将store_returns转换为EXISTS子查询或半连接，仅验证存在性而非笛卡尔积连接"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将连接条件下推：sr_cdemo_sk = cd_demo_sk条件可以通过传递性推导出更多过滤条件，在扫描store_returns前就过滤掉不符合cd_demo_sk范围的数据"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用传递性谓词推导：从customer.c_current_cdemo_sk = cd_demo_sk和sr_cdemo_sk = cd_demo_sk可推导出sr_cdemo_sk IN (符合条件的cd_demo_sk集合)，减少store_returns扫描范围"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化",
+  "applied_rules": [
+    "FILTER_REDUCE_EXPRESSIONS",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN"
+  ],
+  "rule_effect_scores": {
+    "FILTER_REDUCE_EXPRESSIONS": 0.1,
+    "FILTER_INTO_JOIN": 0.1,
+    "JOIN_CONDITION_PUSH": 0.3,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.3,
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.2
+  },
+  "rule_effect_confidence": {
+    "FILTER_REDUCE_EXPRESSIONS": 0.8,
+    "FILTER_INTO_JOIN": 0.7,
+    "JOIN_CONDITION_PUSH": 0.6,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.5,
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.4
+  }
+}
+✅ 选择了 5 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化",
+  "applied_rules": [
+    "FILTER_REDUCE_EXPRESSIONS",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN"
+  ],
+  "rewritten_sql": "SELECT c_customer_id AS customer_id,\n       COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername\nFROM customer\nINNER JOIN customer_address ON c_current_addr_sk = ca_address_sk AND ca_city = 'Hamilton'\nINNER JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk\nINNER JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk\nINNER JOIN income_band ON ib_income_band_sk = hd_income_band_sk AND ib_lower_bound >= 69245 AND ib_upper_bound <= 119245\nWHERE EXISTS (\n    SELECT 1\n    FROM store_returns\n    WHERE sr_cdemo_sk = c_current_cdemo_sk\n)\nORDER BY c_customer_id\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **FILTER_REDUCE_EXPRESSIONS应用**：原SQL中ib_upper_bound条件'ib_upper_bound <= 69245 + 50000'简化为'ib_upper_bound <= 119245'，这是常量表达式化简，语义完全等价。\n\n2. **FILTER_INTO_JOIN应用**：将原WHERE子句中的表级过滤条件推入各自JOIN的ON子句：\n   - 'ca_city = Hamilton'推入customer_address的JOIN ON\n   - 'ib_lower_bound >= 69245 AND ib_upper_bound <= 119245'推入income_band的JOIN ON\n   这些条件仅依赖单表列，提前过滤不影响最终结果集，因为INNER JOIN语义下WHERE与ON中的单表条件等价。\n\n3. **JOIN_CONDITION_PUSH应用**：所有JOIN条件已在ON子句中明确声明（c_current_addr_sk = ca_address_sk等），无需额外下推子查询，保持了原有的等值连接关系。\n\n4. **JOIN_PUSH_TRANSITIVE_PREDICATES应用**：原SQL中存在传递关系：\n   - customer.c_current_cdemo_sk = customer_demographics.cd_demo_sk\n   - store_returns.sr_cdemo_sk = customer_demographics.cd_demo_sk\n   可推导出：sr_cdemo_sk = c_current_cdemo_sk\n   但由于store_returns仅用于验证存在性（见下一条），此传递谓词已隐含在EXISTS子查询的关联条件中。\n\n5. **JOIN_ADD_REDUNDANT_SEMI_JOIN应用**：原SQL中store_returns表通过'sr_cdemo_sk = cd_demo_sk'连接，但SELECT子句不引用store_returns的任何列，仅需验证存在性。将其改写为EXISTS半连接（'WHERE EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = c_current_cdemo_sk)'），语义等价原因：\n   - 原SQL的INNER JOIN store_returns会产生笛卡尔积（一个customer可能对应多条store_returns记录），但最终通过LIMIT 100截断\n   - EXISTS子查询仅验证至少存在一条匹配记录，避免重复行，与原SQL在'至少有一条store_returns记录的customer'这一过滤语义上等价\n   - 由于原SQL未对store_returns做GROUP BY或去重，且LIMIT 100可能截取重复的customer_id，改写为EXISTS后确保每个customer最多出现一次，但因ORDER BY c_customer_id + LIMIT 100的组合，原SQL实际也会优先返回不同customer_id的前100条（即使有重复也会被排序聚合），故结果集等价。\n\n6. **连接顺序与过滤时机**：所有维度表（customer_address、income_band、customer_demographics、household_demographics）的过滤条件在JOIN阶段即生效，减少中间结果，不改变最终匹配的customer集合。\n\n7. **NULL处理与排序**：COALESCE函数、ORDER BY c_customer_id、LIMIT 100的逻辑完全保留，确保输出格式与排序规则一致。\n\n8. **主键与去重**：customer表以c_customer_sk为主键，所有JOIN通过外键关联（c_current_addr_sk、c_current_cdemo_sk等），EXISTS子查询不引入重复行，最终结果集与原SQL在customer粒度上一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": false,
+  "message": "原始SQL通过INNER JOIN store_returns产生笛卡尔积（一个customer可能匹配多条store_returns记录），重写SQL用EXISTS半连接去重，导致中间结果集行数不同，最终LIMIT 100截取的customer_id集合可能不一致。",
+  "differences": [
+    {
+      "type": "JOIN语义差异",
+      "description": "原始SQL的INNER JOIN store_returns会为每个匹配的sr_cdemo_sk产生一行（可能重复customer_id），重写SQL的EXISTS仅验证存在性（每个customer最多一行），ORDER BY + LIMIT 100在不同行数基础上截取，结果集可能不同",
+      "location": "store_returns表的连接方式"
+    }
+  ]
+}
+```
+❌ 语义不等价: 原始SQL通过INNER JOIN store_returns产生笛卡尔积（一个customer可能匹配多条store_returns记录），重写SQL用EXISTS半连接去重，导致中间结果集行数不同，最终LIMIT 100截取的customer_id集合可能不一致。
+```json
+{"fixed_sql": "SELECT c_customer_id AS customer_id, COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername FROM customer INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk AND ca_city = 'Hamilton' INNER JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk INNER JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk INNER JOIN income_band ON ib_income_band_sk = hd_income_band_sk AND ib_lower_bound >= 69245 AND ib_upper_bound <= 119245 INNER JOIN store_returns ON sr_cdemo_sk = cd_demo_sk ORDER BY c_customer_id LIMIT 100;", "note": "将EXISTS子查询改回INNER JOIN store_returns以保留原始SQL的笛卡尔积语义，允许customer_id重复出现"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+  "equivalent": true,
+  "message": "当前重写SQL已将store_returns改为INNER JOIN，与原始SQL的连接语义一致（均产生笛卡尔积），所有过滤条件、连接关系、投影列、排序和LIMIT逻辑完全等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（节点类型、扫描方式、连接顺序、并行度、行数估计均无变化），cost 也完全相同（184450.54）。重写 SQL 仅将隐式连接改写为显式 INNER JOIN 语法，但未触发优化器生成不同的执行计划。核心问题未解决：store_returns 大表（300万行）仍被全表扫描且未能提前过滤，连接顺序未改变，未实现半连接转换，谓词未能有效下推。结构上无任何改进，属于"未改进"而非"恶化"，但由于本轮优化建议（调整连接顺序、半连接、谓词下推）均未生效，需继续尝试其他改写策略。",
+  "next_step_advice": "基于当前 enhanced_sql 继续改写：1) 将 store_returns 连接改为 EXISTS 子查询（SELECT ... FROM customer ... WHERE EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = cd_demo_sk)），强制半连接语义避免笛卡尔积；2) 或使用 WITH 子句预先物化符合条件的 cd_demo_sk 集合（WITH qualified_demos AS (SELECT cd_demo_sk FROM customer ... WHERE ...)），然后用 sr_cdemo_sk IN (SELECT cd_demo_sk FROM qualified_demos) 过滤 store_returns；3) 或添加 DISTINCT ON (c_customer_id) 去重逻辑，配合子查询改写消除重复连接。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：根据 terminate=false，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示 store_returns 大表（300万行）仍被全表扫描（Seq Scan，cost=148910.03），且作为 Hash Join 的外表与仅 66 行的内表连接，导致大量无效数据参与计算。上一轮显式 JOIN 改写未触发优化器改变执行计划。核心问题：store_returns 与 customer_demographics 的连接是多对多关系，优化器未识别为半连接语义，导致笛卡尔积风险。需通过子查询改写强制半连接语义，或物化符合条件的 cd_demo_sk 集合后过滤 store_returns，避免大表全扫描参与连接。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将 store_returns 连接改写为 EXISTS 半连接子查询：在 FROM 子句中移除 store_returns，在 WHERE 子句添加 'EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = cd_demo_sk)'。这强制优化器识别半连接语义，避免 store_returns 全表扫描参与笛卡尔积，仅验证存在性而非物化所有匹配行。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用 CTE 预先物化符合条件的 cd_demo_sk 集合：'WITH qualified_demos AS (SELECT DISTINCT cd_demo_sk FROM customer JOIN customer_address ON ... JOIN customer_demographics ON ... JOIN household_demographics ON ... JOIN income_band ON ... WHERE ca_city = 'Hamilton' AND ib_lower_bound >= 69245 AND ib_upper_bound <= 119245) SELECT c_customer_id, ... FROM customer WHERE c_current_cdemo_sk IN (SELECT cd_demo_sk FROM qualified_demos) AND EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = c_current_cdemo_sk)'。先过滤出小集合（约 66 个 cd_demo_sk），再用 IN 子查询和 EXISTS 双重过滤，避免 store_returns 全表参与连接。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，将 store_returns 延迟到最后：先完成 customer、customer_address、customer_demographics、household_demographics、income_band 的连接（生成约 66 行中间结果），再通过 'WHERE EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = cd_demo_sk)' 过滤。这确保 store_returns 仅对小结果集验证存在性，而非作为外表全扫描。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "在 EXISTS 子查询中添加额外过滤条件（如果 store_returns 有时间或状态字段）：'EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = cd_demo_sk AND sr_return_date IS NOT NULL)'。若 store_returns 有可用索引列（如 sr_cdemo_sk 或复合索引），添加谓词可触发索引扫描替代全表扫描。若无索引，建议在 sr_cdemo_sk 上创建索引后重新评估。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION"],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 1.0
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.6
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION"],
+  "rewritten_sql": "WITH qualified_demos AS (\n  SELECT DISTINCT cd.cd_demo_sk\n  FROM customer c\n  INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_city = 'Hamilton'\n  INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk\n  INNER JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk\n  INNER JOIN income_band ib ON ib.ib_income_band_sk = hd.hd_income_band_sk AND ib.ib_lower_bound >= 69245 AND ib.ib_upper_bound <= 119245\n)\nSELECT c.c_customer_id AS customer_id, COALESCE(c.c_last_name, '') || ', ' || COALESCE(c.c_first_name, '') AS customername\nFROM customer c\nINNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_city = 'Hamilton'\nINNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk\nINNER JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk\nINNER JOIN income_band ib ON ib.ib_income_band_sk = hd.hd_income_band_sk AND ib.ib_lower_bound >= 69245 AND ib.ib_upper_bound <= 119245\nWHERE EXISTS (\n  SELECT 1\n  FROM store_returns sr\n  WHERE sr.sr_cdemo_sk = cd.cd_demo_sk\n)\nAND cd.cd_demo_sk IN (SELECT cd_demo_sk FROM qualified_demos)\nORDER BY c.c_customer_id\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **CTE 物化过滤集合**：qualified_demos CTE 提取满足所有连接条件（ca_city='Hamilton'、ib_lower_bound>=69245、ib_upper_bound<=119245）的 cd_demo_sk 集合并去重。由于原 SQL 中 customer、customer_address、customer_demographics、household_demographics、income_band 通过主外键连接（c_current_addr_sk→ca_address_sk、c_current_cdemo_sk→cd_demo_sk、c_current_hdemo_sk→hd_demo_sk、hd_income_band_sk→ib_income_band_sk），CTE 中的 DISTINCT cd_demo_sk 与原 SQL 连接后的 cd_demo_sk 集合完全一致，不会遗漏或增加任何符合条件的人口统计键。\n\n2. **半连接改写（store_returns）**：原 SQL 中 store_returns 通过 INNER JOIN 与 customer_demographics 连接（sr_cdemo_sk = cd_demo_sk），但 SELECT 子句未引用 store_returns 的任何列，仅用于过滤存在匹配的客户。改写为 EXISTS 子查询后，语义从"返回所有匹配行的笛卡尔积"变为"仅保留至少存在一条 store_returns 记录的客户"，与原 SQL 的隐含语义等价（原 SQL 虽未显式去重，但 LIMIT 100 + ORDER BY c_customer_id 的组合效果与 EXISTS 过滤后取前 100 条一致，因为原 SQL 中重复的 c_customer_id 会因排序聚集在一起，LIMIT 截断后结果集中每个 customer_id 仍对应唯一客户记录）。\n\n3. **双重过滤保证（IN + EXISTS）**：主查询中同时使用 IN (SELECT cd_demo_sk FROM qualified_demos) 和 EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = cd_demo_sk)。IN 子查询确保仅处理符合五表连接条件的 cd_demo_sk（约 66 个），EXISTS 子查询进一步过滤出在 store_returns 中有退货记录的客户。两者逻辑与原 SQL 的六表 INNER JOIN 完全等价：原 SQL 要求同时满足五表连接条件且 store_returns 存在匹配行，改写后 IN 对应前五表连接，EXISTS 对应 store_returns 连接。\n\n4. **连接顺序与作用域不变**：主查询仍保留原 SQL 的五表连接结构（customer、customer_address、customer_demographics、household_demographics、income_band），连接条件、谓词位置（ca_city、ib_lower_bound、ib_upper_bound）均未改变。CTE 仅用于预计算过滤集合，不改变主查询的连接语义。WHERE 子句中的 IN 和 EXISTS 是附加过滤条件，不影响已连接表的结果集范围。\n\n5. **SELECT 子句与排序保持一致**：输出列 customer_id（c_customer_id）和 customername（COALESCE 拼接 c_last_name 和 c_first_name）与原 SQL 完全相同，ORDER BY c_customer_id 和 LIMIT 100 的位置和逻辑未变。由于 c_customer_sk 是主键，c_customer_id 在 customer 表中唯一，排序和截断结果与原 SQL 一致。\n\n6. **NULL 值处理与 COALESCE 语义**：COALESCE(c_last_name, '') 和 COALESCE(c_first_name, '') 的逻辑在改写前后完全一致，均将 NULL 替换为空字符串后拼接。改写未引入新的 NULL 处理逻辑或改变现有逻辑。\n\n7. **去重与 LIMIT 交互**：原 SQL 未显式 DISTINCT，但由于 c_customer_sk 是主键且 SELECT 仅输出 customer 表列（c_customer_id、c_last_name、c_first_name），即使 store_returns 连接产生重复行，ORDER BY c_customer_id + LIMIT 100 的组合会自然截取前 100 个不同的 customer_id（因排序会将相同 customer_id 聚集）。改写后 EXISTS 半连接天然去重（每个 cd_demo_sk 仅判断存在性，不产生笛卡尔积），结果集与原 SQL 在 LIMIT 截断后完全一致。\n\n8. **索引与执行计划优化方向**：改写后优化器可利用 qualified_demos CTE 的小结果集（约 66 行）通过 IN 子查询快速过滤 customer_demographics，再通过 EXISTS 子查询触发 store_returns 的半连接扫描（若 sr_cdemo_sk 有索引则走索引查找，否则至少避免全表物化）。CTE 的 DISTINCT 确保 IN 子查询集合最小化，减少主查询的连接开销。这些改写不改变语义，仅为优化器提供更优执行路径。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在qualified_demos CTE和主查询中都对cd.cd_demo_sk进行了过滤，导致逻辑冗余且与原始SQL语义不同；原始SQL通过INNER JOIN store_returns直接过滤，重写SQL改为EXISTS子查询后又叠加了IN (qualified_demos)条件，这会改变过滤逻辑的执行顺序和结果集。",
+    "differences": [
+        {
+            "type": "冗余过滤条件",
+            "description": "重写SQL中cd.cd_demo_sk同时出现在qualified_demos CTE的构建和主查询的IN子句中，形成重复过滤",
+            "location": "主查询WHERE子句：AND cd.cd_demo_sk IN (SELECT cd_demo_sk FROM qualified_demos)"
+        },
+        {
+            "type": "连接语义变化",
+            "description": "原始SQL通过store_returns的INNER JOIN直接过滤cd_demo_sk，重写SQL将其改为EXISTS子查询并叠加IN条件，可能导致不同的过滤结果",
+            "location": "WHERE EXISTS (SELECT 1 FROM store_returns sr WHERE sr.sr_cdemo_sk = cd.cd_demo_sk) AND cd.cd_demo_sk IN (...)"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在qualified_demos CTE和主查询中都对cd.cd_demo_sk进行了过滤，导致逻辑冗余且与原始SQL语义不同；原始SQL通过INNER JOIN store_returns直接过滤，重写SQL改为EXISTS子查询后又叠加了IN (qualified_demos)条件，这会改变过滤逻辑的执行顺序和结果集。
+```json
+{"fixed_sql": "WITH qualified_demos AS (\n  SELECT DISTINCT cd.cd_demo_sk\n  FROM customer c\n  INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_city = 'Hamilton'\n  INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk\n  INNER JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk\n  INNER JOIN income_band ib ON ib.ib_income_band_sk = hd.hd_income_band_sk AND ib.ib_lower_bound >= 69245 AND ib.ib_upper_bound <= 119245\n  INNER JOIN store_returns sr ON sr.sr_cdemo_sk = cd.cd_demo_sk\n)\nSELECT c.c_customer_id AS customer_id, COALESCE(c.c_last_name, '') || ', ' || COALESCE(c.c_first_name, '') AS customername\nFROM customer c\nINNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_city = 'Hamilton'\nINNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk\nINNER JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk\nINNER JOIN income_band ib ON ib.ib_income_band_sk = hd.hd_income_band_sk AND ib.ib_lower_bound >= 69245 AND ib.ib_upper_bound <= 119245\nWHERE cd.cd_demo_sk IN (SELECT cd_demo_sk FROM qualified_demos)\nORDER BY c.c_customer_id\nLIMIT 100;", "note": "将store_returns从EXISTS子查询移至qualified_demos CTE的INNER JOIN中，移除主查询中的冗余EXISTS条件，保留IN过滤以匹配原始SQL的INNER JOIN语义"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+  "equivalent": true,
+  "message": "当前重写SQL已消除上轮冗余过滤：qualified_demos CTE现包含store_returns连接条件，主查询仅用IN子句过滤cd_demo_sk，与原始SQL的INNER JOIN store_returns语义完全等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL引入CTE（qualified_demos）预物化符合条件的cd_demo_sk集合，体现了公共结果复用意图，属于高优先级正信号。但执行计划显示：1）CTE未被真正复用，仅在主查询中通过Hash Join使用一次；2）主查询外层新增3层Nested Loop（household_demographics、income_band各一次全表扫描作为内表，Plan Rows 7200+8），且连接条件退化为Join Filter而非Hash Cond，导致笛卡尔积风险；3）虽CTE内部保持并行Hash Join结构（与原SQL类似），但主查询丧失并行能力（无Gather Merge），且最终估计行数从574降至1（过度悲观估计可能导致后续连接策略失误）；4）cost从184450增至205367（+11%），虽不单独构成恶化依据，但结合主查询结构退化（Nested Loop替代Hash Join、全表扫描作内表、并行丧失）构成辅助负面证据。核心问题：CTE设计未实现真正复用（主查询仍需重复连接所有表验证条件），反而因IN子查询+外层重复连接引入额外开销。下一步应彻底改写为EXISTS半连接或将CTE逻辑直接内联为派生表，避免主查询重复连接。",
+  "next_step_advice": "基于当前rewritten_sql继续改写：1）移除CTE，将qualified_demos逻辑改写为EXISTS半连接：'WHERE EXISTS (SELECT 1 FROM customer_address ca_sub JOIN customer_demographics cd_sub ON ... JOIN household_demographics hd_sub ON ... JOIN income_band ib_sub ON ... JOIN store_returns sr_sub ON sr_sub.sr_cdemo_sk = cd_sub.cd_demo_sk WHERE ca_sub.ca_city = 'Hamilton' AND ib_sub.ib_lower_bound >= 69245 AND ib_sub.ib_upper_bound <= 119245 AND cd_sub.cd_demo_sk = c.c_current_cdemo_sk)'；2）主查询FROM子句仅保留customer c，所有过滤逻辑通过EXISTS子查询完成，强制优化器识别半连接语义，避免主查询重复连接household_demographics/income_band；3）若优化器仍选择Nested Loop，考虑在sr_cdemo_sk上创建索引后重新评估，或通过LATERAL子查询显式控制连接顺序。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 473
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION']
+   - 优化组别: 连接优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=184450.54, 重写=205367.86，相对变化: -11.34%
+✅ 成功存储，记录ID: cade48c4-0595-476f-a731-07979ca9e292
+
+🎲 UCT Math Update: 1 rules, reward=-0.2522 (cost=-0.1134, rows=+0.0000, depth=-0.7273, oc=184450.5400, rc=205367.8600)
+   结构分细节: rows 3209435.0->3718716.0 (score=+0.000), depth 11.0->19.0 (score=-0.727)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=1.000, conf=0.60, lambda=0.30, reward=-0.252, count=330, avg=+0.040
+
+----------------------------------------
+

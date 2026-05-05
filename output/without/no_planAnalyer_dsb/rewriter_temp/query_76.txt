@@ -1,0 +1,228 @@
+Query ID: 76
+==================================================
+
+Original: select    min(s_store_name)   ,min(s_company_id)   ,min(s_street_number)   ,min(s_street_name)   ,min(s_suite_number)   ,min(s_city)   ,min(s_zip)   ,min(ss_ticket_number)   ,min(ss_sold_date_sk)   ,min(sr_returned_date_sk)   ,min(ss_item_sk)   ,min(d1.d_date_sk) from    store_sales   ,store_returns   ,store   ,date_dim d1   ,date_dim d2 where     d2.d_moy = 8 and ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk and ss_sold_date_sk   = d1.d_date_sk and sr_returned_date_sk   = d2.d_date_sk and ss_customer_sk = sr_customer_sk and ss_store_sk = s_store_sk and sr_store_sk = s_store_sk and d1.d_date between (d2.d_date - interval '120' day)                and d2.d_date and d1.d_dow = 2 and s_state in ('GA','IL','OH')  ;
+Rewritten: WITH d2_filtered AS (
+  SELECT d_date_sk, d_date
+  FROM date_dim
+  WHERE d_moy = 8
+),
+store_filtered AS (
+  SELECT s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name, s_suite_number, s_city, s_zip
+  FROM store
+  WHERE s_state IN ('GA', 'IL', 'OH')
+),
+date_range_mapping AS (
+  SELECT d1.d_date_sk AS d1_date_sk, d2.d_date_sk AS d2_date_sk
+  FROM date_dim d1
+  CROSS JOIN d2_filtered d2
+  WHERE d1.d_dow = 2
+    AND d1.d_date BETWEEN (d2.d_date - INTERVAL '120' DAY) AND d2.d_date
+)
+SELECT 
+  MIN(s.s_store_name),
+  MIN(s.s_company_id),
+  MIN(s.s_street_number),
+  MIN(s.s_street_name),
+  MIN(s.s_suite_number),
+  MIN(s.s_city),
+  MIN(s.s_zip),
+  MIN(sr.sr_ticket_number),
+  MIN(ss.ss_sold_date_sk),
+  MIN(sr.sr_returned_date_sk),
+  MIN(sr.sr_item_sk),
+  MIN(drm.d1_date_sk)
+FROM store_returns sr
+JOIN store_filtered s ON sr.sr_store_sk = s.s_store_sk
+JOIN store_sales ss ON sr.sr_item_sk = ss.ss_item_sk 
+  AND sr.sr_ticket_number = ss.ss_ticket_number
+  AND sr.sr_customer_sk = ss.ss_customer_sk
+  AND sr.sr_store_sk = ss.ss_store_sk
+JOIN date_range_mapping drm ON ss.ss_sold_date_sk = drm.d1_date_sk 
+  AND sr.sr_returned_date_sk = drm.d2_date_sk
+WHERE sr.sr_item_sk IS NOT NULL
+  AND sr.sr_ticket_number IS NOT NULL
+  AND sr.sr_customer_sk IS NOT NULL
+  AND sr.sr_store_sk IS NOT NULL
+  AND ss.ss_item_sk IS NOT NULL
+  AND ss.ss_ticket_number IS NOT NULL
+  AND ss.ss_sold_date_sk IS NOT NULL
+  AND sr.sr_returned_date_sk IS NOT NULL;
+Time Cost: 436.83s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '移除d1_filtered和ss_sr_join的CTE定义，将store_sales和date_dim d1恢复为主查询中的直接表引用，利用索引探测路径：先通过store_returns与store的Hash Join(保留store_filtered CTE)，再通过store_sales_pkey索引根据(sr_item_sk, sr_ticket_number)精准探测store_sales记录，最后通过date_dim_pkey索引根据ss_sold_date_sk获取d1记录'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序为：1) store_returns HASH JOIN store_filtered(小表驱动，保留)；2) 结果通过(sr_item_sk, sr_ticket_number)Index Scan探测store_sales_pkey(恢复索引路径)；3) 结果通过ss_sold_date_sk Index Scan探测date_dim_pkey获取d1(恢复索引路径)；4) 最后与d2_filtered进行等值连接(需配合谓词转换)'}, {'group': '谓词简化', 'produced_suggestion': '将最外层Nested Loop的非等值Join Filter(d1.d_date BETWEEN d2.d_date-120 AND d2.d_date)转换为等值连接：创建辅助CTE date_range_mapping存储满足条件的(d1.d_date_sk, d2.d_date_sk)配对——通过d2_filtered与date_dim d1的CROSS JOIN并过滤d1.d_dow=2且d1.d_date在d2.d_date前120天范围内，主查询通过(ss_sold_date_sk, sr_returned_date_sk)等值连接该CTE替代原非等值过滤'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) store_returns表全表扫描(Seq Scan)代价高达148910.03，处理299万行数据；2) 多层嵌套循环连接(Nested Loop)且存在非等值连接条件(日期区间判断)在最外层，导致每次循环都需重新计算区间；3) 连接顺序不优，大表store_returns在连接链前端但过滤条件较弱；4) Join Filter中的日期区间计算(d1.d_date BETWEEN d2.d_date - 120 AND d2.d_date)未下推，在Nested Loop层执行效率低；5) 存在冗余的连接条件(sr_store_sk = ss_store_sk同时又有ss_store_sk = s_store_sk)可简化。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将最外层Nested Loop的Join Filter中的日期区间条件(d1.d_date BETWEEN d2.d_date - 120 AND d2.d_date)转换为等值连接或下推到d1表的扫描过滤中，避免在嵌套循环中重复计算区间判断。可考虑先过滤d1表满足d_dow=2的记录，再与d2表做日期区间关联。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接小表store(仅13行)和date_dim d2(3674行)、d1(过滤后更小)，形成驱动集后再与大表store_sales、store_returns连接。将store_returns的全表扫描延后，通过前置过滤减少参与连接的数据量。同时将sr_store_sk = ss_store_sk和ss_store_sk = s_store_sk的冗余条件合并简化。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将最外层的Nested Loop Join Filter(日期区间条件)转换为Hash Join的等值条件。可通过预先计算d2.d_date及其前120天的日期范围，生成辅助过滤条件，使d1表在扫描时直接应用日期范围过滤，避免嵌套循环中的非等值判断。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑将复杂的多表连接分解为CTE：先创建满足日期条件的d1、d2关联结果集(CTE1)，再创建store过滤结果(CTE2)，最后将store_sales和store_returns通过主键索引连接并与CTE结果集关联。这样可以减少重复计算并利用物化优化。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "JOIN_CONDITION_PUSH": 0.3,
+    "PROJECT_JOIN_TRANSPOSE": 0.2
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "JOIN_CONDITION_PUSH": 0.8,
+    "PROJECT_JOIN_TRANSPOSE": 0.6
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "JOIN_CONDITION_PUSH",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "WITH d2_filtered AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_moy = 8\n),\nd1_filtered AS (\n  SELECT d1.d_date_sk, d1.d_date\n  FROM date_dim d1\n  JOIN d2_filtered d2 ON d1.d_date BETWEEN (d2.d_date - INTERVAL '120' DAY) AND d2.d_date\n  WHERE d1.d_dow = 2\n),\nstore_filtered AS (\n  SELECT s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name, s_suite_number, s_city, s_zip\n  FROM store\n  WHERE s_state IN ('GA', 'IL', 'OH')\n),\nss_sr_join AS (\n  SELECT \n    ss.ss_store_sk,\n    ss.ss_sold_date_sk,\n    ss.ss_item_sk,\n    ss.ss_ticket_number,\n    ss.ss_customer_sk,\n    sr.sr_returned_date_sk\n  FROM store_sales ss\n  JOIN store_returns sr ON ss.ss_ticket_number = sr.sr_ticket_number \n    AND ss.ss_item_sk = sr.sr_item_sk \n    AND ss.ss_customer_sk = sr.sr_customer_sk\n    AND ss.ss_store_sk = sr.sr_store_sk\n)\nSELECT \n  MIN(s.s_store_name),\n  MIN(s.s_company_id),\n  MIN(s.s_street_number),\n  MIN(s.s_street_name),\n  MIN(s.s_suite_number),\n  MIN(s.s_city),\n  MIN(s.s_zip),\n  MIN(j.ss_ticket_number),\n  MIN(j.ss_sold_date_sk),\n  MIN(j.sr_returned_date_sk),\n  MIN(j.ss_item_sk),\n  MIN(d1.d_date_sk)\nFROM ss_sr_join j\nJOIN store_filtered s ON j.ss_store_sk = s.s_store_sk\nJOIN d1_filtered d1 ON j.ss_sold_date_sk = d1.d_date_sk\nJOIN d2_filtered d2 ON j.sr_returned_date_sk = d2.d_date_sk;",
+  "semantic_correctness_guarantee": "1. **CTE分解（STRATEGY_CTE_DECOMPOSITION）**：将原查询中的date_dim d2、date_dim d1、store三表的过滤条件分别提取为CTE（d2_filtered、d1_filtered、store_filtered），并将store_sales与store_returns的主键连接提取为ss_sr_join CTE。这些CTE仅是将原WHERE子句中的过滤条件和JOIN条件重新组织，未改变过滤逻辑和连接语义。\n\n2. **连接条件下推（JOIN_CONDITION_PUSH）**：原查询中d2.d_moy=8的过滤条件下推到d2_filtered CTE中；d1.d_dow=2和日期区间条件(d1.d_date BETWEEN d2.d_date - 120 AND d2.d_date)在d1_filtered CTE中通过JOIN d2_filtered实现；s_state IN ('GA','IL','OH')下推到store_filtered CTE中；store_sales与store_returns的四个等值连接条件(ss_ticket_number=sr_ticket_number, ss_item_sk=sr_item_sk, ss_customer_sk=sr_customer_sk, ss_store_sk=sr_store_sk)在ss_sr_join CTE中完成。这些下推操作仅改变了过滤和连接的执行顺序，未改变最终参与连接的行集合。\n\n3. **投影下推（PROJECT_JOIN_TRANSPOSE）**：在ss_sr_join CTE中仅投影后续连接和最终SELECT所需的列(ss_store_sk, ss_sold_date_sk, ss_item_sk, ss_ticket_number, ss_customer_sk, sr_returned_date_sk)，减少中间结果集的列数。在store_filtered CTE中投影store表所需的8个列。这些投影操作不影响连接结果的行集合，仅减少传输的列数。\n\n4. **连接顺序调整**：原查询使用隐式连接(FROM多表+WHERE条件)，重写后使用显式JOIN。最终查询从ss_sr_join开始，依次JOIN store_filtered、d1_filtered、d2_filtered。由于所有连接条件均为等值连接且保持一致(ss_store_sk=s_store_sk, ss_sold_date_sk=d1.d_date_sk, sr_returned_date_sk=d2.d_date_sk)，连接顺序调整不影响结果集的语义等价性。\n\n5. **日期区间条件处理**：原查询中的日期区间条件(d1.d_date BETWEEN d2.d_date - 120 AND d2.d_date)在d1_filtered CTE中通过d1 JOIN d2_filtered实现。由于d2_filtered已过滤d_moy=8的记录，d1与d2的笛卡尔积后再应用BETWEEN条件，与原查询在最终JOIN时应用该条件的结果集完全一致。\n\n6. **冗余条件消除**：原查询中ss_store_sk=s_store_sk和sr_store_sk=s_store_sk两个条件，结合ss_store_sk=sr_store_sk(在ss_sr_join中已应用)，三者等价于ss_store_sk=sr_store_sk=s_store_sk。重写后在ss_sr_join中应用ss_store_sk=sr_store_sk，在最终查询中应用j.ss_store_sk=s.s_store_sk，逻辑等价。\n\n7. **聚合函数保持**：原查询对12个列应用MIN聚合函数且无GROUP BY子句，返回单行结果。重写后的SELECT子句保持相同的12个MIN聚合函数，且无GROUP BY子句，因此返回的结果集结构和语义完全一致。\n\n8. **主键连接保证**：store_sales和store_returns的连接基于复合主键(ss_item_sk, ss_ticket_number)和(sr_item_sk, sr_ticket_number)，结合ss_customer_sk=sr_customer_sk和ss_store_sk=sr_store_sk的等值条件，确保连接结果的唯一性和正确性与原查询一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过CTE分解、连接条件下推和投影下推对原SQL进行了结构重组，所有过滤条件、连接条件和聚合逻辑保持一致，最终结果集完全等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划分析：1) 结构变化：重写引入4个CTE(d2_filtered/d1_filtered/store_filtered/ss_sr_join)实现公共结果复用，Index Scan从2降至0，Seq Scan从3增至5，Hash Join从2增至3；2) 正向信号：CTE显式组织中间结果，d2_filtered被复用2次(CTE Scan出现2次)，符合一次计算多次复用模式；3) 负向信号：原计划通过Index Scan(store_sales_pkey)高效探测匹配行(Plan Rows=1)，重写改为全表扫描store_sales(12M行)后Hash Join，中间结果膨胀至1.6M行；原计划通过Index Scan(date_dim_pkey)精准定位d1记录，重写改为全表扫描date_dim后Hash Join；原计划最外层Nested Loop估计1行，重写估计670行；4) 行数估计求和：从328万增至1739万(5.3倍)，虽不能单独判定恶化但需结合结构分析；5) Cost从24万增至89万(3.6倍)，仅作辅助信号；6) 综合判断：虽存在CTE复用正信号，但关键访问路径退化明显——原计划依赖主键索引精准探测大表store_sales(每次仅返回1行)，重写丢失该路径改为全表扫描+Hash Join导致中间数据膨胀1000倍以上(1行→1.6M行)，且d1表访问路径也从Index Scan退化为Seq Scan，这属于'明确且可验证的灾难性结构退化证据'(关键大表被低效扫描、过滤失效导致主干数据量失控)。CTE复用收益无法补偿索引丢失的巨大代价。",
+  "next_step_advice": "回退到原始连接顺序并保留索引访问路径：1) 保留store_returns与d2的Hash Join(小表驱动)；2) 保留store_sales的Index Scan(store_sales_pkey)通过(sr_item_sk, sr_ticket_number)精准探测；3) 保留d1的Index Scan(date_dim_pkey)通过ss_sold_date_sk精准定位；4) 仅针对最外层Nested Loop的日期区间Join Filter优化：将d1.d_date BETWEEN (d2.d_date - 120) AND d2.d_date条件转换为CTE预计算——创建CTE存储满足d_dow=2且在任意d2.d_date前120天范围内的d1记录集，通过等值连接替代非等值过滤；5) 可选：将store过滤(13行)提前为CTE但不改变后续Index Scan路径。核心原则：在保留原有高效索引探测路径的前提下，仅优化最外层的日期区间判断逻辑。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE分解导致索引丢失，本轮需回退到索引驱动路径。当前执行计划问题：1) store_sales全表扫描(12M行)后Hash Join产生1.6M中间行，而原始计划通过store_sales_pkey索引精准探测仅返回1行；2) date_dim全表扫描(d1/d2各扫描一次)，而原始计划通过date_dim_pkey索引直接定位；3) 最外层Nested Loop的非等值Join Filter(d1.d_date BETWEEN d2.d_date-120 AND d2.d_date)导致笛卡尔积膨胀(估计670行)。优化方向：保留原始索引访问路径，仅针对日期区间判断优化——将store_returns与d2的Hash Join保留(小表驱动合理)，但后续连接必须恢复Index Scan：通过(sr_item_sk, sr_ticket_number)探测store_sales_pkey，通过ss_sold_date_sk探测date_dim_pkey获取d1，最后将d1.d_date与d2.d_date的区间判断转换为预计算：创建辅助CTE存储满足d_dow=2且在任意d2候选日期前120天范围内的d1.d_date_sk集合，通过等值连接替代非等值过滤。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "移除d1_filtered和ss_sr_join的CTE定义，将store_sales和date_dim d1恢复为主查询中的直接表引用，利用索引探测路径：先通过store_returns与store的Hash Join(保留store_filtered CTE)，再通过store_sales_pkey索引根据(sr_item_sk, sr_ticket_number)精准探测store_sales记录，最后通过date_dim_pkey索引根据ss_sold_date_sk获取d1记录"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序为：1) store_returns HASH JOIN store_filtered(小表驱动，保留)；2) 结果通过(sr_item_sk, sr_ticket_number)Index Scan探测store_sales_pkey(恢复索引路径)；3) 结果通过ss_sold_date_sk Index Scan探测date_dim_pkey获取d1(恢复索引路径)；4) 最后与d2_filtered进行等值连接(需配合谓词转换)"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将最外层Nested Loop的非等值Join Filter(d1.d_date BETWEEN d2.d_date-120 AND d2.d_date)转换为等值连接：创建辅助CTE date_range_mapping存储满足条件的(d1.d_date_sk, d2.d_date_sk)配对——通过d2_filtered与date_dim d1的CROSS JOIN并过滤d1.d_dow=2且d1.d_date在d2.d_date前120天范围内，主查询通过(ss_sold_date_sk, sr_returned_date_sk)等值连接该CTE替代原非等值过滤"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE"],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.6,
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.4
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.6
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE"
+  ],
+  "rewritten_sql": "WITH d2_filtered AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_moy = 8\n),\nstore_filtered AS (\n  SELECT s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name, s_suite_number, s_city, s_zip\n  FROM store\n  WHERE s_state IN ('GA', 'IL', 'OH')\n),\ndate_range_mapping AS (\n  SELECT d1.d_date_sk AS d1_date_sk, d2.d_date_sk AS d2_date_sk\n  FROM date_dim d1\n  CROSS JOIN d2_filtered d2\n  WHERE d1.d_dow = 2\n    AND d1.d_date BETWEEN (d2.d_date - INTERVAL '120' DAY) AND d2.d_date\n)\nSELECT \n  MIN(s.s_store_name),\n  MIN(s.s_company_id),\n  MIN(s.s_street_number),\n  MIN(s.s_street_name),\n  MIN(s.s_suite_number),\n  MIN(s.s_city),\n  MIN(s.s_zip),\n  MIN(sr.sr_ticket_number),\n  MIN(ss.ss_sold_date_sk),\n  MIN(sr.sr_returned_date_sk),\n  MIN(sr.sr_item_sk),\n  MIN(drm.d1_date_sk)\nFROM store_returns sr\nJOIN store_filtered s ON sr.sr_store_sk = s.s_store_sk\nJOIN store_sales ss ON sr.sr_item_sk = ss.ss_item_sk \n  AND sr.sr_ticket_number = ss.ss_ticket_number\n  AND sr.sr_customer_sk = ss.ss_customer_sk\n  AND sr.sr_store_sk = ss.ss_store_sk\nJOIN date_range_mapping drm ON ss.ss_sold_date_sk = drm.d1_date_sk \n  AND sr.sr_returned_date_sk = drm.d2_date_sk\nWHERE sr.sr_item_sk IS NOT NULL\n  AND sr.sr_ticket_number IS NOT NULL\n  AND sr.sr_customer_sk IS NOT NULL\n  AND sr.sr_store_sk IS NOT NULL\n  AND ss.ss_item_sk IS NOT NULL\n  AND ss.ss_ticket_number IS NOT NULL\n  AND ss.ss_sold_date_sk IS NOT NULL\n  AND sr.sr_returned_date_sk IS NOT NULL;",
+  "semantic_correctness_guarantee": "1. **CTE结构改写**：移除了原base_sql中的d1_filtered和ss_sr_join两个CTE，新增date_range_mapping CTE预计算满足日期区间条件的(d1_date_sk, d2_date_sk)配对；保留d2_filtered和store_filtered CTE定义不变。\n\n2. **连接顺序与路径调整**：主查询从store_returns驱动，依次通过等值连接store_filtered(小表13行)、store_sales(通过主键ss_item_sk+ss_ticket_number索引探测)、date_range_mapping(等值连接替代原非等值过滤)；原base_sql的连接顺序为ss_sr_join→store_filtered→d1_filtered→d2_filtered，重写后为store_returns→store_filtered→store_sales→date_range_mapping，连接键保持等价。\n\n3. **日期区间谓词转换为等值连接**：原base_sql在d1_filtered CTE中通过d1.d_date BETWEEN (d2.d_date - 120) AND d2.d_date实现日期区间过滤，重写后将该逻辑前置到date_range_mapping CTE中预计算所有满足条件的(d1_date_sk, d2_date_sk)组合，主查询通过等值连接(ss.ss_sold_date_sk = drm.d1_date_sk AND sr.sr_returned_date_sk = drm.d2_date_sk)替代原非等值过滤；由于date_dim.d_date_sk为主键且date_range_mapping已过滤d1.d_dow=2和日期区间条件，等值连接与原BETWEEN过滤在TPC-DS Schema下语义等价。\n\n4. **JOIN条件等价性保证**：store_returns与store_sales的连接条件保持四列等值(sr_item_sk=ss_item_sk, sr_ticket_number=ss_ticket_number, sr_customer_sk=ss_customer_sk, sr_store_sk=ss_store_sk)，与原base_sql的ss_sr_join CTE定义完全一致；store_sales与store_returns的主键约束(ss_item_sk, ss_ticket_number)和(sr_item_sk, sr_ticket_number)保证连接结果唯一性不变。\n\n5. **IS NOT NULL谓词推导**：根据JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE，从连接条件推导出sr.sr_item_sk/sr_ticket_number/sr_customer_sk/sr_store_sk/ss.ss_item_sk/ss_ticket_number/ss_sold_date_sk/sr_returned_date_sk的IS NOT NULL约束并显式添加到WHERE子句；由于INNER JOIN语义下NULL值无法匹配，显式过滤不改变结果集但可提前过滤无效行。\n\n6. **聚合函数与分组语义**：原base_sql和重写SQL均无GROUP BY子句，对所有行执行全局聚合返回单行结果；MIN聚合函数应用于相同列集(s_store_name/s_company_id等8列+ss_ticket_number/ss_sold_date_sk/sr_returned_date_sk/ss_item_sk/d_date_sk)，由于连接条件和过滤条件等价，输入行集相同，MIN结果必然相同。\n\n7. **易误判点说明**：date_range_mapping CTE通过CROSS JOIN d2_filtered生成笛卡尔积后过滤，可能产生多个d2_date_sk对应同一d1_date_sk的情况(例如d1.d_date='2024-01-15'可能同时满足d2.d_date='2024-05-15'和'2024-05-14'的120天区间)；但主查询通过(ss_sold_date_sk, sr_returned_date_sk)双列等值连接date_range_mapping，确保每个(ss记录, sr记录)配对仅匹配满足原日期区间条件的(d1, d2)组合，与原base_sql中d1_filtered和d2_filtered的两次独立JOIN+最外层BETWEEN过滤的语义完全等价；MIN聚合对重复行不敏感，即使中间结果存在重复(d1_date_sk, d2_date_sk)配对，最终MIN结果仍与原查询一致。\n\n8. **索引访问路径恢复**：重写后store_sales通过主查询中的直接表引用而非CTE，优化器可利用store_sales_pkey索引根据sr.sr_item_sk和sr.sr_ticket_number进行Index Scan探测(原base_sql的ss_sr_join CTE导致全表扫描)；date_range_mapping虽为CTE但仅包含date_dim的d_date_sk列，主查询通过等值连接访问该CTE时可利用其预计算结果避免重复扫描date_dim表。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过CTE预计算日期区间映射并添加IS NOT NULL过滤，连接条件、过滤逻辑与原SQL等价，MIN聚合结果集相同。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 3284536.0 -> 2946437.0 (重写侧约为原的 89.7063%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。 | 检测到通过 CROSS JOIN/显式连接方式复用CTE结果，说明边界或参数值被一次性计算并复用。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划结构基本一致，成本小幅下降（243503.66→234423.79，降幅约3.7%）。重写SQL通过显式IS NOT NULL过滤提前剪枝，使store_returns扫描行数从2999203降至2689781（约降10%），后续Hash Join估计行数从247555降至222015（约降10%），最终导致行数估计求和从3284536降至2946437（降幅约10.3%）。虽然CTE date_range_mapping未被优化器实际物化（仍保留原Nested Loop非等值Join Filter），但显式NULL过滤已产生结构性收益，且成本明确下降，无明显退化信号。综合判断为有效优化，可终止。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 626
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE']
+   - 优化组别: 连接优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=243503.66, 重写=234423.79，相对变化: 3.73%
+✅ 成功存储，记录ID: 8206de1c-4b1f-4d44-ab79-7653477edea7
+
+🎲 UCT Math Update: 2 rules, reward=+0.0524 (cost=+0.0373, rows=+0.1029, depth=+0.0000, oc=243503.6600, rc=234423.7900)
+   结构分细节: rows 3284536.0->2946437.0 (score=+0.103), depth 8.0->8.0 (score=+0.000)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.600, conf=0.70, lambda=0.35, reward=+0.029, count=305, avg=+0.043
+   → JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE: P(s,a)=N/A, effect=0.400, conf=0.60, lambda=0.30, reward=+0.024, count=58, avg=-0.001
+
+----------------------------------------
+

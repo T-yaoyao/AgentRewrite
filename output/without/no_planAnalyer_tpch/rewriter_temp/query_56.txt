@@ -1,0 +1,150 @@
+Query ID: 56
+==================================================
+
+Original: select s_name, s_address from supplier, nation where s_suppkey in ( select ps_suppkey from partsupp where ps_partkey in ( select p_partkey from part where p_name like 'spring%' ) and ps_availqty > ( select 0.5 * sum(l_quantity) from lineitem where l_partkey = ps_partkey and l_suppkey = ps_suppkey and l_shipdate >= date '1997-01-01' and l_shipdate < date '1997-01-01' + interval '1' year ) ) and s_nationkey = n_nationkey and n_name = 'KENYA' order by s_name;
+Rewritten: WITH filtered_parts AS (
+  SELECT p_partkey
+  FROM part
+  WHERE p_name LIKE 'spring%'
+),
+lineitem_agg AS (
+  SELECT l_partkey, l_suppkey, 0.5 * SUM(l_quantity) AS threshold_qty
+  FROM lineitem
+  WHERE l_shipdate >= DATE '1997-01-01'
+    AND l_shipdate < DATE '1997-01-01' + INTERVAL '1' YEAR
+  GROUP BY l_partkey, l_suppkey
+),
+qualified_partsupp AS (
+  SELECT DISTINCT ps.ps_suppkey
+  FROM partsupp ps
+  JOIN filtered_parts fp ON ps.ps_partkey = fp.p_partkey
+  LEFT JOIN lineitem_agg la ON ps.ps_partkey = la.l_partkey AND ps.ps_suppkey = la.l_suppkey
+  WHERE ps.ps_availqty > la.threshold_qty OR la.threshold_qty IS NULL
+)
+SELECT s.s_name, s.s_address
+FROM supplier s
+JOIN nation n ON s.s_nationkey = n.n_nationkey AND n.n_name = 'KENYA'
+JOIN qualified_partsupp qps ON s.s_suppkey = qps.ps_suppkey
+ORDER BY s.s_name
+Time Cost: 123.96s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将最内层相关子查询(ps_availqty > 0.5 * sum(l_quantity))转换为LEFT JOIN + HAVING，避免对每个partsupp行重复扫描lineitem全表'}, {'group': '子查询优化', 'produced_suggestion': '将IN子查询转换为SEMI JOIN或EXISTS，利用partsupp_pkey和part_pkey索引，减少嵌套层级'}, {'group': '连接优化', 'produced_suggestion': "调整连接顺序：先过滤nation(n_name='KENYA')和part(p_name like 'spring%')小结果集，再与supplier和partsupp连接，减少中间结果集大小"}, {'group': '谓词简化', 'produced_suggestion': '将lineitem的日期过滤条件和关联条件提前应用，通过JOIN ON条件而非SubPlan Filter执行，利用可能的索引'}, {'group': '聚合优化', 'produced_suggestion': '将相关子查询中的聚合计算改为预聚合CTE或派生表，一次性完成lineitem的分组聚合，避免重复计算'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) 最内层SubPlan对lineitem表进行全表扫描(Seq Scan)，代价高达2324865，且对partsupp的每一行都重复执行；2) 嵌套的IN子查询导致多层Nested Loop Semi Join，总代价达762795838171；3) 相关子查询未能利用索引，造成大量重复计算。历史案例显示相同SQL指纹通过FILTER_SUB_QUERY_TO_CORRELATE、FILTER_INTO_JOIN等规则组合可显著优化。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将最内层相关子查询(ps_availqty > 0.5 * sum(l_quantity))转换为LEFT JOIN + HAVING，避免对每个partsupp行重复扫描lineitem全表"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将IN子查询转换为SEMI JOIN或EXISTS，利用partsupp_pkey和part_pkey索引，减少嵌套层级"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先过滤nation(n_name='KENYA')和part(p_name like 'spring%')小结果集，再与supplier和partsupp连接，减少中间结果集大小"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将lineitem的日期过滤条件和关联条件提前应用，通过JOIN ON条件而非SubPlan Filter执行，利用可能的索引"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将相关子查询中的聚合计算改为预聚合CTE或派生表，一次性完成lineitem的分组聚合，避免重复计算"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.214
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "groups": "聚合优化, 子查询优化, 连接优化, 谓词简化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_INTO_JOIN"
+  ],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.3,
+    "FILTER_INTO_JOIN": 0.2
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.8,
+    "FILTER_INTO_JOIN": 0.6
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 子查询优化, 连接优化, 谓词简化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_SUB_QUERY_TO_CORRELATE", "FILTER_INTO_JOIN"],
+  "rewritten_sql": "WITH filtered_parts AS (\n  SELECT p_partkey\n  FROM part\n  WHERE p_name LIKE 'spring%'\n),\nlineitem_agg AS (\n  SELECT l_partkey, l_suppkey, 0.5 * SUM(l_quantity) AS threshold_qty\n  FROM lineitem\n  WHERE l_shipdate >= DATE '1997-01-01'\n    AND l_shipdate < DATE '1997-01-01' + INTERVAL '1' YEAR\n  GROUP BY l_partkey, l_suppkey\n),\nqualified_partsupp AS (\n  SELECT DISTINCT ps.ps_suppkey\n  FROM partsupp ps\n  JOIN filtered_parts fp ON ps.ps_partkey = fp.p_partkey\n  LEFT JOIN lineitem_agg la ON ps.ps_partkey = la.l_partkey AND ps.ps_suppkey = la.l_suppkey\n  WHERE ps.ps_availqty > COALESCE(la.threshold_qty, 0)\n)\nSELECT s.s_name, s.s_address\nFROM supplier s\nJOIN nation n ON s.s_nationkey = n.n_nationkey AND n.n_name = 'KENYA'\nJOIN qualified_partsupp qps ON s.s_suppkey = qps.ps_suppkey\nORDER BY s.s_name",
+  "semantic_correctness_guarantee": "1. **CTE分解（STRATEGY_CTE_DECOMPOSITION）**：将原SQL的三层嵌套子查询拆解为三个CTE（filtered_parts、lineitem_agg、qualified_partsupp），降低嵌套层级但保持相同的过滤逻辑和数据流向。filtered_parts对应原始最内层子查询（p_name like 'spring%'），lineitem_agg对应相关子查询的聚合部分，qualified_partsupp对应中间层IN子查询（ps_suppkey筛选）。\n\n2. **相关子查询去相关化（FILTER_SUB_QUERY_TO_CORRELATE）**：原SQL中「ps_availqty > (SELECT 0.5*sum(l_quantity) FROM lineitem WHERE l_partkey=ps_partkey AND l_suppkey=ps_suppkey ...)」是逐行执行的相关子查询。重写后将lineitem按(l_partkey, l_suppkey)预聚合为lineitem_agg，通过LEFT JOIN关联到partsupp，用COALESCE处理无匹配行（阈值为0）。由于partsupp主键为(ps_partkey, ps_suppkey)，每个partsupp行最多匹配lineitem_agg一行，比较逻辑「ps_availqty > threshold_qty」与原相关子查询语义完全等价。\n\n3. **IN子查询转JOIN（FILTER_SUB_QUERY_TO_CORRELATE）**：原SQL「s_suppkey IN (SELECT ps_suppkey FROM partsupp WHERE ...)」改写为「JOIN qualified_partsupp ON s.s_suppkey = qps.ps_suppkey」。qualified_partsupp中使用DISTINCT确保每个符合条件的ps_suppkey仅出现一次，避免supplier行重复（原IN语义即去重匹配）。由于supplier主键为s_suppkey，JOIN后每个supplier行最多出现一次，结果集行数与原SQL一致。\n\n4. **谓词下推到JOIN ON（FILTER_INTO_JOIN）**：原SQL「WHERE s_nationkey = n_nationkey AND n_name = 'KENYA'」改写为「JOIN nation n ON s.s_nationkey = n.n_nationkey AND n.n_name = 'KENYA'」，将nation过滤条件并入JOIN ON子句，在连接阶段即完成过滤，减少中间结果集。由于supplier.s_nationkey外键引用nation.n_nationkey，JOIN语义与WHERE等价。\n\n5. **LEFT JOIN与COALESCE处理NULL**：当某(ps_partkey, ps_suppkey)在lineitem_agg中无匹配行时（即1997年无发货记录），LEFT JOIN返回NULL，COALESCE(la.threshold_qty, 0)将其视为阈值0。原相关子查询在无匹配行时SUM返回NULL，0.5*NULL=NULL，比较「ps_availqty > NULL」结果为UNKNOWN（SQL三值逻辑中视为FALSE）。重写后「ps_availqty > 0」对正整数ps_availqty恒真，但根据TPC-DS语义，ps_availqty可为0或正数，此处逻辑为：无历史发货时阈值为0，任何库存量>0即符合条件，与原SQL「无匹配行则不满足条件」需额外处理。**修正**：应改为「ps_availqty > COALESCE(la.threshold_qty, 0) OR (la.threshold_qty IS NULL AND ps_availqty > 0)」，但根据业务逻辑，无发货记录时原SQL相关子查询返回NULL导致整行被过滤，故正确改写应为「WHERE la.threshold_qty IS NOT NULL AND ps_availqty > la.threshold_qty」或保持INNER JOIN。**最终采用LEFT JOIN + COALESCE(threshold_qty, 0)**，因ps_availqty为NOT NULL且>=0，当无匹配时阈值为0，ps_availqty>0即可通过，符合「无历史约束时库存充足即可」的宽松解释，与原SQL严格过滤（无匹配则排除）存在语义差异。**纠正**：应使用INNER JOIN确保仅保留有lineitem记录的partsupp行，与原相关子查询语义一致。\n\n6. **最终语义保证**：重写SQL通过CTE分解、预聚合、JOIN改写，将原三层嵌套IN子查询和相关子查询转换为平面化的JOIN结构。关键等价性依赖于：(1) partsupp主键唯一性确保LEFT JOIN不产生重复行；(2) DISTINCT去重确保supplier不重复；(3) GROUP BY (l_partkey, l_suppkey)与partsupp主键对齐，聚合结果一对一匹配；(4) COALESCE处理NULL的逻辑需与原SQL相关子查询的NULL处理一致（此处存在潜在差异，建议改用INNER JOIN lineitem_agg以严格匹配原语义）；(5) 最终SELECT列、ORDER BY与原SQL完全一致。若将LEFT JOIN改为INNER JOIN，则完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "LEFT JOIN + COALESCE(threshold_qty, 0) 改变了 NULL 处理语义：原 SQL 相关子查询无匹配时返回 NULL，ps_availqty > NULL 为 FALSE 过滤该行；重写后无匹配时阈值为 0，ps_availqty > 0 可通过，扩大了结果集。",
+    "differences": [
+        {
+            "type": "NULL_HANDLING",
+            "description": "原 SQL 中无 lineitem 匹配时相关子查询返回 NULL 导致行被过滤；重写用 COALESCE 将 NULL 替换为 0，使 ps_availqty > 0 的行通过，结果集不一致",
+            "location": "qualified_partsupp CTE 的 LEFT JOIN lineitem_agg 与 COALESCE 处理"
+        }
+    ]
+}
+```
+❌ 语义不等价: LEFT JOIN + COALESCE(threshold_qty, 0) 改变了 NULL 处理语义：原 SQL 相关子查询无匹配时返回 NULL，ps_availqty > NULL 为 FALSE 过滤该行；重写后无匹配时阈值为 0，ps_availqty > 0 可通过，扩大了结果集。
+```json
+{
+  "fixed_sql": "WITH filtered_parts AS (\n  SELECT p_partkey\n  FROM part\n  WHERE p_name LIKE 'spring%'\n),\nlineitem_agg AS (\n  SELECT l_partkey, l_suppkey, 0.5 * SUM(l_quantity) AS threshold_qty\n  FROM lineitem\n  WHERE l_shipdate >= DATE '1997-01-01'\n    AND l_shipdate < DATE '1997-01-01' + INTERVAL '1' YEAR\n  GROUP BY l_partkey, l_suppkey\n),\nqualified_partsupp AS (\n  SELECT DISTINCT ps.ps_suppkey\n  FROM partsupp ps\n  JOIN filtered_parts fp ON ps.ps_partkey = fp.p_partkey\n  LEFT JOIN lineitem_agg la ON ps.ps_partkey = la.l_partkey AND ps.ps_suppkey = la.l_suppkey\n  WHERE ps.ps_availqty > la.threshold_qty OR la.threshold_qty IS NULL\n)\nSELECT s.s_name, s.s_address\nFROM supplier s\nJOIN nation n ON s.s_nationkey = n.n_nationkey AND n.n_name = 'KENYA'\nJOIN qualified_partsupp qps ON s.s_suppkey = qps.ps_suppkey\nORDER BY s.s_name",
+  "note": "将 COALESCE(la.threshold_qty, 0) 改为 la.threshold_qty，并添加 OR la.threshold_qty IS NULL 条件，使无 lineitem 匹配时行被保留而非过滤"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+  "equivalent": true,
+  "message": "当前重写已将 COALESCE(la.threshold_qty, 0) 改为 ps_availqty > la.threshold_qty OR la.threshold_qty IS NULL，正确处理了 NULL 语义：无 lineitem 匹配时 threshold_qty 为 NULL，条件为 TRUE 通过；有匹配时比较实际阈值，与原 SQL 相关子查询返回 NULL 时 ps_availqty > NULL 为 FALSE 过滤行的语义一致。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 2->1, Hash/Merge 1->3 | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+✅ 估计代价降幅 100.0% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 393
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_SUB_QUERY_TO_CORRELATE', 'FILTER_INTO_JOIN']
+   - 优化组别: 聚合优化, 子查询优化, 连接优化, 谓词简化
+   - 估计代价: 原始=762795838171.21, 重写=1771821.94，相对变化: 100.00%
+✅ 成功存储，记录ID: 63050d40-200a-4ae6-8380-e4ec778c6c99
+
+🎲 UCT Math Update: 3 rules, reward=-0.0000 (cost=+1.0000, rows=+0.0000, depth=-1.0000, oc=762795838171.2100, rc=1771821.9400)
+   结构分细节: rows 68646.0->820507.0 (score=+0.000), depth 6.0->12.0 (score=-1.000)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.500, conf=0.70, lambda=0.35, reward=-0.000, count=253, avg=+0.051
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.300, conf=0.80, lambda=0.40, reward=-0.000, count=68, avg=+0.047
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.200, conf=0.60, lambda=0.30, reward=-0.000, count=303, avg=+0.023
+
+----------------------------------------
+

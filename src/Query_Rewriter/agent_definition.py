@@ -70,10 +70,9 @@ STRICT_JSON_SCHEMAS = {
             "properties": {
                 "terminate": {"type": "boolean"},
                 "reason": {"type": "string"},
-                "no_further_optimization": {"type": "boolean"},
                 "next_step_advice": {"type": "string"},
             },
-            "required": ["terminate", "reason", "no_further_optimization", "next_step_advice"],
+            "required": ["terminate", "reason", "next_step_advice"],
             "additionalProperties": False,
         },
     },
@@ -325,7 +324,7 @@ class ReasoningAgent(Agent):
            - 当查询语句包含复杂的WHERE/JOIN条件，或存在重复子查询计算时，可考虑使用公共表表达式（CTE）
            - 若查询语句本身结构简单，或使用CTE无法减少冗余计算，则应避免过度使用CTE，多余的CTE可能会增加系统开销
         2. 规则选择逻辑：
-           - 先分析输入SQL的结构和执行计划中的瓶颈
+           - 先分析输入 SQL 的结构；再结合下方「以下为 EXPLAIN FORMAT JSON」中的 Plan 树（算子类型、Total Cost、Plan Rows、连接与扫描方式等）识别瓶颈与高代价路径
            - 逐一考虑规则库中的规则，判断其是否适用
            - 挑选能够解决问题的规则
            - 按照规则依赖关系进行排序
@@ -350,7 +349,7 @@ class ReasoningAgent(Agent):
         <索引信息>
         {index_info}
 
-        <执行计划分析结果>
+        以下为 EXPLAIN FORMAT JSON（PostgreSQL `EXPLAIN (FORMAT JSON)` 的原始输出；非中文摘要报告，请直接从 JSON 解析计划树）：
         {explain_info}
 
         3. 输出要求：**只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）。字段：
@@ -455,7 +454,7 @@ class DecisionAgent(Agent):
            - <sql语句>: 当前轮次的基底 SQL。第一轮它等于原始SQL；若进入下一轮，它就是上一轮的 rewritten_sql
            - <统计信息>: 数据库表统计信息
            - <索引信息>: 表索引（索引名与定义）
-           - <执行计划分析结果>: 智能执行计划分析器生成的分析结果
+           - 以下为 EXPLAIN FORMAT JSON: PostgreSQL `EXPLAIN (FORMAT JSON)` 的原始 JSON 执行计划（非自然语言分析报告）
            {few_shot_context}
            {previous_feedback_text}
 
@@ -464,7 +463,7 @@ class DecisionAgent(Agent):
            - 针对反馈中的未改进原因和 next_step_advice 调整优化组
            - advice 中要体现对失败原因的修正策略（不是泛化建议）
 
-        2. 基于执行计划分析中的高代价算子信息，判断SQL是否可以通过以下优化方式提升性能：
+        2. 基于上述 EXPLAIN FORMAT JSON 中各 Plan 节点的 Total Cost、算子类型与估计行数等信息，判断 SQL 是否可以通过以下优化方式提升性能：
            - 子查询优化：子查询转换为JOIN、相关子查询优化、CTE分解等
            - 连接优化：连接顺序调整、连接条件优化、半连接转换等
            - 谓词简化：过滤条件下推、合并、表达式简化等
@@ -500,7 +499,7 @@ class DecisionAgent(Agent):
         <索引信息>
         {index_info}
 
-        <执行计划分析结果>
+        以下为 EXPLAIN FORMAT JSON（PostgreSQL `EXPLAIN (FORMAT JSON)` 的原始输出；非中文摘要报告，请直接从 JSON 解析计划树）：
         {explain_info}
         """)
 
@@ -574,8 +573,7 @@ class DecisionAgent(Agent):
           a. 结构上明确改进；或
           b. 检测到去相关、子计划减少、重复执行消除、或 CTE/派生表/预聚合复用等高优先级正信号，且不存在明确灾难性结构退化证据；或
           c. 行数估计求和（Plan Rows累加）大幅度降低（如降至原10%以下），无论cost是否增加，均视为优化成功；或
-          d. costs大幅度降低；或
-          e. 判断"下一步重写已几乎无改进空间"（no_further_optimization=true）。
+          d. costs大幅度降低。
         - `terminate = false`：
           结构上明确恶化（如关键大表被重复扫描、并行度显著下降且无补偿、过滤明显失效导致主干数据量失控、明显引入新的高开销排序/物化主瓶颈等）。注意：不得仅因出现全表扫描、索引/位图扫描减少、cost 明显上升、或行数估计求和上升就判为恶化。
         - 重要补充：
@@ -588,7 +586,6 @@ class DecisionAgent(Agent):
         {{
           "terminate": true/false,
           "reason": "简要说明依据：执行计划变化、结构性改进/退化信号、cost（仅辅助）、改进点、最终结论；若存在去相关/子计划减少/公共结果复用等高优先级正信号，应明确说明其为何足以支持成功终止；若引用行数估计求和或高 cost，只能作为辅助信息，不得将其单独作为恶化结论依据；若不确定终止需明确不确定原因。",
-          "no_further_optimization": true/false,
           "next_step_advice": "当 terminate=false 时，必须给出下一轮可执行改进建议；terminate=true 时可写“无需下一步优化”。"
         }}
 
@@ -608,10 +605,12 @@ class DecisionAgent(Agent):
         {rewritten_costs}
         </enhanced_sql_costs>
 
+        以下为 EXPLAIN FORMAT JSON（对应 original_sql，`EXPLAIN (FORMAT JSON)` 原始输出）：
         <original_sql_explain>
         {json.dumps(original_explain, ensure_ascii=False, indent=2) if isinstance(original_explain, (dict, list)) else original_explain}
         </original_sql_explain>
 
+        以下为 EXPLAIN FORMAT JSON（对应 enhanced_sql，`EXPLAIN (FORMAT JSON)` 原始输出）：
         <enhanced_sql_explain>
         {json.dumps(rewritten_explain, ensure_ascii=False, indent=2) if isinstance(rewritten_explain, (dict, list)) else rewritten_explain}
         </enhanced_sql_explain>
@@ -636,7 +635,6 @@ class DecisionAgent(Agent):
         fallback = {
             "terminate": True,
             "reason": "无法解析响应，默认终止优化",
-            "no_further_optimization": True,
             "next_step_advice": "无需下一步优化。",
         }
         result = parse_llm_json_with_default(response, fallback)
@@ -644,7 +642,6 @@ class DecisionAgent(Agent):
             return fallback
         result.setdefault("terminate", True)
         result.setdefault("reason", "")
-        result.setdefault("no_further_optimization", False)
         result.setdefault("next_step_advice", "")
         return result
 
@@ -1169,6 +1166,160 @@ class SemanticCheckAgent(Agent):
             ),
         )
 
+    @staticmethod
+    def _sql_cmp_norm(text: str) -> str:
+        if text is None:
+            return ""
+        return re.sub(r"\s+", "", str(text).strip().rstrip(";")).lower()
+
+    @staticmethod
+    def _split_top_level_csv(text: str) -> List[str]:
+        parts: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        in_single = False
+        in_double = False
+        i = 0
+        s = text or ""
+        while i < len(s):
+            ch = s[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth = max(0, depth - 1)
+                elif ch == "," and depth == 0:
+                    parts.append("".join(cur).strip())
+                    cur = []
+                    i += 1
+                    continue
+            cur.append(ch)
+            i += 1
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    @staticmethod
+    def _parse_select_item(item: str) -> Dict[str, str]:
+        s = (item or "").strip()
+        m = re.match(r"(?is)^(.*?)(?:\s+as)?\s+([a-zA-Z_][a-zA-Z0-9_]*)$", s)
+        if m:
+            expr = m.group(1).strip()
+            alias = m.group(2).strip()
+        else:
+            expr = s
+            alias = s
+        return {"expr": expr, "alias": alias}
+
+    @staticmethod
+    def _parse_simple_call(expr: str) -> Optional[Dict[str, str]]:
+        m = re.match(r"(?is)^([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)\)$", (expr or "").strip())
+        if not m:
+            return None
+        return {"func": m.group(1).strip().lower(), "arg": m.group(2).strip()}
+
+    @classmethod
+    def _detect_two_level_aggregate_fold_equivalence(cls, original_sql: str, rewritten_sql: str) -> bool:
+        """
+        Deterministic guardrail for a common false negative:
+        SELECT ... FROM (SELECT ... GROUP BY K,U) t GROUP BY K
+        => SELECT ... FROM base GROUP BY K
+        where outer aggregates are foldable:
+        MIN(MIN(v))->MIN(v), MAX(MAX(v))->MAX(v), SUM(SUM(v))->SUM(v), SUM(COUNT(v))->COUNT(v)
+        """
+        orig = (original_sql or "").strip().rstrip(";")
+        rew = (rewritten_sql or "").strip().rstrip(";")
+        if not orig or not rew:
+            return False
+
+        orig_m = re.match(
+            r"(?is)^\s*select\s+(?P<outer_select>.+?)\s+from\s*\(\s*select\s+(?P<inner_select>.+?)\s+from\s+(?P<source>.+?)\s+group\s+by\s+(?P<inner_group>.+?)\s*\)\s*(?:as\s+)?(?P<alias>[a-zA-Z_][a-zA-Z0-9_]*)\s+group\s+by\s+(?P<outer_group>.+?)\s*$",
+            orig,
+        )
+        rew_m = re.match(
+            r"(?is)^\s*select\s+(?P<select>.+?)\s+from\s+(?P<source>.+?)\s+group\s+by\s+(?P<group>.+?)\s*$",
+            rew,
+        )
+        if not orig_m or not rew_m:
+            return False
+
+        if cls._sql_cmp_norm(orig_m.group("source")) != cls._sql_cmp_norm(rew_m.group("source")):
+            return False
+        if cls._sql_cmp_norm(orig_m.group("outer_group")) != cls._sql_cmp_norm(rew_m.group("group")):
+            return False
+
+        outer_group_keys = {
+            cls._sql_cmp_norm(x) for x in cls._split_top_level_csv(orig_m.group("outer_group"))
+        }
+        inner_group_keys = [
+            cls._sql_cmp_norm(x) for x in cls._split_top_level_csv(orig_m.group("inner_group"))
+        ]
+        if not outer_group_keys or not outer_group_keys.issubset(set(inner_group_keys)):
+            return False
+        if len(inner_group_keys) <= len(outer_group_keys):
+            return False
+
+        inner_items = [cls._parse_select_item(x) for x in cls._split_top_level_csv(orig_m.group("inner_select"))]
+        outer_items = [cls._parse_select_item(x) for x in cls._split_top_level_csv(orig_m.group("outer_select"))]
+        rew_items = [cls._parse_select_item(x) for x in cls._split_top_level_csv(rew_m.group("select"))]
+        if not inner_items or len(outer_items) != len(rew_items):
+            return False
+
+        inner_alias_to_expr = {cls._sql_cmp_norm(it["alias"]): it["expr"] for it in inner_items}
+        rew_by_alias = {cls._sql_cmp_norm(it["alias"]): it["expr"] for it in rew_items}
+        if set(cls._sql_cmp_norm(it["alias"]) for it in outer_items) != set(rew_by_alias.keys()):
+            return False
+
+        for outer in outer_items:
+            alias_key = cls._sql_cmp_norm(outer["alias"])
+            rew_expr = rew_by_alias.get(alias_key)
+            if rew_expr is None:
+                return False
+
+            outer_expr_norm = cls._sql_cmp_norm(outer["expr"])
+            rew_expr_norm = cls._sql_cmp_norm(rew_expr)
+            if outer_expr_norm in outer_group_keys:
+                if rew_expr_norm != outer_expr_norm:
+                    return False
+                continue
+
+            outer_call = cls._parse_simple_call(outer["expr"])
+            if not outer_call:
+                return False
+            inner_expr = inner_alias_to_expr.get(cls._sql_cmp_norm(outer_call["arg"]))
+            if not inner_expr:
+                return False
+            inner_call = cls._parse_simple_call(inner_expr)
+            rew_call = cls._parse_simple_call(rew_expr)
+            if not inner_call or not rew_call:
+                return False
+
+            inner_arg_norm = cls._sql_cmp_norm(inner_call["arg"])
+            rew_arg_norm = cls._sql_cmp_norm(rew_call["arg"])
+            if outer_call["func"] == "min" and inner_call["func"] == "min" and rew_call["func"] == "min":
+                if rew_arg_norm != inner_arg_norm:
+                    return False
+                continue
+            if outer_call["func"] == "max" and inner_call["func"] == "max" and rew_call["func"] == "max":
+                if rew_arg_norm != inner_arg_norm:
+                    return False
+                continue
+            if outer_call["func"] == "sum" and inner_call["func"] == "sum" and rew_call["func"] == "sum":
+                if rew_arg_norm != inner_arg_norm:
+                    return False
+                continue
+            if outer_call["func"] == "sum" and inner_call["func"] == "count" and rew_call["func"] == "count":
+                if rew_arg_norm != inner_arg_norm:
+                    return False
+                continue
+            return False
+        return True
+
     def _parse_equivalence_response(self, response: str) -> dict:
         default = {
             "equivalent": False,
@@ -1177,7 +1328,66 @@ class SemanticCheckAgent(Agent):
         }
         if not response or not str(response).strip():
             return default
-        data = parse_llm_json_with_default(str(response), default)
+        raw = str(response)
+
+        def _extract_all_json_objects(text: str) -> List[Dict[str, Any]]:
+            candidates: List[str] = []
+            for m in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE):
+                block = m.group(1).strip()
+                if block:
+                    candidates.append(block)
+
+            start_positions = [i for i, ch in enumerate(text) if ch == "{"]
+            for start in start_positions:
+                depth = 0
+                i = start
+                n = len(text)
+                in_string = False
+                escaped = False
+                while i < n:
+                    ch = text[i]
+                    if in_string:
+                        if escaped:
+                            escaped = False
+                        elif ch == "\\":
+                            escaped = True
+                        elif ch == '"':
+                            in_string = False
+                    else:
+                        if ch == '"':
+                            in_string = True
+                        elif ch == "{":
+                            depth += 1
+                        elif ch == "}":
+                            depth -= 1
+                            if depth == 0:
+                                candidates.append(text[start : i + 1])
+                                break
+                    i += 1
+
+            parsed_objs: List[Dict[str, Any]] = []
+            seen = set()
+            for cand in candidates:
+                c = cand.strip()
+                if not c or c in seen:
+                    continue
+                seen.add(c)
+                try:
+                    obj = json.loads(c)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    parsed_objs.append(obj)
+            return parsed_objs
+
+        objs = _extract_all_json_objects(raw)
+        data = default
+        for obj in reversed(objs):
+            if "equivalent" in obj or "differences" in obj or "message" in obj:
+                data = obj
+                break
+        else:
+            data = parse_llm_json_with_default(raw, default)
         eq = data.get("equivalent", False)
         diffs = data.get("differences") or []
         if not isinstance(diffs, list):
@@ -1355,5 +1565,15 @@ class SemanticCheckAgent(Agent):
             json_format=True,
             json_schema=STRICT_JSON_SCHEMAS["semantic_equivalence"],
         )
-        return self._parse_equivalence_response(response)
+        parsed = self._parse_equivalence_response(response)
+        if self._detect_two_level_aggregate_fold_equivalence(original_sql, rewritten_sql):
+            parsed = {
+                "equivalent": True,
+                "message": (
+                    "检测到可证明的两层聚合折叠等价：原SQL属于“内层按 (K,U) 分组、外层按 K 聚合”，"
+                    "当前重写满足 MIN(MIN)->MIN、MAX(MAX)->MAX、SUM(SUM)->SUM、SUM(COUNT)->COUNT 的逐列折叠规则。"
+                ),
+                "differences": [],
+            }
+        return parsed
 

@@ -1,0 +1,109 @@
+Query ID: 36
+==================================================
+
+Original: select l_shipmode, sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1997-01-01' + interval '1' year group by l_shipmode order by l_shipmode;
+Rewritten: SELECT l_shipmode,
+       COUNT(*) FILTER (WHERE o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH') AS high_line_count,
+       COUNT(*) FILTER (WHERE o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH') AS low_line_count
+FROM orders
+INNER JOIN lineitem ON o_orderkey = l_orderkey
+                    AND l_shipmode IN ('REG AIR', 'FOB')
+                    AND l_commitdate < l_receiptdate
+                    AND l_shipdate < l_commitdate
+                    AND l_receiptdate >= DATE '1997-01-01'
+                    AND l_receiptdate < DATE '1997-01-01' + INTERVAL '1' YEAR
+GROUP BY l_shipmode
+ORDER BY l_shipmode;
+Time Cost: 135.65s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '将SUM(CASE WHEN...)转换为COUNT(*) FILTER (WHERE...)语法，减少CASE表达式计算开销，利用PostgreSQL原生FILTER子句优化聚合性能'}, {'group': '连接优化', 'produced_suggestion': '将隐式逗号连接改写为显式INNER JOIN，并将lineitem的多个过滤条件作为JOIN ON条件的一部分，便于优化器更好地选择连接顺序和方法'}, {'group': '谓词简化', 'produced_suggestion': '合并l_receiptdate的两个范围条件为单一BETWEEN表达式，简化过滤逻辑并可能触发索引范围扫描'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表使用Seq Scan且代价高达1687513.24，过滤条件复杂导致估计行数仅139行。历史案例显示相似SQL通过AGGREGATE_CASE_TO_FILTER和JOIN_TO_CORRELATE规则优化成功。当前使用逗号连接语法且CASE表达式可转换为FILTER子句以提升聚合效率。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将SUM(CASE WHEN...)转换为COUNT(*) FILTER (WHERE...)语法，减少CASE表达式计算开销，利用PostgreSQL原生FILTER子句优化聚合性能"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将隐式逗号连接改写为显式INNER JOIN，并将lineitem的多个过滤条件作为JOIN ON条件的一部分，便于优化器更好地选择连接顺序和方法"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "合并l_receiptdate的两个范围条件为单一BETWEEN表达式，简化过滤逻辑并可能触发索引范围扫描"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 64 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.221
+   → AGGREGATE_VALUES: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+{
+  "groups": "聚合优化, 连接优化, 谓词简化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "AGGREGATE_CASE_TO_FILTER"
+  ],
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.5,
+    "AGGREGATE_CASE_TO_FILTER": 0.5
+  },
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.6,
+    "AGGREGATE_CASE_TO_FILTER": 0.9
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 连接优化, 谓词简化",
+  "applied_rules": ["FILTER_INTO_JOIN", "AGGREGATE_CASE_TO_FILTER"],
+  "rewritten_sql": "SELECT l_shipmode,\n       COUNT(*) FILTER (WHERE o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH') AS high_line_count,\n       COUNT(*) FILTER (WHERE o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH') AS low_line_count\nFROM orders\nINNER JOIN lineitem ON o_orderkey = l_orderkey\n                    AND l_shipmode IN ('REG AIR', 'FOB')\n                    AND l_commitdate < l_receiptdate\n                    AND l_shipdate < l_commitdate\n                    AND l_receiptdate >= DATE '1997-01-01'\n                    AND l_receiptdate < DATE '1997-01-01' + INTERVAL '1' YEAR\nGROUP BY l_shipmode\nORDER BY l_shipmode;",
+  "semantic_correctness_guarantee": "1. 结构性改写：将隐式逗号连接改写为显式INNER JOIN，将原WHERE子句中仅依赖lineitem表的所有过滤条件（l_shipmode IN、l_commitdate < l_receiptdate、l_shipdate < l_commitdate、l_receiptdate范围条件）移入JOIN ON子句。\n\n2. 聚合函数改写：将SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END)改写为COUNT(*) FILTER (WHERE o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH')；将SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END)改写为COUNT(*) FILTER (WHERE o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH')。\n\n3. 等价性保证（连接改写）：原SQL使用隐式INNER JOIN（逗号连接+WHERE o_orderkey = l_orderkey），与显式INNER JOIN ON o_orderkey = l_orderkey语义完全等价；将lineitem的过滤条件从WHERE移入JOIN ON不改变结果集，因为INNER JOIN中ON条件与WHERE条件对最终结果集的过滤效果相同（不存在外连接的NULL扩展问题）。\n\n4. 等价性保证（聚合改写）：原SQL的SUM(CASE WHEN condition THEN 1 ELSE 0 END)对每行满足条件时累加1、不满足时累加0，等价于COUNT(*) FILTER (WHERE condition)对满足条件的行计数；两种写法在TPC-DS标准语义下对相同输入产生相同输出。\n\n5. GROUP BY与聚合作用域：GROUP BY l_shipmode在原SQL与重写SQL中保持一致，聚合函数作用于每个l_shipmode分组内的行；o_orderpriority来自orders表，通过JOIN关联到每个lineitem行，聚合条件的逻辑分支（'1-URGENT'/'2-HIGH'与其他优先级）完全覆盖所有可能值且互斥。\n\n6. 排序与最终输出：ORDER BY l_shipmode在原SQL与重写SQL中保持一致，确保结果集按相同顺序输出；列名high_line_count和low_line_count保持不变。\n\n7. 易误判点说明：将过滤条件从WHERE移入INNER JOIN ON不会改变结果集，因为INNER JOIN的ON条件与WHERE条件在逻辑上等价（都是在连接后过滤不满足条件的行组合）；COUNT(*) FILTER语法是PostgreSQL标准聚合过滤器，与SUM(CASE WHEN...)在计数场景下完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "两SQL等价：隐式JOIN改为显式INNER JOIN、WHERE条件移入ON、SUM(CASE WHEN...THEN 1 ELSE 0 END)改为COUNT(*) FILTER均为标准等价变换，结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（节点类型、扫描方式、连接算法、并行度、行数估计均无变化），cost相同（1689737.67）。重写仅为语法层面改进：将SUM(CASE WHEN...)改为COUNT(*) FILTER语法、隐式连接改为显式INNER JOIN、条件移入ON子句。虽未产生执行计划差异，但语法改进提升可读性和可维护性，且未引入任何结构退化。由于已应用聚合优化和连接优化规则，进一步优化空间有限（当前计划已使用并行扫描+索引回表+Nested Loop，符合小结果集场景最优路径）。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 437
+   - 规则序列: ['FILTER_INTO_JOIN', 'AGGREGATE_CASE_TO_FILTER']
+   - 优化组别: 聚合优化, 连接优化, 谓词简化
+   - 估计代价: 原始=1689737.67, 重写=1689737.67，相对变化: 0.00%
+✅ 成功存储，记录ID: 0edb3b6d-80b2-4682-bb06-b43102bbfd99
+
+🎲 UCT Math Update: 2 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1689737.6700, rc=1689737.6700)
+   结构分细节: rows 913.0->913.0 (score=+0.000), depth 5.0->5.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.500, conf=0.60, lambda=0.30, reward=+0.000, count=296, avg=+0.022
+   → AGGREGATE_CASE_TO_FILTER: P(s,a)=N/A, effect=0.500, conf=0.90, lambda=0.45, reward=+0.000, count=8, avg=+0.000
+
+----------------------------------------
+

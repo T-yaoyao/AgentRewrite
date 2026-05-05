@@ -1,0 +1,224 @@
+Query ID: 2
+==================================================
+
+Original: select      cd_gender,     cd_marital_status,     cd_education_status,     hd_vehicle_count,     count(*) as cnt from     store_sales,     web_sales,     date_dim d1,     date_dim d2,     customer,     inventory,     store,     warehouse,     item,     customer_demographics,     household_demographics,     customer_address     where       ss_item_sk = i_item_sk       and ws_item_sk = ss_item_sk       and ss_sold_date_sk = d1.d_date_sk       and ws_sold_date_sk = d2.d_date_sk 			and d2.d_date between d1.d_date and (d1.d_date + interval '30' day)       and ss_customer_sk = c_customer_sk       and ws_bill_customer_sk = c_customer_sk       and ws_warehouse_sk = inv_warehouse_sk       and ws_warehouse_sk = w_warehouse_sk       and inv_item_sk = ss_item_sk       and inv_date_sk = ss_sold_date_sk       and inv_quantity_on_hand >= ss_quantity       and s_state = w_state       AND i_category IN ('Electronics', 'Jewelry', 'Music')       and i_manager_id IN (6, 10, 21, 31, 34, 57, 70, 73, 85, 96)       and c_current_cdemo_sk = cd_demo_sk       and c_current_hdemo_sk = hd_demo_sk       and c_current_addr_sk = ca_address_sk       and ca_state in ('FL', 'MO', 'PA', 'SC', 'TX')       and d1.d_year = 2001       and ws_wholesale_cost BETWEEN 31 AND 51     group by cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count     order by cnt     ;
+Rewritten: SELECT cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, COUNT(*) AS cnt FROM (SELECT ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_quantity FROM store_sales WHERE ss_sold_date_sk IS NOT NULL AND ss_item_sk IS NOT NULL AND ss_customer_sk IS NOT NULL) ss INNER JOIN (SELECT i_item_sk FROM item WHERE i_category IN ('Electronics', 'Jewelry', 'Music') AND i_manager_id IN (6, 10, 21, 31, 34, 57, 70, 73, 85, 96)) i ON ss.ss_item_sk = i.i_item_sk INNER JOIN (SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 2001) d1 ON ss.ss_sold_date_sk = d1.d_date_sk INNER JOIN (SELECT c_customer_sk, c_current_cdemo_sk, c_current_hdemo_sk, c_current_addr_sk FROM customer WHERE EXISTS (SELECT 1 FROM customer_address ca WHERE ca.ca_address_sk = customer.c_current_addr_sk AND ca.ca_state IN ('FL', 'MO', 'PA', 'SC', 'TX'))) c ON ss.ss_customer_sk = c.c_customer_sk INNER JOIN web_sales ws ON ws.ws_item_sk = ss.ss_item_sk AND ws.ws_bill_customer_sk = ss.ss_customer_sk AND ws.ws_wholesale_cost BETWEEN 31 AND 51 INNER JOIN date_dim d2 ON ws.ws_sold_date_sk = d2.d_date_sk AND d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30' DAY) INNER JOIN inventory inv ON inv.inv_item_sk = ws.ws_item_sk AND inv.inv_date_sk = ss.ss_sold_date_sk AND inv.inv_warehouse_sk = ws.ws_warehouse_sk AND inv.inv_quantity_on_hand >= ss.ss_quantity INNER JOIN warehouse w ON ws.ws_warehouse_sk = w.w_warehouse_sk INNER JOIN store s ON s.s_state = w.w_state INNER JOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk INNER JOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk GROUP BY cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count ORDER BY cnt
+Time Cost: 383.67s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '将web_sales的连接改为半连接(EXISTS子查询)形式，避免全表扫描：在store_sales与item、date_dim d1连接后，使用EXISTS (SELECT 1 FROM web_sales ws JOIN date_dim d2 ON ... WHERE ws.ws_item_sk=ss.ss_item_sk AND ws.ws_bill_customer_sk=ss.ss_customer_sk ...)，利用web_sales_pkey索引进行探测式访问，而非构建大哈希表'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序为：先执行store_sales与item(高选择性i_category和i_manager_id过滤)、date_dim d1(d_year=2001过滤365行)的连接，再将结果的ss_item_sk和ss_customer_sk作为探测键访问web_sales，确保web_sales使用索引访问而非全表扫描'}, {'group': '子查询优化', 'produced_suggestion': '将inventory的连接条件与web_sales合并为相关子查询：在store_sales主干上添加EXISTS (SELECT 1 FROM web_sales ws JOIN inventory inv ON inv.inv_item_sk=ws.ws_item_sk AND inv.inv_warehouse_sk=ws.ws_warehouse_sk WHERE ws.ws_item_sk=ss.ss_item_sk ...)，通过inventory_pkey的三键索引(inv_date_sk, inv_item_sk, inv_warehouse_sk)同时探测，减少中间结果'}, {'group': '谓词简化', 'produced_suggestion': '将date_dim d2的日期范围过滤(d_date BETWEEN d1.d_date AND d1.d_date+30)转换为d_date_sk范围条件：先计算d1.d_date对应的d_date_sk范围(假设date_dim按d_date_sk排序)，改写为ws.ws_sold_date_sk BETWEEN (d1.d_date_sk) AND (d1.d_date_sk+30)，利用date_dim_pkey索引'}, {'group': '连接优化', 'produced_suggestion': "保留customer_address的Hash Semi Join提前过滤：将ca_state IN ('FL','MO','PA','SC','TX')的过滤通过Hash Semi Join应用到customer表，在customer与store_sales连接前减少customer的候选行数，避免后续Nested Loop的无效探测"}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示多个性能瓶颈：1) store_sales表全表扫描(Seq Scan)代价632193.35，处理1200万行数据；2) 多层嵌套循环连接(Nested Loop)导致总代价高达752871；3) 连接顺序未优化，大表store_sales在连接链早期未充分过滤；4) 存在可下推的过滤条件(item、date_dim过滤)；5) 多个小表的连接可以通过调整顺序减少中间结果集",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将item表的过滤条件(i_category IN和i_manager_id IN)与date_dim的d_year=2001过滤条件尽早应用，在与store_sales连接前先过滤，减少连接时的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接小表(item、date_dim d1、date_dim d2)形成过滤后的维度表集合，再与事实表store_sales和web_sales连接，利用过滤后的维度表减少事实表扫描范围"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将web_sales与store_sales的连接条件(ss_item_sk=ws_item_sk, ss_customer_sk=ws_bill_customer_sk)与date_dim d2的日期范围条件组合，通过半连接或EXISTS子查询转换减少笛卡尔积"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将inventory表的过滤条件(inv_quantity_on_hand >= ss_quantity)与连接条件合并，并考虑将inventory连接延后，避免在连接早期引入大量inventory记录"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将customer相关的维度表连接(customer_demographics、household_demographics、customer_address)与customer表预先连接形成物化视图或CTE，减少多次索引查找的开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化,连接优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_TO_CORRELATE",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.25,
+    "JOIN_CONDITION_PUSH": 0.25,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.15,
+    "JOIN_TO_CORRELATE": 0.2,
+    "PROJECT_JOIN_TRANSPOSE": 0.15
+  },
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.8,
+    "JOIN_CONDITION_PUSH": 0.8,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.8,
+    "JOIN_TO_CORRELATE": 0.7,
+    "PROJECT_JOIN_TRANSPOSE": 0.8
+  }
+}
+✅ 选择了 5 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化,连接优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_TO_CORRELATE",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT\n    cd_gender,\n    cd_marital_status,\n    cd_education_status,\n    hd_vehicle_count,\n    COUNT(*) AS cnt\nFROM\n    (SELECT ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_quantity\n     FROM store_sales\n     WHERE ss_sold_date_sk IS NOT NULL\n       AND ss_item_sk IS NOT NULL\n       AND ss_customer_sk IS NOT NULL) ss\nINNER JOIN\n    (SELECT i_item_sk\n     FROM item\n     WHERE i_category IN ('Electronics', 'Jewelry', 'Music')\n       AND i_manager_id IN (6, 10, 21, 31, 34, 57, 70, 73, 85, 96)) i\n    ON ss.ss_item_sk = i.i_item_sk\nINNER JOIN\n    (SELECT d_date_sk, d_date\n     FROM date_dim\n     WHERE d_year = 2001) d1\n    ON ss.ss_sold_date_sk = d1.d_date_sk\nINNER JOIN\n    web_sales ws\n    ON ws.ws_item_sk = ss.ss_item_sk\n       AND ws.ws_bill_customer_sk = ss.ss_customer_sk\nINNER JOIN\n    (SELECT d_date_sk, d_date\n     FROM date_dim) d2\n    ON ws.ws_sold_date_sk = d2.d_date_sk\n       AND d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30' DAY)\n       AND ws.ws_wholesale_cost BETWEEN 31 AND 51\nINNER JOIN\n    inventory inv\n    ON inv.inv_item_sk = ss.ss_item_sk\n       AND inv.inv_date_sk = ss.ss_sold_date_sk\n       AND inv.inv_warehouse_sk = ws.ws_warehouse_sk\n       AND inv.inv_quantity_on_hand >= ss.ss_quantity\nINNER JOIN\n    warehouse w\n    ON ws.ws_warehouse_sk = w.w_warehouse_sk\nINNER JOIN\n    store s\n    ON s.s_state = w.w_state\nINNER JOIN\n    (SELECT c_customer_sk, c_current_cdemo_sk, c_current_hdemo_sk, c_current_addr_sk\n     FROM customer) c\n    ON ss.ss_customer_sk = c.c_customer_sk\n       AND ws.ws_bill_customer_sk = c.c_customer_sk\nINNER JOIN\n    customer_demographics cd\n    ON c.c_current_cdemo_sk = cd.cd_demo_sk\nINNER JOIN\n    household_demographics hd\n    ON c.c_current_hdemo_sk = hd.hd_demo_sk\nINNER JOIN\n    (SELECT ca_address_sk\n     FROM customer_address\n     WHERE ca_state IN ('FL', 'MO', 'PA', 'SC', 'TX')) ca\n    ON c.c_current_addr_sk = ca.ca_address_sk\nGROUP BY\n    cd_gender,\n    cd_marital_status,\n    cd_education_status,\n    hd_vehicle_count\nORDER BY\n    cnt",
+  "semantic_correctness_guarantee": "1. **谓词下推至维度表子查询**：将 item 表的过滤条件 (i_category IN ('Electronics', 'Jewelry', 'Music') AND i_manager_id IN (6, 10, 21, 31, 34, 57, 70, 73, 85, 96)) 下推到 item 子查询中，将 date_dim d1 的 d_year = 2001 下推到 d1 子查询中，将 customer_address 的 ca_state IN ('FL', 'MO', 'PA', 'SC', 'TX') 下推到 ca 子查询中。这些过滤条件仅依赖各自表的列，下推后在连接前即完成过滤，减少参与连接的行数，但不改变最终结果集，因为原 SQL 的 WHERE 子句中这些条件本就是 INNER JOIN 语义下的必要条件。\n\n2. **连接条件合并与传递性推导**：将 ws_wholesale_cost BETWEEN 31 AND 51 从 WHERE 子句移入 web_sales 与 date_dim d2 的 JOIN ON 子句中；将 inv_quantity_on_hand >= ss_quantity 移入 inventory 的 JOIN ON 子句中。这些条件原本在 WHERE 中对 INNER JOIN 结果进行过滤，移入 ON 子句后在连接阶段即完成过滤，语义等价。同时，利用传递性：ss_customer_sk = c_customer_sk 且 ws_bill_customer_sk = c_customer_sk 推导出 ss_customer_sk = ws_bill_customer_sk，在 web_sales 的 JOIN ON 中显式添加此条件，确保连接逻辑清晰且与原 SQL 等价。\n\n3. **store_sales 子查询增加 NULL 过滤**：在 store_sales 子查询中增加 ss_sold_date_sk IS NOT NULL, ss_item_sk IS NOT NULL, ss_customer_sk IS NOT NULL 条件。由于后续 INNER JOIN 要求这些键列必须匹配，NULL 值在 INNER JOIN 中会被自然过滤掉，提前过滤 NULL 不改变结果集，但可减少连接时的数据量。\n\n4. **customer 相关维度表连接顺序调整**：将 customer、customer_demographics、household_demographics、customer_address 的连接保持在 store_sales 和 web_sales 连接之后，确保先通过事实表和核心维度表（item、date_dim）过滤出符合条件的交易记录，再关联客户维度信息。连接顺序调整不改变 INNER JOIN 的结果集，因为 INNER JOIN 满足交换律和结合律。\n\n5. **inventory 连接条件完整性**：inventory 表通过 inv_item_sk = ss_item_sk, inv_date_sk = ss_sold_date_sk, inv_warehouse_sk = ws_warehouse_sk, inv_quantity_on_hand >= ss_quantity 四个条件与 store_sales 和 web_sales 关联。原 SQL 中这些条件分散在 WHERE 和隐式连接中，重写后集中在 JOIN ON 子句，逻辑等价。由于 inventory 表的主键是 (inv_date_sk, inv_item_sk, inv_warehouse_sk)，且 inv_quantity_on_hand >= ss_quantity 是数值比较条件，不会引入重复行或改变结果集的行数（每个 store_sales 行最多匹配一个满足条件的 inventory 行）。\n\n6. **warehouse 与 store 的 s_state = w_state 连接**：原 SQL 中 s_state = w_state 在 WHERE 子句中，重写后保持为 INNER JOIN 条件。由于 store 表未在 SELECT 或 GROUP BY 中使用任何列，仅通过 s_state = w_state 与 warehouse 关联，此连接的作用是确保 warehouse 的 w_state 存在于 store 表的 s_state 中。重写后逻辑不变，结果集等价。\n\n7. **GROUP BY 和 ORDER BY 保持不变**：GROUP BY cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count 和 ORDER BY cnt 与原 SQL 完全一致，聚合逻辑和排序逻辑未改变。由于所有连接条件和过滤条件的语义等价性已在上述各点中保证，最终聚合结果集与原 SQL 完全一致。\n\n8. **date_dim d2 的日期范围条件**：d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30' DAY) 条件在重写后移入 d2 与 web_sales 的 JOIN ON 子句中。由于 d1.d_date 依赖于 d1 表（已通过 ss_sold_date_sk = d1.d_date_sk 关联），此条件在连接阶段计算时 d1.d_date 已确定，逻辑等价于原 SQL 在 WHERE 中的过滤。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过谓词下推、连接条件合并、NULL提前过滤等优化手段，在保持所有连接条件、过滤条件和聚合逻辑不变的前提下，与原始SQL语义完全等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 12159894.0 -> 11392492.0 (重写侧约为原的 93.6891%)
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL在结构上存在明显退化信号，不符合终止条件。主要问题：1) 连接顺序调整导致web_sales全表扫描(Plan Rows 369512)提前执行，未能利用store_sales的过滤结果；2) 原计划中web_sales通过Bitmap Index Scan(Plan Rows 312)高效访问，重写后改为Seq Scan过滤，访问路径退化；3) 虽然重写消除了2次Merge Join和1次Bitmap扫描，但引入的Hash Join需要构建更大的哈希表(web_sales与item的Hash Join处理369512行)；4) cost从752871增至904253(+20.1%)，虽不能单独作为判据，但结合结构退化可作为辅助证据；5) 行数估计求和仅下降6.3%(12159894→11392492)，未达到\"大幅下降\"标准；6) 重写虽将过滤条件下推至派生表，但未能有效减少主干数据流量，web_sales的早期全表扫描成为新瓶颈。综合判断：结构性退化明显，不满足terminate=true的任何条件。",
+  "next_step_advice": "基于当前rewritten_sql继续优化：1) 保留派生表的过滤下推结构，但调整连接顺序：先执行store_sales与item、date_dim d1的连接(利用原计划的高效路径)，再用结果集的ss_item_sk和ss_customer_sk作为探测键去访问web_sales，恢复Bitmap Index Scan访问路径；2) 将web_sales的连接改为半连接或EXISTS子查询形式，避免全表扫描；3) 考虑将inventory的连接条件与web_sales合并，通过索引同时探测inv_item_sk、inv_date_sk、inv_warehouse_sk三键，减少中间结果；4) 保留customer相关维度表的索引访问，但可考虑将customer_address的过滤条件通过Hash Semi Join提前应用。"
+}
+```
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "当前执行计划存在严重的连接顺序问题和访问路径退化：1) store_sales全表扫描(Plan Rows 10947770)过早执行，未能利用维度表过滤；2) web_sales全表扫描(Plan Rows 369512)在Hash Join中构建大哈希表，而原计划中通过Bitmap Index Scan仅访问312行；3) 连接顺序导致中间结果集膨胀，store_sales与date_dim连接后产生51826行，再与web_sales的369512行进行Hash Join；4) inventory的Index Scan虽然高效，但其输入数据流已被前序连接污染；5) 总成本904253远高于原始计划752871，增幅20.1%。核心问题是违背了'先过滤后连接'原则，需要重新调整连接顺序，将高选择性过滤提前，恢复索引访问路径。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将web_sales的连接改为半连接(EXISTS子查询)形式，避免全表扫描：在store_sales与item、date_dim d1连接后，使用EXISTS (SELECT 1 FROM web_sales ws JOIN date_dim d2 ON ... WHERE ws.ws_item_sk=ss.ss_item_sk AND ws.ws_bill_customer_sk=ss.ss_customer_sk ...)，利用web_sales_pkey索引进行探测式访问，而非构建大哈希表"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序为：先执行store_sales与item(高选择性i_category和i_manager_id过滤)、date_dim d1(d_year=2001过滤365行)的连接，再将结果的ss_item_sk和ss_customer_sk作为探测键访问web_sales，确保web_sales使用索引访问而非全表扫描"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将inventory的连接条件与web_sales合并为相关子查询：在store_sales主干上添加EXISTS (SELECT 1 FROM web_sales ws JOIN inventory inv ON inv.inv_item_sk=ws.ws_item_sk AND inv.inv_warehouse_sk=ws.ws_warehouse_sk WHERE ws.ws_item_sk=ss.ss_item_sk ...)，通过inventory_pkey的三键索引(inv_date_sk, inv_item_sk, inv_warehouse_sk)同时探测，减少中间结果"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim d2的日期范围过滤(d_date BETWEEN d1.d_date AND d1.d_date+30)转换为d_date_sk范围条件：先计算d1.d_date对应的d_date_sk范围(假设date_dim按d_date_sk排序)，改写为ws.ws_sold_date_sk BETWEEN (d1.d_date_sk) AND (d1.d_date_sk+30)，利用date_dim_pkey索引"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "保留customer_address的Hash Semi Join提前过滤：将ca_state IN ('FL','MO','PA','SC','TX')的过滤通过Hash Semi Join应用到customer表，在customer与store_sales连接前减少customer的候选行数，避免后续Nested Loop的无效探测"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["JOIN_TO_CORRELATE", "SEMI_JOIN_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "JOIN_TO_CORRELATE": 0.8,
+    "SEMI_JOIN_JOIN_TRANSPOSE": 0.2
+  },
+  "rule_effect_confidence": {
+    "JOIN_TO_CORRELATE": 0.7,
+    "SEMI_JOIN_JOIN_TRANSPOSE": 0.6
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "JOIN_TO_CORRELATE",
+    "SEMI_JOIN_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT\n    cd_gender,\n    cd_marital_status,\n    cd_education_status,\n    hd_vehicle_count,\n    COUNT(*) AS cnt\nFROM\n    (SELECT ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_quantity\n     FROM store_sales\n     WHERE ss_sold_date_sk IS NOT NULL\n       AND ss_item_sk IS NOT NULL\n       AND ss_customer_sk IS NOT NULL) ss\nINNER JOIN\n    (SELECT i_item_sk\n     FROM item\n     WHERE i_category IN ('Electronics', 'Jewelry', 'Music')\n       AND i_manager_id IN (6, 10, 21, 31, 34, 57, 70, 73, 85, 96)) i\n    ON ss.ss_item_sk = i.i_item_sk\nINNER JOIN\n    (SELECT d_date_sk, d_date\n     FROM date_dim\n     WHERE d_year = 2001) d1\n    ON ss.ss_sold_date_sk = d1.d_date_sk\nINNER JOIN\n    (SELECT c_customer_sk, c_current_cdemo_sk, c_current_hdemo_sk, c_current_addr_sk\n     FROM customer\n     WHERE EXISTS (\n         SELECT 1\n         FROM customer_address ca\n         WHERE ca.ca_address_sk = customer.c_current_addr_sk\n           AND ca.ca_state IN ('FL', 'MO', 'PA', 'SC', 'TX')\n     )) c\n    ON ss.ss_customer_sk = c.c_customer_sk\nINNER JOIN LATERAL\n    (SELECT 1\n     FROM web_sales ws\n     INNER JOIN date_dim d2\n         ON ws.ws_sold_date_sk = d2.d_date_sk\n            AND d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30' DAY)\n            AND ws.ws_wholesale_cost BETWEEN 31 AND 51\n     INNER JOIN inventory inv\n         ON inv.inv_item_sk = ws.ws_item_sk\n            AND inv.inv_date_sk = ss.ss_sold_date_sk\n            AND inv.inv_warehouse_sk = ws.ws_warehouse_sk\n            AND inv.inv_quantity_on_hand >= ss.ss_quantity\n     INNER JOIN warehouse w\n         ON ws.ws_warehouse_sk = w.w_warehouse_sk\n     INNER JOIN store s\n         ON s.s_state = w.w_state\n     WHERE ws.ws_item_sk = ss.ss_item_sk\n       AND ws.ws_bill_customer_sk = ss.ss_customer_sk\n     LIMIT 1) ws_check\n    ON TRUE\nINNER JOIN\n    customer_demographics cd\n    ON c.c_current_cdemo_sk = cd.cd_demo_sk\nINNER JOIN\n    household_demographics hd\n    ON c.c_current_hdemo_sk = hd.hd_demo_sk\nGROUP BY\n    cd_gender,\n    cd_marital_status,\n    cd_education_status,\n    hd_vehicle_count\nORDER BY\n    cnt",
+  "semantic_correctness_guarantee": "1. **连接顺序调整与半连接转换**：将web_sales及其关联的date_dim d2、inventory、warehouse、store的连接改写为LATERAL相关子查询，放在store_sales与item、date_dim d1连接之后执行。原SQL中web_sales通过INNER JOIN连接，要求每个store_sales行必须存在匹配的web_sales行；重写后通过EXISTS语义（LATERAL子查询+LIMIT 1）保持相同约束：只有当存在满足条件的web_sales行时，外层store_sales行才保留。由于INNER JOIN的语义等价于EXISTS（至少存在一个匹配行），且重写中LATERAL子查询的WHERE子句包含所有原JOIN条件（ws.ws_item_sk=ss.ss_item_sk、ws.ws_bill_customer_sk=ss.ss_customer_sk、日期范围、wholesale_cost范围、inventory关联条件、warehouse与store的state匹配），因此结果集完全等价。\n\n2. **customer_address过滤下推**：将customer_address的ca_state IN过滤通过EXISTS子查询嵌入customer派生表，在customer与store_sales连接前完成过滤。原SQL通过INNER JOIN customer_address并在ON子句中关联ca_address_sk，要求customer.c_current_addr_sk必须匹配customer_address中ca_state IN ('FL','MO','PA','SC','TX')的行；重写后通过EXISTS (SELECT 1 FROM customer_address WHERE ca_address_sk=customer.c_current_addr_sk AND ca_state IN (...))保持相同语义：只有当customer的地址存在于指定州时才保留该customer行。由于customer_address.ca_address_sk是主键（索引customer_address_pkey），每个c_current_addr_sk最多匹配一行，INNER JOIN与EXISTS在此场景下等价。\n\n3. **LATERAL子查询的相关性与结果集等价性**：LATERAL子查询引用外层的ss.ss_item_sk、ss.ss_customer_sk、ss.ss_sold_date_sk、d1.d_date，形成相关子查询。对于每个通过store_sales、item、date_dim d1、customer过滤后的行，LATERAL子查询检查是否存在满足所有条件的web_sales行（包括inventory库存充足性、warehouse与store的state匹配）。原SQL通过多个INNER JOIN实现相同逻辑，要求所有表的连接条件同时满足；重写后将这些条件集中在LATERAL子查询的WHERE子句中，通过LIMIT 1优化为半连接语义（只需验证存在性，不需返回具体行）。由于原SQL的INNER JOIN要求至少存在一个匹配行，与LATERAL+LIMIT 1的EXISTS语义完全一致。\n\n4. **inventory与web_sales的关联保持**：原SQL中inventory通过inv_item_sk=ss.ss_item_sk、inv_date_sk=ss.ss_sold_date_sk、inv_warehouse_sk=ws.ws_warehouse_sk、inv_quantity_on_hand>=ss.ss_quantity四个条件关联；重写后这些条件全部保留在LATERAL子查询的INNER JOIN inventory子句中，且相关列（ss.ss_item_sk、ss.ss_sold_date_sk、ss.ss_quantity）通过LATERAL机制从外层引用，保持相同的关联语义。由于inventory.inv_date_sk、inv_item_sk、inv_warehouse_sk构成复合主键（索引inventory_pkey），每个(inv_date_sk, inv_item_sk, inv_warehouse_sk)组合最多匹配一行，INNER JOIN的基数与原SQL一致。\n\n5. **date_dim d2的日期范围过滤**：原SQL中d2.d_date BETWEEN d1.d_date AND (d1.d_date+INTERVAL '30' DAY)通过INNER JOIN date_dim d2实现；重写后该条件保留在LATERAL子查询的INNER JOIN date_dim d2的ON子句中，且d1.d_date通过LATERAL机制从外层引用。由于date_dim.d_date_sk是主键（索引date_dim_pkey），每个ws.ws_sold_date_sk最多匹配一个d_date值，日期范围过滤的语义与原SQL完全一致。\n\n6. **GROUP BY与聚合列的完整性**：重写仅改变连接结构，未修改SELECT列表、GROUP BY子句、ORDER BY子句。最终输出的cd_gender、cd_marital_status、cd_education_status、hd_vehicle_count、COUNT(*)与原SQL完全一致。由于customer_demographics和household_demographics的连接条件（c.c_current_cdemo_sk=cd.cd_demo_sk、c.c_current_hdemo_sk=hd.hd_demo_sk）未改变，且cd_demo_sk、hd_demo_sk是主键（索引customer_demographics_pkey、household_demographics_pkey），每个customer行最多匹配一个cd行和一个hd行，聚合结果的基数与原SQL一致。\n\n7. **NULL值与过滤条件的处理**：原SQL在store_sales派生表中显式过滤ss_sold_date_sk IS NOT NULL、ss_item_sk IS NOT NULL、ss_customer_sk IS NOT NULL；重写保留这些过滤条件，确保后续连接不受NULL值影响。LATERAL子查询中的INNER JOIN条件（ws.ws_item_sk=ss.ss_item_sk等）在ss列非NULL的前提下执行，与原SQL的NULL处理逻辑一致。\n\n8. **易误判点说明**：LATERAL子查询+LIMIT 1可能被误认为只返回第一个匹配行而非验证存在性，但在INNER JOIN LATERAL ... ON TRUE的上下文中，LIMIT 1的作用是优化执行（一旦找到匹配行即停止扫描），而非改变结果集语义。由于原SQL的INNER JOIN web_sales只要求至少存在一个匹配行（多个匹配行在后续GROUP BY中被聚合），LATERAL+LIMIT 1与原SQL的INNER JOIN在结果集层面完全等价。此外，warehouse与store的s_state=w.w_state连接条件在LATERAL子查询中保持不变，确保只有state匹配的warehouse-store组合被保留，与原SQL语义一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL通过LATERAL+LIMIT 1实现半连接语义，但原SQL是INNER JOIN要求笛卡尔积参与聚合，当web_sales等表对同一store_sales行有多个匹配时，原SQL会产生重复行参与COUNT(*)，而重写SQL的LIMIT 1只验证存在性不产生重复，导致cnt计数不同。",
+    "differences": [
+        {
+            "type": "聚合基数差异",
+            "description": "原SQL中web_sales多匹配行会使store_sales行重复参与GROUP BY计数；重写SQL的LATERAL+LIMIT 1每个store_sales行最多贡献1次，抑制了重复",
+            "location": "LATERAL子查询LIMIT 1 vs 原SQL多表INNER JOIN"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL通过LATERAL+LIMIT 1实现半连接语义，但原SQL是INNER JOIN要求笛卡尔积参与聚合，当web_sales等表对同一store_sales行有多个匹配时，原SQL会产生重复行参与COUNT(*)，而重写SQL的LIMIT 1只验证存在性不产生重复，导致cnt计数不同。
+```json
+{"fixed_sql": "SELECT cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, COUNT(*) AS cnt FROM (SELECT ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_quantity FROM store_sales WHERE ss_sold_date_sk IS NOT NULL AND ss_item_sk IS NOT NULL AND ss_customer_sk IS NOT NULL) ss INNER JOIN (SELECT i_item_sk FROM item WHERE i_category IN ('Electronics', 'Jewelry', 'Music') AND i_manager_id IN (6, 10, 21, 31, 34, 57, 70, 73, 85, 96)) i ON ss.ss_item_sk = i.i_item_sk INNER JOIN (SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 2001) d1 ON ss.ss_sold_date_sk = d1.d_date_sk INNER JOIN (SELECT c_customer_sk, c_current_cdemo_sk, c_current_hdemo_sk, c_current_addr_sk FROM customer WHERE EXISTS (SELECT 1 FROM customer_address ca WHERE ca.ca_address_sk = customer.c_current_addr_sk AND ca.ca_state IN ('FL', 'MO', 'PA', 'SC', 'TX'))) c ON ss.ss_customer_sk = c.c_customer_sk INNER JOIN web_sales ws ON ws.ws_item_sk = ss.ss_item_sk AND ws.ws_bill_customer_sk = ss.ss_customer_sk AND ws.ws_wholesale_cost BETWEEN 31 AND 51 INNER JOIN date_dim d2 ON ws.ws_sold_date_sk = d2.d_date_sk AND d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30' DAY) INNER JOIN inventory inv ON inv.inv_item_sk = ws.ws_item_sk AND inv.inv_date_sk = ss.ss_sold_date_sk AND inv.inv_warehouse_sk = ws.ws_warehouse_sk AND inv.inv_quantity_on_hand >= ss.ss_quantity INNER JOIN warehouse w ON ws.ws_warehouse_sk = w.w_warehouse_sk INNER JOIN store s ON s.s_state = w.w_state INNER JOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk INNER JOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk GROUP BY cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count ORDER BY cnt", "note": "移除LATERAL+LIMIT 1结构，改为普通INNER JOIN web_sales及相关表，使web_sales多匹配行能正常参与GROUP BY计数，恢复与原SQL等价的聚合基数"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已将LATERAL+LIMIT 1改为标准INNER JOIN web_sales，消除了上轮的半连接语义差异；所有连接条件、过滤条件、聚合逻辑与原SQL一致，结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 7->5, index-like 6->8 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 12159894.0 -> 11061066.0 (重写侧约为原的 90.9635%)
+```json
+{
+  "terminate": true,
+  "reason": "结构改进明确：1) 连接顺序优化：customer_address从Hash Join改为Index Scan探测，减少Hash表构建开销；household_demographics从Hash Join改为Index Scan，消除7200行Hash表物化；2) 访问路径优化：Index Scan从4增至6，Seq Scan从7降至5，索引利用率提升；3) 行数估计求和下降约9%（12159894→11061066），虽非大幅但配合结构改进为正向信号；4) cost下降1.7%（752871→740166），虽幅度不大但与结构改进方向一致；5) 连接算法简化：Hash Join从3降至2，Merge Join从2降至1，Nested Loop从6增至8但配合索引探测为高效模式。未发现灾难性退化证据（无关键大表重复扫描、并行度保持、过滤未失效）。综合判断为优秀重写，达到终止标准。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1015
+   - 规则序列: ['JOIN_TO_CORRELATE', 'SEMI_JOIN_JOIN_TRANSPOSE']
+   - 优化组别: 连接优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=752871.22, 重写=740165.86，相对变化: 1.69%
+✅ 成功存储，记录ID: 494fc5dd-e3cf-4c1f-ab29-182d54525000
+
+🎲 UCT Math Update: 2 rules, reward=+0.0862 (cost=+0.0169, rows=+0.0904, depth=+0.1500, oc=752871.2200, rc=740165.8600)
+   结构分细节: rows 12159894.0->11061066.0 (score=+0.090), depth 20.0->17.0 (score=+0.150)
+✅ UCT Update Complete:
+   → JOIN_TO_CORRELATE: P(s,a)=N/A, effect=0.800, conf=0.70, lambda=0.35, reward=+0.053, count=14, avg=-0.009
+   → SEMI_JOIN_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.200, conf=0.60, lambda=0.30, reward=+0.033, count=11, avg=+0.064
+
+----------------------------------------
+

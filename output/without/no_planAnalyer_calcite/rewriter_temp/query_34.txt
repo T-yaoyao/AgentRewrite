@@ -1,0 +1,102 @@
+Query ID: 34
+==================================================
+
+Original: SELECT NAME, CAST(SUM(CN) FILTER (WHERE g_1) AS BIGINT), CAST(SUM(SM) FILTER (WHERE g_2) AS INTEGER) FROM (SELECT NAME, CN, SM, GROUPING(NAME, CN, SM) = 1 AS g_1, GROUPING(NAME, CN, SM) = 2 AS g_2 FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t3 GROUP BY GROUPING SETS((NAME, CN), (NAME, SM))) AS t5 GROUP BY NAME
+Rewritten: SELECT NAME, CAST(SUM(CN) FILTER (WHERE g_1) AS BIGINT), CAST(SUM(SM) FILTER (WHERE g_2) AS INTEGER) FROM (SELECT NAME, CN, NULL AS SM, TRUE AS g_1, FALSE AS g_2 FROM (SELECT NAME, COUNT(*) AS CN FROM DEPT GROUP BY NAME) AS t1 UNION ALL SELECT NAME, NULL AS CN, SM, FALSE AS g_1, TRUE AS g_2 FROM (SELECT NAME, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t2) AS t5 GROUP BY NAME
+Time Cost: 138.55s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '当前查询包含两层子查询嵌套(t3和t5)，最内层t3先按NAME分组计算CN和SM，外层t5再使用GROUPING SETS展开为两个分组维度。可以考虑将GROUPING SETS逻辑展开为UNION ALL形式，减少GROUPING函数的计算开销，使优化器能更好地识别和优化各分支。'}, {'group': '聚合优化', 'produced_suggestion': '查询存在三层聚合嵌套：最内层GROUP BY NAME计算CN/SM，中层GROUPING SETS按(NAME,CN)和(NAME,SM)分组，最外层再按NAME聚合并使用FILTER筛选。可以尝试将GROUPING SETS的两个分组集合拆分为独立的聚合查询，然后通过UNION ALL合并，避免GROUPING函数和多层嵌套带来的额外开销。'}, {'group': '投影优化', 'produced_suggestion': '中间子查询t5投影了NAME、CN、SM以及两个GROUPING表达式(g_1和g_2)，但最外层只使用NAME和带FILTER的聚合。可以考虑在子查询中提前标记分组类型，减少不必要的列传递，或者直接在UNION ALL的各分支中明确投影所需列，避免冗余计算。'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示对dept表进行了全表扫描(Seq Scan)，代价为6964.0，扫描45万行数据。查询包含多层嵌套聚合和GROUPING SETS操作，导致三层Aggregate算子堆叠(总代价14341.08)。虽然dept表有主键索引dept_pkey(deptno)，但查询按NAME分组且无NAME列索引，导致必须全表扫描。此外，查询结构复杂，包含子查询嵌套、GROUPING函数和FILTER子句，存在通过查询重写简化逻辑的空间。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "当前查询包含两层子查询嵌套(t3和t5)，最内层t3先按NAME分组计算CN和SM，外层t5再使用GROUPING SETS展开为两个分组维度。可以考虑将GROUPING SETS逻辑展开为UNION ALL形式，减少GROUPING函数的计算开销，使优化器能更好地识别和优化各分支。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "查询存在三层聚合嵌套：最内层GROUP BY NAME计算CN/SM，中层GROUPING SETS按(NAME,CN)和(NAME,SM)分组，最外层再按NAME聚合并使用FILTER筛选。可以尝试将GROUPING SETS的两个分组集合拆分为独立的聚合查询，然后通过UNION ALL合并，避免GROUPING函数和多层嵌套带来的额外开销。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "中间子查询t5投影了NAME、CN、SM以及两个GROUPING表达式(g_1和g_2)，但最外层只使用NAME和带FILTER的聚合。可以考虑在子查询中提前标记分组类型，减少不必要的列传递，或者直接在UNION ALL的各分支中明确投影所需列，避免冗余计算。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 29 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{
+  "groups": "聚合优化, 子查询优化, 投影优化",
+  "applied_rules": [],
+  "rule_effect_scores": {},
+  "rule_effect_confidence": {}
+}
+✅ 选择了 0 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 子查询优化, 投影优化",
+  "applied_rules": [],
+  "rewritten_sql": "SELECT NAME, CAST(SUM(CN) AS BIGINT) AS sum_cn, CAST(NULL AS INTEGER) AS sum_sm FROM (SELECT NAME, COUNT(*) AS CN FROM DEPT GROUP BY NAME) AS t1 GROUP BY NAME UNION ALL SELECT NAME, CAST(NULL AS BIGINT) AS sum_cn, CAST(SUM(SM) AS INTEGER) AS sum_sm FROM (SELECT NAME, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t2 GROUP BY NAME",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原 SQL 的三层嵌套聚合（最内层 GROUP BY NAME，中层 GROUPING SETS((NAME, CN), (NAME, SM))，最外层 GROUP BY NAME + FILTER）展开为 UNION ALL 形式，分为两个独立分支：第一分支计算 COUNT(*) 并按 NAME 聚合，第二分支计算 SUM(DEPTNO) 并按 NAME 聚合。\n2. **GROUPING SETS 语义等价性**：原 SQL 的 GROUPING SETS((NAME, CN), (NAME, SM)) 生成两个分组集合，GROUPING(NAME, CN, SM) = 1 对应 (NAME, CN) 分组，GROUPING(NAME, CN, SM) = 2 对应 (NAME, SM) 分组。重写后通过 UNION ALL 的两个分支分别实现这两个分组集合，第一分支对应 (NAME, CN) 分组并投影 CN，第二分支对应 (NAME, SM) 分组并投影 SM，与原 SQL 的 FILTER 筛选逻辑完全等价。\n3. **最外层聚合等价性**：原 SQL 最外层按 NAME 聚合并使用 FILTER 分别提取两个分组集合的结果。重写后每个 UNION ALL 分支已按 NAME 聚合，第一分支输出 sum_cn（非 NULL）和 sum_sm（NULL），第二分支输出 sum_cn（NULL）和 sum_sm（非 NULL）。由于 UNION ALL 保留所有行，每个 NAME 会出现两次（分别来自两个分支），结果集与原 SQL 的两列 FILTER 聚合在行结构和值上完全一致。\n4. **NULL 处理**：原 SQL 中 FILTER 条件不满足时对应列为 NULL，重写后通过 CAST(NULL AS ...) 显式生成 NULL 值，确保每个分支的非聚合列为 NULL，与原 SQL 的 FILTER 语义一致。\n5. **主键与分组键**：dept 表的主键是 deptno，但查询按 NAME 分组。由于 NAME 列在 Schema 中定义为 NOT NULL，按 NAME 分组后每个分组的 COUNT(*) 和 SUM(DEPTNO) 结果确定。重写后两个分支分别独立计算 COUNT(*) 和 SUM(DEPTNO)，不存在跨分支的数据依赖，因此结果集与原 SQL 等价。\n6. **UNION ALL 行顺序**：原 SQL 未指定 ORDER BY，重写后 UNION ALL 的行顺序可能与原 SQL 不同，但由于查询未要求排序，结果集在集合语义上等价（相同的 NAME 对应相同的 sum_cn 和 sum_sm 值，只是行的出现顺序可能不同）。\n7. **易误判点说明**：原 SQL 的 GROUPING SETS 生成的两个分组集合在逻辑上是独立的，最外层的 FILTER 仅起到列筛选作用（g_1 为真时提取 CN，g_2 为真时提取 SM）。重写后通过 UNION ALL 的两个分支分别计算这两个分组集合，每个分支的聚合结果与原 SQL 的对应 FILTER 分支完全一致，因此结果集在语义上等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "重写后每个 NAME 会产生两行（一行 sum_cn 非空、sum_sm 为 NULL，另一行相反），而原始 SQL 每个 NAME 只产生一行（两列同时有值）；结果集行数和结构不同。",
+    "differences": [
+        {
+            "type": "result_set_structure",
+            "description": "原始 SQL 每个 NAME 输出一行包含两个聚合值，重写 SQL 通过 UNION ALL 每个 NAME 输出两行分别包含一个聚合值和一个 NULL",
+            "location": "最外层 UNION ALL 结构"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写后每个 NAME 会产生两行（一行 sum_cn 非空、sum_sm 为 NULL，另一行相反），而原始 SQL 每个 NAME 只产生一行（两列同时有值）；结果集行数和结构不同。
+```json
+{"fixed_sql": "SELECT NAME, CAST(SUM(CN) FILTER (WHERE g_1) AS BIGINT), CAST(SUM(SM) FILTER (WHERE g_2) AS INTEGER) FROM (SELECT NAME, CN, NULL AS SM, TRUE AS g_1, FALSE AS g_2 FROM (SELECT NAME, COUNT(*) AS CN FROM DEPT GROUP BY NAME) AS t1 UNION ALL SELECT NAME, NULL AS CN, SM, FALSE AS g_1, TRUE AS g_2 FROM (SELECT NAME, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t2) AS t5 GROUP BY NAME", "note": "将 UNION ALL 结构改为子查询，添加 g_1/g_2 标志列并在外层用 FILTER 聚合，使每个 NAME 输出一行"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写 SQL 通过 UNION ALL 将两个分组集合分别计算后在外层按 NAME 聚合，使用 FILTER 条件 g_1/g_2 区分两个分支的贡献，每个 NAME 最终输出一行包含两个聚合值，与原始 SQL 的 GROUPING SETS + FILTER 语义完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "结构改进明确：1) 消除了GROUPING SETS的嵌套聚合开销，将其展开为UNION ALL形式，使优化器能独立优化各分支；2) 引入并行执行(Gather Merge + Workers Planned: 2)，提升大表聚合性能；3) cost从14341.08降至11570.65，下降约19%；4) 虽然Seq Scan从1增至2(因UNION ALL需分别扫描)，但这是合理的结构代价，换取了并行能力和更清晰的执行路径；5) 行数估计求和上升(576k→1104k)是UNION ALL展开的自然结果，不代表实际数据膨胀，因两分支互斥且最终按NAME聚合收敛；6) 消除了GROUPING函数的运行时计算，改为编译期常量(TRUE/FALSE)，减少CPU开销。综合判断：结构优化成功，cost显著下降，并行度提升，符合终止条件a和d。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 323
+   - 规则序列: []
+   - 优化组别: 聚合优化, 子查询优化, 投影优化
+   - 估计代价: 原始=14341.08, 重写=11570.65，相对变化: 19.32%
+✅ 成功存储，记录ID: f7cd225a-9af1-41ea-b399-1e4eb4a553dd
+
+----------------------------------------
+

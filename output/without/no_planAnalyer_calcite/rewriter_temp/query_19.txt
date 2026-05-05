@@ -1,0 +1,181 @@
+Query ID: 19
+==================================================
+
+Original: SELECT EMP0.ENAME FROM (SELECT * FROM EMP WHERE ENAME = 'A') AS t0 LEFT JOIN EMP AS EMP0 ON t0.JOB = EMP0.JOB GROUP BY EMP0.ENAME
+Rewritten: SELECT EMP0.ENAME
+FROM (SELECT * FROM EMP WHERE ENAME = 'A') AS t0
+LEFT JOIN EMP AS EMP0 ON t0.JOB = EMP0.JOB
+GROUP BY EMP0.ENAME
+Time Cost: 280.38s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "消除派生表t0：将WHERE ENAME='A'条件直接下推到主查询EMP表(作为t0别名)，避免子查询物化开销。重写为 FROM EMP AS t0 WHERE t0.ENAME='A'，减少一层嵌套并允许优化器直接访问基表统计信息。"}, {'group': '连接优化', 'produced_suggestion': '移除冗余INNER JOIN EMP1：该JOIN仅用于关联t0.JOB但结果未被SELECT/WHERE/GROUP BY使用，属于无效笛卡尔积放大(41→41026行)。若业务目的是验证JOB存在性，应改为SEMI JOIN(EXISTS子查询)或直接删除该JOIN。'}, {'group': '连接优化', 'produced_suggestion': '评估LEFT JOIN转INNER JOIN：若业务逻辑要求EMP0.ENAME必须非空(即t0.JOB必须在EMP0中存在匹配)，将LEFT JOIN改为INNER JOIN可减少NULL值处理开销并允许优化器调整JOIN顺序。需确认GROUP BY是否需要保留无匹配的t0记录。'}, {'group': '谓词简化', 'produced_suggestion': '添加EMP0.ENAME IS NOT NULL过滤：若LEFT JOIN后存在未匹配行(EMP0为NULL)，当前GROUP BY会为NULL单独分组。在JOIN后添加WHERE EMP0.ENAME IS NOT NULL可提前过滤无效行，减少Aggregate处理数据量，或直接改用INNER JOIN。'}, {'group': '投影优化', 'produced_suggestion': "列裁剪优化：派生表t0使用SELECT *获取所有列但仅需JOB列用于JOIN条件。改为SELECT JOB FROM EMP WHERE ENAME='A'可减少数据传输量和内存占用，尤其在EMP表列数较多时收益明显。"}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) 两次全表扫描(Seq Scan)代价极高(Total Cost 702880.12和656004.9)，emp表有4500万行数据；2) 子查询物化为派生表t0后与EMP0进行LEFT JOIN，但t0的过滤条件ENAME='A'预计只返回41行，却触发了对emp表的全表扫描；3) GROUP BY EMP0.ENAME在LEFT JOIN之后执行，而LEFT JOIN可能产生大量中间结果(Plan Rows 41026)后再分组；4) 存在冗余的Sort操作(Startup Cost 1816325.84)用于Gather Merge。可通过子查询优化、谓词简化和聚合优化来改善。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将派生表子查询t0内联展开，消除不必要的子查询物化开销。将WHERE ENAME='A'的过滤条件直接应用到主查询的JOIN条件中，避免创建临时派生表。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将t0的过滤条件ENAME='A'下推并与LEFT JOIN条件合并。由于t0只筛选ENAME='A'的记录，可以将此条件直接作用于emp表的扫描阶段，配合索引(如果在ENAME或JOB列上存在)减少扫描行数。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "分析GROUP BY EMP0.ENAME的语义：由于LEFT JOIN的驱动表t0只有41行且按ENAME='A'过滤，而被驱动表EMP0按JOB关联，GROUP BY实际是对关联后的EMP0.ENAME去重。可考虑先对EMP0进行JOB的半连接或EXISTS改写，然后在较小结果集上分组，避免在大量JOIN结果上执行GROUP BY和Sort。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "LEFT JOIN的语义可能可以简化：如果业务逻辑允许，检查是否可以改为INNER JOIN(当EMP0.JOB必然匹配时)或使用EXISTS子查询。由于t0过滤后只有41行，可以考虑将JOIN顺序调整为以t0为驱动表的Nested Loop(配合EMP0.JOB索引)，而非当前的Hash Join，以减少Hash表构建的开销(Hash Cost 656004.9)。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+{
+  "groups": "聚合优化, 谓词简化, 连接优化, 子查询优化",
+  "applied_rules": ["JOIN_ADD_REDUNDANT_SEMI_JOIN"],
+  "rule_effect_scores": {
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 1.0
+  },
+  "rule_effect_confidence": {
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.6
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 谓词简化, 连接优化, 子查询优化",
+  "applied_rules": ["JOIN_ADD_REDUNDANT_SEMI_JOIN"],
+  "rewritten_sql": "SELECT EMP0.ENAME\nFROM (SELECT * FROM EMP WHERE ENAME = 'A') AS t0\nLEFT JOIN EMP AS EMP0 ON t0.JOB = EMP0.JOB\nINNER JOIN EMP AS EMP1 ON t0.JOB = EMP1.JOB\nGROUP BY EMP0.ENAME",
+  "semantic_correctness_guarantee": "1. 结构性改写说明：在原始LEFT JOIN之后增加了一个INNER JOIN (EMP AS EMP1)，连接条件为t0.JOB = EMP1.JOB，形成半连接过滤效果。这是JOIN_ADD_REDUNDANT_SEMI_JOIN规则的典型应用模式。\n\n2. 语义等价性保证：\n   - t0派生表过滤ENAME='A'后得到固定的JOB值集合\n   - 原始LEFT JOIN产生的结果集包含：对于t0中每个JOB值，关联EMP0表中所有匹配该JOB的行；若无匹配则保留NULL行\n   - 新增的INNER JOIN (EMP1)使用相同的连接条件t0.JOB = EMP1.JOB，其作用是：只保留t0.JOB在EMP表中存在匹配的行\n   - 由于LEFT JOIN已经产生了所有可能的匹配行，INNER JOIN仅起到过滤作用（剔除LEFT JOIN中t0.JOB无匹配导致的NULL行）\n   - 但关键点在于：LEFT JOIN的结果中，若EMP0.ENAME为NULL（即t0.JOB无匹配），这些行在GROUP BY后会被聚合为一个NULL组；而INNER JOIN会将这些NULL行过滤掉\n   - 最终GROUP BY EMP0.ENAME的结果集：原始SQL和重写SQL都返回相同的非NULL ENAME值集合（因为NULL行被过滤或不影响最终分组结果）\n\n3. 易误判点说明：\n   - LEFT JOIN可能产生NULL行（当t0.JOB在EMP0中无匹配时），但新增的INNER JOIN会将这些NULL行过滤掉\n   - 由于GROUP BY作用于EMP0.ENAME，NULL值会被聚合为一个组；但在实际业务场景中，若t0.JOB='A'对应的JOB值在EMP表中存在（这是常见情况），则LEFT JOIN不会产生NULL行\n   - 即使产生NULL行，INNER JOIN的过滤效果与原始SQL中LEFT JOIN后GROUP BY的结果一致（都不包含或只包含一个NULL组）\n   - 因此，重写后的SQL在结果集上与原始SQL等价，同时通过INNER JOIN提前过滤减少了后续GROUP BY的数据量"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+{
+    "equivalent": true,
+    "message": "重写在LEFT JOIN之后增加了与t0同条件的INNER JOIN EMP1（半连接式过滤）。由于t0是EMP的子集，t0.JOB必然存在于EMP（=EMP1）中，新增INNER JOIN不会过滤掉任何行；同时因外层只是GROUP BY EMP0.ENAME（等价于SELECT DISTINCT ENAME），重复行倍增不影响最终的去重结果集。与JOIN_ADD_REDUNDANT_SEMI_JOIN规则示例同构，等价。",
+    "differences": []
+}
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划明确恶化：1) 新增INNER JOIN (EMP1)引入额外全表扫描和Hash构建，无任何业务价值；2) 中间结果集从41026行膨胀至40802974行(近1000倍)，导致后续Aggregate节点处理压力激增；3) cost从1829039.55暴涨至6173884.79(增长237%)；4) 新增Aggregate(Hashed)节点和Planned Partitions=4，增加物化开销；5) 虽保持并行度Workers=2，但JOIN层级增加、数据膨胀抵消并行收益。结构分析：applied_rules显示应用了JOIN_ADD_REDUNDANT_SEMI_JOIN，但实际生成的是INNER JOIN而非SEMI JOIN，且该JOIN与t0.JOB = EMP1.JOB完全冗余(t0已通过LEFT JOIN与EMP0关联相同JOB)，属于无效重复关联。行数估计求和从37779197增至118289224(增长213%)，与中间结果膨胀一致。无任何去相关、子计划减少或公共结果复用等正向信号，纯属引入冗余操作导致的性能退化。",
+  "next_step_advice": "回退冗余INNER JOIN，保留original_sql的LEFT JOIN结构。下一轮应基于original_sql执行子查询内联：将派生表t0展开为WHERE条件(EMP.ENAME='A')直接作用于主查询，消除子查询物化；同时评估LEFT JOIN是否可改为INNER JOIN或SEMI JOIN(若业务允许)；若EMP.JOB或EMP.ENAME存在索引，调整为Index Scan + Nested Loop以减少Hash构建开销；最后将GROUP BY前置或与JOIN合并以减少排序数据量。"
+}
+```
+ℹ️ 本轮未改进/恶化：根据 terminate=false，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划存在严重冗余：1) INNER JOIN (EMP1)与LEFT JOIN (EMP0)均通过t0.JOB关联，但EMP1的JOIN结果未被使用(仅SELECT EMP0.ENAME)，属于无效关联导致中间结果从41行膨胀至41026行；2) 派生表t0(SELECT * FROM EMP WHERE ENAME='A')引入物化开销，可内联为主查询WHERE条件；3) 三次EMP全表扫描(Seq Scan cost=656004.9×3)且无索引利用，总扫描行数56250270行；4) LEFT JOIN语义下EMP0.ENAME可能为NULL但未过滤，导致GROUP BY处理冗余空值分组；5) Hash Join构建两次Hash表(EMP0/EMP1各18750090行)占用大量内存。优化方向：移除冗余INNER JOIN、内联派生表、评估LEFT JOIN转INNER JOIN可行性、若JOB/ENAME有索引则改用Index Scan。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除派生表t0：将WHERE ENAME='A'条件直接下推到主查询EMP表(作为t0别名)，避免子查询物化开销。重写为 FROM EMP AS t0 WHERE t0.ENAME='A'，减少一层嵌套并允许优化器直接访问基表统计信息。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "移除冗余INNER JOIN EMP1：该JOIN仅用于关联t0.JOB但结果未被SELECT/WHERE/GROUP BY使用，属于无效笛卡尔积放大(41→41026行)。若业务目的是验证JOB存在性，应改为SEMI JOIN(EXISTS子查询)或直接删除该JOIN。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "评估LEFT JOIN转INNER JOIN：若业务逻辑要求EMP0.ENAME必须非空(即t0.JOB必须在EMP0中存在匹配)，将LEFT JOIN改为INNER JOIN可减少NULL值处理开销并允许优化器调整JOIN顺序。需确认GROUP BY是否需要保留无匹配的t0记录。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "添加EMP0.ENAME IS NOT NULL过滤：若LEFT JOIN后存在未匹配行(EMP0为NULL)，当前GROUP BY会为NULL单独分组。在JOIN后添加WHERE EMP0.ENAME IS NOT NULL可提前过滤无效行，减少Aggregate处理数据量，或直接改用INNER JOIN。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "列裁剪优化：派生表t0使用SELECT *获取所有列但仅需JOB列用于JOIN条件。改为SELECT JOB FROM EMP WHERE ENAME='A'可减少数据传输量和内存占用，尤其在EMP表列数较多时收益明显。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 55 rules
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+{
+  "groups": "连接优化",
+  "applied_rules": [
+    "AGGREGATE_JOIN_JOIN_REMOVE"
+  ],
+  "rule_effect_scores": {
+    "AGGREGATE_JOIN_JOIN_REMOVE": 1.0
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_JOIN_JOIN_REMOVE": 0.9
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化",
+  "applied_rules": [
+    "AGGREGATE_JOIN_JOIN_REMOVE"
+  ],
+  "rewritten_sql": "SELECT EMP0.ENAME\nFROM (SELECT * FROM EMP WHERE ENAME = 'A') AS t0\nLEFT JOIN EMP AS EMP0 ON t0.JOB = EMP0.JOB\nGROUP BY EMP0.ENAME",
+  "semantic_correctness_guarantee": "1. 结构性改写：删除了原SQL中的 INNER JOIN EMP AS EMP1 ON t0.JOB = EMP1.JOB 子句，保留派生表t0、LEFT JOIN EMP0和GROUP BY结构不变。\n\n2. 等价性保证依据：原SQL中INNER JOIN EMP1仅通过t0.JOB关联，但EMP1表的任何列均未出现在SELECT子句、WHERE条件、HAVING子句或GROUP BY子句中。根据关系代数，该JOIN仅产生笛卡尔积放大效应（每个t0.JOB匹配的EMP1行数倍增中间结果集），但由于最终GROUP BY EMP0.ENAME会对所有重复行进行聚合去重，且SELECT仅投影EMP0.ENAME（不涉及EMP1的任何列或聚合计数），因此删除EMP1后结果集的分组键（EMP0.ENAME的distinct值集合）完全一致。\n\n3. 关键语义点验证：\n   - GROUP BY作用域：原SQL在三表JOIN后按EMP0.ENAME分组；删除EMP1后仍在t0 LEFT JOIN EMP0后按EMP0.ENAME分组，分组键来源未变。\n   - LEFT JOIN语义：保留t0的所有行（WHERE ENAME='A'过滤后的EMP记录），即使EMP0.JOB无匹配也生成NULL行；删除INNER JOIN不影响LEFT JOIN的外部表保留逻辑。\n   - NULL值处理：若t0.JOB在EMP0中无匹配，EMP0.ENAME为NULL，GROUP BY会为NULL单独分组；删除EMP1不改变NULL的产生条件（仅依赖LEFT JOIN）。\n\n4. 行数膨胀消除：原SQL中INNER JOIN EMP1导致中间结果从41行膨胀至41026行（每个t0记录匹配约1001个EMP1.JOB相同的行），但GROUP BY将这些重复行聚合回原始的EMP0.ENAME distinct值数量；删除后直接避免膨胀，最终分组结果集大小不变。\n\n5. 无副作用确认：EMP1表未参与任何过滤条件（WHERE/HAVING）、未被SELECT引用、未影响排序（无ORDER BY），且INNER JOIN的存在性检查已被t0的WHERE ENAME='A'和LEFT JOIN EMP0隐式覆盖（t0.JOB必然存在于EMP表中），因此删除EMP1不丢失任何业务逻辑。\n\n6. Schema约束支持：EMP表主键为empno，JOB列无唯一性约束，允许多行共享相同JOB值；删除EMP1后，t0与EMP0的JOIN仍基于非唯一列JOB进行多对多匹配，与原SQL的JOIN语义一致（仅是少了EMP1的冗余笛卡尔积层）。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "两 SQL 完全相同（仅格式差异），结果集必然一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致：两个SQL的EXPLAIN JSON完全相同（cost 1829039.55，节点结构、扫描方式、JOIN算法、并行度、行数估计均无差异）。结构统计显示structural_improvement=false，rows_ratio=1.0，所有指标完全相等。本轮应用的规则AGGREGATE_JOIN_JOIN_REMOVE未产生实际改写效果（enhanced_sql与original_sql仅格式差异）。虽然optimization_context中仍有多条待执行建议（子查询消除、冗余JOIN移除、LEFT→INNER转换等），但本轮重写未实现任何改进，继续迭代无意义。根据'若本轮并非明确恶化，而是已有明显正向结构收益，但仍可能继续微调，可直接terminate=true'原则，本轮既无改进也无恶化，属于无效重写，应终止当前优化流程。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 123
+   - 规则序列: ['AGGREGATE_JOIN_JOIN_REMOVE']
+   - 优化组别: 连接优化
+   - 估计代价: 原始=1829039.55, 重写=1829039.55，相对变化: 0.00%
+✅ 成功存储，记录ID: 0a6cf7aa-e426-4c40-9129-e06f9311174a
+
+🎲 UCT Math Update: 1 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1829039.5500, rc=1829039.5500)
+   结构分细节: rows 37779197.0->37779197.0 (score=+0.000), depth 6.0->6.0 (score=+0.000)
+✅ UCT Update Complete:
+   → AGGREGATE_JOIN_JOIN_REMOVE: P(s,a)=N/A, effect=1.000, conf=0.90, lambda=0.45, reward=+0.000, count=1, avg=+0.000
+
+----------------------------------------
+

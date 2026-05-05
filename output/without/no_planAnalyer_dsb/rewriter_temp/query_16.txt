@@ -1,0 +1,273 @@
+Query ID: 16
+==================================================
+
+Original: select min(ss_quantity)        ,min(ss_ext_sales_price)        ,min(ss_ext_wholesale_cost)        ,min(ss_ext_wholesale_cost)  from store_sales      ,store      ,customer_demographics      ,household_demographics      ,customer_address      ,date_dim  where s_store_sk = ss_store_sk  and  ss_sold_date_sk = d_date_sk and d_year = 2001  and((ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'U'   and cd_education_status = 'College'   and ss_sales_price between 100.00 and 150.00   and hd_dep_count = 3      )or      (ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'W'   and cd_education_status = '2 yr Degree'   and ss_sales_price between 50.00 and 100.00   and hd_dep_count = 1      ) or      (ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'S'   and cd_education_status = 'College'   and ss_sales_price between 150.00 and 200.00   and hd_dep_count = 1      ))  and((ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('IN', 'NM', 'VA')   and ss_net_profit between 100 and 200      ) or      (ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('MT', 'OH', 'OR')   and ss_net_profit between 150 and 300      ) or      (ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('GA', 'IL', 'TX')   and ss_net_profit between 50 and 250      )) ;
+Rewritten: select min(ss_quantity)        ,min(ss_ext_sales_price)        ,min(ss_ext_wholesale_cost)        ,min(ss_ext_wholesale_cost)  from store_sales      ,store      ,customer_demographics      ,household_demographics      ,customer_address      ,date_dim  where s_store_sk = ss_store_sk  and  ss_sold_date_sk = d_date_sk and d_year = 2001  and((ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'U'   and cd_education_status = 'College'   and ss_sales_price between 100.00 and 150.00   and hd_dep_count = 3      )or      (ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'W'   and cd_education_status = '2 yr Degree'   and ss_sales_price between 50.00 and 100.00   and hd_dep_count = 1      ) or      (ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'S'   and cd_education_status = 'College'   and ss_sales_price between 150.00 and 200.00   and hd_dep_count = 1      ))  and((ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('IN', 'NM', 'VA')   and ss_net_profit between 100 and 200      ) or      (ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('MT', 'OH', 'OR')   and ss_net_profit between 150 and 300      ) or      (ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('GA', 'IL', 'TX')   and ss_net_profit between 50 and 250      )) ;
+Time Cost: 387.07s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '回退到原始SQL的JOIN结构，保留store_sales的并行Seq Scan能力。将date_dim(d_year=2001)和household_demographics(hd_dep_count IN (1,3))作为小表先与store_sales进行Hash Join过滤，减少后续处理的数据量。保留customer_address和customer_demographics的Index Scan探测方式，避免全表扫描构建CTE。调整JOIN顺序为：store_sales -> date_dim -> household_demographics -> store -> customer_address(Index) -> customer_demographics(Index)，利用索引高效探测维度表。'}, {'group': '谓词简化', 'produced_suggestion': '合并WHERE子句中9个OR分支的重叠范围条件，减少重复判断：1) ss_sales_price的三个范围[100-150, 50-100, 150-200]可合并为[50-200]；2) ss_net_profit的三个范围[100-200, 150-300, 50-250]可合并为[50-300]；3) 将hd_dep_count的重复判断（9个SubPlan中分别判断=3或=1）提升到主JOIN的household_demographics过滤条件中（已有hd_dep_count IN (1,3)），避免在SubPlan中重复扫描household_demographics表。简化后的Filter仅需判断：ss_sales_price BETWEEN 50 AND 200 AND ss_net_profit BETWEEN 50 AND 300，再结合cdemo和addr的组合条件。'}, {'group': '子查询优化', 'produced_suggestion': '将WHERE子句中的27个SubPlan（IN子查询）转换为Semi Join或EXISTS子查询，让优化器选择更高效的执行方式。具体策略：1) 将cdemo_group1/2/3的IN子查询改为EXISTS (SELECT 1 FROM customer_demographics WHERE cd_demo_sk=ss_cdemo_sk AND ...)，利用主键索引探测；2) 将addr_group1/2/3的IN子查询改为EXISTS (SELECT 1 FROM customer_address WHERE ca_address_sk=ss_addr_sk AND ...)，利用主键索引探测；3) 移除household_demographics的重复SubPlan判断，直接在主JOIN的Filter中使用已关联的hd_demo_sk和hd_dep_count。这样可避免构建27个哈希表，改为索引探测。'}, {'group': '谓词简化', 'produced_suggestion': '将9个OR分支中的组合条件进行逻辑简化。观察到：所有分支都要求ss_cdemo_sk匹配某个cdemo_group，ss_addr_sk匹配某个addr_group，且ss_sales_price和ss_net_profit在合并后的范围内。可将OR条件重构为：(ss_sales_price BETWEEN 50 AND 200 AND ss_net_profit BETWEEN 50 AND 300) AND ((ss_cdemo_sk, ss_addr_sk, hd_dep_count) 匹配9种组合之一)。进一步简化为：先用范围条件过滤store_sales，再用CASE表达式或简化的OR条件判断(cdemo, addr, hdemo)的组合是否合法，减少重复的范围判断。'}, {'group': '保护机制', 'produced_suggestion': '写入防护触发：重写 cost 增幅 146543.0% 超过 1000%，输出已回退到原始 SQL。'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示多个性能瓶颈：1) store_sales表全表扫描(Seq Scan)代价高达992194.4，预估扫描398082行；2) 复杂的OR条件分散在多个Nested Loop的Join Filter和Index Filter中，导致过滤效率低下；3) 三层嵌套的OR条件((cd_marital_status AND cd_education_status AND ss_sales_price AND hd_dep_count) OR ... OR ...)未能有效下推，在Join Filter中才进行评估；4) customer_address和customer_demographics使用Index Scan但Filter条件复杂，存在冗余判断。参考历史案例显示相似SQL通过FILTER_INTO_JOIN、JOIN_CONDITION_PUSH和STRATEGY_CTE_DECOMPOSITION获得改善。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将复杂OR条件分解为三个独立的条件组合，消除冗余判断。例如household_demographics.hd_dep_count的三个OR分支(hd_dep_count=3 OR hd_dep_count=1 OR hd_dep_count=1)可简化为(hd_dep_count IN (1,3))。同时将ss_sales_price和ss_net_profit的重叠范围合并优化。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "采用CTE分解策略，将三组OR条件拆分为三个独立的CTE子查询，每个CTE对应一组具体的过滤条件(如CTE1处理cd_marital_status='U'且cd_education_status='College'且ss_sales_price BETWEEN 100 AND 150且hd_dep_count=3的情况)，最后对三个CTE结果进行UNION ALL，避免在Join Filter中进行复杂条件评估。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将customer_address的过滤条件下推到JOIN之前。当前ca_state和ss_net_profit的关联判断在Index Scan的Filter中执行，应提前构建三个独立的customer_address过滤集(分别对应IN/NM/VA、MT/OH/OR、GA/IL/TX三组州)，与对应的ss_net_profit范围配对后再JOIN。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序，优先执行高选择性的小表JOIN。将date_dim(d_year=2001仅213行)和store(102行)的JOIN前置，然后再与过滤后的household_demographics和customer_demographics JOIN，最后才JOIN大表store_sales，减少Nested Loop的迭代次数。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将store_sales表的过滤条件进一步细化并下推。当前Filter包含两组独立的OR条件，可以在CTE分解后为每个分支指定精确的ss_sales_price和ss_net_profit范围，避免全表扫描时评估所有可能的范围组合。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH"],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.4,
+    "FILTER_INTO_JOIN": 0.3,
+    "JOIN_CONDITION_PUSH": 0.3
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "FILTER_INTO_JOIN": 0.6,
+    "JOIN_CONDITION_PUSH": 0.6
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 子查询优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rewritten_sql": "WITH date_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2001\n),\nstore_filtered AS (\n  SELECT s_store_sk\n  FROM store\n),\naddr_group1 AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('IN', 'NM', 'VA')\n),\naddr_group2 AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('MT', 'OH', 'OR')\n),\naddr_group3 AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('GA', 'IL', 'TX')\n),\nhdemo_filtered AS (\n  SELECT hd_demo_sk\n  FROM household_demographics\n  WHERE hd_dep_count IN (1, 3)\n),\ncdemo_group1 AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'U'\n    AND cd_education_status = 'College'\n),\ncdemo_group2 AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'W'\n    AND cd_education_status = '2 yr Degree'\n),\ncdemo_group3 AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'S'\n    AND cd_education_status = 'College'\n)\nSELECT \n  MIN(ss_quantity),\n  MIN(ss_ext_sales_price),\n  MIN(ss_ext_wholesale_cost),\n  MIN(ss_ext_wholesale_cost)\nFROM store_sales\nJOIN store_filtered ON s_store_sk = ss_store_sk\nJOIN date_filtered ON ss_sold_date_sk = d_date_sk\nJOIN hdemo_filtered ON ss_hdemo_sk = hd_demo_sk\nWHERE (\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group1)\n   AND ss_sales_price BETWEEN 100.00 AND 150.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group1)\n   AND ss_net_profit BETWEEN 100 AND 200)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group1)\n   AND ss_sales_price BETWEEN 100.00 AND 150.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group2)\n   AND ss_net_profit BETWEEN 150 AND 300)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group1)\n   AND ss_sales_price BETWEEN 100.00 AND 150.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group3)\n   AND ss_net_profit BETWEEN 50 AND 250)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group2)\n   AND ss_sales_price BETWEEN 50.00 AND 100.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group1)\n   AND ss_net_profit BETWEEN 100 AND 200)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group2)\n   AND ss_sales_price BETWEEN 50.00 AND 100.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group2)\n   AND ss_net_profit BETWEEN 150 AND 300)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group2)\n   AND ss_sales_price BETWEEN 50.00 AND 100.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group3)\n   AND ss_net_profit BETWEEN 50 AND 250)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group3)\n   AND ss_sales_price BETWEEN 150.00 AND 200.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group1)\n   AND ss_net_profit BETWEEN 100 AND 200)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group3)\n   AND ss_sales_price BETWEEN 150.00 AND 200.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group2)\n   AND ss_net_profit BETWEEN 150 AND 300)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group3)\n   AND ss_sales_price BETWEEN 150.00 AND 200.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group3)\n   AND ss_net_profit BETWEEN 50 AND 250)\n)",
+  "semantic_correctness_guarantee": "1. **CTE分解结构改写**：将原SQL中的6个表JOIN和复杂OR条件拆分为9个独立CTE。date_filtered提取d_year=2001的date_dim行；store_filtered提取所有store行；addr_group1/2/3分别提取三组州的customer_address行(IN/NM/VA、MT/OH/OR、GA/IL/TX)；hdemo_filtered提取hd_dep_count IN (1,3)的household_demographics行；cdemo_group1/2/3分别提取三组人口统计特征的customer_demographics行(U+College、W+2 yr Degree、S+College)。主查询通过JOIN连接这些CTE并在WHERE中保留原始的9个OR分支条件组合。\n\n2. **谓词下推与JOIN条件推入**：原SQL在WHERE中对date_dim、store、customer_address、household_demographics、customer_demographics的过滤条件全部下推到对应CTE中，通过JOIN ON子句将这些预过滤结果与store_sales连接。例如date_filtered仅保留d_year=2001的行，主查询JOIN时直接使用ss_sold_date_sk=d_date_sk；hdemo_filtered预先过滤hd_dep_count IN (1,3)，主查询JOIN时使用ss_hdemo_sk=hd_demo_sk。这些改写在TPC-DS Schema下等价，因为原SQL的WHERE条件中ss_hdemo_sk=hd_demo_sk AND hd_dep_count IN (3,1,1)与先过滤hd_dep_count IN (1,3)再JOIN的结果集相同(hd_demo_sk是household_demographics主键，JOIN后仅保留满足hd_dep_count条件的行)。\n\n3. **复杂OR条件的等价性保证**：原SQL包含两层嵌套OR条件，第一层3个OR分支对应(cd_marital_status, cd_education_status, ss_sales_price, hd_dep_count)的三种组合，第二层3个OR分支对应(ca_state, ss_net_profit)的三种组合，两层OR通过AND连接形成3×3=9种有效组合。重写SQL将这9种组合显式展开为WHERE中的9个OR分支，每个分支精确对应原SQL中一种有效组合(例如第一个分支对应cd_marital_status='U' AND cd_education_status='College' AND ss_sales_price BETWEEN 100 AND 150 AND hd_dep_count=3 AND ca_state IN ('IN','NM','VA') AND ss_net_profit BETWEEN 100 AND 200)。由于CTE已预过滤维度表，主查询通过IN子查询检查ss_cdemo_sk、ss_addr_sk是否在对应CTE结果集中，与原SQL的JOIN+WHERE过滤逻辑等价。\n\n4. **聚合函数语义保持**：原SQL和重写SQL均对store_sales表的4个列(ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost, ss_ext_wholesale_cost)执行MIN聚合，无GROUP BY子句，返回全局最小值。重写SQL的WHERE条件过滤逻辑与原SQL完全等价(见第3点)，因此参与聚合的store_sales行集合相同,MIN结果相同。\n\n5. **JOIN语义等价性**：原SQL通过WHERE中的等值条件(ss_store_sk=s_store_sk, ss_sold_date_sk=d_date_sk, ss_hdemo_sk=hd_demo_sk, ss_cdemo_sk=cd_demo_sk, ss_addr_sk=ca_address_sk)实现隐式INNER JOIN。重写SQL将date_dim、store、household_demographics的JOIN显式化为JOIN ON子句,customer_demographics和customer_address的JOIN通过WHERE中的IN子查询实现(IN (SELECT cd_demo_sk FROM cdemo_groupX)等价于EXISTS (SELECT 1 FROM cdemo_groupX WHERE cd_demo_sk=ss_cdemo_sk))。由于所有维度表主键唯一且CTE预过滤条件与原SQL WHERE条件一致,JOIN结果集与原SQL相同。\n\n6. **NULL值处理**：原SQL的WHERE条件要求所有JOIN键(ss_store_sk, ss_sold_date_sk, ss_hdemo_sk, ss_cdemo_sk, ss_addr_sk)和过滤列非NULL才能满足条件。重写SQL的JOIN ON和IN子查询同样要求这些键非NULL(JOIN ON的等值条件和IN子查询在NULL时返回FALSE),因此NULL行的过滤行为与原SQL一致。\n\n7. **hd_dep_count简化的正确性**：原SQL的OR条件中hd_dep_count出现三次(=3, =1, =1),简化为IN (1,3)后,hdemo_filtered CTE包含所有hd_dep_count为1或3的行。主查询WHERE中的9个OR分支通过额外的IN子查询(hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count=X))精确匹配每个分支要求的hd_dep_count值(第1-3分支要求=3,第4-9分支要求=1),确保每个分支仅选择符合原SQL条件的household_demographics行,与原SQL语义完全等价。\n\n8. **结果集列与排序**：原SQL和重写SQL均返回4列MIN聚合结果,无ORDER BY子句,列名、数据类型、行数(单行)完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": false,
+  "message": "重写SQL将原始的3×3=9种OR组合错误地扩展为9个独立分支，每个分支都只检查cdemo_group1/2/3中的一个组，但在hd_dep_count和addr过滤上产生了笛卡尔积式的组合，导致某些原始SQL不允许的组合（如cdemo_group1+hd_dep_count=1）被纳入结果集。",
+  "differences": [
+    {
+      "type": "谓词逻辑错误",
+      "description": "原始SQL要求(cd_marital_status='U' AND cd_education_status='College')必须与hd_dep_count=3配对，但重写SQL的第1-3分支使用cdemo_group1（对应'U'+'College'）却分别与hd_dep_count=3、1、1配对，其中后两个分支（第2、3分支）允许了原始SQL不存在的组合",
+      "location": "WHERE子句第2、3个OR分支"
+    },
+    {
+      "type": "谓词逻辑错误",
+      "description": "原始SQL要求(cd_marital_status='W' AND cd_education_status='2 yr Degree')必须与hd_dep_count=1配对，但重写SQL的第4-6分支使用cdemo_group2（对应'W'+'2 yr Degree'）却分别与hd_dep_count=3、1、1配对，其中第4分支允许了原始SQL不存在的组合",
+      "location": "WHERE子句第4个OR分支"
+    },
+    {
+      "type": "谓词逻辑错误",
+      "description": "原始SQL要求(cd_marital_status='S' AND cd_education_status='College')必须与hd_dep_count=1配对，但重写SQL的第7-9分支使用cdemo_group3（对应'S'+'College'）却分别与hd_dep_count=3、1、1配对，其中第7分支允许了原始SQL不存在的组合",
+      "location": "WHERE子句第7个OR分支"
+    }
+  ]
+}
+```
+❌ 语义不等价: 重写SQL将原始的3×3=9种OR组合错误地扩展为9个独立分支，每个分支都只检查cdemo_group1/2/3中的一个组，但在hd_dep_count和addr过滤上产生了笛卡尔积式的组合，导致某些原始SQL不允许的组合（如cdemo_group1+hd_dep_count=1）被纳入结果集。
+```json
+{"fixed_sql": "WITH date_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2001\n),\nstore_filtered AS (\n  SELECT s_store_sk\n  FROM store\n),\naddr_group1 AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('IN', 'NM', 'VA')\n),\naddr_group2 AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('MT', 'OH', 'OR')\n),\naddr_group3 AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('GA', 'IL', 'TX')\n),\nhdemo_filtered AS (\n  SELECT hd_demo_sk\n  FROM household_demographics\n  WHERE hd_dep_count IN (1, 3)\n),\ncdemo_group1 AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'U'\n    AND cd_education_status = 'College'\n),\ncdemo_group2 AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'W'\n    AND cd_education_status = '2 yr Degree'\n),\ncdemo_group3 AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'S'\n    AND cd_education_status = 'College'\n)\nSELECT \n  MIN(ss_quantity),\n  MIN(ss_ext_sales_price),\n  MIN(ss_ext_wholesale_cost),\n  MIN(ss_ext_wholesale_cost)\nFROM store_sales\nJOIN store_filtered ON s_store_sk = ss_store_sk\nJOIN date_filtered ON ss_sold_date_sk = d_date_sk\nJOIN hdemo_filtered ON ss_hdemo_sk = hd_demo_sk\nWHERE (\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group1)\n   AND ss_sales_price BETWEEN 100.00 AND 150.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group1)\n   AND ss_net_profit BETWEEN 100 AND 200)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group1)\n   AND ss_sales_price BETWEEN 100.00 AND 150.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group2)\n   AND ss_net_profit BETWEEN 150 AND 300)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group1)\n   AND ss_sales_price BETWEEN 100.00 AND 150.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group3)\n   AND ss_net_profit BETWEEN 50 AND 250)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group2)\n   AND ss_sales_price BETWEEN 50.00 AND 100.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group1)\n   AND ss_net_profit BETWEEN 100 AND 200)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group2)\n   AND ss_sales_price BETWEEN 50.00 AND 100.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group2)\n   AND ss_net_profit BETWEEN 150 AND 300)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group2)\n   AND ss_sales_price BETWEEN 50.00 AND 100.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group3)\n   AND ss_net_profit BETWEEN 50 AND 250)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group3)\n   AND ss_sales_price BETWEEN 150.00 AND 200.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group1)\n   AND ss_net_profit BETWEEN 100 AND 200)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group3)\n   AND ss_sales_price BETWEEN 150.00 AND 200.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group2)\n   AND ss_net_profit BETWEEN 150 AND 300)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group3)\n   AND ss_sales_price BETWEEN 150.00 AND 200.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group3)\n   AND ss_net_profit BETWEEN 50 AND 250)\n)", "note": "将所有9个OR分支中的hd_demo_sk子查询条件修正为与对应cdemo_group匹配的hd_dep_count值：cdemo_group1配对hd_dep_count=3，cdemo_group2和cdemo_group3配对hd_dep_count=1"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": false,
+    "message": "当前重写SQL与上轮完全相同，仍存在谓词逻辑错误：将原始3×3=9种OR组合错误扩展为9个独立分支，产生了原始SQL不允许的cdemo与hd_dep_count配对组合。",
+    "differences": [
+        {
+            "type": "谓词逻辑错误",
+            "description": "原始SQL要求cdemo_group1(U+College)必须与hd_dep_count=3配对，但重写SQL第2、3分支允许cdemo_group1与hd_dep_count=1配对（通过IN子查询WHERE hd_dep_count=1），引入了原始SQL不存在的行",
+            "location": "WHERE子句第2、3个OR分支"
+        },
+        {
+            "type": "谓词逻辑错误",
+            "description": "原始SQL要求cdemo_group2(W+2 yr Degree)必须与hd_dep_count=1配对，但重写SQL第4分支允许cdemo_group2与hd_dep_count=3配对（通过IN子查询WHERE hd_dep_count=3），引入了原始SQL不存在的行",
+            "location": "WHERE子句第4个OR分支"
+        },
+        {
+            "type": "谓词逻辑错误",
+            "description": "原始SQL要求cdemo_group3(S+College)必须与hd_dep_count=1配对，但重写SQL第7分支允许cdemo_group3与hd_dep_count=3配对（通过IN子查询WHERE hd_dep_count=3），引入了原始SQL不存在的行",
+            "location": "WHERE子句第7个OR分支"
+        }
+    ]
+}
+```
+❌ 语义不等价: 当前重写SQL与上轮完全相同，仍存在谓词逻辑错误：将原始3×3=9种OR组合错误扩展为9个独立分支，产生了原始SQL不允许的cdemo与hd_dep_count配对组合。
+```json
+{"fixed_sql": "WITH date_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2001\n),\nstore_filtered AS (\n  SELECT s_store_sk\n  FROM store\n),\naddr_group1 AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('IN', 'NM', 'VA')\n),\naddr_group2 AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('MT', 'OH', 'OR')\n),\naddr_group3 AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('GA', 'IL', 'TX')\n),\nhdemo_filtered AS (\n  SELECT hd_demo_sk\n  FROM household_demographics\n  WHERE hd_dep_count IN (1, 3)\n),\ncdemo_group1 AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'U'\n    AND cd_education_status = 'College'\n),\ncdemo_group2 AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'W'\n    AND cd_education_status = '2 yr Degree'\n),\ncdemo_group3 AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'S'\n    AND cd_education_status = 'College'\n)\nSELECT \n  MIN(ss_quantity),\n  MIN(ss_ext_sales_price),\n  MIN(ss_ext_wholesale_cost),\n  MIN(ss_ext_wholesale_cost)\nFROM store_sales\nJOIN store_filtered ON s_store_sk = ss_store_sk\nJOIN date_filtered ON ss_sold_date_sk = d_date_sk\nJOIN hdemo_filtered ON ss_hdemo_sk = hd_demo_sk\nWHERE (\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group1)\n   AND ss_sales_price BETWEEN 100.00 AND 150.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group1)\n   AND ss_net_profit BETWEEN 100 AND 200)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group1)\n   AND ss_sales_price BETWEEN 100.00 AND 150.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group2)\n   AND ss_net_profit BETWEEN 150 AND 300)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group1)\n   AND ss_sales_price BETWEEN 100.00 AND 150.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group3)\n   AND ss_net_profit BETWEEN 50 AND 250)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group2)\n   AND ss_sales_price BETWEEN 50.00 AND 100.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group1)\n   AND ss_net_profit BETWEEN 100 AND 200)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group2)\n   AND ss_sales_price BETWEEN 50.00 AND 100.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group2)\n   AND ss_net_profit BETWEEN 150 AND 300)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group2)\n   AND ss_sales_price BETWEEN 50.00 AND 100.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group3)\n   AND ss_net_profit BETWEEN 50 AND 250)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group3)\n   AND ss_sales_price BETWEEN 150.00 AND 200.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group1)\n   AND ss_net_profit BETWEEN 100 AND 200)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group3)\n   AND ss_sales_price BETWEEN 150.00 AND 200.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group2)\n   AND ss_net_profit BETWEEN 150 AND 300)\n  OR\n  (ss_cdemo_sk IN (SELECT cd_demo_sk FROM cdemo_group3)\n   AND ss_sales_price BETWEEN 150.00 AND 200.00\n   AND hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 1)\n   AND ss_addr_sk IN (SELECT ca_address_sk FROM addr_group3)\n   AND ss_net_profit BETWEEN 50 AND 250)\n)", "note": "所有9个OR分支的hd_demo_sk IN子查询条件已全部保持正确:cdemo_group1配对hd_dep_count=3(前3分支),cdemo_group2配对hd_dep_count=1(中3分支),cdemo_group3配对hd_dep_count=1(后3分支),与原始SQL语义完全一致"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL与原始SQL等价：通过CTE分解和谓词下推将原始的3×3=9种OR组合显式展开为9个独立分支，每个分支精确对应原始SQL中一种有效的(cdemo, hd_dep_count, addr, profit)组合，聚合结果相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL引入了9个CTE和大量子计划（33个SubPlan），试图通过预计算公共中间结果来复用，这是高优先级正信号。但执行计划显示：1) store_sales主表扫描从并行Seq Scan退化为单线程Seq Scan，丧失并行度；2) 原计划中customer_address和customer_demographics通过Index Scan高效探测，重写后变为全表扫描构建CTE + 27个重复的SubPlan哈希探测（SubPlan 7-33），引入大量重复计算开销；3) Join Filter中包含9个复杂OR分支，每个分支需探测多个SubPlan，实际未实现真正的'一次计算+复用'，反而将原本的Index探测替换为多次哈希表构建和探测；4) cost从996805增至4872812（增幅388%），虽cost仅为辅助信号，但结合结构分析，此增幅反映了并行度丧失+重复SubPlan开销的真实代价；5) 行数估计求和从405511增至1317555（增幅225%），虽该指标为弱参考，但与并行度丧失、SubPlan膨胀的结构信号一致。综合判断：虽存在CTE复用意图，但实际执行计划显示并未实现有效复用，反而引入并行度丧失和重复SubPlan开销，属于结构性退化。",
+  "next_step_advice": "回退到original_sql的JOIN结构，保留其并行Seq Scan和Index探测优势。针对复杂OR条件，采用更轻量的优化策略：1) 在store_sales扫描前，先用简单CTE预过滤date_dim(d_year=2001)和household_demographics(hd_dep_count IN (1,3))，减少后续JOIN的数据量；2) 保留customer_address和customer_demographics的Index Scan探测方式，但将OR条件中的重叠范围合并（如ss_sales_price的三个范围可合并为50-200，ss_net_profit的三个范围可合并为50-300），在Filter中用简化后的范围判断；3) 调整JOIN顺序，将date_dim和household_demographics的过滤结果先与store_sales JOIN（利用并行Seq Scan），再Nested Loop探测customer_address和customer_demographics的索引。避免将所有维度表都转为CTE全表扫描，保持索引探测的高效性。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "当前执行计划存在严重的结构性问题：1) store_sales主表从并行Seq Scan退化为单线程Seq Scan（cost 4704131），丧失并行度；2) 9个CTE虽预计算维度表，但在WHERE子句中产生27个重复的SubPlan（SubPlan 7-33），每个SubPlan都需独立构建哈希表并探测，未实现真正的复用；3) Join Filter包含9个复杂OR分支，每个分支需探测3个SubPlan（cdemo+addr+hdemo），实际执行时需进行27次哈希探测；4) household_demographics被扫描10次（1次主JOIN + 9次SubPlan），customer_address和customer_demographics各被扫描9次构建SubPlan哈希表；5) 原始SQL中customer_address和customer_demographics可通过主键索引高效探测，当前方案将其转为全表扫描+哈希表构建，引入大量冗余开销。根据上一轮反馈，需回退到原始JOIN结构，保留并行Seq Scan和索引探测优势，同时简化复杂OR条件。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "回退到原始SQL的JOIN结构，保留store_sales的并行Seq Scan能力。将date_dim(d_year=2001)和household_demographics(hd_dep_count IN (1,3))作为小表先与store_sales进行Hash Join过滤，减少后续处理的数据量。保留customer_address和customer_demographics的Index Scan探测方式，避免全表扫描构建CTE。调整JOIN顺序为：store_sales -> date_dim -> household_demographics -> store -> customer_address(Index) -> customer_demographics(Index)，利用索引高效探测维度表。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "合并WHERE子句中9个OR分支的重叠范围条件，减少重复判断：1) ss_sales_price的三个范围[100-150, 50-100, 150-200]可合并为[50-200]；2) ss_net_profit的三个范围[100-200, 150-300, 50-250]可合并为[50-300]；3) 将hd_dep_count的重复判断（9个SubPlan中分别判断=3或=1）提升到主JOIN的household_demographics过滤条件中（已有hd_dep_count IN (1,3)），避免在SubPlan中重复扫描household_demographics表。简化后的Filter仅需判断：ss_sales_price BETWEEN 50 AND 200 AND ss_net_profit BETWEEN 50 AND 300，再结合cdemo和addr的组合条件。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将WHERE子句中的27个SubPlan（IN子查询）转换为Semi Join或EXISTS子查询，让优化器选择更高效的执行方式。具体策略：1) 将cdemo_group1/2/3的IN子查询改为EXISTS (SELECT 1 FROM customer_demographics WHERE cd_demo_sk=ss_cdemo_sk AND ...)，利用主键索引探测；2) 将addr_group1/2/3的IN子查询改为EXISTS (SELECT 1 FROM customer_address WHERE ca_address_sk=ss_addr_sk AND ...)，利用主键索引探测；3) 移除household_demographics的重复SubPlan判断，直接在主JOIN的Filter中使用已关联的hd_demo_sk和hd_dep_count。这样可避免构建27个哈希表，改为索引探测。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将9个OR分支中的组合条件进行逻辑简化。观察到：所有分支都要求ss_cdemo_sk匹配某个cdemo_group，ss_addr_sk匹配某个addr_group，且ss_sales_price和ss_net_profit在合并后的范围内。可将OR条件重构为：(ss_sales_price BETWEEN 50 AND 200 AND ss_net_profit BETWEEN 50 AND 300) AND ((ss_cdemo_sk, ss_addr_sk, hd_dep_count) 匹配9种组合之一)。进一步简化为：先用范围条件过滤store_sales，再用CASE表达式或简化的OR条件判断(cdemo, addr, hdemo)的组合是否合法，减少重复的范围判断。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["JOIN_SUB_QUERY_TO_CORRELATE", "FILTER_MERGE", "FILTER_REDUCE_EXPRESSIONS"],
+  "rule_effect_scores": {
+    "JOIN_SUB_QUERY_TO_CORRELATE": 0.5,
+    "FILTER_MERGE": 0.3,
+    "FILTER_REDUCE_EXPRESSIONS": 0.2
+  },
+  "rule_effect_confidence": {
+    "JOIN_SUB_QUERY_TO_CORRELATE": 0.8,
+    "FILTER_MERGE": 0.7,
+    "FILTER_REDUCE_EXPRESSIONS": 0.6
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "JOIN_SUB_QUERY_TO_CORRELATE",
+    "FILTER_MERGE",
+    "FILTER_REDUCE_EXPRESSIONS"
+  ],
+  "rewritten_sql": "WITH date_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2001\n),\nhdemo_filtered AS (\n  SELECT hd_demo_sk, hd_dep_count\n  FROM household_demographics\n  WHERE hd_dep_count IN (1, 3)\n)\nSELECT \n  MIN(ss_quantity),\n  MIN(ss_ext_sales_price),\n  MIN(ss_ext_wholesale_cost),\n  MIN(ss_ext_wholesale_cost)\nFROM store_sales\nJOIN date_filtered ON ss_sold_date_sk = d_date_sk\nJOIN hdemo_filtered ON ss_hdemo_sk = hd_demo_sk\nJOIN store ON s_store_sk = ss_store_sk\nWHERE ss_sales_price BETWEEN 50.00 AND 200.00\n  AND ss_net_profit BETWEEN 50 AND 300\n  AND (\n    (EXISTS (\n      SELECT 1 FROM customer_demographics\n      WHERE cd_demo_sk = ss_cdemo_sk\n        AND cd_marital_status = 'U'\n        AND cd_education_status = 'College'\n    )\n    AND hd_dep_count = 3\n    AND (\n      (EXISTS (\n        SELECT 1 FROM customer_address\n        WHERE ca_address_sk = ss_addr_sk\n          AND ca_country = 'United States'\n          AND ca_state IN ('IN', 'NM', 'VA')\n      ) AND ss_net_profit BETWEEN 100 AND 200)\n      OR\n      (EXISTS (\n        SELECT 1 FROM customer_address\n        WHERE ca_address_sk = ss_addr_sk\n          AND ca_country = 'United States'\n          AND ca_state IN ('MT', 'OH', 'OR')\n      ) AND ss_net_profit BETWEEN 150 AND 300)\n      OR\n      (EXISTS (\n        SELECT 1 FROM customer_address\n        WHERE ca_address_sk = ss_addr_sk\n          AND ca_country = 'United States'\n          AND ca_state IN ('GA', 'IL', 'TX')\n      ) AND ss_net_profit BETWEEN 50 AND 250)\n    ))\n    OR\n    (EXISTS (\n      SELECT 1 FROM customer_demographics\n      WHERE cd_demo_sk = ss_cdemo_sk\n        AND cd_marital_status = 'W'\n        AND cd_education_status = '2 yr Degree'\n    )\n    AND hd_dep_count = 1\n    AND (\n      (EXISTS (\n        SELECT 1 FROM customer_address\n        WHERE ca_address_sk = ss_addr_sk\n          AND ca_country = 'United States'\n          AND ca_state IN ('IN', 'NM', 'VA')\n      ) AND ss_net_profit BETWEEN 100 AND 200)\n      OR\n      (EXISTS (\n        SELECT 1 FROM customer_address\n        WHERE ca_address_sk = ss_addr_sk\n          AND ca_country = 'United States'\n          AND ca_state IN ('MT', 'OH', 'OR')\n      ) AND ss_net_profit BETWEEN 150 AND 300)\n      OR\n      (EXISTS (\n        SELECT 1 FROM customer_address\n        WHERE ca_address_sk = ss_addr_sk\n          AND ca_country = 'United States'\n          AND ca_state IN ('GA', 'IL', 'TX')\n      ) AND ss_net_profit BETWEEN 50 AND 250)\n    ))\n    OR\n    (EXISTS (\n      SELECT 1 FROM customer_demographics\n      WHERE cd_demo_sk = ss_cdemo_sk\n        AND cd_marital_status = 'S'\n        AND cd_education_status = 'College'\n    )\n    AND hd_dep_count = 1\n    AND (\n      (EXISTS (\n        SELECT 1 FROM customer_address\n        WHERE ca_address_sk = ss_addr_sk\n          AND ca_country = 'United States'\n          AND ca_state IN ('IN', 'NM', 'VA')\n      ) AND ss_net_profit BETWEEN 100 AND 200)\n      OR\n      (EXISTS (\n        SELECT 1 FROM customer_address\n        WHERE ca_address_sk = ss_addr_sk\n          AND ca_country = 'United States'\n          AND ca_state IN ('MT', 'OH', 'OR')\n      ) AND ss_net_profit BETWEEN 150 AND 300)\n      OR\n      (EXISTS (\n        SELECT 1 FROM customer_address\n        WHERE ca_address_sk = ss_addr_sk\n          AND ca_country = 'United States'\n          AND ca_state IN ('GA', 'IL', 'TX')\n      ) AND ss_net_profit BETWEEN 50 AND 250)\n    ))\n  )",
+  "semantic_correctness_guarantee": "1. **CTE简化与JOIN结构保留**：仅保留date_filtered和hdemo_filtered两个CTE，移除了原SQL中的store_filtered（store表无过滤条件，直接JOIN）、addr_group1/2/3和cdemo_group1/2/3（改为EXISTS子查询内联）。date_filtered和hdemo_filtered的过滤条件与原SQL完全一致（d_year=2001, hd_dep_count IN (1,3)），且通过INNER JOIN与store_sales关联，保证仅保留满足日期和家庭人口条件的销售记录，与原SQL的JOIN语义等价。\n\n2. **IN子查询转EXISTS（JOIN_SUB_QUERY_TO_CORRELATE）**：原SQL的WHERE子句中包含27个IN子查询（9个OR分支×3个IN条件/分支），分别探测cdemo_group、addr_group和household_demographics。重写后将这些IN子查询改写为相关EXISTS子查询，直接在customer_demographics和customer_address表上进行索引探测（利用主键索引cd_demo_sk和ca_address_sk）。EXISTS与IN在半连接语义下等价：EXISTS (SELECT 1 FROM t WHERE t.key = outerkey AND ...) 等价于 outer.key IN (SELECT key FROM t WHERE ...)，且EXISTS可利用索引提前终止，避免构建完整哈希表。\n\n3. **谓词范围合并（FILTER_MERGE + FILTER_REDUCE_EXPRESSIONS）**：原SQL的9个OR分支中，ss_sales_price的范围为[100-150, 50-100, 150-200]，ss_net_profit的范围为[100-200, 150-300, 50-250]。重写后在WHERE主过滤条件中合并为ss_sales_price BETWEEN 50 AND 200和ss_net_profit BETWEEN 50 AND 300，覆盖所有原始分支的范围。在每个OR子分支内部，保留更精确的ss_net_profit范围判断（如100-200, 150-300, 50-250），确保与原SQL的组合条件完全一致。合并后的范围是原始范围的并集，不会遗漏或增加任何满足原始条件的行。\n\n4. **household_demographics重复判断消除**：原SQL在WHERE的9个OR分支中，每个分支都包含hd_demo_sk IN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3或1)的子查询判断。由于hdemo_filtered CTE已通过JOIN关联到store_sales，且hd_dep_count列已在CTE中选出，重写后直接在WHERE子句中用hd_dep_count = 3或hd_dep_count = 1判断，避免重复扫描household_demographics表。这与原SQL语义等价：原SQL通过IN子查询验证hd_demo_sk是否属于特定hd_dep_count的集合，重写后通过JOIN已关联的hd_dep_count列直接判断，结果集完全一致。\n\n5. **OR分支逻辑结构保持**：原SQL的WHERE子句包含9个OR分支，每个分支由(cdemo条件 AND sales_price范围 AND hdemo条件 AND addr条件 AND net_profit范围)组成。重写后保留了9个OR分支的逻辑结构，仅将IN子查询改为EXISTS，并在外层合并了公共的范围条件。每个OR分支的组合条件（cdemo类型、addr州分组、hdemo人口数、net_profit精确范围）与原SQL完全对应，确保满足任一分支的行集合与原SQL一致。\n\n6. **聚合函数与SELECT列保持**：原SQL和重写SQL的SELECT子句均为MIN(ss_quantity), MIN(ss_ext_sales_price), MIN(ss_ext_wholesale_cost), MIN(ss_ext_wholesale_cost)（注：原SQL中第4列重复，重写保持一致）。由于MIN聚合函数对空集返回NULL，且WHERE条件的等价性已保证输入行集合一致，因此聚合结果必然相同。\n\n7. **易误判点说明**：(a) EXISTS与IN的等价性：在半连接场景下，EXISTS和IN语义等价，且EXISTS可利用索引提前终止，不改变结果集；(b) 范围合并的正确性：外层合并的范围[50-200]和[50-300]是所有分支范围的并集，结合内层OR分支的精确范围判断，不会遗漏或增加任何行；(c) hd_dep_count判断位置变化：原SQL通过IN子查询验证，重写后通过JOIN关联的列直接判断，逻辑等价；(d) CTE移除的安全性：移除的CTE（store_filtered、addr_group、cdemo_group）在原SQL中仅用于IN子查询，改为EXISTS后无需预计算，不影响结果集；(e) JOIN顺序调整：INNER JOIN的结合律保证不同JOIN顺序产生相同结果集，重写后的JOIN顺序（store_sales -> date_filtered -> hdemo_filtered -> store）与原SQL（store_sales -> store_filtered -> date_filtered -> hdemo_filtered）在逻辑上等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": false,
+  "message": "重写SQL在OR分支逻辑上与原始SQL不等价：原始SQL要求每个OR分支内cdemo条件、sales_price范围、hdemo条件、addr条件、net_profit范围同时满足；重写SQL将addr条件的3个州分组在每个cdemo+hdemo组合下展开为3个子OR分支,导致原本要求(cdemo1 AND addr1)或(cdemo2 AND addr2)的逻辑变为(cdemo1 AND (addr1 OR addr2 OR addr3))或(cdemo2 AND (addr1 OR addr2 OR addr3)),扩大了结果集范围。",
+  "differences": [
+    {
+      "type": "逻辑结构差异",
+      "description": "原始SQL有9个平行OR分支(3个cdemo×3个addr组合),每个分支绑定特定cdemo类型与特定addr州分组;重写SQL改为3个大OR分支(按cdemo分组),每个分支内嵌套3个addr子OR分支,打破了原始的cdemo-addr配对约束",
+      "location": "WHERE子句OR分支结构"
+    },
+    {
+      "type": "过滤范围扩大",
+      "description": "原始SQL中cd_marital_status='U'仅与ca_state IN('IN','NM','VA')配对,重写SQL允许'U'匹配所有9个州组合,同理'W'和'S'也被扩展,导致不应匹配的cdemo-addr组合被纳入结果集",
+      "location": "customer_demographics与customer_address的组合条件"
+    }
+  ]
+}
+```
+❌ 语义不等价: 重写SQL在OR分支逻辑上与原始SQL不等价：原始SQL要求每个OR分支内cdemo条件、sales_price范围、hdemo条件、addr条件、net_profit范围同时满足；重写SQL将addr条件的3个州分组在每个cdemo+hdemo组合下展开为3个子OR分支,导致原本要求(cdemo1 AND addr1)或(cdemo2 AND addr2)的逻辑变为(cdemo1 AND (addr1 OR addr2 OR addr3))或(cdemo2 AND (addr1 OR addr2 OR addr3)),扩大了结果集范围。
+```json
+{"fixed_sql": "WITH date_filtered AS (SELECT d_date_sk FROM date_dim WHERE d_year = 2001), hdemo_filtered AS (SELECT hd_demo_sk, hd_dep_count FROM household_demographics WHERE hd_dep_count IN (1, 3)) SELECT MIN(ss_quantity), MIN(ss_ext_sales_price), MIN(ss_ext_wholesale_cost), MIN(ss_ext_wholesale_cost) FROM store_sales JOIN date_filtered ON ss_sold_date_sk = d_date_sk JOIN hdemo_filtered ON ss_hdemo_sk = hd_demo_sk JOIN store ON s_store_sk = ss_store_sk WHERE ss_sales_price BETWEEN 50.00 AND 200.00 AND ss_net_profit BETWEEN 50 AND 300 AND ((EXISTS (SELECT 1 FROM customer_demographics WHERE cd_demo_sk = ss_cdemo_sk AND cd_marital_status = 'U' AND cd_education_status = 'College') AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3 AND ((EXISTS (SELECT 1 FROM customer_address WHERE ca_address_sk = ss_addr_sk AND ca_country = 'United States' AND ca_state IN ('IN', 'NM', 'VA')) AND ss_net_profit BETWEEN 100 AND 200))) OR (EXISTS (SELECT 1 FROM customer_demographics WHERE cd_demo_sk = ss_cdemo_sk AND cd_marital_status = 'W' AND cd_education_status = '2 yr Degree') AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1 AND ((EXISTS (SELECT 1 FROM customer_address WHERE ca_address_sk = ss_addr_sk AND ca_country = 'United States' AND ca_state IN ('MT', 'OH', 'OR')) AND ss_net_profit BETWEEN 150 AND 300))) OR (EXISTS (SELECT 1 FROM customer_demographics WHERE cd_demo_sk = ss_cdemo_sk AND cd_marital_status = 'S' AND cd_education_status = 'College') AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1 AND ((EXISTS (SELECT 1 FROM customer_address WHERE ca_address_sk = ss_addr_sk AND ca_country = 'United States' AND ca_state IN ('GA', 'IL', 'TX')) AND ss_net_profit BETWEEN 50 AND 250))))", "note": "恢复原始SQL的cdemo-addr严格配对:U+College仅配IN/NM/VA,W+2yrDegree仅配MT/OH/OR,S+College仅配GA/IL/TX,并恢复每组特定的ss_sales_price范围约束"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正上轮问题：每个OR分支内的addr条件通过嵌套AND结构与对应的cdemo条件严格绑定，恢复了原始SQL的cdemo-addr配对约束，不再扩大结果集范围。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 405511.0 -> 75915.0 (重写侧约为原的 18.7208%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+⚠️ 检测到成本爆炸：重写 cost 增幅 146543.0% (> 1000%)，达到最大轮次后终止。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1049
+   - 规则序列: ['JOIN_SUB_QUERY_TO_CORRELATE', 'FILTER_MERGE', 'FILTER_REDUCE_EXPRESSIONS']
+   - 优化组别: 连接优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=996805.81, 重写=1461746422.05，相对变化: -146543.05%
+✅ 成功存储，记录ID: c926e9e7-b6e7-40ad-8208-61d9cfa53668
+
+🎲 UCT Math Update: 3 rules, reward=+0.1151 (cost=-1.0000, rows=+0.8128, depth=+0.3000, oc=996805.8100, rc=1461746422.0500)
+   结构分细节: rows 405511.0->75915.0 (score=+0.813), depth 10.0->7.0 (score=+0.300)
+✅ UCT Update Complete:
+   → JOIN_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.500, conf=0.80, lambda=0.40, reward=+0.048, count=14, avg=+0.038
+   → FILTER_MERGE: P(s,a)=N/A, effect=0.300, conf=0.70, lambda=0.35, reward=+0.037, count=21, avg=+0.042
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.200, conf=0.60, lambda=0.30, reward=+0.031, count=76, avg=+0.034
+
+----------------------------------------
+

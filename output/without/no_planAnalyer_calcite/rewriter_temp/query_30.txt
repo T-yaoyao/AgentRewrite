@@ -1,0 +1,103 @@
+Query ID: 30
+==================================================
+
+Original: SELECT MGR, SUM(SUM_SAL) FROM (SELECT MGR, SUM(SAL) AS SUM_SAL FROM EMP GROUP BY MGR, DEPTNO HAVING DEPTNO = 100) AS t2 GROUP BY MGR
+Rewritten: SELECT MGR, SUM(SAL) FROM EMP WHERE DEPTNO = 100 GROUP BY MGR
+Time Cost: 131.29s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将子查询中的HAVING DEPTNO=100下推为WHERE DEPTNO=100，在扫描阶段即过滤数据，减少参与聚合的行数，降低Seq Scan的有效代价'}, {'group': '聚合优化', 'produced_suggestion': '消除子查询中冗余的DEPTNO分组键（HAVING已限定DEPTNO=100为常量），GROUP BY仅保留MGR，减少分组维度和中间结果'}, {'group': '子查询优化', 'produced_suggestion': '合并内外两层聚合为单层：WHERE DEPTNO=100后直接GROUP BY MGR并SUM(SAL)，消除子查询嵌套和二次聚合的Gather Merge开销'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示对45M行的emp表进行全表扫描(Seq Scan, Total Cost=702880.12)，且存在两层聚合嵌套。外层子查询按MGR和DEPTNO分组后用HAVING过滤DEPTNO=100，再在外层按MGR聚合。可通过谓词下推将HAVING条件转为WHERE，消除冗余的DEPTNO分组键，并简化为单层聚合，减少中间结果集和计算开销。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将子查询中的HAVING DEPTNO=100下推为WHERE DEPTNO=100，在扫描阶段即过滤数据，减少参与聚合的行数，降低Seq Scan的有效代价"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除子查询中冗余的DEPTNO分组键（HAVING已限定DEPTNO=100为常量），GROUP BY仅保留MGR，减少分组维度和中间结果"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "合并内外两层聚合为单层：WHERE DEPTNO=100后直接GROUP BY MGR并SUM(SAL)，消除子查询嵌套和二次聚合的Gather Merge开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+{
+  "groups": "聚合优化, 谓词简化, 子查询优化",
+  "applied_rules": ["FILTER_AGGREGATE_TRANSPOSE", "AGGREGATE_ANY_PULL_UP_CONSTANTS", "AGGREGATE_MERGE"],
+  "rule_effect_scores": {
+    "FILTER_AGGREGATE_TRANSPOSE": 0.4,
+    "AGGREGATE_ANY_PULL_UP_CONSTANTS": 0.2,
+    "AGGREGATE_MERGE": 0.4
+  },
+  "rule_effect_confidence": {
+    "FILTER_AGGREGATE_TRANSPOSE": 0.9,
+    "AGGREGATE_ANY_PULL_UP_CONSTANTS": 0.8,
+    "AGGREGATE_MERGE": 0.9
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "FILTER_AGGREGATE_TRANSPOSE",
+    "AGGREGATE_ANY_PULL_UP_CONSTANTS",
+    "AGGREGATE_MERGE"
+  ],
+  "rewritten_sql": "SELECT MGR, SUM(SAL) FROM EMP WHERE DEPTNO = 100 GROUP BY MGR",
+  "semantic_correctness_guarantee": "1. **FILTER_AGGREGATE_TRANSPOSE应用**：将子查询中的HAVING DEPTNO=100下推为WHERE DEPTNO=100，在扫描阶段即过滤数据。由于DEPTNO是分组键之一且HAVING条件仅依赖该分组键，下推后语义等价：原SQL先按(MGR,DEPTNO)分组再过滤DEPTNO=100的组，等价于先过滤DEPTNO=100的行再分组。\n2. **AGGREGATE_ANY_PULL_UP_CONSTANTS应用**：消除子查询中的DEPTNO分组键。由于WHERE DEPTNO=100已将DEPTNO限定为常量100，所有参与聚合的行DEPTNO均为100，GROUP BY (MGR, DEPTNO)等价于GROUP BY MGR（DEPTNO不再产生分组差异）。移除常量分组键后，每个MGR对应的SUM(SAL)结果不变。\n3. **AGGREGATE_MERGE应用**：合并内外两层聚合为单层。原SQL外层对子查询结果按MGR分组并SUM(SUM_SAL)，等价于对基表按MGR分组并SUM(SAL)。由于子查询已按MGR分组（DEPTNO为常量不影响分组），外层再按MGR分组时每个MGR仅对应一行，SUM(SUM_SAL)直接等于子查询的SUM_SAL。因此可直接在基表上WHERE DEPTNO=100后GROUP BY MGR并SUM(SAL)。\n4. **结果集等价性验证**：原SQL返回每个MGR在DEPTNO=100部门的工资总和；重写SQL同样返回WHERE DEPTNO=100条件下每个MGR的SUM(SAL)，列名MGR和聚合值完全一致。\n5. **NULL值处理**：MGR列可为NULL（Schema中MGR INTEGER无NOT NULL约束），原SQL和重写SQL对NULL值的MGR均作为独立分组键处理，GROUP BY行为一致。\n6. **无重复行风险**：EMP表有主键empno，WHERE过滤后不会产生重复行；单层聚合GROUP BY MGR的结果与两层聚合嵌套的结果在行数和分组逻辑上完全等价。\n7. **无ORDER BY/LIMIT影响**：原SQL和重写SQL均无ORDER BY或LIMIT子句，结果集顺序不影响语义等价性；聚合结果仅依赖分组键和聚合函数，与行顺序无关。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过三步规则变换与原始SQL等价：HAVING下推为WHERE、消除常量分组键DEPTNO、合并两层聚合为单层，最终结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 387.0 -> 286.0 (重写侧约为原的 73.9018%)
+```json
+{
+  "terminate": true,
+  "reason": "执行计划变化：消除了一层冗余聚合节点（Aggregate从2个减少到1个），Plan Rows累加从387降至286（降幅26%）。结构性改进：(1)通过HAVING→WHERE下推，过滤在扫描阶段即生效；(2)消除子查询中冗余的DEPTNO分组键；(3)合并内外两层聚合为单层，减少中间物化和Gather Merge开销。改进点：SQL逻辑层面实现谓词下推+聚合合并，执行计划层面减少聚合节点和中间结果集。成本：Total Cost从703897.34微降至703894.56（降幅0.0039%），虽然幅度极小但方向正确。结论：结构明确改进（去除冗余聚合层、减少分组维度、降低行数估计），且cost未恶化，满足终止条件a和d，优化成功。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 124
+   - 规则序列: ['FILTER_AGGREGATE_TRANSPOSE', 'AGGREGATE_ANY_PULL_UP_CONSTANTS', 'AGGREGATE_MERGE']
+   - 优化组别: 聚合优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=703897.34, 重写=703894.56，相对变化: 0.00%
+✅ 成功存储，记录ID: 71c1c4b8-c7d3-4767-80b6-ed9251bf9813
+
+🎲 UCT Math Update: 3 rules, reward=+0.1644 (cost=+0.0000, rows=+0.2610, depth=+0.2000, oc=703897.3400, rc=703894.5600)
+   结构分细节: rows 387.0->286.0 (score=+0.261), depth 5.0->4.0 (score=+0.200)
+✅ UCT Update Complete:
+   → FILTER_AGGREGATE_TRANSPOSE: P(s,a)=N/A, effect=0.400, conf=0.90, lambda=0.45, reward=+0.063, count=27, avg=+0.222
+   → AGGREGATE_ANY_PULL_UP_CONSTANTS: P(s,a)=N/A, effect=0.200, conf=0.80, lambda=0.40, reward=+0.046, count=2, avg=+0.039
+   → AGGREGATE_MERGE: P(s,a)=N/A, effect=0.400, conf=0.90, lambda=0.45, reward=+0.056, count=8, avg=+0.173
+
+----------------------------------------
+

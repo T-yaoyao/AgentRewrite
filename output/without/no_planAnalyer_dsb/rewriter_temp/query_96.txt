@@ -1,0 +1,170 @@
+Query ID: 96
+==================================================
+
+Original: select    cd_gender,   cd_marital_status,   cd_education_status,   count(*) cnt1,   cd_purchase_estimate,   count(*) cnt2,   cd_credit_rating,   count(*) cnt3  from   customer c,customer_address ca,customer_demographics  where   c.c_current_addr_sk = ca.ca_address_sk and   ca_state in ('MD','MO','OK') and   cd_demo_sk = c.c_current_cdemo_sk   and cd_marital_status in ('W', 'U', 'W')   and cd_education_status in ('Primary', 'Primary') and   exists (select *           from store_sales,date_dim           where c.c_customer_sk = ss_customer_sk and                 ss_sold_date_sk = d_date_sk and                 d_year = 2002 and                 d_moy between 5 and 5+2                 and ss_list_price between 132 and 221           ) and    (not exists (select *             from web_sales,date_dim             where c.c_customer_sk = ws_bill_customer_sk and                   ws_sold_date_sk = d_date_sk and                   d_year = 2002 and                   d_moy between 5 and 5+2                   and ws_list_price between 132 and 221             ) and     not exists (select *             from catalog_sales,date_dim             where c.c_customer_sk = cs_ship_customer_sk and                   cs_sold_date_sk = d_date_sk and                   d_year = 2002 and                   d_moy between 5 and 5+2                   and cs_list_price between 132 and 221)             )  group by cd_gender,           cd_marital_status,           cd_education_status,           cd_purchase_estimate,           cd_credit_rating  order by cd_gender,           cd_marital_status,           cd_education_status,           cd_purchase_estimate,           cd_credit_rating  limit 100;
+Rewritten: WITH date_filtered AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2002 AND d_moy BETWEEN 5 AND 7
+),
+store_customers AS (
+  SELECT DISTINCT ss_customer_sk
+  FROM store_sales
+  JOIN date_filtered ON ss_sold_date_sk = d_date_sk
+  WHERE ss_list_price BETWEEN 132 AND 221
+),
+web_customers AS (
+  SELECT DISTINCT ws_bill_customer_sk
+  FROM web_sales
+  JOIN date_filtered ON ws_sold_date_sk = d_date_sk
+  WHERE ws_list_price BETWEEN 132 AND 221
+),
+catalog_customers AS (
+  SELECT DISTINCT cs_ship_customer_sk
+  FROM catalog_sales
+  JOIN date_filtered ON cs_sold_date_sk = d_date_sk
+  WHERE cs_list_price BETWEEN 132 AND 221
+)
+SELECT
+  cd_gender,
+  cd_marital_status,
+  cd_education_status,
+  COUNT(*) AS cnt1,
+  cd_purchase_estimate,
+  COUNT(*) AS cnt2,
+  cd_credit_rating,
+  COUNT(*) AS cnt3
+FROM customer c
+JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_state IN ('MD', 'MO', 'OK')
+JOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk AND cd.cd_marital_status IN ('W', 'U') AND cd.cd_education_status = 'Primary'
+JOIN store_customers sc ON c.c_customer_sk = sc.ss_customer_sk
+LEFT JOIN web_customers wc ON c.c_customer_sk = wc.ws_bill_customer_sk
+LEFT JOIN catalog_customers cc ON c.c_customer_sk = cc.cs_ship_customer_sk
+WHERE wc.ws_bill_customer_sk IS NULL AND cc.cs_ship_customer_sk IS NULL
+GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+LIMIT 100
+Time Cost: 148.65s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将EXISTS子查询显式转换为INNER JOIN或Semi Join，将NOT EXISTS子查询转换为LEFT JOIN + IS NULL或Anti Join，避免Nested Loop反复物化扫描。特别是store_sales的EXISTS已被优化为Semi Join，但web_sales和catalog_sales的NOT EXISTS仍使用低效的Anti Nested Loop，应统一转换为Hash Anti Join。'}, {'group': '谓词简化', 'produced_suggestion': "简化冗余IN条件：cd_marital_status in ('W','U','W')简化为in ('W','U')，cd_education_status in ('Primary','Primary')简化为='Primary'。将date_dim的过滤条件(d_year=2002 AND d_moy BETWEEN 5 AND 7)提取为CTE或子查询，避免重复扫描date_dim表3次。"}, {'group': '常量折叠', 'produced_suggestion': "预计算常量表达式：将'd_moy between 5 and 5+2'中的'5+2'计算为7，改写为'd_moy between 5 and 7'。将价格范围'between 132 and 221'作为常量在所有三个销售表的扫描中统一应用。"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：先执行小表date_dim与销售表的Hash Join过滤(当前已部分实现)，然后再与customer表关联。将customer与customer_address的Hash Join结果与customer_demographics的Index Scan结果先物化，再与销售表Semi/Anti Join，减少重复扫描customer表。考虑将三个销售表的date_dim过滤结果合并为一个CTE，避免date_dim被扫描3次。'}, {'group': '聚合优化', 'produced_suggestion': '当前GROUP BY包含5个字段且需要排序(Sort代价726180.44)，考虑在Semi/Anti Join之前先对customer_demographics进行预聚合或去重，减少后续连接的数据量。由于最终LIMIT 100，可考虑在聚合前增加Top-N优化。'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示多个明显性能瓶颈：1) 三个大表(store_sales 28.8M行, catalog_sales 14.4M行, web_sales 7.2M行)均进行全表扫描(Seq Scan)且代价极高(692193.53, 458923.89, 230649.25)；2) 两个Anti Join使用Nested Loop且无索引支持，导致重复物化扫描(Materialize代价465090.16和235766.99)；3) EXISTS和NOT EXISTS子查询未转换为高效的Semi/Anti Join形式，而是通过嵌套循环实现；4) date_dim表被扫描3次(d_year=2002且d_moy between 5 and 7的相同条件)，存在冗余计算；5) 谓词条件cd_marital_status in ('W','U','W')和cd_education_status in ('Primary','Primary')存在重复值，未简化；6) 常量表达式5+2未预计算。历史案例显示相似SQL通过CTE分解、谓词下推、连接条件优化等组合策略可显著提升性能。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS子查询显式转换为INNER JOIN或Semi Join，将NOT EXISTS子查询转换为LEFT JOIN + IS NULL或Anti Join，避免Nested Loop反复物化扫描。特别是store_sales的EXISTS已被优化为Semi Join，但web_sales和catalog_sales的NOT EXISTS仍使用低效的Anti Nested Loop，应统一转换为Hash Anti Join。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "简化冗余IN条件：cd_marital_status in ('W','U','W')简化为in ('W','U')，cd_education_status in ('Primary','Primary')简化为='Primary'。将date_dim的过滤条件(d_year=2002 AND d_moy BETWEEN 5 AND 7)提取为CTE或子查询，避免重复扫描date_dim表3次。"
+    },
+    {
+      "group": "常量折叠",
+      "produced_suggestion": "预计算常量表达式：将'd_moy between 5 and 5+2'中的'5+2'计算为7，改写为'd_moy between 5 and 7'。将价格范围'between 132 and 221'作为常量在所有三个销售表的扫描中统一应用。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先执行小表date_dim与销售表的Hash Join过滤(当前已部分实现)，然后再与customer表关联。将customer与customer_address的Hash Join结果与customer_demographics的Index Scan结果先物化，再与销售表Semi/Anti Join，减少重复扫描customer表。考虑将三个销售表的date_dim过滤结果合并为一个CTE，避免date_dim被扫描3次。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "当前GROUP BY包含5个字段且需要排序(Sort代价726180.44)，考虑在Semi/Anti Join之前先对customer_demographics进行预聚合或去重，减少后续连接的数据量。由于最终LIMIT 100，可考虑在聚合前增加Top-N优化。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 82 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.213
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+{
+  "groups": "子查询优化, 谓词简化, 常量折叠, 连接优化, 聚合优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "JOIN_CONDITION_PUSH",
+    "FILTER_INTO_JOIN",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES"
+  ],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.3,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.2,
+    "FILTER_REDUCE_EXPRESSIONS": 0.1,
+    "JOIN_CONDITION_PUSH": 0.15,
+    "FILTER_INTO_JOIN": 0.15,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.1
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.7,
+    "FILTER_REDUCE_EXPRESSIONS": 0.9,
+    "JOIN_CONDITION_PUSH": 0.8,
+    "FILTER_INTO_JOIN": 0.8,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.7
+  }
+}
+✅ 选择了 6 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 谓词简化, 常量折叠, 连接优化, 聚合优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "JOIN_CONDITION_PUSH",
+    "FILTER_INTO_JOIN",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES"
+  ],
+  "rewritten_sql": "WITH date_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2002 AND d_moy BETWEEN 5 AND 7\n),\nstore_customers AS (\n  SELECT DISTINCT ss_customer_sk\n  FROM store_sales\n  JOIN date_filtered ON ss_sold_date_sk = d_date_sk\n  WHERE ss_list_price BETWEEN 132 AND 221\n),\nweb_customers AS (\n  SELECT DISTINCT ws_bill_customer_sk\n  FROM web_sales\n  JOIN date_filtered ON ws_sold_date_sk = d_date_sk\n  WHERE ws_list_price BETWEEN 132 AND 221\n),\ncatalog_customers AS (\n  SELECT DISTINCT cs_ship_customer_sk\n  FROM catalog_sales\n  JOIN date_filtered ON cs_sold_date_sk = d_date_sk\n  WHERE cs_list_price BETWEEN 132 AND 221\n)\nSELECT\n  cd_gender,\n  cd_marital_status,\n  cd_education_status,\n  COUNT(*) AS cnt1,\n  cd_purchase_estimate,\n  COUNT(*) AS cnt2,\n  cd_credit_rating,\n  COUNT(*) AS cnt3\nFROM customer c\nJOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_state IN ('MD', 'MO', 'OK')\nJOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk AND cd.cd_marital_status IN ('W', 'U') AND cd.cd_education_status = 'Primary'\nJOIN store_customers sc ON c.c_customer_sk = sc.ss_customer_sk\nLEFT JOIN web_customers wc ON c.c_customer_sk = wc.ws_bill_customer_sk\nLEFT JOIN catalog_customers cc ON c.c_customer_sk = cc.cs_ship_customer_sk\nWHERE wc.ws_bill_customer_sk IS NULL AND cc.cs_ship_customer_sk IS NULL\nGROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating\nORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **CTE提取date_dim过滤**:原SQL中date_dim的过滤条件(d_year=2002 AND d_moy BETWEEN 5 AND 7)在三个子查询中重复出现。通过CTE date_filtered提取该过滤,避免重复扫描date_dim表,但date_dim.d_date_sk是主键,每次JOIN的结果集与原SQL完全一致。\n\n2. **EXISTS转Semi Join**:原SQL的EXISTS子查询(store_sales)被改写为CTE store_customers,通过DISTINCT ss_customer_sk去重后与customer表INNER JOIN。由于只需判断存在性,DISTINCT确保每个customer_sk最多出现一次,INNER JOIN语义等价于EXISTS(只保留在store_sales中有匹配记录的customer)。\n\n3. **NOT EXISTS转Anti Join**:原SQL的两个NOT EXISTS子查询(web_sales和catalog_sales)被改写为CTE(web_customers和catalog_customers),通过LEFT JOIN + IS NULL实现Anti Join。LEFT JOIN保留左表所有行,IS NULL过滤掉右表有匹配的行,语义等价于NOT EXISTS(只保留在web_sales和catalog_sales中无匹配记录的customer)。\n\n4. **谓词简化**:cd_marital_status IN ('W','U','W')简化为IN ('W','U'),去除重复值'W';cd_education_status IN ('Primary','Primary')简化为='Primary',去除冗余IN。简化后过滤条件与原SQL等价,但表达更简洁。\n\n5. **常量折叠**:d_moy BETWEEN 5 AND 5+2计算为BETWEEN 5 AND 7,预计算常量表达式,避免运行时重复计算,结果集不变。\n\n6. **过滤条件下推到JOIN ON**:将ca_state、cd_marital_status、cd_education_status的过滤条件从WHERE子句移到对应JOIN的ON子句中。由于这些都是INNER JOIN,ON子句中的过滤与WHERE子句中的过滤语义完全等价,但ON子句过滤可在JOIN阶段提前减少中间结果。\n\n7. **关键等价性保证**:customer表通过c_customer_sk与三个销售表关联,c_customer_sk是主键,确保关联的唯一性。store_customers的INNER JOIN保证只保留EXISTS条件满足的customer;web_customers和catalog_customers的LEFT JOIN + IS NULL保证只保留NOT EXISTS条件满足的customer。最终结果集与原SQL完全一致:只包含在store_sales中有购买记录,但在web_sales和catalog_sales中无购买记录的customer,且满足所有维度表过滤条件。\n\n8. **GROUP BY和ORDER BY保持不变**:聚合字段、分组字段、排序字段与原SQL完全一致,LIMIT 100确保返回前100行,结果集顺序和内容与原SQL等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过CTE提取公共过滤、EXISTS改写为INNER JOIN + DISTINCT、NOT EXISTS改写为LEFT JOIN + IS NULL、谓词简化及条件下推，与原始SQL在结果集上完全等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: SeqScan reduced by 2 | Join: NestedLoop 3->1, Hash/Merge 5->7 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "结构上明确改进，满足多项高优先级正信号：1) 去相关成功：原SQL中3个相关子查询（EXISTS/NOT EXISTS）被转换为CTE+JOIN，消除了Nested Loop反复物化扫描；2) 公共结果复用：date_filtered CTE被复用3次，避免date_dim重复扫描；3) 子计划减少：原SQL的Materialize子计划（web_sales/catalog_sales各一次物化）被CTE预聚合替代，减少重复执行；4) 预聚合优化：store_customers/web_customers/catalog_customers通过DISTINCT预聚合压缩中间结果；5) 连接算法优化：Anti Nested Loop转换为Hash Anti Join，提升大表反连接效率。虽然cost从143万增至191万（+33%），但这是CTE物化和预聚合的合理代价，且行数估计求和从476万增至1204万主要因CTE扫描计数方式差异，不代表实际数据膨胀。结构收益（去相关+复用+预聚合）远超cost增幅，符合DSS/OLAP场景优化模式。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1138
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_SUB_QUERY_TO_CORRELATE', 'FILTER_REDUCE_EXPRESSIONS', 'JOIN_CONDITION_PUSH', 'FILTER_INTO_JOIN', 'JOIN_PUSH_TRANSITIVE_PREDICATES']
+   - 优化组别: 子查询优化, 谓词简化, 常量折叠, 连接优化, 聚合优化
+   - 估计代价: 原始=1434042.16, 重写=1907556.87，相对变化: -33.02%
+✅ 成功存储，记录ID: c58a6d4d-647f-49b4-a110-67a081ac65bc
+
+🎲 UCT Math Update: 6 rules, reward=-0.0991 (cost=-0.3302, rows=+0.0000, depth=+0.0000, oc=1434042.1600, rc=1907556.8700)
+   结构分细节: rows 4760091.0->12042577.0 (score=+0.000), depth 12.0->12.0 (score=+0.000)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.300, conf=0.80, lambda=0.40, reward=-0.025, count=317, avg=+0.041
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=-0.019, count=86, avg=+0.045
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.100, conf=0.90, lambda=0.45, reward=-0.014, count=89, avg=+0.030
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.150, conf=0.80, lambda=0.40, reward=-0.015, count=304, avg=+0.009
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.150, conf=0.80, lambda=0.40, reward=-0.014, count=362, avg=+0.019
+   → JOIN_PUSH_TRANSITIVE_PREDICATES: P(s,a)=N/A, effect=0.100, conf=0.70, lambda=0.35, reward=-0.012, count=126, avg=+0.006
+
+----------------------------------------
+

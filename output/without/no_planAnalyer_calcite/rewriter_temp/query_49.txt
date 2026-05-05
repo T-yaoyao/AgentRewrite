@@ -1,0 +1,104 @@
+Query ID: 49
+==================================================
+
+Original: select * from emp e1  where e1.empno > SOME (select deptno from dept)
+Rewritten: WITH dept_min AS (
+  SELECT MIN(deptno) AS min_deptno
+  FROM dept
+)
+SELECT e1.*
+FROM emp e1
+CROSS JOIN dept_min
+WHERE e1.empno > dept_min.min_deptno
+Time Cost: 197.73s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将'empno > SOME (select deptno from dept)'改写为'EXISTS (SELECT 1 FROM dept WHERE deptno < e1.empno)'或'empno > (SELECT MIN(deptno) FROM dept)'。后者通过聚合将子查询转为常量比较，可完全消除Nested Loop，仅需一次dept聚合扫描。"}, {'group': '聚合优化', 'produced_suggestion': "利用dept表的统计信息(450000行)和索引dept_pkey，将子查询聚合为'SELECT MIN(deptno) FROM dept'，优化器可通过索引直接获取最小值(Index Only Scan limit 1)，代价极低，然后将条件简化为'e1.empno > <常量>'，emp表可利用emp_pkey索引进行Range Scan。"}, {'group': '谓词简化', 'produced_suggestion': "若改写为'empno > (SELECT MIN(deptno) FROM dept)'，谓词变为简单比较'empno > 常量'，可在emp表上利用emp_pkey索引进行Index Scan(empno > 常量)，避免全表扫描，预计可将emp扫描代价从656004.9降低到索引范围扫描级别。"}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示使用了Nested Loop Semi Join，外表emp进行全表扫描(Seq Scan)代价高达656004.9，内表dept通过索引扫描但循环次数极高(18750090次外表行 × 索引查找)，总代价达8911252.62。子查询'empno > SOME (select deptno from dept)'可以改写为等价的JOIN或EXISTS形式，并通过谓词转换和聚合优化减少循环次数。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将'empno > SOME (select deptno from dept)'改写为'EXISTS (SELECT 1 FROM dept WHERE deptno < e1.empno)'或'empno > (SELECT MIN(deptno) FROM dept)'。后者通过聚合将子查询转为常量比较，可完全消除Nested Loop，仅需一次dept聚合扫描。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "利用dept表的统计信息(450000行)和索引dept_pkey，将子查询聚合为'SELECT MIN(deptno) FROM dept'，优化器可通过索引直接获取最小值(Index Only Scan limit 1)，代价极低，然后将条件简化为'e1.empno > <常量>'，emp表可利用emp_pkey索引进行Range Scan。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "若改写为'empno > (SELECT MIN(deptno) FROM dept)'，谓词变为简单比较'empno > 常量'，可在emp表上利用emp_pkey索引进行Index Scan(empno > 常量)，避免全表扫描，预计可将emp扫描代价从656004.9降低到索引范围扫描级别。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.221
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{
+  "groups": "聚合优化, 谓词简化, 子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "AGGREGATE_FILTER_TRANSPOSE", "FILTER_REDUCE_EXPRESSIONS"],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.4,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.3,
+    "FILTER_REDUCE_EXPRESSIONS": 0.3
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.8,
+    "FILTER_REDUCE_EXPRESSIONS": 0.9
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "AGGREGATE_FILTER_TRANSPOSE",
+    "FILTER_REDUCE_EXPRESSIONS"
+  ],
+  "rewritten_sql": "WITH dept_min AS (\n  SELECT MIN(deptno) AS min_deptno\n  FROM dept\n)\nSELECT e1.*\nFROM emp e1\nCROSS JOIN dept_min\nWHERE e1.empno > dept_min.min_deptno",
+  "semantic_correctness_guarantee": "1. 结构性改写说明：原SQL使用'empno > SOME (select deptno from dept)'子查询比较，根据SQL标准，SOME等价于ANY，表示empno大于dept.deptno集合中的任意一个值即满足条件。重写后将子查询提取为CTE(dept_min)，计算dept表中deptno的最小值，然后通过CROSS JOIN将该常量值关联到主查询，条件改写为'e1.empno > dept_min.min_deptno'。\n\n2. 语义等价性证明：根据比较谓词语义，'empno > SOME (select deptno from dept)'等价于'empno > MIN(select deptno from dept)'。这是因为只要empno大于dept.deptno集合中的最小值，就必然大于集合中的至少一个值(即最小值本身)，从而满足SOME条件。反之，如果empno小于等于最小值，则不可能大于集合中的任何值。因此将子查询聚合为MIN(deptno)在语义上完全等价。\n\n3. 结果集一致性保证：原查询返回emp表中所有满足条件的行的全部列(SELECT *)，重写后的查询同样返回emp表的全部列(e1.*)，且过滤条件在逻辑上等价，因此结果集的行数、列结构、数据内容完全一致。\n\n4. 空值处理正确性：根据提供的Schema，dept.deptno定义为NOT NULL，因此MIN(deptno)不会返回NULL。即使dept表为空，MIN会返回NULL，此时'empno > NULL'的比较结果为UNKNOWN(等同于FALSE)，与原查询在空表情况下的行为一致(子查询返回空集，SOME条件不满足)。\n\n5. CTE提取的合理性：将子查询提取为CTE(STRATEGY_CTE_DECOMPOSITION)并计算聚合值，使得子查询只需执行一次，通过CROSS JOIN将常量值传递给主查询，避免了原查询中可能的相关子查询重复执行。\n\n6. 谓词简化的正确性：将'empno > SOME (subquery)'简化为'empno > 常量'(FILTER_REDUCE_EXPRESSIONS)，消除了子查询的复杂性，使得条件变为简单的标量比较，可利用emp_pkey索引进行高效的Range Scan。\n\n7. 聚合下推的有效性：通过在CTE中对dept表进行聚合(AGGREGATE_FILTER_TRANSPOSE的变体应用)，将450000行的dept表聚合为单个MIN值，大幅减少了后续JOIN的数据量，且由于dept_pkey索引的存在，MIN聚合可通过Index Only Scan高效完成。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "原始SQL的'empno > SOME (select deptno from dept)'在语义上等价于'empno > MIN(deptno)'，重写SQL通过CTE计算MIN(deptno)并用CROSS JOIN传递该常量值，过滤条件'e1.empno > dept_min.min_deptno'与原始条件完全等价，结果集一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 1->0, index-like 1->2 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 40150192.0 -> 30450146.0 (重写侧约为原的 75.8406%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。 | 检测到通过 CROSS JOIN/显式连接方式复用CTE结果，说明边界或参数值被一次性计算并复用。
+✅ 估计代价降幅 93.0% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 66
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'AGGREGATE_FILTER_TRANSPOSE', 'FILTER_REDUCE_EXPRESSIONS']
+   - 优化组别: 聚合优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=10412259.82, 重写=733194.0，相对变化: 92.96%
+✅ 成功存储，记录ID: 519cb2c2-b757-44ed-92a6-1bbe90d046e2
+
+🎲 UCT Math Update: 3 rules, reward=+0.2755 (cost=+0.9296, rows=+0.2416, depth=-0.3333, oc=10412259.8200, rc=733194.0000)
+   结构分细节: rows 40150192.0->30450146.0 (score=+0.242), depth 3.0->4.0 (score=-0.333)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.400, conf=0.70, lambda=0.35, reward=+0.105, count=267, avg=+0.050
+   → AGGREGATE_FILTER_TRANSPOSE: P(s,a)=N/A, effect=0.300, conf=0.80, lambda=0.40, reward=+0.088, count=36, avg=+0.016
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.300, conf=0.90, lambda=0.45, reward=+0.083, count=70, avg=+0.034
+
+----------------------------------------
+

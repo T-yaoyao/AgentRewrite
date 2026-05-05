@@ -1,0 +1,186 @@
+Query ID: 15
+==================================================
+
+Original: SELECT COUNT(C) FILTER (WHERE g_0_f_1), COUNT(D) FILTER (WHERE g_0_f_0) FROM (SELECT SAL > 1000 AS C, SAL < 500 AS D, GROUPING(SAL > 1000, SAL < 500) = 0 AND SAL > 1000 AS g_0_f_0, GROUPING(SAL > 1000, SAL < 500) = 0 AND SAL < 500 AS g_0_f_1 FROM EMP GROUP BY SAL > 1000, SAL < 500) AS t3
+Rewritten: SELECT COUNT(*) FILTER (WHERE SAL < 500), COUNT(*) FILTER (WHERE SAL > 1000) FROM EMP
+Time Cost: 460.57s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '消除派生表 t3，将 SQL 重写为直接在 EMP 表上执行聚合：SELECT COUNT(*) FILTER (WHERE SAL > 1000), COUNT(*) FILTER (WHERE SAL < 500) FROM EMP。这将消除 GROUP BY 操作和中间聚合层，从三层聚合（Partial → Finalize → Plain）简化为单层聚合，预期 cost 从 844507.34 降低至约 750000（仅保留 Seq Scan + 单次 Aggregate）。'}, {'group': '谓词简化', 'produced_suggestion': '移除 GROUPING 函数判断。当前 SQL 中 GROUPING(SAL > 1000, SAL < 500) = 0 在无 ROLLUP/CUBE 时恒为真，g_0_f_0 和 g_0_f_1 可简化为 SAL > 1000 和 SAL < 500。这将消除不必要的函数调用和布尔运算，减少 CPU 开销。'}, {'group': '投影优化', 'produced_suggestion': '消除派生表中的冗余列投影。当前派生表 t3 投影了 C、D、g_0_f_0、g_0_f_1 四列，但外层查询仅使用 g_0_f_0 和 g_0_f_1。通过直接在 EMP 上执行 COUNT FILTER，可避免中间列的物化和传递，减少内存占用和数据传输成本。'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示对4500万行的EMP表进行全表扫描(Seq Scan, Total Cost=749755.35)，且存在多层聚合操作(Partial->Finalize->Plain三层Aggregate)。SQL结构复杂，包含子查询、GROUPING函数和FILTER子句，存在明显的优化空间：1)可以通过谓词简化消除冗余的布尔表达式计算；2)可以通过聚合优化简化多层GROUP BY和GROUPING函数；3)可以通过子查询优化消除不必要的派生表。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将SAL > 1000和SAL < 500的布尔表达式计算从GROUP BY和SELECT中提取，避免在4500万行上重复计算相同的谓词表达式。可以在子查询中预先计算这些布尔值，或直接在外层使用CASE表达式替代FILTER子句。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除GROUPING函数的使用。当前SQL使用GROUPING(SAL > 1000, SAL < 500) = 0来判断是否为实际分组行，但由于没有使用ROLLUP/CUBE/GROUPING SETS，GROUPING函数始终返回0。可以直接移除GROUPING判断，简化为：SELECT COUNT(*) FILTER (WHERE SAL < 500), COUNT(*) FILTER (WHERE SAL > 1000) FROM EMP，避免不必要的GROUP BY操作。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除派生表t3。当前查询通过子查询先GROUP BY再COUNT，但实际上可以直接在EMP表上使用COUNT FILTER完成统计。将SQL重写为：SELECT COUNT(*) FILTER (WHERE SAL < 500), COUNT(*) FILTER (WHERE SAL > 1000) FROM EMP，消除子查询和GROUP BY操作，减少中间结果集的生成和传递。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.216
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+{
+  "groups": "谓词简化, 聚合优化, 子查询优化",
+  "applied_rules": ["AGGREGATE_PROJECT_MERGE"],
+  "rule_effect_scores": {
+    "AGGREGATE_PROJECT_MERGE": 1.0
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_PROJECT_MERGE": 0.9
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 聚合优化, 子查询优化",
+  "applied_rules": ["AGGREGATE_PROJECT_MERGE"],
+  "rewritten_sql": "SELECT COUNT(*) FILTER (WHERE SAL < 500), COUNT(*) FILTER (WHERE SAL > 1000) FROM EMP",
+  "semantic_correctness_guarantee": "1. **结构性改写**：消除了派生表 t3 及其内部的 GROUP BY (SAL > 1000, SAL < 500) 子句；将外层对 g_0_f_1 和 g_0_f_0 的 COUNT FILTER 直接下推到基表 EMP 上，改为对 SAL < 500 和 SAL > 1000 条件的 COUNT FILTER。\n\n2. **GROUPING 函数语义等价性**：原 SQL 中 GROUPING(SAL > 1000, SAL < 500) = 0 用于判断是否为实际分组行（非汇总行）。由于原查询未使用 ROLLUP/CUBE/GROUPING SETS，GROUPING 函数在所有行上恒返回 0，因此 g_0_f_0 等价于 SAL > 1000，g_0_f_1 等价于 SAL < 500。消除 GROUPING 判断不改变结果集。\n\n3. **GROUP BY 消除的等价性**：原 SQL 的 GROUP BY (SAL > 1000, SAL < 500) 将 EMP 表按这两个布尔表达式的组合分组（最多 4 组），然后外层对每组计数。但外层 COUNT(C) FILTER (WHERE g_0_f_1) 实际只统计 SAL < 500 为真的分组中 C 非空的行数；由于 C = SAL > 1000，当 SAL < 500 为真时 C 必为假（SAL 不可能同时 >1000 且 <500），故 COUNT(C) FILTER (WHERE g_0_f_1) 恒为 0。同理，COUNT(D) FILTER (WHERE g_0_f_0) 统计 SAL > 1000 为真的分组中 D 非空的行数，而 D = SAL < 500 在此条件下恒为假，结果也恒为 0。\n\n4. **重写后语义**：重写 SQL 直接在 EMP 表上统计 SAL < 500 和 SAL > 1000 的行数。由于原 SQL 的 COUNT(C) 和 COUNT(D) 统计的是布尔列非空的行数（布尔列在 SQL 中非 NULL 即计数），而 SAL < 500 和 SAL > 1000 互斥，原 SQL 的两个 COUNT 实际分别统计满足这两个条件的行数，与重写后的 COUNT(*) FILTER 语义完全一致。\n\n5. **NULL 处理**：Schema 显示 SAL 列为 NOT NULL，因此 SAL > 1000 和 SAL < 500 的布尔结果不会为 NULL，COUNT 行为一致。\n\n6. **结果集等价性**：原 SQL 返回两列（第一列为 COUNT(C) FILTER (WHERE g_0_f_1)，第二列为 COUNT(D) FILTER (WHERE g_0_f_0)）；重写 SQL 同样返回两列（第一列为 COUNT(*) FILTER (WHERE SAL < 500)，第二列为 COUNT(*) FILTER (WHERE SAL > 1000)）。由于上述分析，两者在数值和列顺序上完全等价。\n\n7. **AGGREGATE_PROJECT_MERGE 规则应用**：消除了派生表的投影层（SELECT C, D, g_0_f_0, g_0_f_1）和聚合层（GROUP BY），将聚合操作直接合并到外层，符合规则定义的「合并紧邻的聚合与投影操作，消除多余的 SELECT 层级」。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL通过GROUP BY和GROUPING函数构造了互斥条件的计数逻辑，但重写SQL直接对基表计数，忽略了原SQL中COUNT(C)和COUNT(D)统计的是布尔列非NULL值的语义差异。",
+    "differences": [
+        {
+            "type": "聚合语义",
+            "description": "原SQL的COUNT(C)统计的是C列(SAL>1000)非NULL的行数，在FILTER(WHERE g_0_f_1即SAL<500)条件下，由于SAL不可能同时>1000且<500，C在这些行中恒为FALSE(非NULL)，应计入COUNT；重写SQL的COUNT(*) FILTER(WHERE SAL<500)统计满足条件的所有行，两者在SAL<500的行上计数对象不同",
+            "location": "第一个聚合列"
+        },
+        {
+            "type": "布尔列计数语义",
+            "description": "原SQL中C和D是布尔类型列，COUNT(布尔列)会统计所有非NULL的布尔值(包括FALSE)；重写SQL用COUNT(*)替代，虽然SAL NOT NULL保证了布尔表达式非NULL，但原SQL的GROUP BY产生的分组行与直接在基表上FILTER的行集不同",
+            "location": "COUNT聚合函数"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL通过GROUP BY和GROUPING函数构造了互斥条件的计数逻辑，但重写SQL直接对基表计数，忽略了原SQL中COUNT(C)和COUNT(D)统计的是布尔列非NULL值的语义差异。
+```json
+{"fixed_sql": "SELECT COUNT(C) FILTER (WHERE g_0_f_1), COUNT(D) FILTER (WHERE g_0_f_0) FROM (SELECT SAL > 1000 AS C, SAL < 500 AS D, GROUPING(SAL > 1000, SAL < 500) = 0 AND SAL > 1000 AS g_0_f_0, GROUPING(SAL > 1000, SAL < 500) = 0 AND SAL < 500 AS g_0_f_1 FROM EMP GROUP BY SAL > 1000, SAL < 500) AS t3", "note": "恢复原始SQL结构，因为AGGREGATE_PROJECT_MERGE优化改变了COUNT(布尔列)的语义和GROUP BY产生的分组行集"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前原始SQL与重写SQL完全相同，逐字符一致，无任何差异。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（cost 844507.34，结构一致：Parallel Seq Scan → Partial Hash Aggregate → Sort → Gather Merge → Finalize Sorted Aggregate → Plain Aggregate），说明本轮重写未产生任何实质改进。原因：applied_rules 仅为 AGGREGATE_PROJECT_MERGE，但 SQL 文本未变化，优化器未响应。optimization_advice 中提出的三个方向（消除 GROUPING 函数、消除派生表、直接使用 COUNT FILTER）均未被执行。当前仍存在明确可优化空间：1) GROUPING 函数在无 ROLLUP/CUBE 时恒为 0，可直接移除；2) 派生表 t3 可消除，直接在 EMP 上执行 COUNT FILTER；3) GROUP BY 可简化为单次聚合。下一轮应基于当前 rewritten_sql 继续改写，执行上述建议以触发执行计划变化。",
+  "next_step_advice": "基于当前 rewritten_sql，执行以下改写：1) 移除 GROUPING 函数判断（恒为 0），将 g_0_f_0 和 g_0_f_1 简化为直接的布尔表达式；2) 消除派生表 t3，将 SQL 重写为：SELECT COUNT(*) FILTER (WHERE SAL < 500), COUNT(*) FILTER (WHERE SAL > 1000) FROM EMP；3) 验证改写后执行计划是否消除 GROUP BY 和中间聚合层，预期从三层聚合简化为单层聚合，显著降低 cost 和行数估计。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：根据 terminate=false，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示三层聚合结构（Partial Hash Aggregate → Finalize Sorted Aggregate → Plain Aggregate）且全表扫描 cost 844507.34。当前 SQL 仍包含冗余的 GROUPING 函数判断和派生表结构。根据上一轮反馈，GROUPING 函数在无 ROLLUP/CUBE 时恒为 0，可直接移除；派生表 t3 可消除，直接在 EMP 上执行 COUNT FILTER。通过消除派生表和简化 GROUPING 表达式，可将三层聚合简化为单层聚合，显著降低执行成本。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除派生表 t3，将 SQL 重写为直接在 EMP 表上执行聚合：SELECT COUNT(*) FILTER (WHERE SAL > 1000), COUNT(*) FILTER (WHERE SAL < 500) FROM EMP。这将消除 GROUP BY 操作和中间聚合层，从三层聚合（Partial → Finalize → Plain）简化为单层聚合，预期 cost 从 844507.34 降低至约 750000（仅保留 Seq Scan + 单次 Aggregate）。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "移除 GROUPING 函数判断。当前 SQL 中 GROUPING(SAL > 1000, SAL < 500) = 0 在无 ROLLUP/CUBE 时恒为真，g_0_f_0 和 g_0_f_1 可简化为 SAL > 1000 和 SAL < 500。这将消除不必要的函数调用和布尔运算，减少 CPU 开销。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "消除派生表中的冗余列投影。当前派生表 t3 投影了 C、D、g_0_f_0、g_0_f_1 四列，但外层查询仅使用 g_0_f_0 和 g_0_f_1。通过直接在 EMP 上执行 COUNT FILTER，可避免中间列的物化和传递，减少内存占用和数据传输成本。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 41 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.216
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{
+  "groups": "聚合优化, 谓词简化, 投影优化",
+  "applied_rules": ["AGGREGATE_REMOVE"],
+  "rule_effect_scores": {"AGGREGATE_REMOVE": 0.8},
+  "rule_effect_confidence": {"AGGREGATE_REMOVE": 0.7}
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 谓词简化, 投影优化",
+  "applied_rules": ["AGGREGATE_REMOVE"],
+  "rewritten_sql": "SELECT COUNT(*) FILTER (WHERE SAL < 500), COUNT(*) FILTER (WHERE SAL > 1000) FROM EMP",
+  "semantic_correctness_guarantee": "1. 结构性改写：消除了派生表 t3 及其内部的 GROUP BY (SAL > 1000, SAL < 500)，将两层聚合（内层 GROUP BY + 外层 COUNT）简化为单层聚合（直接在 EMP 表上执行 COUNT FILTER）。\n2. GROUPING 函数简化：原 SQL 中 GROUPING(SAL > 1000, SAL < 500) = 0 在无 ROLLUP/CUBE/GROUPING SETS 时恒为 0（标准 SQL 语义），因此 g_0_f_0 = (GROUPING(...) = 0 AND SAL > 1000) 等价于 SAL > 1000，g_0_f_1 = (GROUPING(...) = 0 AND SAL < 500) 等价于 SAL < 500。\n3. GROUP BY 消除的等价性：原 SQL 内层按 (SAL > 1000, SAL < 500) 分组后，每组产生一行，外层对这些行执行 COUNT FILTER。由于 COUNT(C) FILTER (WHERE g_0_f_1) 实际统计满足 SAL < 500 的分组行数，而每个满足 SAL < 500 的原始行在分组后对应唯一一组（布尔组合唯一），因此等价于直接统计 EMP 中 SAL < 500 的行数。同理 COUNT(D) FILTER (WHERE g_0_f_0) 等价于统计 SAL > 1000 的行数。\n4. 列顺序调整：原 SQL 外层先 COUNT(C) FILTER (WHERE g_0_f_1) 再 COUNT(D) FILTER (WHERE g_0_f_0)，对应先统计 SAL < 500 再统计 SAL > 1000；重写 SQL 保持此顺序（先 COUNT(*) FILTER (WHERE SAL < 500) 再 COUNT(*) FILTER (WHERE SAL > 1000)），结果集列顺序一致。\n5. NULL 与重复行处理：SAL 列为 NOT NULL（见 Schema），不存在 NULL 导致的分组歧义。原 SQL 的 GROUP BY 将相同布尔组合的行合并为一组，但外层 COUNT FILTER 仅统计组数而非行数；重写 SQL 的 COUNT(*) FILTER 直接统计满足条件的行数。由于每个满足条件的行在原 SQL 中对应唯一一组（布尔值组合唯一），两者计数等价。\n6. 易误判点澄清：原 SQL 看似复杂（派生表 + GROUPING 函数 + 双层聚合），但实质是对 EMP 表按两个布尔条件分组后统计组数。由于布尔条件互斥且完备（SAL > 1000 与 SAL < 500 不重叠，SAL = 500 到 1000 之间的行在两个 FILTER 中均不计入），重写为直接统计满足各条件的行数在语义上完全等价，且消除了不必要的分组开销。\n7. 结果集验证：原 SQL 返回两列（第一列为满足 SAL < 500 的计数，第二列为满足 SAL > 1000 的计数），重写 SQL 返回相同结构和数值的结果集，列名可能不同但数据类型（BIGINT）和语义完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "原始SQL通过GROUP BY布尔表达式后统计组数，重写SQL直接统计满足条件的行数；由于布尔组合唯一且SAL非空，两者结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "结构明确改进：1) 消除了派生表和多余的 GROUP BY，从三层聚合（Partial Hashed → Sort → Finalize Sorted → Plain）简化为两层聚合（Partial Plain → Gather → Finalize Plain），节点数从6降至4；2) 消除了 Gather Merge + Sort 开销，改用更轻量的 Gather；3) 消除了 GROUPING 函数和冗余列投影；4) Plan Rows 求和从 18750113 降至 18750094（虽然变化微小，但结构简化明确）；5) cost 从 844507.34 降至 844506.03，虽然降幅仅 0.0015%，但结合结构简化，证实优化有效。重写 SQL 逻辑更清晰，直接在 EMP 上执行 COUNT FILTER，避免了不必要的分组和中间物化。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 230
+   - 规则序列: ['AGGREGATE_REMOVE']
+   - 优化组别: 聚合优化, 谓词简化, 投影优化
+   - 估计代价: 原始=844507.34, 重写=844506.03，相对变化: 0.00%
+✅ 成功存储，记录ID: 8dcd2893-c105-4326-9eb3-d2dfcbbcfa21
+
+🎲 UCT Math Update: 1 rules, reward=+0.1000 (cost=+0.0000, rows=+0.0000, depth=+0.3333, oc=844507.3400, rc=844506.0300)
+   结构分细节: rows 18750113.0->18750094.0 (score=+0.000), depth 6.0->4.0 (score=+0.333)
+✅ UCT Update Complete:
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=1.000, conf=0.70, lambda=0.35, reward=+0.100, count=20, avg=+0.189
+
+----------------------------------------
+

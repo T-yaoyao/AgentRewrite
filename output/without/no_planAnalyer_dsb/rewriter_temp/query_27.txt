@@ -1,0 +1,233 @@
+Query ID: 27
+==================================================
+
+Original: select min(i_item_id),         min(ca_country),         min(ca_state),         min(ca_county),         min(cs_quantity),         min(cs_list_price),         min(cs_coupon_amt),         min(cs_sales_price),         min(cs_net_profit),         min(c_birth_year),         min(cd_dep_count)  from catalog_sales, customer_demographics, customer, customer_address, date_dim, item  where cs_sold_date_sk = d_date_sk and        cs_item_sk = i_item_sk and        cs_bill_cdemo_sk = cd_demo_sk and        cs_bill_customer_sk = c_customer_sk and        cd_gender = 'F' and        cd_education_status = 'Secondary' and        c_current_addr_sk = ca_address_sk and        d_year = 2001 and        c_birth_month = 1 and        ca_state in ('MS', 'NY', 'VA')        and cs_wholesale_cost BETWEEN 65 AND 70        AND i_category = 'Women' ;
+Rewritten: SELECT min(i.i_item_id),
+       min(ca.ca_country),
+       min(ca.ca_state),
+       min(ca.ca_county),
+       min(cs.cs_quantity),
+       min(cs.cs_list_price),
+       min(cs.cs_coupon_amt),
+       min(cs.cs_sales_price),
+       min(cs.cs_net_profit),
+       min(c.c_birth_year),
+       min(cd.cd_dep_count)
+FROM item i
+CROSS JOIN LATERAL (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2001
+) d
+CROSS JOIN LATERAL (
+  SELECT cs_item_sk, cs_bill_cdemo_sk, cs_bill_customer_sk, cs_sold_date_sk,
+         cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit
+  FROM catalog_sales
+  WHERE cs_item_sk = i.i_item_sk
+    AND cs_sold_date_sk = d.d_date_sk
+    AND cs_wholesale_cost BETWEEN 65 AND 70
+) cs
+CROSS JOIN LATERAL (
+  SELECT cd_demo_sk, cd_dep_count
+  FROM customer_demographics
+  WHERE cd_demo_sk = cs.cs_bill_cdemo_sk
+    AND cd_gender = 'F'
+    AND cd_education_status = 'Secondary'
+) cd
+CROSS JOIN LATERAL (
+  SELECT c_customer_sk, c_current_addr_sk, c_birth_year
+  FROM customer
+  WHERE c_customer_sk = cs.cs_bill_customer_sk
+    AND c_birth_month = 1
+) c
+CROSS JOIN LATERAL (
+  SELECT ca_address_sk, ca_country, ca_state, ca_county
+  FROM customer_address
+  WHERE ca_address_sk = c.c_current_addr_sk
+    AND ca_state IN ('MS', 'NY', 'VA')
+) ca
+WHERE i.i_category = 'Women'
+Time Cost: 286.16s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': "将高选择性小表date_dim(d_year=2001, 213行)和item(i_category='Women')作为驱动表，通过INNER JOIN catalog_sales并利用EXISTS半连接提前过滤。调整连接顺序为：date_dim -> item -> catalog_sales(cs_sold_date_sk+cs_item_sk双键查找) -> customer_demographics -> customer -> customer_address，减少大表扫描范围"}, {'group': '子查询优化', 'produced_suggestion': '将catalog_sales的cs_wholesale_cost过滤改为EXISTS子查询：WHERE EXISTS (SELECT 1 FROM catalog_sales cs2 WHERE cs2.cs_item_sk=item.i_item_sk AND cs2.cs_sold_date_sk=date_dim.d_date_sk AND cs2.cs_wholesale_cost BETWEEN 65 AND 70)，利用索引catalog_sales_pkey(cs_item_sk)避免全表扫描'}, {'group': '谓词简化', 'produced_suggestion': "将customer_demographics、customer、customer_address的过滤条件通过IN子查询预物化：WHERE cs_bill_cdemo_sk IN (SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender='F' AND cd_education_status='Secondary')，减少Nested Loop回表次数，利用索引批量查找"}, {'group': '连接优化', 'produced_suggestion': '针对catalog_sales缺失索引的情况，尝试将JOIN改为半连接：SELECT ... FROM item JOIN date_dim ON ... WHERE EXISTS (SELECT 1 FROM catalog_sales WHERE cs_item_sk=item.i_item_sk AND cs_sold_date_sk=date_dim.d_date_sk AND cs_wholesale_cost BETWEEN 65 AND 70 AND cs_bill_customer_sk IN (...))，先用小表构建过滤条件再探测大表'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示catalog_sales表进行了全表扫描(Seq Scan)，代价高达458923.89，且估计扫描139570行。虽然已有主键索引，但WHERE条件cs_wholesale_cost BETWEEN 65 AND 70无法利用现有索引。此外，多层Nested Loop连接在并行执行后仍有优化空间，可通过谓词下推、连接顺序调整和过滤条件优化来减少中间结果集大小。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将catalog_sales表的过滤条件cs_wholesale_cost BETWEEN 65 AND 70与其他高选择性过滤条件(如date_dim.d_year=2001、item.i_category='Women')尽早应用，减少后续连接的数据量。考虑将这些过滤条件在JOIN之前通过子查询或CTE预先过滤。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先连接高选择性的小表(date_dim过滤后213行、item过滤后的结果)，再连接catalog_sales大表。将date_dim和item的过滤条件前置，形成更小的驱动表，避免catalog_sales全表扫描后再过滤。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将catalog_sales的过滤条件(cs_wholesale_cost、cs_sold_date_sk、cs_item_sk)封装为派生表或CTE，先进行过滤和连接date_dim、item，形成中间结果集后再与customer、customer_demographics、customer_address连接，减少Nested Loop的迭代次数。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在各个连接阶段仅保留后续操作必需的列(连接键、过滤列、最终MIN聚合列)，消除不必要的列传递，减少中间结果集的数据传输开销。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 55 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "FILTER_INTO_JOIN": 0.2,
+    "JOIN_CONDITION_PUSH": 0.2,
+    "PROJECT_JOIN_TRANSPOSE": 0.1
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "FILTER_INTO_JOIN": 0.7,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "PROJECT_JOIN_TRANSPOSE": 0.6
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "WITH cs_filtered AS (\n  SELECT cs_item_sk, cs_bill_cdemo_sk, cs_bill_customer_sk, cs_sold_date_sk,\n         cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit\n  FROM catalog_sales\n  WHERE cs_wholesale_cost BETWEEN 65 AND 70\n),\ndate_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2001\n),\nitem_filtered AS (\n  SELECT i_item_sk, i_item_id\n  FROM item\n  WHERE i_category = 'Women'\n),\ncd_filtered AS (\n  SELECT cd_demo_sk, cd_dep_count\n  FROM customer_demographics\n  WHERE cd_gender = 'F' AND cd_education_status = 'Secondary'\n),\ncust_filtered AS (\n  SELECT c_customer_sk, c_current_addr_sk, c_birth_year\n  FROM customer\n  WHERE c_birth_month = 1\n),\nca_filtered AS (\n  SELECT ca_address_sk, ca_country, ca_state, ca_county\n  FROM customer_address\n  WHERE ca_state IN ('MS', 'NY', 'VA')\n)\nSELECT min(i.i_item_id),\n       min(ca.ca_country),\n       min(ca.ca_state),\n       min(ca.ca_county),\n       min(cs.cs_quantity),\n       min(cs.cs_list_price),\n       min(cs.cs_coupon_amt),\n       min(cs.cs_sales_price),\n       min(cs.cs_net_profit),\n       min(c.c_birth_year),\n       min(cd.cd_dep_count)\nFROM cs_filtered cs\nJOIN date_filtered d ON cs.cs_sold_date_sk = d.d_date_sk\nJOIN item_filtered i ON cs.cs_item_sk = i.i_item_sk\nJOIN cd_filtered cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk\nJOIN cust_filtered c ON cs.cs_bill_customer_sk = c.c_customer_sk\nJOIN ca_filtered ca ON c.c_current_addr_sk = ca.ca_address_sk",
+  "semantic_correctness_guarantee": "1. **CTE提取与过滤下推**：将原SQL中WHERE子句的所有过滤条件按表分别提取到6个CTE中(cs_filtered、date_filtered、item_filtered、cd_filtered、cust_filtered、ca_filtered)，每个CTE仅保留后续JOIN和最终投影所需的列。这是STRATEGY_CTE_DECOMPOSITION和PROJECT_JOIN_TRANSPOSE的应用，将过滤操作前置到各表的CTE中，减少JOIN时的数据量。\n\n2. **过滤条件与JOIN键的对应关系**：\n   - cs_filtered: 保留cs_wholesale_cost BETWEEN 65 AND 70的过滤，保留连接键cs_sold_date_sk、cs_item_sk、cs_bill_cdemo_sk、cs_bill_customer_sk及最终MIN聚合所需列\n   - date_filtered: 保留d_year=2001过滤，保留连接键d_date_sk\n   - item_filtered: 保留i_category='Women'过滤，保留连接键i_item_sk及最终MIN所需的i_item_id\n   - cd_filtered: 保留cd_gender='F' AND cd_education_status='Secondary'过滤，保留连接键cd_demo_sk及最终MIN所需的cd_dep_count\n   - cust_filtered: 保留c_birth_month=1过滤，保留连接键c_customer_sk、c_current_addr_sk及最终MIN所需的c_birth_year\n   - ca_filtered: 保留ca_state IN ('MS','NY','VA')过滤，保留连接键ca_address_sk及最终MIN所需的ca_country、ca_state、ca_county\n\n3. **JOIN顺序与等价性保证**：原SQL使用隐式INNER JOIN(逗号分隔)，重写后使用显式INNER JOIN。JOIN顺序调整为：先连接高选择性的date_filtered和item_filtered到cs_filtered，再连接cd_filtered、cust_filtered、ca_filtered。由于所有JOIN都是INNER JOIN且连接条件为等值连接(ON子句中的等式)，根据关系代数的交换律和结合律，JOIN顺序的改变不影响最终结果集的语义等价性。\n\n4. **过滤条件提前与结果集等价性**：原SQL在WHERE子句中对各表进行过滤后再JOIN，重写SQL在CTE中对各表提前过滤后再JOIN。由于INNER JOIN的语义是：先做笛卡尔积，再应用ON条件和WHERE条件进行过滤。将WHERE条件中仅依赖单表的谓词提前到CTE中执行，与在JOIN后通过WHERE过滤的结果集完全等价(这是FILTER_INTO_JOIN和JOIN_CONDITION_PUSH的应用)，因为过滤掉的行在原SQL的JOIN结果中也不会出现。\n\n5. **投影列的完整性**：重写SQL在各CTE中仅保留后续操作必需的列(连接键、过滤列、最终MIN聚合列)，最终SELECT子句对这些列执行MIN聚合。原SQL的SELECT子句对所有表的相应列执行MIN聚合，重写SQL保证了所有被MIN聚合的列都通过CTE传递到最终SELECT，因此聚合结果与原SQL等价。\n\n6. **MIN聚合的语义保持**：原SQL和重写SQL都对相同的11个列执行MIN聚合，且聚合的输入行集合(经过所有过滤和JOIN后的结果集)完全相同。MIN函数对NULL值的处理在两个SQL中一致(MIN忽略NULL值)，因此聚合结果等价。\n\n7. **主键与连接键的正确性**：catalog_sales的主键是(cs_item_sk, cs_order_number)，重写SQL通过cs_item_sk与item_filtered连接，通过cs_sold_date_sk与date_filtered连接，通过cs_bill_cdemo_sk与cd_filtered连接，通过cs_bill_customer_sk与cust_filtered连接。customer通过c_current_addr_sk与ca_filtered连接。所有连接键与原SQL的WHERE子句中的等值条件一致，保证了JOIN的正确性和结果集的等价性。\n\n8. **NULL值处理的等价性**：原SQL和重写SQL在JOIN和过滤时对NULL值的处理逻辑一致。例如，cs_wholesale_cost BETWEEN 65 AND 70会过滤掉NULL值，ca_state IN ('MS','NY','VA')也会过滤掉NULL值。CTE中的过滤与原SQL的WHERE过滤对NULL的处理完全相同，因此不会引入或遗漏任何行。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过CTE将原SQL的WHERE过滤条件按表分解并下推，再用显式INNER JOIN重组，所有过滤条件、连接键、投影列及MIN聚合语义与原SQL完全一致，结果集等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（cost、节点类型、扫描方式、连接顺序均无变化），说明优化器未采纳CTE重写。虽然重写SQL引入了6个CTE意图预过滤和复用中间结果，但实际执行计划显示：1) catalog_sales仍为全表扫描（139570行估计）；2) 所有CTE被优化器内联展开，未产生物化或复用效果；3) 连接顺序、索引使用、并行度均与原SQL一致。结构上无改进也无恶化，属于'无效重写'而非'明确恶化'。但由于本轮未产生任何优化收益，且仍存在可执行的优化空间（如强制物化CTE、调整JOIN顺序、引入索引提示），应继续下一轮优化。",
+  "next_step_advice": "优化器将CTE完全内联，未实现预期的过滤复用。下一轮建议：1) 在关键CTE（如cs_filtered、date_filtered）后添加OFFSET 0或LIMIT NULL强制物化，阻止优化器内联；2) 尝试将高选择性过滤条件（d_year=2001、i_category='Women'）的表作为驱动表，通过STRAIGHT_JOIN或显式JOIN顺序提示优先连接小表；3) 检查catalog_sales.cs_wholesale_cost、cs_sold_date_sk是否有索引，若无则考虑在CTE中使用EXISTS半连接替代JOIN，减少大表扫描范围；4) 若数据库支持，尝试用临时表替代CTE实现真正的中间结果物化。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示catalog_sales全表扫描(458923.89 cost)是主要瓶颈，占总成本99%。虽然CTE已将过滤条件分离，但优化器将其内联后仍采用Seq Scan。关键问题：1) catalog_sales缺乏cs_wholesale_cost、cs_sold_date_sk的索引，导致139570行估计扫描；2) 连接顺序不合理，大表catalog_sales作为驱动表，而高选择性维度表(date_dim 213行、item Women类目)未优先过滤；3) 多层Nested Loop连接(item/customer/customer_demographics/customer_address)逐层回表，未利用批量索引查找。可通过调整连接顺序、引入半连接、添加索引提示等重写优化。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将高选择性小表date_dim(d_year=2001, 213行)和item(i_category='Women')作为驱动表，通过INNER JOIN catalog_sales并利用EXISTS半连接提前过滤。调整连接顺序为：date_dim -> item -> catalog_sales(cs_sold_date_sk+cs_item_sk双键查找) -> customer_demographics -> customer -> customer_address，减少大表扫描范围"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将catalog_sales的cs_wholesale_cost过滤改为EXISTS子查询：WHERE EXISTS (SELECT 1 FROM catalog_sales cs2 WHERE cs2.cs_item_sk=item.i_item_sk AND cs2.cs_sold_date_sk=date_dim.d_date_sk AND cs2.cs_wholesale_cost BETWEEN 65 AND 70)，利用索引catalog_sales_pkey(cs_item_sk)避免全表扫描"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将customer_demographics、customer、customer_address的过滤条件通过IN子查询预物化：WHERE cs_bill_cdemo_sk IN (SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender='F' AND cd_education_status='Secondary')，减少Nested Loop回表次数，利用索引批量查找"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "针对catalog_sales缺失索引的情况，尝试将JOIN改为半连接：SELECT ... FROM item JOIN date_dim ON ... WHERE EXISTS (SELECT 1 FROM catalog_sales WHERE cs_item_sk=item.i_item_sk AND cs_sold_date_sk=date_dim.d_date_sk AND cs_wholesale_cost BETWEEN 65 AND 70 AND cs_bill_customer_sk IN (...))，先用小表构建过滤条件再探测大表"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["JOIN_TO_CORRELATE", "FILTER_CORRELATE"],
+  "rule_effect_scores": {
+    "JOIN_TO_CORRELATE": 0.6,
+    "FILTER_CORRELATE": 0.4
+  },
+  "rule_effect_confidence": {
+    "JOIN_TO_CORRELATE": 0.5,
+    "FILTER_CORRELATE": 0.7
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["JOIN_TO_CORRELATE", "FILTER_CORRELATE"],
+  "rewritten_sql": "SELECT min(i.i_item_id),\n       min(ca.ca_country),\n       min(ca.ca_state),\n       min(ca.ca_county),\n       min(cs.cs_quantity),\n       min(cs.cs_list_price),\n       min(cs.cs_coupon_amt),\n       min(cs.cs_sales_price),\n       min(cs.cs_net_profit),\n       min(c.c_birth_year),\n       min(cd.cd_dep_count)\nFROM item i\nCROSS JOIN LATERAL (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2001\n) d\nCROSS JOIN LATERAL (\n  SELECT cs_item_sk, cs_bill_cdemo_sk, cs_bill_customer_sk, cs_sold_date_sk,\n         cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit\n  FROM catalog_sales\n  WHERE cs_item_sk = i.i_item_sk\n    AND cs_sold_date_sk = d.d_date_sk\n    AND cs_wholesale_cost BETWEEN 65 AND 70\n) cs\nCROSS JOIN LATERAL (\n  SELECT cd_demo_sk, cd_dep_count\n  FROM customer_demographics\n  WHERE cd_demo_sk = cs.cs_bill_cdemo_sk\n    AND cd_gender = 'F'\n    AND cd_education_status = 'Secondary'\n) cd\nCROSS JOIN LATERAL (\n  SELECT c_customer_sk, c_current_addr_sk, c_birth_year\n  FROM customer\n  WHERE c_customer_sk = cs.cs_bill_customer_sk\n    AND c_birth_month = 1\n) c\nCROSS JOIN LATERAL (\n  SELECT ca_address_sk, ca_country, ca_state, ca_county\n  FROM customer_address\n  WHERE ca_address_sk = c.c_current_addr_sk\n    AND ca_state IN ('MS', 'NY', 'VA')\n) ca\nWHERE i.i_category = 'Women'",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原SQL中的6个CTE（cs_filtered、date_filtered、item_filtered、cd_filtered、cust_filtered、ca_filtered）和后续的INNER JOIN链改写为：以item表为驱动表，通过CROSS JOIN LATERAL依次关联date_dim、catalog_sales、customer_demographics、customer、customer_address，每个LATERAL子查询内部包含原CTE的过滤条件和与外层表的关联条件。\n\n2. **JOIN到相关子查询的等价性**：原SQL的INNER JOIN语义要求所有表的关联条件和过滤条件同时满足才返回结果行。重写后的CROSS JOIN LATERAL在PostgreSQL语义下等价于INNER JOIN：当LATERAL子查询返回空集时，整行被过滤（与INNER JOIN的不匹配行为一致）；当返回非空时，与外层行组合（与INNER JOIN的匹配行为一致）。关键关联条件已下推到各LATERAL子查询的WHERE子句中：cs_item_sk=i.i_item_sk、cs_sold_date_sk=d.d_date_sk、cd_demo_sk=cs.cs_bill_cdemo_sk、c_customer_sk=cs.cs_bill_customer_sk、ca_address_sk=c.c_current_addr_sk。\n\n3. **过滤条件下推的等价性**：原SQL在各CTE中预过滤（如cs_wholesale_cost BETWEEN 65 AND 70、d_year=2001、i_category='Women'等），重写后将这些条件保留在对应的LATERAL子查询或最外层WHERE中。由于LATERAL子查询在每次外层行迭代时独立执行，过滤条件的作用域与原CTE+JOIN的组合效果一致：例如cs_wholesale_cost过滤在catalog_sales的LATERAL子查询中，仅对当前i.i_item_sk和d.d_date_sk组合有效的catalog_sales行生效，与原SQL先过滤cs_filtered再JOIN的结果集相同。\n\n4. **聚合函数的等价性**：原SQL和重写SQL均对所有满足条件的行执行min()聚合，无GROUP BY子句，返回单行结果。重写后的LATERAL关联不改变最终参与聚合的行集合：只有当所有6个表（item、date_dim、catalog_sales、customer_demographics、customer、customer_address）的关联和过滤条件全部满足时，才会产生一行参与聚合，与原SQL的INNER JOIN链逻辑完全一致。\n\n5. **主键与关联列的正确性**：catalog_sales的主键为(cs_item_sk, cs_order_number)，重写后通过cs_item_sk=i.i_item_sk关联，虽然未直接使用主键的完整组合，但cs_item_sk是主键的一部分，关联逻辑正确。其他表的主键关联（customer.c_customer_sk、customer_address.ca_address_sk、customer_demographics.cd_demo_sk、date_dim.d_date_sk、item.i_item_sk）在LATERAL子查询的WHERE条件中均已正确引用，保证了与原SQL相同的一对一或一对多关联语义。\n\n6. **NULL值处理的等价性**：原SQL使用INNER JOIN，任何关联列为NULL的行会被自动过滤。重写后的LATERAL子查询在WHERE条件中使用等值比较（如cs_item_sk=i.i_item_sk），当任一侧为NULL时比较结果为FALSE，子查询返回空集，导致该行被过滤，与INNER JOIN的NULL处理行为一致。\n\n7. **易误判点说明**：虽然重写引入了LATERAL相关子查询，但由于所有关联条件和过滤条件均已正确下推，且CROSS JOIN LATERAL在有WHERE关联条件时等价于INNER JOIN，不会产生笛卡尔积或重复行。原SQL的CTE虽然在语法上独立定义，但在执行时被优化器内联，与重写后的LATERAL子查询在逻辑上等价。最终结果集的列、数据类型、聚合值均与原SQL完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写将原SQL的INNER JOIN链改写为CROSS JOIN LATERAL形式，所有关联条件和过滤条件均已正确下推到各LATERAL子查询中，LATERAL在有WHERE关联条件时等价于INNER JOIN，最终参与聚合的行集合完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 检测到通过 CROSS JOIN/显式连接方式复用CTE结果，说明边界或参数值被一次性计算并复用。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（cost 462537.3，结构一致：2个Seq Scan、4个Index Scan、1个Hash Join、4个Nested Loop、2个并行worker），说明 CROSS JOIN LATERAL 改写未被优化器采纳，仍回退到原始 Nested Loop + Hash Join 路径。重写 SQL 虽引入 LATERAL 子查询语法，但未产生任何结构性改进（无去相关、无子计划减少、无CTE复用、无预聚合），也未降低 cost 或行数估计。当前仍存在 catalog_sales 全表扫描（139570行）瓶颈，且未利用小表驱动或半连接优化。",
+  "next_step_advice": "基于当前 enhanced_sql，尝试以下改进：1) 将 item(i_category='Women') 和 date_dim(d_year=2001) 通过 WITH CTE 预物化为驱动表，再 INNER JOIN catalog_sales 并添加 cs_item_sk、cs_sold_date_sk 双键索引提示（如支持）；2) 将 customer_demographics、customer、customer_address 的过滤条件改为 IN 子查询预物化（如 cs_bill_cdemo_sk IN (SELECT cd_demo_sk FROM customer_demographics WHERE ...)），减少 Nested Loop 回表；3) 若优化器仍不采纳，考虑显式 INNER JOIN 顺序提示或半连接改写（EXISTS）强制小表驱动。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 593
+   - 规则序列: ['JOIN_TO_CORRELATE', 'FILTER_CORRELATE']
+   - 优化组别: 连接优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=462537.3, 重写=462537.3，相对变化: 0.00%
+✅ 成功存储，记录ID: 05e143f3-a6d3-4e2f-b062-31369889b73c
+
+🎲 UCT Math Update: 2 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=462537.3000, rc=462537.3000)
+   结构分细节: rows 140734.0->140734.0 (score=+0.000), depth 9.0->9.0 (score=+0.000)
+✅ UCT Update Complete:
+   → JOIN_TO_CORRELATE: P(s,a)=N/A, effect=0.600, conf=0.50, lambda=0.25, reward=+0.000, count=17, avg=-0.015
+   → FILTER_CORRELATE: P(s,a)=N/A, effect=0.400, conf=0.70, lambda=0.35, reward=+0.000, count=14, avg=-0.007
+
+----------------------------------------
+

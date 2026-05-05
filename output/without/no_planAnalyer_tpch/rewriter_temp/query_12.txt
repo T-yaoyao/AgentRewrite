@@ -1,0 +1,109 @@
+Query ID: 12
+==================================================
+
+Original: select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1994-02-01' and o_orderdate < date '1994-02-01' + interval '3' month and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;
+Rewritten: SELECT o_orderpriority, COUNT(*) AS order_count
+FROM orders
+JOIN (SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate) AS sub_lineitem
+ON orders.o_orderkey = sub_lineitem.l_orderkey
+AND orders.o_orderdate >= DATE '1994-02-01'
+AND orders.o_orderdate < DATE '1994-02-01' + INTERVAL '3' MONTH
+GROUP BY o_orderpriority
+ORDER BY o_orderpriority
+Time Cost: 431.37s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将EXISTS子查询转换为SEMI JOIN或IN子查询形式，使优化器能够选择更高效的半连接执行策略，避免先对lineitem全表聚合再与orders关联的低效模式'}, {'group': '谓词简化', 'produced_suggestion': "将orders表的日期过滤条件(o_orderdate >= '1994-02-01' AND o_orderdate < '1994-05-01')与子查询条件合并，使过滤尽早生效，减少参与连接的数据量"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，先过滤orders表(利用日期条件筛选约125万行)，再与lineitem表关联，而非当前的先聚合lineitem再关联orders的方式，可显著降低连接代价'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表进行了全表扫描(Seq Scan)，代价高达1874969.65，扫描约2000万行后再进行聚合去重得到200个orderkey，然后与orders表进行Nested Loop连接。这是典型的EXISTS子查询未充分优化的场景。根据相似历史案例，该SQL指纹曾成功应用FILTER_SUB_QUERY_TO_CORRELATE和FILTER_INTO_JOIN等规则优化。可以将EXISTS子查询转换为半连接(SEMI JOIN)，并将过滤条件下推，避免lineitem全表扫描后再关联orders。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS子查询转换为SEMI JOIN或IN子查询形式，使优化器能够选择更高效的半连接执行策略，避免先对lineitem全表聚合再与orders关联的低效模式"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将orders表的日期过滤条件(o_orderdate >= '1994-02-01' AND o_orderdate < '1994-05-01')与子查询条件合并，使过滤尽早生效，减少参与连接的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，先过滤orders表(利用日期条件筛选约125万行)，再与lineitem表关联，而非当前的先聚合lineitem再关联orders的方式，可显著降低连接代价"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+{
+  "groups": "子查询优化, 谓词简化, 连接优化",
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "SEMI_JOIN_JOIN_TRANSPOSE", "FILTER_INTO_JOIN"],
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.4,
+    "SEMI_JOIN_JOIN_TRANSPOSE": 0.4,
+    "FILTER_INTO_JOIN": 0.2
+  },
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.6,
+    "SEMI_JOIN_JOIN_TRANSPOSE": 0.7,
+    "FILTER_INTO_JOIN": 0.6
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 谓词简化, 连接优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "SEMI_JOIN_JOIN_TRANSPOSE",
+    "FILTER_INTO_JOIN"
+  ],
+  "rewritten_sql": "SELECT o_orderpriority, COUNT(*) AS order_count\nFROM orders\nJOIN (SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate) AS sub_lineitem\nON orders.o_orderkey = sub_lineitem.l_orderkey\nAND orders.o_orderdate >= DATE '1994-02-01'\nAND orders.o_orderdate < DATE '1994-02-01' + INTERVAL '3' MONTH\nGROUP BY o_orderpriority\nORDER BY o_orderpriority",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原 SQL 中的 EXISTS 相关子查询改写为 INNER JOIN + DISTINCT 子查询。原 SQL 的 EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate) 转换为 JOIN (SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate)。\n\n2. 等价性保证 - EXISTS 到 SEMI JOIN：原 EXISTS 子查询的语义是"存在至少一条 lineitem 记录满足 l_orderkey = o_orderkey 且 l_commitdate < l_receiptdate"。改写后的 JOIN + DISTINCT 确保每个满足条件的 o_orderkey 只保留一次（DISTINCT 去重），与 EXISTS 的存在性语义完全等价。由于 lineitem 表的主键是 (l_orderkey, l_linenumber)，同一 l_orderkey 可能有多条记录，DISTINCT 确保不会因多条 lineitem 导致 orders 记录重复计数。\n\n3. 谓词下推到 JOIN ON：将原 WHERE 子句中的 orders 表日期过滤条件 (o_orderdate >= DATE '1994-02-01' AND o_orderdate < DATE '1994-02-01' + INTERVAL '3' MONTH) 移入 JOIN 的 ON 子句。这不改变结果集，因为这些条件仅依赖 orders 表，在 INNER JOIN 中 WHERE 与 ON 对单表过滤条件语义等价。\n\n4. 子查询内过滤保持：lineitem 子查询中的 l_commitdate < l_receiptdate 过滤条件保持在子查询内部，确保只有满足该条件的 l_orderkey 参与 JOIN，与原 EXISTS 子查询的过滤逻辑一致。\n\n5. GROUP BY 与聚合保持：改写后仍按 o_orderpriority 分组并 COUNT(*)，由于 JOIN 后每个符合条件的 o_orderkey 只出现一次（DISTINCT 保证），COUNT(*) 结果与原 SQL 相同。\n\n6. ORDER BY 保持：最终结果按 o_orderpriority 排序，与原 SQL 一致。\n\n7. 易误判点说明：虽然将 EXISTS 改为 JOIN 可能引入重复行风险，但通过在子查询中对 l_orderkey 使用 DISTINCT，确保每个 orders 记录最多匹配一次，避免了重复计数问题。这与 EXISTS 的"存在性检查"语义完全对应。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL将EXISTS相关子查询改写为JOIN + DISTINCT，符合FILTER_SUB_QUERY_TO_CORRELATE规则的典型变换模式，且WHERE条件推入JOIN ON符合FILTER_INTO_JOIN规则；两SQL在orders主键约束下结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 20274762.0 -> 8332496.0 (重写侧约为原的 41.0979%)
+```json
+{
+  "terminate": true,
+  "reason": "结构明确改进：1) 去相关成功：原 EXISTS 子查询转为 JOIN + DISTINCT 派生表，消除了相关子查询的重复执行；2) 并行化增强：引入 Parallel Seq Scan (Workers Planned: 2) 和 Gather Merge，提升大表扫描效率；3) 行数估计求和大幅下降：从 20,274,762 降至 8,332,496 (降至原 41%)，表明数据流显著优化；4) cost 下降 24%：从 1,928,048.65 降至 1,461,158.32，与结构改进一致；5) 过滤前移：日期条件在 Index Scan 层面即生效，减少无效数据参与连接。虽然重写侧增加了 Unique + Gather Merge + Sort 节点，但这是去相关和并行化的必要代价，整体收益远超开销。符合高优先级正信号（去相关 + 公共结果复用 + 并行增强），无灾难性退化证据。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 269
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE', 'SEMI_JOIN_JOIN_TRANSPOSE', 'FILTER_INTO_JOIN']
+   - 优化组别: 子查询优化, 谓词简化, 连接优化
+   - 估计代价: 原始=1928048.65, 重写=1461158.32，相对变化: 24.22%
+✅ 成功存储，记录ID: 21ee83d2-f851-415e-9cc4-7233ca478593
+
+🎲 UCT Math Update: 3 rules, reward=+0.1283 (cost=+0.2422, rows=+0.5890, depth=-0.6000, oc=1928048.6500, rc=1461158.3200)
+   结构分细节: rows 20274762.0->8332496.0 (score=+0.589), depth 5.0->8.0 (score=-0.600)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.400, conf=0.60, lambda=0.30, reward=+0.048, count=60, avg=+0.054
+   → SEMI_JOIN_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.400, conf=0.70, lambda=0.35, reward=+0.045, count=8, avg=+0.082
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.200, conf=0.60, lambda=0.30, reward=+0.034, count=277, avg=+0.022
+
+----------------------------------------
+

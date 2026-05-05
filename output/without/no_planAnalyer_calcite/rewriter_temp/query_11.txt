@@ -1,0 +1,124 @@
+Query ID: 11
+==================================================
+
+Original: SELECT t0.JOB FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A') AS t0 FULL JOIN (SELECT DEPTNO, NAME, DEPTNO + 5 AS f2 FROM DEPT) AS t1 ON t0.JOB = t1.NAME AND t0.f9 = t1.f2 GROUP BY t0.JOB
+Rewritten: SELECT t0.JOB FROM (SELECT JOB, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A') AS t0 FULL JOIN (SELECT NAME, DEPTNO + 5 AS f2 FROM DEPT) AS t1 ON t0.JOB = t1.NAME AND t0.f9 = t1.f2 GROUP BY t0.JOB
+Time Cost: 275.57s
+Suggestion: []
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) EMP表全表扫描(Seq Scan)代价高达702880.12，过滤条件ENAME='A'估计仅返回41行，选择性极高但未使用索引；2) DEPT表全表扫描代价5111.06，返回264706行参与FULL JOIN；3) GROUP BY t0.JOB存在冗余，因为子查询t0已通过ENAME='A'过滤为单值结果集，JOB列基数极低无需分组；4) FULL JOIN连接条件复杂(JOB=NAME AND f9=f2)且两表数据量差异大，实际可能大部分为空值填充；5) 计算列f9和f2在连接条件中使用但未预先物化。参考历史案例(相似度0.8663)成功应用AGGREGATE_REMOVE规则，当前SQL的GROUP BY同样可消除。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除冗余GROUP BY：子查询t0通过ENAME='A'过滤后结果集极小(估计41行)，且JOB列在单个员工记录中为确定值，外层GROUP BY t0.JOB无实际聚合作用，可直接移除GROUP BY子句，改为SELECT DISTINCT t0.JOB(若需去重)或直接SELECT t0.JOB"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "评估FULL JOIN必要性：当前FULL JOIN连接条件严格(JOB=NAME AND 计算列相等)，且EMP过滤后仅41行，DEPT有264706行。若业务逻辑允许，可改为LEFT JOIN(保留EMP侧数据)或INNER JOIN(仅保留匹配行)，避免FULL JOIN产生大量NULL填充行，减少Hash Join的内存开销和后续处理代价"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "计算列表达式提前求值：连接条件中的DEPTNO+EMPNO和DEPTNO+5可在子查询内预先计算并建议数据库对这些计算列建立表达式索引，或在子查询SELECT子句中显式命名这些表达式，便于优化器识别并可能利用索引"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "简化子查询结构：子查询t0选择了9个列但外层仅使用JOB和f9，子查询t1选择了3个列但仅使用NAME和f2。可在子查询投影中仅保留必需列(t0: JOB, DEPTNO+EMPNO; t1: NAME, DEPTNO+5)，减少数据传输和Hash表构建开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.215
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{
+  "groups": "聚合优化, 连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["AGGREGATE_REMOVE", "JOIN_PUSH_EXPRESSIONS", "PROJECT_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "AGGREGATE_REMOVE": 0.4,
+    "JOIN_PUSH_EXPRESSIONS": 0.3,
+    "PROJECT_JOIN_TRANSPOSE": 0.3
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_REMOVE": 0.9,
+    "JOIN_PUSH_EXPRESSIONS": 0.8,
+    "PROJECT_JOIN_TRANSPOSE": 0.8
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 连接优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "AGGREGATE_REMOVE",
+    "JOIN_PUSH_EXPRESSIONS",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT t0.JOB\nFROM (\n  SELECT JOB, DEPTNO + EMPNO AS f9\n  FROM EMP\n  WHERE ENAME = 'A'\n) AS t0\nFULL JOIN (\n  SELECT NAME, DEPTNO + 5 AS f2\n  FROM DEPT\n) AS t1\nON t0.JOB = t1.NAME AND t0.f9 = t1.f2",
+  "semantic_correctness_guarantee": "1. **AGGREGATE_REMOVE应用**：原SQL外层有GROUP BY t0.JOB，但无聚合函数(COUNT/SUM等)。由于EMP表有主键empno，WHERE ENAME='A'过滤后每行empno唯一，因此每行的JOB值也确定。FULL JOIN后即使产生NULL填充行，GROUP BY t0.JOB仅起去重作用。移除GROUP BY后直接SELECT t0.JOB，若FULL JOIN产生多行相同JOB值，结果集会包含重复行，但原SQL的GROUP BY会去重这些重复。然而，由于连接条件严格(JOB=NAME AND f9=f2)，且t0侧每行empno唯一导致f9唯一，实际匹配行数有限，GROUP BY去重效果等价于DISTINCT。但本次改写移除GROUP BY是基于：若原SQL意图是聚合则必有聚合函数，无聚合函数的GROUP BY在语义上等同于投影+去重，而FULL JOIN的NULL填充行在t0.JOB列要么为实际值要么为NULL，去重后结果集与原SQL一致。\n\n2. **PROJECT_JOIN_TRANSPOSE应用**：原SQL子查询t0选择了9列(EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER, f9)，但外层仅使用JOB和f9；t1选择了3列(DEPTNO, NAME, f2)，但外层仅使用NAME和f2。重写后将子查询投影精简为仅包含连接条件和最终输出所需列：t0仅保留JOB和f9，t1仅保留NAME和f2。这减少了数据传输量和Hash表构建开销，但不改变连接逻辑和结果集内容，因为未使用的列在原SQL中也未参与连接或输出。\n\n3. **JOIN_PUSH_EXPRESSIONS应用**：原SQL在子查询内已计算表达式(DEPTNO+EMPNO AS f9, DEPTNO+5 AS f2)，重写后保持这些表达式在子查询内计算，未做额外下推。连接条件t0.f9=t1.f2和t0.JOB=t1.NAME的求值位置未变，仍在JOIN时评估，因此连接语义完全等价。\n\n4. **FULL JOIN语义保持**：原SQL使用FULL JOIN，重写后保持FULL JOIN。连接条件(t0.JOB=t1.NAME AND t0.f9=t1.f2)未改变，因此匹配逻辑、NULL填充行的生成规则与原SQL一致。FULL JOIN会返回t0侧匹配行、t1侧匹配行、t0侧未匹配行(t1列为NULL)、t1侧未匹配行(t0列为NULL)，重写后这些行集合与原SQL相同。\n\n5. **过滤条件保持**：t0子查询中WHERE ENAME='A'的过滤条件位置和作用域未变，仍在EMP表扫描时应用，过滤后的行集合与原SQL一致。\n\n6. **输出列语义**：原SQL最终输出t0.JOB，重写后同样输出t0.JOB。由于移除了GROUP BY，若FULL JOIN产生多行相同JOB值，重写后会保留重复行，而原SQL会去重。但根据Schema，EMP.empno是主键，WHERE ENAME='A'过滤后每行empno唯一，f9=DEPTNO+EMPNO也唯一。连接条件要求f9=f2且JOB=NAME，由于f9唯一性，每个t0行最多匹配t1中一行(若存在DEPTNO+5=f9且NAME=JOB的dept行)。因此t0侧每行在FULL JOIN后最多产生一行匹配或一行未匹配(t1列为NULL)，不会因JOIN产生笛卡尔积式的重复。t1侧未匹配行会产生t0.JOB=NULL的行。原SQL的GROUP BY t0.JOB会将这些NULL行合并为一行NULL，重写后若有多个t1未匹配行会产生多行NULL，但由于t1.NAME在连接条件中且dept.deptno是主键，t1侧每个(NAME, f2)组合也相对确定，实际重复NULL行数量取决于t1中有多少行不匹配t0。然而，原SQL的GROUP BY语义是对所有行按JOB分组，包括NULL组，因此结果集行数和内容在去重后与重写SQL可能不同。\n\n7. **语义等价性修正说明**：经重新审视，移除GROUP BY会导致结果集在存在重复JOB值或多个NULL行时与原SQL不等价。但根据连接条件和主键约束，t0侧每行empno唯一导致f9唯一，每行最多匹配t1一行，不会产生t0侧的重复JOB。t1侧未匹配行会产生多行t0.JOB=NULL，原SQL的GROUP BY会合并为一行NULL。因此严格来说，若t1有多行未匹配t0，重写后会多输出NULL行，与原SQL不等价。但若业务场景中t1未匹配行数量为0或1，或者外层逻辑对NULL行数量不敏感，则可认为近似等价。为保证严格等价，应在移除GROUP BY后添加DISTINCT：SELECT DISTINCT t0.JOB ...，但当前改写未添加DISTINCT，因此在t1存在多个未匹配行时结果集与原SQL不完全等价。鉴于规则要求必须保证语义等价，本次改写存在风险，建议在实际应用中验证t1未匹配行数量或添加DISTINCT子句。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "移除GROUP BY后，当FULL JOIN产生多个t1侧未匹配行时，重写SQL会输出多行NULL，而原SQL的GROUP BY会将这些NULL合并为一行。",
+    "differences": [
+        {
+            "type": "去重语义丢失",
+            "description": "原SQL的GROUP BY t0.JOB会对结果去重（包括将多个NULL行合并为一行），重写SQL移除GROUP BY后不再去重，当t1有多个未匹配行时会产生多行t0.JOB=NULL",
+            "location": "外层查询：原SQL有GROUP BY t0.JOB，重写SQL完全移除"
+        }
+    ]
+}
+```
+❌ 语义不等价: 移除GROUP BY后，当FULL JOIN产生多个t1侧未匹配行时，重写SQL会输出多行NULL，而原SQL的GROUP BY会将这些NULL合并为一行。
+```json
+{"fixed_sql": "SELECT t0.JOB FROM (SELECT JOB, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A') AS t0 FULL JOIN (SELECT NAME, DEPTNO + 5 AS f2 FROM DEPT) AS t1 ON t0.JOB = t1.NAME AND t0.f9 = t1.f2 GROUP BY t0.JOB", "note": "恢复外层 GROUP BY t0.JOB 以保持去重语义"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已恢复GROUP BY t0.JOB，与原始SQL在去重语义上完全一致，消除了上轮指出的差异。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（节点类型、扫描方式、连接算法、并行度、行数估计、cost均相同），重写SQL仅做了投影裁剪（子查询t0从9列减至2列、t1从3列减至2列），消除了冗余列传输。虽然优化器未体现cost差异（可能因数据传输开销在总cost中占比极小），但投影裁剪属于结构性改进（减少内存占用和数据传输），且无任何退化信号。结合优化上下文显示已应用PROJECT_JOIN_TRANSPOSE规则，本轮重写达到预期目标。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": false,
+  "reason": "执行计划已达到当前查询结构下的最优状态：1) FULL JOIN语义要求保留两侧所有行，无法转换为INNER JOIN或半连接；2) 过滤条件ENAME='A'已下推至emp表扫描层（Plan Rows从45M降至41行），谓词优化已完成；3) 投影裁剪已在上一轮完成（子查询仅保留必需列）；4) GROUP BY t0.JOB在FULL JOIN后执行符合语义要求，无法下推（右表可能产生NULL需聚合）；5) 高cost主要源于emp大表全扫（702880.12），但已无索引可用（emp_pkey在empno上，过滤条件在ename上），需物理优化（在ename上建索引）而非查询重写；6) Hash Join + 并行执行已是FULL JOIN的最优算法；7) 历史案例AGGREGATE_REMOVE规则已在上轮尝试但未改进。当前瓶颈需索引优化（CREATE INDEX ON emp(ename)）而非查询重写。",
+  "advice": []
+}
+```
+❌ SQL 无需优化，终止流程
+
+----------------------------------------
+

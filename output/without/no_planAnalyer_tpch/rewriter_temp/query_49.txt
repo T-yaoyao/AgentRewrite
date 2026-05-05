@@ -1,0 +1,99 @@
+Query ID: 49
+==================================================
+
+Original: select c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity) from customer, orders, lineitem where o_orderkey in ( select l_orderkey from lineitem group by l_orderkey having sum(l_quantity) > 315 ) and c_custkey = o_custkey and o_orderkey = l_orderkey group by c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice order by o_totalprice desc, o_orderdate limit 100;
+Rewritten: WITH lineitem_agg AS (
+  SELECT l_orderkey, SUM(l_quantity) AS total_quantity
+  FROM lineitem
+  GROUP BY l_orderkey
+  HAVING SUM(l_quantity) > 315
+)
+SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, la.total_quantity
+FROM customer
+JOIN orders ON c_custkey = o_custkey
+JOIN lineitem_agg la ON o_orderkey = la.l_orderkey
+ORDER BY o_totalprice DESC, o_orderdate
+LIMIT 100
+Time Cost: 70.13s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将IN子查询中的聚合结果提取为CTE，避免lineitem表的重复扫描。将子查询转换为JOIN方式，利用聚合结果直接关联orders表，减少嵌套层次。'}, {'group': '聚合优化', 'produced_suggestion': '将外层GROUP BY与子查询中的聚合合并优化。先对lineitem按l_orderkey分组聚合并过滤sum(l_quantity)>315，然后与orders、customer进行JOIN，最后再进行外层聚合，避免对全量lineitem数据进行多次处理。'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) lineitem表全表扫描(Seq Scan)代价高达1725004.52，扫描近6000万行；2) 子查询中对lineitem再次全表扫描并进行聚合(代价1500056.82)；3) 同一张表lineitem被扫描两次，存在冗余计算；4) 相似历史案例显示该SQL模式可通过CTE分解和聚合下推优化获得性能提升。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将IN子查询中的聚合结果提取为CTE，避免lineitem表的重复扫描。将子查询转换为JOIN方式，利用聚合结果直接关联orders表，减少嵌套层次。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将外层GROUP BY与子查询中的聚合合并优化。先对lineitem按l_orderkey分组聚合并过滤sum(l_quantity)>315，然后与orders、customer进行JOIN，最后再进行外层聚合，避免对全量lineitem数据进行多次处理。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 26 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.212
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_VALUES: UCT=1.100
+{
+  "groups": "子查询优化, 聚合优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"
+  ],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.5
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.8
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 聚合优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"],
+  "rewritten_sql": "WITH lineitem_agg AS (\n  SELECT l_orderkey, SUM(l_quantity) AS total_quantity\n  FROM lineitem\n  GROUP BY l_orderkey\n  HAVING SUM(l_quantity) > 315\n)\nSELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, la.total_quantity\nFROM customer\nJOIN orders ON c_custkey = o_custkey\nJOIN lineitem_agg la ON o_orderkey = la.l_orderkey\nORDER BY o_totalprice DESC, o_orderdate\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原 IN 子查询中的聚合逻辑（SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING SUM(l_quantity) > 315）提取为 CTE（lineitem_agg），并将 IN 半连接转换为 INNER JOIN。\n\n2. 聚合下推与合并：原查询外层对 lineitem 表按 (c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice) 分组并计算 SUM(l_quantity)。由于 o_orderkey 是 lineitem 表的主键前缀（l_orderkey, l_linenumber），且 orders 表的 o_orderkey 是主键，因此按 o_orderkey 分组的 SUM(l_quantity) 在 CTE 中预先计算后，与 orders 表 JOIN 时，每个 o_orderkey 对应唯一的 total_quantity 值，无需外层再次聚合。\n\n3. GROUP BY 消除的等价性：原查询的 GROUP BY (c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice) 中，由于 c_custkey 是 customer 表主键，o_orderkey 是 orders 表主键，且 c_name 函数依赖于 c_custkey，o_orderdate 和 o_totalprice 函数依赖于 o_orderkey，因此分组键实际由两个主键决定。重写后直接 JOIN 三表，每行对应唯一的 (c_custkey, o_orderkey) 组合，结果集与原查询完全一致。\n\n4. 过滤条件等价性：原 IN 子查询的 HAVING SUM(l_quantity) > 315 过滤条件在 CTE 中保持不变，通过 JOIN lineitem_agg 确保只保留满足条件的 o_orderkey，与原 IN 语义等价。\n\n5. 聚合结果等价性：原查询外层 SUM(l_quantity) 对每个 o_orderkey 的所有 lineitem 行求和。由于 lineitem 表按 (l_orderkey, l_linenumber) 主键约束，CTE 中按 l_orderkey 分组的 SUM(l_quantity) 已包含该订单的全部行项，JOIN 后直接引用 total_quantity 与原聚合结果完全相同。\n\n6. 排序与 LIMIT 保持：ORDER BY o_totalprice DESC, o_orderdate 和 LIMIT 100 在重写后保持不变，确保返回相同的 Top 100 结果集。\n\n7. NULL 与重复行处理：由于涉及的连接键均为主键或外键（c_custkey, o_orderkey），且 Schema 中定义为 NOT NULL，不存在 NULL 值导致的语义差异。重写前后均为 INNER JOIN，不会产生额外的重复行或丢失行。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写将IN子查询改为CTE+JOIN，并利用o_orderkey主键消除外层GROUP BY；聚合结果通过CTE预计算后直接引用，与原查询结果集完全一致。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 84982562.0 -> 24995405.0 (重写侧约为原的 29.4124%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+✅ 估计代价降幅 56.5% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 363
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'AGGREGATE_JOIN_TRANSPOSE_EXTENDED']
+   - 优化组别: 子查询优化, 聚合优化
+   - 估计代价: 原始=3452047.73, 重写=1501729.21，相对变化: 56.50%
+✅ 成功存储，记录ID: dfc1a4a9-8c62-4ed3-906e-86474aac8986
+
+🎲 UCT Math Update: 2 rules, reward=+0.5442 (cost=+0.5650, rows=+0.7059, depth=+0.3077, oc=3452047.7300, rc=1501729.2100)
+   结构分细节: rows 84982562.0->24995405.0 (score=+0.706), depth 13.0->9.0 (score=+0.308)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.500, conf=0.80, lambda=0.40, reward=+0.281, count=249, avg=+0.049
+   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: P(s,a)=N/A, effect=0.500, conf=0.80, lambda=0.40, reward=+0.263, count=59, avg=+0.092
+
+----------------------------------------
+

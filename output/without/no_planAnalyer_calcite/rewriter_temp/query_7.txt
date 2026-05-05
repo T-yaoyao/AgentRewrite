@@ -1,0 +1,99 @@
+Query ID: 7
+==================================================
+
+Original: SELECT t2.EMPNO, t2.ENAME, t2.JOB, t2.MGR, t2.HIREDATE, t2.SAL, t2.COMM, t2.DEPTNO, t2.SLACKER, t3.DEPTNO AS DEPTNO0, t3.NAME FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER FROM EMP ORDER BY SAL) AS t2 INNER JOIN (SELECT * FROM DEPT) AS t3 ON t2.DEPTNO = t3.DEPTNO ORDER BY t2.SAL FETCH NEXT 10 ROWS ONLY
+Rewritten: SELECT emp.EMPNO, emp.ENAME, emp.JOB, emp.MGR, emp.HIREDATE, emp.SAL, emp.COMM, emp.DEPTNO, emp.SLACKER, dept.DEPTNO AS DEPTNO0, dept.NAME
+FROM emp
+INNER JOIN dept ON emp.DEPTNO = dept.DEPTNO
+ORDER BY emp.SAL
+FETCH NEXT 10 ROWS ONLY
+Time Cost: 210.48s
+Suggestion: [{'group': '排序优化', 'produced_suggestion': '消除子查询t2中的冗余ORDER BY SAL，因为外层查询已经有ORDER BY t2.SAL，内层排序结果会被外层Nested Loop打乱，完全无效。直接在最外层进行一次排序即可'}, {'group': '子查询优化', 'produced_suggestion': '将子查询t2展开为直接的表引用EMP，消除不必要的派生表包装，减少优化器处理复杂度'}, {'group': '子查询优化', 'produced_suggestion': '将子查询t3展开为直接的表引用DEPT，消除SELECT *的派生表包装，简化查询结构'}, {'group': '投影优化', 'produced_suggestion': '明确列出DEPT表需要的列(DEPTNO, NAME)而非SELECT *，减少数据传输量，虽然当前Memoize已优化但明确投影有助于后续优化'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显的性能瓶颈：1) 子查询t2中的ORDER BY SAL导致了昂贵的Gather Merge和Sort操作(cost=4651410.73..4698285.95)，处理4500万行数据；2) 外层查询又进行了相同的ORDER BY SAL排序，造成冗余排序；3) 子查询t3对DEPT表的SELECT *是不必要的包装；4) 可以通过消除冗余排序、简化子查询来显著降低执行代价",
+  "advice": [
+    {
+      "group": "排序优化",
+      "produced_suggestion": "消除子查询t2中的冗余ORDER BY SAL，因为外层查询已经有ORDER BY t2.SAL，内层排序结果会被外层Nested Loop打乱，完全无效。直接在最外层进行一次排序即可"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将子查询t2展开为直接的表引用EMP，消除不必要的派生表包装，减少优化器处理复杂度"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将子查询t3展开为直接的表引用DEPT，消除SELECT *的派生表包装，简化查询结构"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "明确列出DEPT表需要的列(DEPTNO, NAME)而非SELECT *，减少数据传输量，虽然当前Memoize已优化但明确投影有助于后续优化"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 16 rules
+   → SORT_PROJECT_TRANSPOSE: UCT=1.100
+   → SORT_UNION_TRANSPOSE: UCT=1.100
+   → SORT_UNION_TRANSPOSE_MATCH_NULL_FETCH: UCT=1.100
+{
+  "groups": "排序优化, 子查询优化, 投影优化",
+  "applied_rules": ["SORT_REMOVE", "PROJECT_REMOVE"],
+  "rule_effect_scores": {
+    "SORT_REMOVE": 0.6,
+    "PROJECT_REMOVE": 0.4
+  },
+  "rule_effect_confidence": {
+    "SORT_REMOVE": 0.9,
+    "PROJECT_REMOVE": 0.8
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "排序优化, 子查询优化, 投影优化",
+  "applied_rules": [
+    "SORT_REMOVE",
+    "PROJECT_REMOVE"
+  ],
+  "rewritten_sql": "SELECT emp.EMPNO, emp.ENAME, emp.JOB, emp.MGR, emp.HIREDATE, emp.SAL, emp.COMM, emp.DEPTNO, emp.SLACKER, dept.DEPTNO AS DEPTNO0, dept.NAME\nFROM emp\nINNER JOIN dept ON emp.DEPTNO = dept.DEPTNO\nORDER BY emp.SAL\nFETCH NEXT 10 ROWS ONLY",
+  "semantic_correctness_guarantee": "1. **子查询展开（PROJECT_REMOVE）**：原 SQL 中 t2 子查询为 `(SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER FROM EMP ORDER BY SAL)`，仅做列投影与排序，无聚合、去重或过滤；t3 子查询为 `(SELECT * FROM DEPT)`，仅做全列投影。根据 PROJECT_REMOVE 规则，这两层派生表可直接展开为基表 emp 和 dept，列投影在外层 SELECT 中明确列出，语义完全等价。\n\n2. **冗余排序消除（SORT_REMOVE）**：原 SQL 在 t2 子查询内有 `ORDER BY SAL`，外层又有 `ORDER BY t2.SAL FETCH NEXT 10 ROWS ONLY`。由于 INNER JOIN 操作会打乱子查询的排序结果（Nested Loop 或 Hash Join 均不保证内层排序顺序传递到外层），内层排序对最终结果集无影响。最终排序由外层 `ORDER BY emp.SAL FETCH NEXT 10 ROWS ONLY` 唯一决定，删除内层排序后结果集完全一致。\n\n3. **JOIN 条件与结果集范围**：原 SQL 的 INNER JOIN 条件为 `t2.DEPTNO = t3.DEPTNO`，重写后为 `emp.DEPTNO = dept.DEPTNO`，JOIN 键与作用域未变。由于 dept 表的 deptno 为主键（dept_pkey），每个 emp.DEPTNO 最多匹配一行 dept 记录，JOIN 结果行数等于满足条件的 emp 行数，不会产生笛卡尔积或重复行。\n\n4. **列投影与别名**：原 SQL 外层 SELECT 列出 t2 的 9 列（EMPNO 至 SLACKER）和 t3 的 2 列（DEPTNO AS DEPTNO0, NAME），重写后明确从 emp 和 dept 投影相同列，别名 DEPTNO0 保持一致。由于 t2 和 t3 子查询未做列变换（t2 投影 emp 的 9 列，t3 投影 dept 的全部列），展开后列来源与数据类型完全对应。\n\n5. **FETCH NEXT 10 ROWS ONLY 语义**：原 SQL 和重写 SQL 均在最外层应用 `ORDER BY emp.SAL FETCH NEXT 10 ROWS ONLY`，限制返回 SAL 最小的 10 行（JOIN 后）。由于内层排序已被证明无效，重写后仅保留外层排序与 FETCH，结果集的行数、顺序、内容完全一致。\n\n6. **NULL 与边界情况**：emp.DEPTNO 和 dept.DEPTNO 均为 NOT NULL（根据 Schema），INNER JOIN 不会因 NULL 值产生语义差异。emp.SAL 为 NOT NULL，ORDER BY 排序稳定。若存在 SAL 相同的行，原 SQL 和重写 SQL 的排序结果可能因数据库实现而异，但这是原 SQL 本身的不确定性，重写未引入新的不确定性。\n\n7. **统计信息与索引无关性**：重写仅改变查询结构（消除派生表与冗余排序），不依赖统计信息或索引的具体值。无论 dept 有 450,000 行还是 emp 有 45,000,000 行，逻辑等价性均成立。索引（dept_pkey, emp_pkey）可能影响执行计划，但不影响结果集语义。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过PROJECT_REMOVE展开了两个无语义的派生表（t2仅投影列，t3为SELECT *），并通过SORT_REMOVE消除了内层冗余排序（INNER JOIN会打乱子查询排序，最终顺序由外层ORDER BY唯一决定）；JOIN条件、列投影、FETCH语义均未改变，结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 1->0, Hash/Merge 0->1 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 127500624.0 -> 101779908.0 (重写侧约为原的 79.8270%)
+✅ 估计代价降幅 68.8% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 310
+   - 规则序列: ['SORT_REMOVE', 'PROJECT_REMOVE']
+   - 优化组别: 排序优化, 子查询优化, 投影优化
+   - 估计代价: 原始=4652416.32, 重写=1452006.13，相对变化: 68.79%
+✅ 成功存储，记录ID: bf6b358c-8bc4-4cca-ab79-76d987523470
+
+🎲 UCT Math Update: 2 rules, reward=+0.2271 (cost=+0.6879, rows=+0.2017, depth=-0.2000, oc=4652416.3200, rc=1452006.1300)
+   结构分细节: rows 127500624.0->101779908.0 (score=+0.202), depth 5.0->6.0 (score=-0.200)
+✅ UCT Update Complete:
+   → SORT_REMOVE: P(s,a)=N/A, effect=0.600, conf=0.90, lambda=0.45, reward=+0.127, count=6, avg=+0.140
+   → PROJECT_REMOVE: P(s,a)=N/A, effect=0.400, conf=0.80, lambda=0.40, reward=+0.100, count=28, avg=+0.056
+
+----------------------------------------
+

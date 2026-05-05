@@ -1,0 +1,103 @@
+Query ID: 47
+==================================================
+
+Original: select sum(l_extendedprice) / 7.0 as avg_yearly from lineitem, part where p_partkey = l_partkey and p_brand = 'Brand#32' and p_container = 'WRAP PKG' and l_quantity < ( select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey );
+Rewritten: SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly
+FROM lineitem
+JOIN part ON p_partkey = l_partkey AND p_brand = 'Brand#32' AND p_container = 'WRAP PKG'
+JOIN (
+  SELECT l_partkey, AVG(l_quantity) * 0.2 AS threshold_qty
+  FROM lineitem
+  GROUP BY l_partkey
+) AS subq ON lineitem.l_partkey = subq.l_partkey AND l_quantity < subq.threshold_qty
+Time Cost: 157.77s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将相关子查询转换为JOIN：先对lineitem按l_partkey分组计算avg(l_quantity)，然后与主查询JOIN并应用过滤条件l_quantity < 0.2 * avg_qty，消除每行重复执行子查询的开销'}, {'group': '聚合优化', 'produced_suggestion': '聚合下推：将子查询的聚合计算提前物化为派生表，避免在Hash Join的Join Filter中重复计算，降低SubPlan执行次数'}, {'group': '谓词简化', 'produced_suggestion': '过滤条件下推：将p_brand和p_container的过滤条件尽早应用于part表扫描，减少Hash表大小和后续Join的数据量'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示相关子查询(SubPlan 1)对每个匹配行重复执行全表扫描lineitem(Cost=1875719.48)，导致总成本高达20694446.31。历史案例显示相同SQL指纹通过FILTER_SUB_QUERY_TO_CORRELATE+AGGREGATE_JOIN_TRANSPOSE_EXTENDED优化后性能提升显著。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将相关子查询转换为JOIN：先对lineitem按l_partkey分组计算avg(l_quantity)，然后与主查询JOIN并应用过滤条件l_quantity < 0.2 * avg_qty，消除每行重复执行子查询的开销"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "聚合下推：将子查询的聚合计算提前物化为派生表，避免在Hash Join的Join Filter中重复计算，降低SubPlan执行次数"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "过滤条件下推：将p_brand和p_container的过滤条件尽早应用于part表扫描，减少Hash表大小和后续Join的数据量"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.218
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_VALUES: UCT=1.100
+{
+  "groups": "子查询优化, 聚合优化, 谓词简化",
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "FILTER_INTO_JOIN"],
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.4,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.4,
+    "FILTER_INTO_JOIN": 0.2
+  },
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.512,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.526,
+    "FILTER_INTO_JOIN": 0.394
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 聚合优化, 谓词简化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "FILTER_INTO_JOIN"
+  ],
+  "rewritten_sql": "SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly\nFROM lineitem\nJOIN part ON p_partkey = l_partkey AND p_brand = 'Brand#32' AND p_container = 'WRAP PKG'\nJOIN (\n  SELECT l_partkey, AVG(l_quantity) * 0.2 AS threshold_qty\n  FROM lineitem\n  GROUP BY l_partkey\n) AS subq ON lineitem.l_partkey = subq.l_partkey AND l_quantity < subq.threshold_qty",
+  "semantic_correctness_guarantee": "1. 相关子查询去相关化：原SQL中的相关子查询 `SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey` 被改写为独立的派生表subq，按l_partkey分组预先计算0.2*AVG(l_quantity)作为threshold_qty，然后通过JOIN关联，消除了相关性。\n\n2. 聚合下推到JOIN前：子查询的聚合计算(AVG)被提前物化为派生表subq，避免在原相关子查询中每行重复执行，JOIN条件 `lineitem.l_partkey = subq.l_partkey` 保证了每个lineitem行匹配到正确的partkey对应的阈值。\n\n3. 过滤条件合并到JOIN ON：part表的过滤条件 `p_brand = 'Brand#32' AND p_container = 'WRAP PKG'` 从WHERE子句移入JOIN ON子句，在连接阶段即完成过滤，减少中间结果集大小。\n\n4. 数量比较条件位置调整：原WHERE中的 `l_quantity < (子查询)` 改写为JOIN ON中的 `l_quantity < subq.threshold_qty`，语义等价因为subq.threshold_qty就是原子查询的计算结果0.2*AVG(l_quantity)。\n\n5. 结果集等价性保证：最终SUM聚合的对象仍是满足所有原始条件的lineitem.l_extendedprice行：(1)p_partkey=l_partkey的JOIN条件未变；(2)part表过滤条件p_brand和p_container未变；(3)数量阈值比较l_quantity < 0.2*AVG(按partkey分组)的语义未变，只是计算方式从相关子查询改为预聚合JOIN。\n\n6. 无重复行风险：subq按l_partkey分组后每个partkey只有一行(AVG聚合结果)，JOIN时lineitem的每行最多匹配subq中一行，不会产生笛卡尔积导致的重复计数。\n\n7. NULL处理一致性：AVG函数对NULL的处理在原SQL和重写SQL中一致，且l_partkey为主键一部分(NOT NULL)，JOIN条件不会因NULL导致语义差异。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过去相关化将相关子查询改写为预聚合JOIN，语义完全等价：subq按l_partkey分组计算0.2*AVG(l_quantity)作为阈值，JOIN条件确保每个lineitem行匹配正确的partkey阈值，最终SUM的行集合与原SQL一致。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 60312290.0 -> 50081461.0 (重写侧约为原的 83.0369%) | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。
+✅ 估计代价降幅 85.5% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 204
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE', 'AGGREGATE_JOIN_TRANSPOSE_EXTENDED', 'FILTER_INTO_JOIN']
+   - 优化组别: 子查询优化, 聚合优化, 谓词简化
+   - 估计代价: 原始=20694446.31, 重写=3002853.14，相对变化: 85.49%
+✅ 成功存储，记录ID: 95755ac8-ed93-4da3-914e-e77064f34036
+
+🎲 UCT Math Update: 3 rules, reward=+0.1443 (cost=+0.8549, rows=+0.1696, depth=-0.6000, oc=20694446.3100, rc=3002853.1400)
+   结构分细节: rows 60312290.0->50081461.0 (score=+0.170), depth 5.0->8.0 (score=-0.600)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.400, conf=0.51, lambda=0.26, reward=+0.054, count=65, avg=+0.048
+   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: P(s,a)=N/A, effect=0.400, conf=0.53, lambda=0.26, reward=+0.050, count=57, avg=+0.089
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.200, conf=0.39, lambda=0.20, reward=+0.040, count=300, avg=+0.023
+
+----------------------------------------
+

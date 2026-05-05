@@ -1,0 +1,101 @@
+Query ID: 9
+==================================================
+
+Original: select l_orderkey, sum(l_extendedprice * (1 - l_discount)) as revenue, o_orderdate, o_shippriority from customer, orders, lineitem where c_mktsegment = 'BUILDING' and c_custkey = o_custkey and l_orderkey = o_orderkey and o_orderdate < date '1995-03-08' and l_shipdate > date '1995-03-08' group by l_orderkey, o_orderdate, o_shippriority order by revenue desc, o_orderdate limit 10;
+Rewritten: SELECT l_orderkey, SUM(l_extendedprice * (1 - l_discount)) AS revenue, o_orderdate, o_shippriority
+FROM (SELECT c_custkey FROM customer WHERE c_mktsegment = 'BUILDING') AS c
+INNER JOIN orders ON c.c_custkey = o_custkey AND o_orderdate < DATE '1995-03-08'
+INNER JOIN lineitem ON l_orderkey = o_orderkey AND l_shipdate > DATE '1995-03-08'
+GROUP BY l_orderkey, o_orderdate, o_shippriority
+ORDER BY revenue DESC, o_orderdate
+LIMIT 10;
+Time Cost: 82.82s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '调整三表连接顺序：先连接orders和lineitem（两表都有日期过滤条件且通过o_orderkey/l_orderkey关联），再与customer连接。这样可以先利用日期条件过滤减少中间结果，避免customer表的大量数据参与早期连接。'}, {'group': '谓词简化', 'produced_suggestion': "将customer表的c_mktsegment='BUILDING'过滤条件尽早应用，确保在连接前就过滤掉不符合条件的客户记录，减少参与Hash Join的数据量。"}, {'group': '连接优化', 'produced_suggestion': '考虑将隐式连接改写为显式INNER JOIN语法，明确连接条件和过滤条件的分离，便于优化器更好地选择连接顺序和方法。参考历史案例中FILTER_INTO_JOIN和JOIN_CONDITION_PUSH的成功经验。'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示三表连接采用了两次Hash Join，其中customer表和orders表先连接再与lineitem表连接。从统计信息看customer表有150万行，过滤后约12万行；orders表过滤后约298万行；lineitem表过滤后约833万行。当前连接顺序导致中间结果集较大（578453行），且最终需要对771091行进行排序和聚合。可以通过调整连接顺序、将过滤条件更早应用、以及利用历史案例中成功的FILTER_INTO_JOIN和JOIN_CONDITION_PUSH规则来减少中间结果集大小。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整三表连接顺序：先连接orders和lineitem（两表都有日期过滤条件且通过o_orderkey/l_orderkey关联），再与customer连接。这样可以先利用日期条件过滤减少中间结果，避免customer表的大量数据参与早期连接。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将customer表的c_mktsegment='BUILDING'过滤条件尽早应用，确保在连接前就过滤掉不符合条件的客户记录，减少参与Hash Join的数据量。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "考虑将隐式连接改写为显式INNER JOIN语法，明确连接条件和过滤条件的分离，便于优化器更好地选择连接顺序和方法。参考历史案例中FILTER_INTO_JOIN和JOIN_CONDITION_PUSH的成功经验。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化",
+  "applied_rules": ["JOIN_CONDITION_PUSH", "FILTER_INTO_JOIN"],
+  "rule_effect_scores": {
+    "JOIN_CONDITION_PUSH": 0.5,
+    "FILTER_INTO_JOIN": 0.5
+  },
+  "rule_effect_confidence": {
+    "JOIN_CONDITION_PUSH": 0.8,
+    "FILTER_INTO_JOIN": 0.8
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化",
+  "applied_rules": ["JOIN_CONDITION_PUSH", "FILTER_INTO_JOIN"],
+  "rewritten_sql": "SELECT l_orderkey, SUM(l_extendedprice * (1 - l_discount)) AS revenue, o_orderdate, o_shippriority\nFROM (SELECT c_custkey FROM customer WHERE c_mktsegment = 'BUILDING') AS c\nINNER JOIN orders ON c.c_custkey = o_custkey AND o_orderdate < DATE '1995-03-08'\nINNER JOIN lineitem ON l_orderkey = o_orderkey AND l_shipdate > DATE '1995-03-08'\nGROUP BY l_orderkey, o_orderdate, o_shippriority\nORDER BY revenue DESC, o_orderdate\nLIMIT 10;",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原始SQL的隐式连接（逗号分隔的FROM子句）改写为显式INNER JOIN；将customer表的过滤条件c_mktsegment='BUILDING'下推到子查询中，仅保留c_custkey列；将orders和lineitem的日期过滤条件分别移入各自的JOIN ON子句。\n\n2. 等价性保证-过滤条件位置：原SQL在WHERE子句中的所有过滤条件（c_mktsegment='BUILDING'、o_orderdate<'1995-03-08'、l_shipdate>'1995-03-08'）在重写后仍然全部应用，只是位置从WHERE移到了子查询或JOIN ON中。对于INNER JOIN，ON子句中的过滤条件与WHERE子句中的过滤条件语义完全等价，因为INNER JOIN的结果集只包含满足ON条件的行。\n\n3. 等价性保证-连接条件：原SQL的连接条件c_custkey=o_custkey和l_orderkey=o_orderkey在重写后保持不变，仍在JOIN ON子句中；连接类型为INNER JOIN，与原始隐式连接（笛卡尔积+WHERE过滤）的语义完全一致。\n\n4. 等价性保证-投影与聚合：SELECT子句中的列（l_orderkey、revenue计算、o_orderdate、o_shippriority）、GROUP BY子句（l_orderkey、o_orderdate、o_shippriority）、ORDER BY子句（revenue DESC、o_orderdate）和LIMIT 10均未改变，聚合函数SUM(l_extendedprice*(1-l_discount))的计算逻辑完全相同。\n\n5. 等价性保证-customer子查询：将customer表改写为子查询(SELECT c_custkey FROM customer WHERE c_mktsegment='BUILDING')仅保留c_custkey列，因为原SQL中customer表只在连接条件c_custkey=o_custkey中使用该列，其他列未被引用；过滤条件c_mktsegment='BUILDING'在子查询中应用，与原WHERE子句中的效果完全相同。\n\n6. 等价性保证-NULL处理：原SQL的连接条件和过滤条件均为等值或比较操作，不涉及IS NULL判断；重写后的JOIN ON和子查询WHERE条件对NULL值的处理逻辑与原SQL一致（NULL不满足等值或比较条件，会被过滤）。\n\n7. 等价性保证-主键约束：根据Schema，customer.c_custkey、orders.o_orderkey、lineitem.(l_orderkey,l_linenumber)均有主键或唯一索引；重写后的连接通过c_custkey和o_orderkey关联，不会产生额外的重复行；GROUP BY使用l_orderkey（orders的主键，通过等值连接传递唯一性）作为分组键之一，确保聚合结果的正确性。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL将隐式连接改为显式INNER JOIN，并将过滤条件从WHERE移入JOIN ON子句和customer子查询，符合FILTER_INTO_JOIN和JOIN_CONDITION_PUSH规则的典型变换模式；连接条件、过滤逻辑、聚合分组排序限制均保持一致，结果集完全相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致：两个SQL的EXPLAIN JSON结构、节点类型、扫描方式、连接顺序、并行度、cost、行数估计完全相同。重写仅将隐式连接改为显式INNER JOIN并引入派生表，但优化器生成了相同的执行计划（customer→orders→lineitem的Hash Join顺序，均为Parallel Seq Scan + Hash Join，Workers Planned=2）。结构上无改进也无恶化，cost持平（2291398.0），行数估计求和持平（16849430.0）。虽然SQL语法更清晰，但执行层面无实质优化收益。由于已应用JOIN_CONDITION_PUSH和FILTER_INTO_JOIN规则且计划未变化，继续在此方向优化空间极小。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 326
+   - 规则序列: ['JOIN_CONDITION_PUSH', 'FILTER_INTO_JOIN']
+   - 优化组别: 连接优化, 谓词简化
+   - 估计代价: 原始=2291398.0, 重写=2291398.0，相对变化: 0.00%
+✅ 成功存储，记录ID: d995bd51-cbfa-446e-892d-e9d3cede1fa7
+
+🎲 UCT Math Update: 2 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=2291398.0000, rc=2291398.0000)
+   结构分细节: rows 16849430.0->16849430.0 (score=+0.000), depth 11.0->11.0 (score=+0.000)
+✅ UCT Update Complete:
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.500, conf=0.80, lambda=0.40, reward=+0.000, count=245, avg=+0.010
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.500, conf=0.80, lambda=0.40, reward=+0.000, count=274, avg=+0.022
+
+----------------------------------------
+

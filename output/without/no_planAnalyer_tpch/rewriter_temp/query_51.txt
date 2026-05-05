@@ -1,0 +1,100 @@
+Query ID: 51
+==================================================
+
+Original: select c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity) from customer, orders, lineitem where o_orderkey in ( select l_orderkey from lineitem group by l_orderkey having sum(l_quantity) > 313 ) and c_custkey = o_custkey and o_orderkey = l_orderkey group by c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice order by o_totalprice desc, o_orderdate limit 100;
+Rewritten: WITH lineitem_agg AS (
+  SELECT l_orderkey, SUM(l_quantity) AS total_quantity
+  FROM lineitem
+  GROUP BY l_orderkey
+  HAVING SUM(l_quantity) > 313
+)
+SELECT c.c_name, c.c_custkey, o.o_orderkey, o.o_orderdate, o.o_totalprice, la.total_quantity
+FROM lineitem_agg la
+JOIN orders o ON la.l_orderkey = o.o_orderkey
+JOIN customer c ON o.o_custkey = c.c_custkey
+ORDER BY o.o_totalprice DESC, o.o_orderdate
+LIMIT 100
+Time Cost: 68.57s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将IN子查询转换为JOIN，避免子查询独立执行。将having条件的聚合结果作为派生表与主查询JOIN，消除lineitem的重复扫描'}, {'group': '聚合优化', 'produced_suggestion': '应用AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则，将聚合操作下推。先对lineitem按l_orderkey分组聚合得到满足sum(l_quantity)>313的订单集合，再与orders和customer连接，减少参与连接的数据量'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：先执行lineitem聚合过滤得到符合条件的小结果集，再与orders通过索引连接，最后与customer连接。利用索引orders_pkey和customer_pkey加速连接'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) lineitem表全表扫描(Seq Scan)代价高达1725004.52，扫描近6000万行；2) 子查询中对lineitem再次全表扫描并进行聚合(代价1500056.82)；3) 同一张表lineitem被扫描两次，存在冗余计算；4) 历史案例显示相同SQL指纹通过CTE分解和聚合连接转换优化成功率100%",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将IN子查询转换为JOIN，避免子查询独立执行。将having条件的聚合结果作为派生表与主查询JOIN，消除lineitem的重复扫描"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "应用AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则，将聚合操作下推。先对lineitem按l_orderkey分组聚合得到满足sum(l_quantity)>313的订单集合，再与orders和customer连接，减少参与连接的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先执行lineitem聚合过滤得到符合条件的小结果集，再与orders通过索引连接，最后与customer连接。利用索引orders_pkey和customer_pkey加速连接"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.209
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_VALUES: UCT=1.100
+{
+  "groups": "聚合优化, 子查询优化, 连接优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.5
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.7
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 子查询优化, 连接优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"],
+  "rewritten_sql": "WITH lineitem_agg AS (\n  SELECT l_orderkey, SUM(l_quantity) AS total_quantity\n  FROM lineitem\n  GROUP BY l_orderkey\n  HAVING SUM(l_quantity) > 313\n)\nSELECT c.c_name, c.c_custkey, o.o_orderkey, o.o_orderdate, o.o_totalprice, la.total_quantity\nFROM lineitem_agg la\nJOIN orders o ON la.l_orderkey = o.o_orderkey\nJOIN customer c ON o.o_custkey = c.c_custkey\nORDER BY o.o_totalprice DESC, o.o_orderdate\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原 SQL 中的 IN 子查询（SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 313）提取为 CTE（lineitem_agg），应用 STRATEGY_CTE_DECOMPOSITION 规则；同时将原 SQL 中对 lineitem 表的二次扫描（主查询中的 lineitem 连接）消除，改为直接使用 CTE 中已聚合的结果。\n\n2. 聚合下推：应用 AGGREGATE_JOIN_TRANSPOSE_EXTENDED 规则，将 sum(l_quantity) 聚合操作从主查询的 GROUP BY 中下推到 CTE 内部，在 JOIN 之前完成聚合过滤，减少参与连接的数据量。CTE 中按 l_orderkey 分组并过滤 sum(l_quantity) > 313，与原 IN 子查询语义完全一致。\n\n3. 连接等价性：原 SQL 通过 o_orderkey IN (子查询) 和 o_orderkey = l_orderkey 两个条件关联 orders 和 lineitem；重写后通过 la.l_orderkey = o.o_orderkey 的 INNER JOIN 实现相同过滤效果。由于 l_orderkey 是 lineitem 主键的一部分，且 CTE 中已按 l_orderkey 分组，每个 l_orderkey 在 CTE 中唯一出现，JOIN 不会产生重复行。\n\n4. GROUP BY 等价性：原 SQL 的 GROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice 实际上是按订单级别分组（o_orderkey 是 orders 主键，决定了 o_orderdate 和 o_totalprice；c_custkey 通过外键关联决定了 c_name）。重写后无需 GROUP BY，因为 CTE 已按 l_orderkey 聚合，每个订单对应一行；JOIN orders 和 customer 后仍保持订单级别的一对一关系，不会产生重复。\n\n5. 聚合结果等价性：原 SQL 的 sum(l_quantity) 计算的是每个订单的所有 lineitem 行的数量总和；重写后 CTE 中的 SUM(l_quantity) 同样按 l_orderkey 分组计算，结果完全一致。主查询直接引用 la.total_quantity，避免了重复聚合。\n\n6. 过滤条件等价性：原 SQL 的 HAVING sum(l_quantity) > 313 在子查询中过滤订单；重写后在 CTE 的 HAVING 子句中应用相同条件，过滤逻辑和时机完全一致，确保只有满足条件的订单参与后续 JOIN。\n\n7. 排序和限制等价性：ORDER BY o_totalprice DESC, o_orderdate 和 LIMIT 100 在重写后保持不变，作用于相同的结果集（订单级别的数据），排序键和限制行数完全一致，最终返回的 100 行结果与原 SQL 相同。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "两查询等价：重写将IN子查询提取为CTE并消除了对lineitem的二次扫描，利用o_orderkey主键保证JOIN后仍为订单级一对一，聚合结果、过滤条件、排序限制均保持一致。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 84982562.0 -> 24995405.0 (重写侧约为原的 29.4124%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+✅ 估计代价降幅 56.5% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 363
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'AGGREGATE_JOIN_TRANSPOSE_EXTENDED']
+   - 优化组别: 聚合优化, 子查询优化, 连接优化
+   - 估计代价: 原始=3452047.73, 重写=1501729.21，相对变化: 56.50%
+✅ 成功存储，记录ID: e1adfdf5-ec34-40af-85bd-c9b898a3ee26
+
+🎲 UCT Math Update: 2 rules, reward=+0.5442 (cost=+0.5650, rows=+0.7059, depth=+0.3077, oc=3452047.7300, rc=1501729.2100)
+   结构分细节: rows 84982562.0->24995405.0 (score=+0.706), depth 13.0->9.0 (score=+0.308)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.500, conf=0.80, lambda=0.40, reward=+0.281, count=251, avg=+0.051
+   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: P(s,a)=N/A, effect=0.500, conf=0.70, lambda=0.35, reward=+0.263, count=61, avg=+0.097
+
+----------------------------------------
+

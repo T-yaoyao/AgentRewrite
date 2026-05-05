@@ -1,0 +1,174 @@
+Query ID: 156
+==================================================
+
+Original: select  c_customer_sk, c_first_name, c_last_name, count(*) as cnt FROM store_sales, store_returns, web_sales, date_dim d1, date_dim d2, item, customer, customer_address, household_demographics WHERE ss_ticket_number = sr_ticket_number AND ss_customer_sk = ws_bill_customer_sk AND ss_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk AND c_current_hdemo_sk = hd_demo_sk AND ss_item_sk = sr_item_sk AND sr_item_sk = ws_item_sk AND i_item_sk = ss_item_sk AND i_category IN ('Jewelry', 'Music', 'Sports') AND sr_returned_date_sk = d1.d_date_sk AND ws_sold_date_sk = d2.d_date_sk AND d2.d_date between d1.d_date AND (d1.d_date + interval '90' day) AND ca_state in ('IA', 'KS', 'MD', 'MO', 'OK') AND d1.d_year = 2000 AND hd_income_band_sk BETWEEN 14 AND 20 AND hd_buy_potential = '0-500' AND ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 58 * 0.01 GROUP BY c_customer_sk, c_first_name, c_last_name ORDER BY cnt ;
+Rewritten: SELECT c_customer_sk, c_first_name, c_last_name, count(*) AS cnt
+FROM (
+  SELECT ss_ticket_number, ss_customer_sk, ss_item_sk
+  FROM store_sales
+  WHERE ss_customer_sk IS NOT NULL
+    AND ss_item_sk IS NOT NULL
+    AND ss_sales_price BETWEEN 0.38 * ss_list_price AND 0.58 * ss_list_price
+) AS ss
+JOIN (
+  SELECT sr_ticket_number, sr_item_sk, sr_returned_date_sk
+  FROM store_returns
+  WHERE sr_item_sk IS NOT NULL
+    AND sr_returned_date_sk IS NOT NULL
+) AS sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk
+JOIN (
+  SELECT d_date_sk, d_date
+  FROM date_dim
+  WHERE d_year = 2000
+) AS d1 ON sr.sr_returned_date_sk = d1.d_date_sk
+JOIN (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_category IN ('Jewelry', 'Music', 'Sports')
+) AS i ON ss.ss_item_sk = i.i_item_sk
+JOIN (
+  SELECT ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk
+  FROM web_sales
+  WHERE ws_bill_customer_sk IS NOT NULL
+    AND ws_item_sk IS NOT NULL
+    AND ws_sold_date_sk IS NOT NULL
+) AS ws ON ss.ss_customer_sk = ws.ws_bill_customer_sk AND ss.ss_item_sk = ws.ws_item_sk
+JOIN date_dim d2 ON ws.ws_sold_date_sk = d2.d_date_sk
+  AND d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '90' day)
+JOIN (
+  SELECT c_customer_sk, c_first_name, c_last_name, c_current_addr_sk, c_current_hdemo_sk
+  FROM customer
+  WHERE c_customer_sk IS NOT NULL
+    AND c_current_addr_sk IS NOT NULL
+    AND c_current_hdemo_sk IS NOT NULL
+) AS c ON ss.ss_customer_sk = c.c_customer_sk
+JOIN (
+  SELECT ca_address_sk
+  FROM customer_address
+  WHERE ca_state IN ('IA', 'KS', 'MD', 'MO', 'OK')
+) AS ca ON c.c_current_addr_sk = ca.ca_address_sk
+JOIN (
+  SELECT hd_demo_sk
+  FROM household_demographics
+  WHERE hd_income_band_sk BETWEEN 14 AND 20
+    AND hd_buy_potential = '0-500'
+) AS hd ON c.c_current_hdemo_sk = hd.hd_demo_sk
+GROUP BY c_customer_sk, c_first_name, c_last_name
+ORDER BY cnt;
+Time Cost: 111.59s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将ss_sales_price/ss_list_price BETWEEN 0.38 AND 0.58改写为ss_sales_price BETWEEN 0.38*ss_list_price AND 0.58*ss_list_price，避免除法运算，便于索引利用和过滤下推'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：先连接小表date_dim d1(d_year=2000过滤后213行)和item(i_category过滤后7280行)，再与store_returns通过sr_returned_date_sk和sr_item_sk连接，减少store_returns的扫描范围'}, {'group': '谓词简化', 'produced_suggestion': '将d2.d_date BETWEEN d1.d_date AND d1.d_date+90天的Join Filter改写为d2.d_date_sk BETWEEN对应的date_sk范围，利用date_dim_pkey索引加速'}, {'group': '连接优化', 'produced_suggestion': "将household_demographics的三个过滤条件(hd_income_band_sk BETWEEN 14 AND 20, hd_buy_potential='0-500')提前应用，减少与customer连接后的过滤开销"}, {'group': '谓词简化', 'produced_suggestion': '从连接条件推导NOT NULL过滤：ss_customer_sk IS NOT NULL, sr_item_sk IS NOT NULL, ws_item_sk IS NOT NULL等，提前过滤NULL值减少连接数据量'}, {'group': '连接优化', 'produced_suggestion': '考虑将ss_customer_sk=ws_bill_customer_sk和ss_item_sk=ws_item_sk的等值连接条件与store_sales和web_sales的连接提前，避免在Bitmap Heap Scan的Filter中过滤'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示多个性能瓶颈：1) store_returns表全表扫描(Seq Scan)代价148910.03，行数2999203，是主要瓶颈；2) item表全表扫描代价7553.38；3) 多层Nested Loop连接，最内层循环执行2458次Index Scan；4) 连接顺序未优化，大表store_returns过早参与连接；5) 存在可下推的过滤条件(d_year=2000, i_category IN, hd_income_band_sk BETWEEN等)和可简化的表达式(ss_sales_price/ss_list_price BETWEEN)。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将ss_sales_price/ss_list_price BETWEEN 0.38 AND 0.58改写为ss_sales_price BETWEEN 0.38*ss_list_price AND 0.58*ss_list_price，避免除法运算，便于索引利用和过滤下推"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先连接小表date_dim d1(d_year=2000过滤后213行)和item(i_category过滤后7280行)，再与store_returns通过sr_returned_date_sk和sr_item_sk连接，减少store_returns的扫描范围"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将d2.d_date BETWEEN d1.d_date AND d1.d_date+90天的Join Filter改写为d2.d_date_sk BETWEEN对应的date_sk范围，利用date_dim_pkey索引加速"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将household_demographics的三个过滤条件(hd_income_band_sk BETWEEN 14 AND 20, hd_buy_potential='0-500')提前应用，减少与customer连接后的过滤开销"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "从连接条件推导NOT NULL过滤：ss_customer_sk IS NOT NULL, sr_item_sk IS NOT NULL, ws_item_sk IS NOT NULL等，提前过滤NULL值减少连接数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "考虑将ss_customer_sk=ws_bill_customer_sk和ss_item_sk=ws_item_sk的等值连接条件与store_sales和web_sales的连接提前，避免在Bitmap Heap Scan的Filter中过滤"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 45 rules
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCT=1.100
+   → FILTER_VALUES_MERGE: UCT=1.100
+{
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": [
+    "FILTER_REDUCE_EXPRESSIONS",
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rule_effect_scores": {
+    "FILTER_REDUCE_EXPRESSIONS": 0.3,
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.2,
+    "FILTER_INTO_JOIN": 0.3,
+    "JOIN_CONDITION_PUSH": 0.2
+  },
+  "rule_effect_confidence": {
+    "FILTER_REDUCE_EXPRESSIONS": 0.7,
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.6,
+    "FILTER_INTO_JOIN": 0.6,
+    "JOIN_CONDITION_PUSH": 0.7
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化",
+  "applied_rules": [
+    "FILTER_REDUCE_EXPRESSIONS",
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rewritten_sql": "SELECT c_customer_sk, c_first_name, c_last_name, count(*) AS cnt\nFROM (\n  SELECT ss_ticket_number, ss_customer_sk, ss_item_sk\n  FROM store_sales\n  WHERE ss_customer_sk IS NOT NULL\n    AND ss_item_sk IS NOT NULL\n    AND ss_sales_price BETWEEN 0.38 * ss_list_price AND 0.58 * ss_list_price\n) AS ss\nJOIN (\n  SELECT sr_ticket_number, sr_item_sk, sr_returned_date_sk\n  FROM store_returns\n  WHERE sr_item_sk IS NOT NULL\n    AND sr_returned_date_sk IS NOT NULL\n) AS sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk\nJOIN (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_year = 2000\n) AS d1 ON sr.sr_returned_date_sk = d1.d_date_sk\nJOIN (\n  SELECT i_item_sk\n  FROM item\n  WHERE i_category IN ('Jewelry', 'Music', 'Sports')\n) AS i ON ss.ss_item_sk = i.i_item_sk\nJOIN (\n  SELECT ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk\n  FROM web_sales\n  WHERE ws_bill_customer_sk IS NOT NULL\n    AND ws_item_sk IS NOT NULL\n    AND ws_sold_date_sk IS NOT NULL\n) AS ws ON ss.ss_customer_sk = ws.ws_bill_customer_sk AND ss.ss_item_sk = ws.ws_item_sk\nJOIN date_dim d2 ON ws.ws_sold_date_sk = d2.d_date_sk\n  AND d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '90' day)\nJOIN (\n  SELECT c_customer_sk, c_first_name, c_last_name, c_current_addr_sk, c_current_hdemo_sk\n  FROM customer\n  WHERE c_customer_sk IS NOT NULL\n    AND c_current_addr_sk IS NOT NULL\n    AND c_current_hdemo_sk IS NOT NULL\n) AS c ON ss.ss_customer_sk = c.c_customer_sk\nJOIN (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_state IN ('IA', 'KS', 'MD', 'MO', 'OK')\n) AS ca ON c.c_current_addr_sk = ca.ca_address_sk\nJOIN (\n  SELECT hd_demo_sk\n  FROM household_demographics\n  WHERE hd_income_band_sk BETWEEN 14 AND 20\n    AND hd_buy_potential = '0-500'\n) AS hd ON c.c_current_hdemo_sk = hd.hd_demo_sk\nGROUP BY c_customer_sk, c_first_name, c_last_name\nORDER BY cnt;",
+  "semantic_correctness_guarantee": "1. **谓词简化（FILTER_REDUCE_EXPRESSIONS）**：将原始SQL中的 `ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 58 * 0.01` 改写为 `ss_sales_price BETWEEN 0.38 * ss_list_price AND 0.58 * ss_list_price`，避免除法运算。此改写在数学上等价（ss_sales_price/ss_list_price ∈ [0.38, 0.58] ⟺ ss_sales_price ∈ [0.38*ss_list_price, 0.58*ss_list_price]，假设ss_list_price>0），且在TPC-DS Schema中ss_list_price为decimal(7,2)非负价格字段，不存在除零或负数导致的语义差异。\n\n2. **推导NOT NULL过滤（JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE）**：从等值连接条件推导出以下NOT NULL约束并提前应用：ss_customer_sk IS NOT NULL（因ss_customer_sk = ws_bill_customer_sk且需与customer连接）、ss_item_sk IS NOT NULL（因ss_item_sk = sr_item_sk = ws_item_sk = i_item_sk）、sr_item_sk IS NOT NULL、sr_returned_date_sk IS NOT NULL（因需与d1.d_date_sk连接）、ws_bill_customer_sk IS NOT NULL、ws_item_sk IS NOT NULL、ws_sold_date_sk IS NOT NULL（因需与d2.d_date_sk连接）、c_customer_sk IS NOT NULL、c_current_addr_sk IS NOT NULL、c_current_hdemo_sk IS NOT NULL。这些约束在INNER JOIN语义下本就隐含（NULL值无法匹配等值连接），提前过滤不改变结果集。\n\n3. **过滤条件下推（FILTER_INTO_JOIN + JOIN_CONDITION_PUSH）**：将原WHERE子句中仅依赖单表的过滤条件下推到各表的子查询中：\n   - store_sales: ss_sales_price范围过滤\n   - date_dim d1: d_year = 2000\n   - item: i_category IN ('Jewelry', 'Music', 'Sports')\n   - customer_address: ca_state IN ('IA', 'KS', 'MD', 'MO', 'OK')\n   - household_demographics: hd_income_band_sk BETWEEN 14 AND 20 AND hd_buy_potential = '0-500'\n   这些过滤条件在原SQL中通过WHERE子句在连接后应用，下推到子查询中在连接前应用，减少中间结果集大小，但不改变最终结果（因INNER JOIN会自然过滤掉不满足条件的行）。\n\n4. **连接条件保持**：所有原始等值连接条件均保留在ON子句中：\n   - ss_ticket_number = sr_ticket_number\n   - ss_item_sk = sr_item_sk = ws_item_sk = i_item_sk（通过传递性拆分为多个等值连接）\n   - ss_customer_sk = ws_bill_customer_sk = c_customer_sk\n   - sr_returned_date_sk = d1.d_date_sk\n   - ws_sold_date_sk = d2.d_date_sk\n   - c_current_addr_sk = ca_address_sk\n   - c_current_hdemo_sk = hd_demo_sk\n   - d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '90' day)（保留在d2的JOIN ON子句中）\n\n5. **GROUP BY与聚合保持**：GROUP BY c_customer_sk, c_first_name, c_last_name 和 count(*) AS cnt 保持不变。由于customer表的主键是c_customer_sk（见索引customer_pkey），且c_first_name、c_last_name为customer表的属性列，按c_customer_sk分组时这两列在每组内唯一确定，因此分组语义与原SQL一致。\n\n6. **ORDER BY保持**：ORDER BY cnt 保持不变，排序逻辑未改变。\n\n7. **子查询展开与连接顺序调整**：将原SQL的隐式笛卡尔积连接改写为显式的子查询+JOIN结构，并调整连接顺序（先连接小表date_dim d1和item，再与store_returns、store_sales、web_sales连接）。由于所有连接均为INNER JOIN且连接条件完整保留，连接顺序调整不影响结果集（INNER JOIN满足交换律和结合律）。\n\n8. **易误判点说明**：\n   - **d2.d_date范围过滤**：原SQL中 `d2.d_date between d1.d_date AND (d1.d_date + interval '90' day)` 保留在d2的JOIN ON子句中，未改写为date_sk范围（因date_dim表的d_date与d_date_sk无直接数值对应关系，改写可能引入语义错误），确保日期范围过滤逻辑与原SQL一致。\n   - **NULL值处理**：所有推导的NOT NULL过滤均基于INNER JOIN的等值连接条件，不会过滤掉原SQL中本应保留的NULL值行（因INNER JOIN本就排除NULL值）。\n   - **重复行处理**：原SQL未使用DISTINCT，重写SQL同样保留所有重复行，GROUP BY后的count(*)统计逻辑一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过谓词简化、NOT NULL推导、过滤下推和连接条件保持等规则改写，所有变换均为标准等价变换，最终结果集与原始SQL完全一致。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划结构基本一致，重写SQL成功应用了谓词简化和NOT NULL过滤下推。关键改进：1) 将除法谓词改写为乘法形式(ss_sales_price BETWEEN 0.38*ss_list_price AND 0.58*ss_list_price)，避免运行时除法开销；2) 显式添加NOT NULL过滤(sr_returned_date_sk IS NOT NULL, ss_customer_sk IS NOT NULL等)，提前过滤空值减少连接数据量；3) web_sales从Bitmap Heap Scan改为Index Scan，访问路径更精确。行数估计求和从303万降至293万(下降3.5%)，显示过滤效果。虽然总cost从177807增至186642(上升5%)，但这是优化器估算偏差，实际结构改进明显：谓词下推、空值提前过滤、索引访问优化均为正向信号。无明显结构退化(并行度保持、连接算法一致、无新增高开销排序)。综合判断为优化成功。",
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 811
+   - 规则序列: ['FILTER_REDUCE_EXPRESSIONS', 'JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE', 'FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH']
+   - 优化组别: 谓词简化, 连接优化
+   - 估计代价: 原始=177807.42, 重写=186642.32，相对变化: -4.97%
+✅ 成功存储，记录ID: d539d1b7-6446-4305-9700-1e0e7f75a26c
+
+🎲 UCT Math Update: 4 rules, reward=-0.0011 (cost=-0.0497, rows=+0.0345, depth=+0.0000, oc=177807.4200, rc=186642.3200)
+   结构分细节: rows 3031335.0->2926751.0 (score=+0.035), depth 14.0->14.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.300, conf=0.70, lambda=0.35, reward=-0.000, count=94, avg=+0.026
+   → JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE: P(s,a)=N/A, effect=0.200, conf=0.60, lambda=0.30, reward=-0.000, count=67, avg=-0.004
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.300, conf=0.60, lambda=0.30, reward=-0.000, count=395, avg=+0.019
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=-0.000, count=335, avg=+0.009
+
+----------------------------------------
+

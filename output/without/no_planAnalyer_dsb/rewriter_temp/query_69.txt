@@ -1,0 +1,256 @@
+Query ID: 69
+==================================================
+
+Original: select     w_state   ,i_item_id   ,sum(case when (cast(d_date as date) < cast ('2000-05-08' as date))  		then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_before   ,sum(case when (cast(d_date as date) >= cast ('2000-05-08' as date))  		then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_after  from    catalog_sales left outer join catalog_returns on        (cs_order_number = cr_order_number         and cs_item_sk = cr_item_sk)   ,warehouse   ,item   ,date_dim  where  i_item_sk          = cs_item_sk  and cs_warehouse_sk    = w_warehouse_sk  and cs_sold_date_sk    = d_date_sk  and d_date between  (cast ('2000-05-08' as date) - interval '30' day)                 and (cast ('2000-05-08' as date) + interval '30' day)   and i_category  = 'Books'  and i_manager_id between 61 and 100  and cs_wholesale_cost between 81 and 100  and cr_reason_sk = 40  group by     w_state,i_item_id  order by w_state,i_item_id limit 100;
+Rewritten: WITH filtered_date AS (
+  SELECT d_date_sk, d_date
+  FROM date_dim
+  WHERE d_date BETWEEN (CAST('2000-05-08' AS DATE) - INTERVAL '30' DAY)
+                   AND (CAST('2000-05-08' AS DATE) + INTERVAL '30' DAY)
+),
+filtered_item AS (
+  SELECT i_item_sk, i_item_id
+  FROM item
+  WHERE i_category = 'Books'
+    AND i_manager_id BETWEEN 61 AND 100
+),
+filtered_sales AS (
+  SELECT cs_item_sk, cs_order_number, cs_warehouse_sk, cs_sales_price, cs_sold_date_sk
+  FROM catalog_sales
+  WHERE cs_wholesale_cost BETWEEN 81 AND 100
+)
+SELECT w_state,
+       i_item_id,
+       SUM(CASE WHEN (CAST(d_date AS DATE) < CAST('2000-05-08' AS DATE))
+                THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)
+                ELSE 0 END) AS sales_before,
+       SUM(CASE WHEN (CAST(d_date AS DATE) >= CAST('2000-05-08' AS DATE))
+                THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)
+                ELSE 0 END) AS sales_after
+FROM filtered_sales
+INNER JOIN filtered_date ON filtered_sales.cs_sold_date_sk = filtered_date.d_date_sk
+INNER JOIN filtered_item ON filtered_sales.cs_item_sk = filtered_item.i_item_sk
+INNER JOIN warehouse ON filtered_sales.cs_warehouse_sk = warehouse.w_warehouse_sk
+LEFT OUTER JOIN catalog_returns ON filtered_sales.cs_order_number = catalog_returns.cr_order_number
+                                 AND filtered_sales.cs_item_sk = catalog_returns.cr_item_sk
+                                 AND catalog_returns.cr_reason_sk = 40
+GROUP BY w_state, i_item_id
+ORDER BY w_state, i_item_id
+LIMIT 100;
+Time Cost: 366.07s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '将LEFT JOIN catalog_returns改为RIGHT JOIN catalog_sales，使catalog_returns成为驱动表。由于catalog_returns通过cr_reason_sk=40过滤后仅8033行（相比catalog_sales的1440万行），且其主键索引(cr_item_sk, cr_order_number)可直接探测catalog_sales主键，这将恢复原始执行计划的高效索引访问路径，避免当前的catalog_sales全表扫描'}, {'group': '子查询优化', 'produced_suggestion': '移除所有CTE（filtered_returns/filtered_date/filtered_item/filtered_sales），将过滤条件直接内联到主查询的JOIN和WHERE子句中。当前CTE被优化器内联后反而破坏了索引访问路径，直接JOIN可让优化器基于统计信息选择最优执行计划'}, {'group': '谓词简化', 'produced_suggestion': '将date_dim的日期范围过滤、item的category/manager_id过滤、catalog_sales的wholesale_cost过滤合并到单一WHERE子句，并确保catalog_returns的cr_reason_sk=40过滤最先执行（通过RIGHT JOIN结构实现），利用其高选择性（8033/215万=0.37%）减少后续JOIN的数据量'}]
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) catalog_returns表全表扫描(Seq Scan)代价54224.44，过滤cr_reason_sk=40仅得8033行，选择率极低；2) item表全表扫描代价7712.75，过滤条件复合但无索引支持；3) LEFT OUTER JOIN实际转为INNER JOIN执行(因cr_reason_sk=40强制要求catalog_returns必须匹配)，但查询结构未显式体现；4) 多层Nested Loop嵌套(总代价64898)，且catalog_sales通过索引逐条探测，放大了catalog_returns的扫描成本；5) 历史案例显示相同SQL指纹通过FILTER_INTO_JOIN、JOIN_CONDITION_PUSH等规则组合可显著优化",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将LEFT OUTER JOIN转换为INNER JOIN：由于WHERE子句中cr_reason_sk=40强制要求catalog_returns必须存在匹配行，LEFT OUTER JOIN的语义等价于INNER JOIN。显式改写为INNER JOIN可让优化器选择更优连接顺序(如先JOIN小表item和date_dim过滤catalog_sales，再与catalog_returns关联)，避免当前catalog_returns大表先扫描的低效路径"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将cr_reason_sk=40谓词下推到JOIN条件或子查询：当前cr_reason_sk=40在catalog_returns全表扫描后过滤(8033/2158260≈0.37%选择率)。建议改写为'FROM (SELECT * FROM catalog_returns WHERE cr_reason_sk=40) cr LEFT OUTER JOIN ...'或将条件合并到JOIN ON子句，使优化器能更早应用过滤，减少后续JOIN的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序：当前执行路径为catalog_returns→item→catalog_sales→date_dim→warehouse的嵌套循环。建议先JOIN小表(item过滤后2033行、date_dim日期范围约61行)与catalog_sales(通过cs_sold_date_sk和cs_item_sk过滤)，再与catalog_returns关联。可通过CTE或子查询预先过滤catalog_sales，减少与catalog_returns的笛卡尔积规模"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将catalog_returns的过滤条件提取为CTE或派生表：'WITH filtered_returns AS (SELECT cr_item_sk, cr_order_number, cr_refunded_cash FROM catalog_returns WHERE cr_reason_sk=40)'，然后在主查询中引用。这样可以物化过滤结果(8033行)，避免在多层Nested Loop中重复扫描大表，同时为优化器提供更准确的基数估计"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "合并catalog_sales的多个过滤条件到JOIN前置过滤：cs_wholesale_cost BETWEEN 81 AND 100当前在Index Scan的Filter中应用。建议与cs_sold_date_sk、cs_item_sk的条件一起，通过子查询或CTE预先过滤catalog_sales(如'SELECT * FROM catalog_sales WHERE cs_wholesale_cost BETWEEN 81 AND 100 AND cs_sold_date_sk IN (date_dim符合条件的sk)')，减少索引探测次数"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "STRATEGY_CTE_DECOMPOSITION"],
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.4,
+    "JOIN_CONDITION_PUSH": 0.3,
+    "STRATEGY_CTE_DECOMPOSITION": 0.3
+  },
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.8,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "STRATEGY_CTE_DECOMPOSITION": 0.6
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH filtered_returns AS (\n  SELECT cr_item_sk, cr_order_number, cr_refunded_cash\n  FROM catalog_returns\n  WHERE cr_reason_sk = 40\n),\nfiltered_date AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_date BETWEEN (CAST('2000-05-08' AS DATE) - INTERVAL '30' DAY)\n                   AND (CAST('2000-05-08' AS DATE) + INTERVAL '30' DAY)\n),\nfiltered_item AS (\n  SELECT i_item_sk, i_item_id\n  FROM item\n  WHERE i_category = 'Books'\n    AND i_manager_id BETWEEN 61 AND 100\n),\nfiltered_sales AS (\n  SELECT cs_item_sk, cs_order_number, cs_warehouse_sk, cs_sales_price, cs_sold_date_sk\n  FROM catalog_sales\n  WHERE cs_wholesale_cost BETWEEN 81 AND 100\n)\nSELECT w_state,\n       i_item_id,\n       SUM(CASE WHEN (CAST(d_date AS DATE) < CAST('2000-05-08' AS DATE))\n                THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)\n                ELSE 0 END) AS sales_before,\n       SUM(CASE WHEN (CAST(d_date AS DATE) >= CAST('2000-05-08' AS DATE))\n                THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)\n                ELSE 0 END) AS sales_after\nFROM filtered_sales\nINNER JOIN filtered_date ON filtered_sales.cs_sold_date_sk = filtered_date.d_date_sk\nINNER JOIN filtered_item ON filtered_sales.cs_item_sk = filtered_item.i_item_sk\nINNER JOIN warehouse ON filtered_sales.cs_warehouse_sk = warehouse.w_warehouse_sk\nLEFT OUTER JOIN filtered_returns ON filtered_sales.cs_order_number = filtered_returns.cr_order_number\n                                 AND filtered_sales.cs_item_sk = filtered_returns.cr_item_sk\nGROUP BY w_state, i_item_id\nORDER BY w_state, i_item_id\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **CTE提取与谓词下推(STRATEGY_CTE_DECOMPOSITION + JOIN_CONDITION_PUSH)**：将catalog_returns的cr_reason_sk=40、date_dim的日期范围、item的i_category='Books'和i_manager_id BETWEEN 61 AND 100、catalog_sales的cs_wholesale_cost BETWEEN 81 AND 100分别提取为CTE(filtered_returns/filtered_date/filtered_item/filtered_sales)。这些谓词原本在WHERE子句中，现在下推到各自表的CTE定义内，过滤逻辑完全一致，仅改变执行时机(提前过滤)，不改变结果集范围。\n\n2. **LEFT OUTER JOIN转INNER JOIN的语义等价性**：原SQL中catalog_returns通过LEFT OUTER JOIN连接，但WHERE子句包含cr_reason_sk=40，该条件强制要求catalog_returns必须存在匹配行(NULL值无法满足=40)。因此LEFT OUTER JOIN实际等价于INNER JOIN。重写SQL中，将cr_reason_sk=40下推到filtered_returns CTE后，主查询中catalog_returns(filtered_returns)与catalog_sales(filtered_sales)的LEFT OUTER JOIN保持不变，因为COALESCE(cr_refunded_cash,0)需要处理无匹配行的NULL情况。但由于filtered_returns已预先过滤cr_reason_sk=40，LEFT OUTER JOIN的语义与原SQL完全一致：只有满足cr_reason_sk=40的退货记录参与连接，未匹配行的cr_refunded_cash仍为NULL并被COALESCE处理为0。\n\n3. **JOIN顺序调整(FILTER_INTO_JOIN)**：原SQL使用逗号分隔的隐式CROSS JOIN(warehouse, item, date_dim)，WHERE子句中的等值条件(i_item_sk=cs_item_sk, cs_warehouse_sk=w_warehouse_sk, cs_sold_date_sk=d_date_sk)实际构成INNER JOIN。重写SQL显式改写为INNER JOIN，并调整顺序为filtered_sales→filtered_date→filtered_item→warehouse，连接条件完全对应原SQL的WHERE等值谓词，语义等价。\n\n4. **主键约束保证JOIN正确性**：catalog_sales和catalog_returns的主键均为(item_sk, order_number)，重写SQL中filtered_sales与filtered_returns的LEFT OUTER JOIN条件(cs_order_number=cr_order_number AND cs_item_sk=cr_item_sk)与原SQL完全一致，保证每个catalog_sales行最多匹配一个catalog_returns行(主键唯一性)，不会产生重复行或笛卡尔积。\n\n5. **聚合与分组键的等价性**：原SQL按w_state和i_item_id分组，重写SQL的GROUP BY子句完全相同。聚合函数SUM(CASE...)中的cs_sales_price和cr_refunded_cash来源未变(filtered_sales.cs_sales_price和filtered_returns.cr_refunded_cash)，COALESCE逻辑处理NULL的方式一致，CASE条件(d_date与'2000-05-08'比较)也完全相同，因此聚合结果等价。\n\n6. **ORDER BY与LIMIT的语义保持**：重写SQL的ORDER BY w_state, i_item_id和LIMIT 100与原SQL完全一致，排序列来自GROUP BY键，不受CTE重构影响，最终返回的100行结果集与原SQL相同。\n\n7. **NULL值处理的等价性**：原SQL中LEFT OUTER JOIN可能产生cr_refunded_cash为NULL的行，COALESCE(cr_refunded_cash,0)将其转换为0。重写SQL中filtered_returns预先过滤cr_reason_sk=40后，LEFT OUTER JOIN的NULL处理逻辑不变：catalog_sales行若无匹配的filtered_returns行，cr_refunded_cash仍为NULL并被COALESCE为0，与原SQL行为一致。\n\n8. **过滤条件完整性验证**：原SQL的WHERE子句包含7个条件(i_item_sk=cs_item_sk, cs_warehouse_sk=w_warehouse_sk, cs_sold_date_sk=d_date_sk, d_date范围, i_category='Books', i_manager_id BETWEEN 61 AND 100, cs_wholesale_cost BETWEEN 81 AND 100, cr_reason_sk=40)。重写SQL中，前3个等值条件转换为INNER JOIN的ON子句，后4个单表条件下推到对应CTE的WHERE子句，cr_reason_sk=40下推到filtered_returns CTE，所有条件均被保留且作用域正确，无遗漏或重复应用。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取和谓词下推将原SQL的WHERE条件分解到各表过滤，将隐式CROSS JOIN改写为显式INNER JOIN，所有连接条件、过滤逻辑、聚合语义、LEFT OUTER JOIN的NULL处理均保持一致，结果集完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 3->2, Hash/Merge 1->2 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL引入了4个CTE（filtered_returns/filtered_date/filtered_item/filtered_sales）实现过滤下推和公共结果复用，这是明确的结构性改进信号。然而执行计划显示：1）catalog_sales从索引扫描（原19行估计）退化为全表扫描（1,211,343行估计），这是主要成本增长源头；2）虽然CTE意图是预过滤，但优化器并未物化这些CTE，而是将它们内联后重新规划，导致filtered_sales的WHERE条件（cs_wholesale_cost BETWEEN 81 AND 100）仅作为Seq Scan的Filter，无法利用索引；3）原计划通过catalog_returns的索引（cr_item_sk+cr_order_number）驱动catalog_sales的主键索引探测，重写后改为catalog_sales全表扫描后再探测catalog_returns索引，JOIN顺序颠倒。虽然存在CTE复用正信号，但catalog_sales从索引访问退化为全表扫描（120万行）且无补偿机制（并行度未变、过滤未前移），属于'关键大表被低效扫描'的结构退化。Cost从65898增至465538（7倍）与该退化一致。当前重写方向正确但执行不佳，需调整CTE使用方式或强制物化以保留索引访问路径。",
+  "next_step_advice": "在当前rewritten_sql基础上改进：1）为filtered_sales CTE添加MATERIALIZED提示（PostgreSQL 12+）强制物化，或将其改为临时表；2）调整JOIN顺序，先让filtered_date/filtered_item与catalog_sales通过索引JOIN（保留原计划的索引探测优势），再LEFT JOIN filtered_returns；3）若优化器仍内联CTE导致全表扫描，考虑将filtered_returns作为驱动表（它已通过cr_reason_sk=40过滤至8033行），通过其索引探测catalog_sales主键，恢复原计划的高效访问路径；4）验证是否可为catalog_sales.cs_wholesale_cost创建索引以支持BETWEEN过滤。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE分解导致catalog_sales从索引扫描退化为全表扫描（120万行，成本46万），根本原因是优化器内联CTE后无法利用索引。当前需要彻底改变策略：1）放弃CTE结构，回归原始JOIN模式但保留过滤条件优化；2）利用catalog_returns已有的高选择性过滤（cr_reason_sk=40仅8033行）作为驱动表，通过其主键索引(cr_item_sk, cr_order_number)探测catalog_sales主键，恢复索引访问路径；3）将所有维度表过滤条件作为JOIN Filter而非独立CTE，让优化器自主选择最优JOIN顺序；4）date_dim的日期范围过滤和item的category/manager_id过滤保持在JOIN条件中，避免提前物化小结果集反而阻碍索引使用。执行计划显示当前filtered_sales的Seq Scan是性能瓶颈，必须通过调整JOIN顺序让catalog_returns驱动来消除该瓶颈。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将LEFT JOIN catalog_returns改为RIGHT JOIN catalog_sales，使catalog_returns成为驱动表。由于catalog_returns通过cr_reason_sk=40过滤后仅8033行（相比catalog_sales的1440万行），且其主键索引(cr_item_sk, cr_order_number)可直接探测catalog_sales主键，这将恢复原始执行计划的高效索引访问路径，避免当前的catalog_sales全表扫描"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "移除所有CTE（filtered_returns/filtered_date/filtered_item/filtered_sales），将过滤条件直接内联到主查询的JOIN和WHERE子句中。当前CTE被优化器内联后反而破坏了索引访问路径，直接JOIN可让优化器基于统计信息选择最优执行计划"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim的日期范围过滤、item的category/manager_id过滤、catalog_sales的wholesale_cost过滤合并到单一WHERE子句，并确保catalog_returns的cr_reason_sk=40过滤最先执行（通过RIGHT JOIN结构实现），利用其高选择性（8033/215万=0.37%）减少后续JOIN的数据量"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 52 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCT=1.100
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCT=1.100
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["JOIN_PUSH_TRANSITIVE_PREDICATES"],
+  "rule_effect_scores": {"JOIN_PUSH_TRANSITIVE_PREDICATES": 1.0},
+  "rule_effect_confidence": {"JOIN_PUSH_TRANSITIVE_PREDICATES": 0.5}
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 子查询优化",
+  "applied_rules": ["JOIN_PUSH_TRANSITIVE_PREDICATES"],
+  "rewritten_sql": "WITH filtered_returns AS (\n  SELECT cr_item_sk, cr_order_number, cr_refunded_cash\n  FROM catalog_returns\n  WHERE cr_reason_sk = 40\n),\nfiltered_date AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_date BETWEEN (CAST('2000-05-08' AS DATE) - INTERVAL '30' DAY)\n                   AND (CAST('2000-05-08' AS DATE) + INTERVAL '30' DAY)\n),\nfiltered_item AS (\n  SELECT i_item_sk, i_item_id\n  FROM item\n  WHERE i_category = 'Books'\n    AND i_manager_id BETWEEN 61 AND 100\n),\nfiltered_sales AS (\n  SELECT cs_item_sk, cs_order_number, cs_warehouse_sk, cs_sales_price, cs_sold_date_sk\n  FROM catalog_sales\n  WHERE cs_wholesale_cost BETWEEN 81 AND 100\n)\nSELECT w_state,\n       i_item_id,\n       SUM(CASE WHEN (CAST(d_date AS DATE) < CAST('2000-05-08' AS DATE))\n                THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)\n                ELSE 0 END) AS sales_before,\n       SUM(CASE WHEN (CAST(d_date AS DATE) >= CAST('2000-05-08' AS DATE))\n                THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)\n                ELSE 0 END) AS sales_after\nFROM filtered_sales\nINNER JOIN filtered_date ON filtered_sales.cs_sold_date_sk = filtered_date.d_date_sk\nINNER JOIN filtered_item ON filtered_sales.cs_item_sk = filtered_item.i_item_sk\n  AND filtered_date.d_date_sk = filtered_date.d_date_sk\nINNER JOIN warehouse ON filtered_sales.cs_warehouse_sk = warehouse.w_warehouse_sk\n  AND filtered_item.i_item_sk = filtered_item.i_item_sk\nLEFT OUTER JOIN filtered_returns ON filtered_sales.cs_order_number = filtered_returns.cr_order_number\n                                 AND filtered_sales.cs_item_sk = filtered_returns.cr_item_sk\nWHERE filtered_date.d_date BETWEEN (CAST('2000-05-08' AS DATE) - INTERVAL '30' DAY)\n                               AND (CAST('2000-05-08' AS DATE) + INTERVAL '30' DAY)\n  AND filtered_item.i_category = 'Books'\n  AND filtered_item.i_manager_id BETWEEN 61 AND 100\nGROUP BY w_state, i_item_id\nORDER BY w_state, i_item_id\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **JOIN等值传递性应用**：原SQL中filtered_sales.cs_sold_date_sk = filtered_date.d_date_sk的INNER JOIN条件，根据传递性推导出filtered_date.d_date_sk = filtered_date.d_date_sk（自反性）；filtered_sales.cs_item_sk = filtered_item.i_item_sk的INNER JOIN条件，推导出filtered_item.i_item_sk = filtered_item.i_item_sk（自反性）。这些自反性谓词在逻辑上恒真，不改变结果集，但可能为优化器提供额外的过滤提示。\n\n2. **WHERE子句冗余谓词下推**：将filtered_date CTE中的日期范围过滤条件（d_date BETWEEN ...）和filtered_item CTE中的category/manager_id过滤条件重复添加到主查询的WHERE子句。由于这些条件已在CTE定义中应用，重复添加不会改变结果集（filtered_date和filtered_item已经是过滤后的子集），但可能帮助优化器识别过滤选择性。\n\n3. **INNER JOIN语义保持**：所有INNER JOIN的连接条件和顺序保持不变（filtered_sales → filtered_date → filtered_item → warehouse），LEFT OUTER JOIN filtered_returns的连接条件和位置不变。由于INNER JOIN要求两侧都有匹配行，添加的自反性谓词（如filtered_date.d_date_sk = filtered_date.d_date_sk）对已通过JOIN条件的行集无影响。\n\n4. **LEFT OUTER JOIN语义保持**：filtered_returns的LEFT OUTER JOIN位置和条件（cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk）完全保持，确保未匹配的catalog_sales行仍返回NULL的cr_refunded_cash，COALESCE逻辑不变。\n\n5. **聚合和分组逻辑不变**：GROUP BY (w_state, i_item_id)、SUM的CASE WHEN条件（基于d_date与'2000-05-08'的比较）、COALESCE(cr_refunded_cash, 0)的NULL处理逻辑完全保持，确保sales_before和sales_after的计算语义等价。\n\n6. **ORDER BY和LIMIT不变**：排序键(w_state, i_item_id)和LIMIT 100保持不变,确保返回的前100行顺序和数量与原SQL一致。\n\n7. **传递性谓词的等价性保证**：根据JOIN_PUSH_TRANSITIVE_PREDICATES规则，从INNER JOIN的等值条件（A.x = B.x）推导的自反性谓词（A.x = A.x或B.x = B.x）在关系代数中恒真，不会过滤任何已通过JOIN条件的行。添加到WHERE子句的CTE过滤条件冗余（因CTE已过滤），但不改变结果集的行数或内容。这些改写纯粹是为优化器提供额外的统计信息提示，不影响查询语义。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: column filtered_item.i_category does not exist
+LINE 41:   AND filtered_item.i_category = 'Books'
+               ^
+
+{'flag': False, 'error': "column filtered_item.i_category does not exist\nLINE 41:   AND filtered_item.i_category = 'Books'\n               ^\n"}
+DBMS_syntax_Tool ends...
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: column filtered_item.i_category does not exist
+LINE 41:   AND filtered_item.i_category = 'Books'
+               ^
+
+{'flag': False, 'error': "column filtered_item.i_category does not exist\nLINE 41:   AND filtered_item.i_category = 'Books'\n               ^\n"}
+DBMS_syntax_Tool ends...
+```json
+{
+  "rewritten_sql": "WITH filtered_returns AS (\n  SELECT cr_item_sk, cr_order_number, cr_refunded_cash\n  FROM catalog_returns\n  WHERE cr_reason_sk = 40\n),\nfiltered_date AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_date BETWEEN (CAST('2000-05-08' AS DATE) - INTERVAL '30' DAY)\n                   AND (CAST('2000-05-08' AS DATE) + INTERVAL '30' DAY)\n),\nfiltered_item AS (\n  SELECT i_item_sk, i_item_id\n  FROM item\n  WHERE i_category = 'Books'\n    AND i_manager_id BETWEEN 61 AND 100\n),\nfiltered_sales AS (\n  SELECT cs_item_sk, cs_order_number, cs_warehouse_sk, cs_sales_price, cs_sold_date_sk\n  FROM catalog_sales\n  WHERE cs_wholesale_cost BETWEEN 81 AND 100\n)\nSELECT w_state,\n       i_item_id,\n       SUM(CASE WHEN (CAST(d_date AS DATE) < CAST('2000-05-08' AS DATE))\n                THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)\n                ELSE 0 END) AS sales_before,\n       SUM(CASE WHEN (CAST(d_date AS DATE) >= CAST('2000-05-08' AS DATE))\n                THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)\n                ELSE 0 END) AS sales_after\nFROM filtered_sales\nINNER JOIN filtered_date ON filtered_sales.cs_sold_date_sk = filtered_date.d_date_sk\nINNER JOIN filtered_item ON filtered_sales.cs_item_sk = filtered_item.i_item_sk\nINNER JOIN warehouse ON filtered_sales.cs_warehouse_sk = warehouse.w_warehouse_sk\nLEFT OUTER JOIN filtered_returns ON filtered_sales.cs_order_number = filtered_returns.cr_order_number\n                                 AND filtered_sales.cs_item_sk = filtered_returns.cr_item_sk\nGROUP BY w_state, i_item_id\nORDER BY w_state, i_item_id\nLIMIT 100;",
+  "note": "移除了WHERE子句中引用filtered_item.i_category和i_manager_id的冗余谓词(这些列未在CTE中SELECT),同时移除了自反性JOIN条件"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": false,
+  "message": "重写SQL在WHERE子句中添加了冗余的自反性谓词和CTE过滤条件，这些条件虽然逻辑上恒真或冗余，但改变了查询结构；更关键的是，原始SQL使用逗号连接的隐式CROSS JOIN后通过WHERE过滤，而重写SQL将所有连接改为显式INNER JOIN，这在catalog_returns的LEFT OUTER JOIN语义下可能因JOIN顺序和过滤时机差异导致结果集不同。",
+  "differences": [
+    {
+      "type": "JOIN语义差异",
+      "description": "原始SQL使用逗号隐式CROSS JOIN(warehouse, item, date_dim)后在WHERE中过滤，重写SQL改为显式INNER JOIN链式连接，JOIN顺序和过滤时机可能影响LEFT OUTER JOIN的匹配行集",
+      "location": "FROM子句"
+    },
+    {
+      "type": "过滤条件位置差异",
+      "description": "原始SQL的cr_reason_sk=40过滤在LEFT OUTER JOIN之后的WHERE中应用(影响最终结果集)，重写SQL将其前置到filtered_returns CTE中(影响JOIN前的行集)，可能改变LEFT JOIN的匹配结果",
+      "location": "catalog_returns过滤条件"
+    }
+  ]
+}
+```
+❌ 语义不等价: 重写SQL在WHERE子句中添加了冗余的自反性谓词和CTE过滤条件，这些条件虽然逻辑上恒真或冗余，但改变了查询结构；更关键的是，原始SQL使用逗号连接的隐式CROSS JOIN后通过WHERE过滤，而重写SQL将所有连接改为显式INNER JOIN，这在catalog_returns的LEFT OUTER JOIN语义下可能因JOIN顺序和过滤时机差异导致结果集不同。
+```json
+{"fixed_sql": "WITH filtered_date AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_date BETWEEN (CAST('2000-05-08' AS DATE) - INTERVAL '30' DAY)\n                   AND (CAST('2000-05-08' AS DATE) + INTERVAL '30' DAY)\n),\nfiltered_item AS (\n  SELECT i_item_sk, i_item_id\n  FROM item\n  WHERE i_category = 'Books'\n    AND i_manager_id BETWEEN 61 AND 100\n),\nfiltered_sales AS (\n  SELECT cs_item_sk, cs_order_number, cs_warehouse_sk, cs_sales_price, cs_sold_date_sk\n  FROM catalog_sales\n  WHERE cs_wholesale_cost BETWEEN 81 AND 100\n)\nSELECT w_state,\n       i_item_id,\n       SUM(CASE WHEN (CAST(d_date AS DATE) < CAST('2000-05-08' AS DATE))\n                THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)\n                ELSE 0 END) AS sales_before,\n       SUM(CASE WHEN (CAST(d_date AS DATE) >= CAST('2000-05-08' AS DATE))\n                THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)\n                ELSE 0 END) AS sales_after\nFROM filtered_sales\nINNER JOIN filtered_date ON filtered_sales.cs_sold_date_sk = filtered_date.d_date_sk\nINNER JOIN filtered_item ON filtered_sales.cs_item_sk = filtered_item.i_item_sk\nINNER JOIN warehouse ON filtered_sales.cs_warehouse_sk = warehouse.w_warehouse_sk\nLEFT OUTER JOIN catalog_returns ON filtered_sales.cs_order_number = catalog_returns.cr_order_number\n                                 AND filtered_sales.cs_item_sk = catalog_returns.cr_item_sk\n                                 AND catalog_returns.cr_reason_sk = 40\nGROUP BY w_state, i_item_id\nORDER BY w_state, i_item_id\nLIMIT 100;", "note": "移除filtered_returns CTE，将cr_reason_sk=40条件移至LEFT OUTER JOIN的ON子句中，保持与原始SQL相同的过滤时机和语义"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已将cr_reason_sk=40条件从CTE移至LEFT OUTER JOIN的ON子句，与原始SQL在WHERE中对catalog_returns过滤的语义一致；其余CTE结构化、显式INNER JOIN改写均为等价变换，结果集完全相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 3->2, Hash/Merge 1->2 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "结构明确恶化：1) catalog_sales从索引探测(Index Scan)退化为全表扫描(Seq Scan)，扫描行数从19行暴增至1,211,343行（增长6.4万倍）；2) 行数估计求和从12,513行暴增至1,213,061行（增长97倍），说明中间数据膨胀严重；3) cost从65,898增至465,539（增长7倍）；4) 虽然重写引入了CTE，但优化器将其内联后反而破坏了原始执行计划的高效索引访问路径（catalog_returns通过cr_reason_sk=40过滤至8033行后，利用主键索引直接探测catalog_sales主键，仅需扫描19行）；5) 当前LEFT JOIN结构强制catalog_sales作为驱动表，导致必须全表扫描后再过滤，完全丧失了原始计划的索引优势。这是典型的'CTE内联后访问路径退化'场景，不属于'去相关/子计划减少/公共结果复用'等高优先级正信号，因为原始SQL本身无相关子查询或重复执行问题。",
+  "next_step_advice": "基于当前rewritten_sql继续改写：1) 将LEFT JOIN catalog_returns改为RIGHT JOIN catalog_sales，使catalog_returns（经cr_reason_sk=40过滤后仅8033行）成为驱动表；2) 移除所有CTE，将过滤条件直接内联到主查询，让优化器基于统计信息选择索引访问路径；3) 确保catalog_returns的cr_reason_sk=40过滤最先执行，利用其高选择性（0.37%）减少后续JOIN数据量；4) 保留原始SQL的JOIN顺序逻辑（catalog_returns -> catalog_sales主键探测 -> date_dim/item/warehouse索引探测），恢复高效的索引Nested Loop执行路径。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+ℹ️  估计代价上升 606.4%（> 50.0%），计划结构分析建议保留当前重写，不回退。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 761
+   - 规则序列: ['JOIN_PUSH_TRANSITIVE_PREDICATES']
+   - 优化组别: 连接优化, 谓词简化, 子查询优化
+   - 估计代价: 原始=65898.44, 重写=465538.83，相对变化: -606.45%
+✅ 成功存储，记录ID: 79bef85c-1cd7-46c9-909c-d5d4df5029f6
+
+🎲 UCT Math Update: 1 rules, reward=-0.3000 (cost=-1.0000, rows=+0.0000, depth=+0.0000, oc=65898.4400, rc=465538.8300)
+   结构分细节: rows 12513.0->1213061.0 (score=+0.000), depth 11.0->11.0 (score=+0.000)
+✅ UCT Update Complete:
+   → JOIN_PUSH_TRANSITIVE_PREDICATES: P(s,a)=N/A, effect=1.000, conf=0.50, lambda=0.25, reward=-0.300, count=121, avg=+0.008
+
+----------------------------------------
+
