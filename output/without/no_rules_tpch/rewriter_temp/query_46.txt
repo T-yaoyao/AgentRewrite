@@ -1,0 +1,123 @@
+Query ID: 46
+==================================================
+
+Original: select sum(l_extendedprice) / 7.0 as avg_yearly from lineitem, part where p_partkey = l_partkey and p_brand = 'Brand#35' and p_container = 'LG PKG' and l_quantity < ( select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey );
+Rewritten: SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly FROM (SELECT l_partkey, 0.2 * AVG(l_quantity) AS avg_threshold FROM lineitem WHERE l_partkey IN (SELECT p_partkey FROM part WHERE p_brand = 'Brand#35' AND p_container = 'LG PKG') GROUP BY l_partkey) AS subq JOIN part ON subq.l_partkey = p_partkey AND p_brand = 'Brand#35' AND p_container = 'LG PKG' JOIN lineitem ON lineitem.l_partkey = subq.l_partkey AND lineitem.l_quantity < subq.avg_threshold
+Time Cost: 125.15s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将相关子查询(select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey)转换为JOIN+聚合形式，消除SubPlan重复执行。具体方案：先对lineitem按l_partkey分组计算avg(l_quantity)*0.2，然后与外层查询JOIN，将l_quantity < subquery条件改为l_quantity < agg_result，避免每行触发子查询执行。'}, {'group': '聚合优化', 'produced_suggestion': '子查询解关联后，将聚合计算(avg(l_quantity))提前独立执行并物化为中间结果集，通过AGGREGATE_JOIN_TRANSPOSE将聚合操作与JOIN分离，减少Hash Join阶段的计算负担，降低当前82.3%的Join代价占比。'}, {'group': '谓词简化', 'produced_suggestion': "将part表的过滤条件(p_brand = 'Brand#35' AND p_container = 'LG PKG')尽早应用，在JOIN前过滤part表(当前200万行)，减少Hash Join的构建代价和探测代价。同时将l_quantity过滤条件在子查询解关联后下推到lineitem扫描阶段。"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) Hash Join代价占比82.3%，其中Join Filter包含相关子查询(SubPlan 1)导致每行都需执行子查询；2) 子查询内部对lineitem_1进行Seq Scan(代价占比9.1%)且Filter条件为l_partkey = part.p_partkey，这是典型的相关子查询模式；3) 外层lineitem表Seq Scan代价占比8.3%。历史案例显示相同SQL指纹通过FILTER_SUB_QUERY_TO_CORRELATE + AGGREGATE_JOIN_TRANSPOSE_EXTENDED组合可有效优化。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将相关子查询(select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey)转换为JOIN+聚合形式，消除SubPlan重复执行。具体方案：先对lineitem按l_partkey分组计算avg(l_quantity)*0.2，然后与外层查询JOIN，将l_quantity < subquery条件改为l_quantity < agg_result，避免每行触发子查询执行。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "子查询解关联后，将聚合计算(avg(l_quantity))提前独立执行并物化为中间结果集，通过AGGREGATE_JOIN_TRANSPOSE将聚合操作与JOIN分离，减少Hash Join阶段的计算负担，降低当前82.3%的Join代价占比。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将part表的过滤条件(p_brand = 'Brand#35' AND p_container = 'LG PKG')尽早应用，在JOIN前过滤part表(当前200万行)，减少Hash Join的构建代价和探测代价。同时将l_quantity过滤条件在子查询解关联后下推到lineitem扫描阶段。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "groups": "子查询优化,聚合优化,谓词简化",
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "FILTER_INTO_JOIN"],
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.4,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.4,
+    "FILTER_INTO_JOIN": 0.2
+  },
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.7,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.7,
+    "FILTER_INTO_JOIN": 0.6
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,聚合优化,谓词简化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "FILTER_INTO_JOIN"
+  ],
+  "rewritten_sql": "SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly\nFROM (\n    SELECT l_partkey, 0.2 * AVG(l_quantity) AS avg_threshold\n    FROM lineitem\n    GROUP BY l_partkey\n) AS subq\nJOIN part ON subq.l_partkey = p_partkey\n    AND p_brand = 'Brand#35'\n    AND p_container = 'LG PKG'\nJOIN lineitem ON lineitem.l_partkey = subq.l_partkey\n    AND lineitem.l_quantity < subq.avg_threshold",
+  "semantic_correctness_guarantee": "1. **相关子查询去相关化（FILTER_SUB_QUERY_TO_CORRELATE）**：原SQL中的相关子查询 `(SELECT 0.2 * AVG(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)` 对每个外层 lineitem 行重复执行。重写后将其转换为独立子查询 `subq`，按 `l_partkey` 分组预计算 `0.2 * AVG(l_quantity)` 作为 `avg_threshold`，然后通过 JOIN 关联。由于子查询仅依赖 `l_partkey`（相关列），对每个 `l_partkey` 的聚合结果唯一，因此 `lineitem.l_quantity < subq.avg_threshold` 与原 `l_quantity < (相关子查询)` 在每行的过滤逻辑完全等价。\n\n2. **聚合操作前置与JOIN分离（AGGREGATE_JOIN_TRANSPOSE_EXTENDED）**：原SQL在 WHERE 子句中嵌套聚合子查询，导致聚合与 JOIN 耦合。重写后将聚合计算独立为 `subq` 子查询（GROUP BY l_partkey），先物化聚合结果，再与 part 和 lineitem 进行 JOIN。由于 `l_partkey` 是 lineitem 表的外键（指向 partp_partkey），且聚合仅依赖 `l_partkey` 分组，提前聚合不会改变最终结果集的行数或聚合值的正确性。\n\n3. **谓词下推到JOIN条件（FILTER_INTO_JOIN）**：原SQL的 part 表过滤条件 `p_brand = 'Brand#35' AND p_container = 'LG PKG'` 在 WHERE 子句中。重写后将这些条件下推到 `subq JOIN part` 的 ON 子句中，在 JOIN 阶段提前过滤 part 表（从200万行减少到符合条件的少量行），减少后续 JOIN lineitem 的探测代价。由于 JOIN ON 条件与 WHERE 条件在内连接语义下等价（都要求条件为真才保留行），此下推不改变结果集。\n\n4. **JOIN顺序调整的等价性**：重写后先 JOIN subq 和 part（通过 `subq.l_partkey = p_partkey` 和 part 过滤条件），再 JOIN lineitem（通过 `lineitem.l_partkey = subq.l_partkey` 和数量过滤条件）。原SQL隐式先 JOIN lineitem 和 part，再应用相关子查询过滤。由于所有 JOIN 都是内连接（INNER JOIN），且 JOIN 条件基于主外键关系（`l_partkey` 外键指向 `p_partkey` 主键），JOIN 顺序调整不影响最终结果集的行组成，仅影响执行效率。\n\n5. **聚合函数SUM的作用域保持不变**：原SQL对过滤后的 lineitem 行的 `l_extendedprice` 求和后除以7.0。重写后同样对满足所有 JOIN 和过滤条件的 lineitem 行的 `l_extendedprice` 求和后除以7.0。由于过滤条件（part 表条件 + 数量阈值条件）完全等价，参与 SUM 聚合的行集合相同，因此聚合结果相同。\n\n6. **NULL值处理的等价性**：原SQL的相关子查询 `AVG(l_quantity)` 若某 `l_partkey` 无对应行则返回 NULL，导致 `l_quantity < NULL` 为 FALSE（过滤掉该行）。重写后 `subq` 的 GROUP BY 仅包含存在 lineitem 行的 `l_partkey`，JOIN 时若某 `l_partkey` 在 subq 中不存在则无法匹配（内连接丢弃），效果与原SQL一致。若 `l_partkey` 存在但 `AVG(l_quantity)` 为 NULL（理论上不可能，因 `l_quantity NOT NULL`），则 `l_quantity < NULL` 同样为 FALSE，行为一致。\n\n7. **结果集列与排序的一致性**：原SQL和重写SQL均仅返回一列 `avg_yearly`（SUM 聚合结果除以7.0），无 ORDER BY 子句，因此结果集结构和内容完全一致。重写未引入额外列、未改变聚合逻辑、未添加 DISTINCT 或 LIMIT，保证单行单列结果的语义等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在JOIN顺序上引入了语义错误：先JOIN subq和part再JOIN lineitem，导致subq中包含所有l_partkey的聚合结果，而原SQL的相关子查询仅对满足part过滤条件的l_partkey计算阈值。",
+    "differences": [
+        {
+            "type": "聚合范围差异",
+            "description": "原SQL相关子查询仅对满足p_brand='Brand#35'且p_container='LG PKG'的p_partkey计算AVG(l_quantity)；重写SQL的subq对lineitem全表所有l_partkey分组聚合，包含不满足part过滤条件的partkey",
+            "location": "subq子查询与part表JOIN的先后顺序"
+        },
+        {
+            "type": "过滤条件作用时机",
+            "description": "原SQL中part过滤条件通过p_partkey=l_partkey隐式限制了相关子查询的计算范围；重写SQL中subq独立计算后才与part JOIN，导致avg_threshold可能基于错误的partkey集合",
+            "location": "相关子查询去相关化的实现方式"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在JOIN顺序上引入了语义错误：先JOIN subq和part再JOIN lineitem，导致subq中包含所有l_partkey的聚合结果，而原SQL的相关子查询仅对满足part过滤条件的l_partkey计算阈值。
+```json
+{"fixed_sql": "SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly FROM (SELECT l_partkey, 0.2 * AVG(l_quantity) AS avg_threshold FROM lineitem WHERE l_partkey IN (SELECT p_partkey FROM part WHERE p_brand = 'Brand#35' AND p_container = 'LG PKG') GROUP BY l_partkey) AS subq JOIN part ON subq.l_partkey = p_partkey AND p_brand = 'Brand#35' AND p_container = 'LG PKG' JOIN lineitem ON lineitem.l_partkey = subq.l_partkey AND lineitem.l_quantity < subq.avg_threshold", "note": "在subq子查询中添加WHERE过滤，仅对满足part条件的partkey计算平均值，确保聚合范围与原SQL相关子查询一致"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正上轮问题：subq现在仅对满足part过滤条件的l_partkey计算阈值（通过WHERE l_partkey IN (SELECT p_partkey FROM part WHERE...)限定范围），与原SQL相关子查询的计算范围一致；后续JOIN逻辑正确关联，结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 60309894.0 -> 50222619.0 (重写侧约为原的 83.2743%) | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。
+✅ 估计代价降幅 85.5% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 204
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE', 'AGGREGATE_JOIN_TRANSPOSE_EXTENDED', 'FILTER_INTO_JOIN']
+   - 优化组别: 子查询优化,聚合优化,谓词简化
+   - 估计代价: 原始=20694419.77, 重写=2998573.11，相对变化: 85.51%
+✅ 成功存储，记录ID: ce7e27f2-3a14-441f-b306-114f42dc0844
+
+🎲 UCT Math Update: 3 rules, reward=+0.0234 (cost=+0.8551, rows=+0.1673, depth=-1.0000, oc=20694419.7700, rc=2998573.1100)
+   结构分细节: rows 60309894.0->50222619.0 (score=+0.167), depth 5.0->10.0 (score=-1.000)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.400, conf=0.70, lambda=0.35, reward=+0.009, count=60, avg=+0.051
+   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: P(s,a)=N/A, effect=0.400, conf=0.70, lambda=0.35, reward=+0.008, count=56, avg=+0.090
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.200, conf=0.60, lambda=0.30, reward=+0.006, count=294, avg=+0.023
+
+----------------------------------------
+

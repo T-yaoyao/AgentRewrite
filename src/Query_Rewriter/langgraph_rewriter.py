@@ -37,8 +37,7 @@ from src.Query_Rewriter.agent_definition import (
     ReasoningAgent,
     RewriteAgent,
     SemanticCheckAgent,
-    get_rule_examples,
-    get_rules_by_groups,
+    get_all_rules,
 )
 from src.Query_Rewriter.global_memory import GlobalMemoryManager
 from src.Query_Rewriter.schema_context import (
@@ -804,7 +803,7 @@ class LangGraphQueryRewriter:
                 g = a.get("group")
                 if g:
                     groups.append(g)
-            lib = get_rules_by_groups(groups)
+            lib = get_all_rules()
             stats = _stats_str(state["data_statistics"])
             idx = state.get("index_info") or self.index_info
             explain_info = state.get("initial_explain_info", "")
@@ -818,7 +817,7 @@ class LangGraphQueryRewriter:
                 )
             
             # ====== Bandit scoring (single-pass generation + bandit sorting) ======
-            context = self.bandit.extract_context(base_sql, explain_info, groups)
+            context = self.bandit.extract_context(base_sql, explain_info, [])
             scored_rules = self.bandit.score_rules(lib, context)
             
             # Build UCT-scored rule library for LLM
@@ -865,15 +864,12 @@ class LangGraphQueryRewriter:
         try:
             base_sql = _state_sql(state.get("current_sql") or state["initial_sql"])
             sel = state.get("selected_rules") or {"applied_rules": [], "groups": ""}
-            rules = sel.get("applied_rules", [])
-            ex = get_rule_examples(rules)
             stats = _stats_str(state["data_statistics"])
             idx = state.get("index_info") or self.index_info
             async with self.llm_semaphore:
                 rr = await self.rewrite_agent.rewrite_with_rule_sequence(
                     base_sql,
                     sel,
-                    ex,
                     json.dumps(state.get("optimization_advice") or [], ensure_ascii=False),
                     stats,
                     schema_content=state.get("schema_content") or "",

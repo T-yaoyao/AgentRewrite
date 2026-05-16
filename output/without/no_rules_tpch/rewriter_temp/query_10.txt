@@ -1,0 +1,199 @@
+Query ID: 10
+==================================================
+
+Original: select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1996-01-01' and o_orderdate < date '1996-01-01' + interval '3' month and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;
+Rewritten: WITH qualified_lineitem AS (
+    SELECT DISTINCT l_orderkey
+    FROM lineitem
+    WHERE l_commitdate < l_receiptdate
+)
+SELECT o.o_orderpriority, COUNT(*) AS order_count
+FROM orders o
+WHERE o.o_orderdate >= DATE '1996-01-01'
+  AND o.o_orderdate < DATE '1996-01-01' + INTERVAL '3' MONTH
+  AND o.o_orderkey IN (SELECT l_orderkey FROM qualified_lineitem)
+GROUP BY o.o_orderpriority
+ORDER BY o.o_orderpriority;
+Time Cost: 320.58s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "移除派生表和DISTINCT，将EXISTS子查询改写为IN子查询或显式SEMI JOIN：SELECT o_orderpriority, COUNT(*) FROM orders o WHERE o_orderdate >= DATE '1996-01-01' AND o_orderdate < DATE '1996-04-01' AND o_orderkey IN (SELECT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate) GROUP BY o_orderpriority ORDER BY o_orderpriority。这样可避免冗余去重，让优化器选择Hash Semi Join替代Nested Loop索引探测。"}, {'group': '聚合优化', 'produced_suggestion': '通过移除派生表的DISTINCT，让主查询直接对orders表进行GROUP BY，恢复Hashed Aggregate策略（原SQL使用），避免当前Sort+Unique+Sorted Aggregate的流水线阻塞开销（占2.5%+1.7%代价）。'}, {'group': '连接优化', 'produced_suggestion': "若优化器仍选择Nested Loop，考虑在lineitem子查询中先物化满足l_commitdate < l_receiptdate的l_orderkey集合（通过CTE或派生表），然后用Hash Semi Join与orders关联：WITH qualified_orders AS (SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate) SELECT o_orderpriority, COUNT(*) FROM orders o JOIN qualified_orders q ON o.o_orderkey = q.l_orderkey WHERE o_orderdate >= DATE '1996-01-01' AND o_orderdate < DATE '1996-04-01' GROUP BY o_orderpriority ORDER BY o_orderpriority。"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表全表扫描代价占比97.2%，且存在相关子查询导致的性能瓶颈。历史案例显示相似SQL通过FILTER_SUB_QUERY_TO_CORRELATE等规则优化后性能提升明显。当前SQL的EXISTS子查询可以转换为半连接，结合谓词下推和连接优化可显著降低扫描代价。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS相关子查询转换为SEMI JOIN，避免对lineitem表的重复扫描。应用FILTER_SUB_QUERY_TO_CORRELATE规则，将子查询条件l_commitdate < l_receiptdate作为连接后的过滤条件，减少中间结果集大小。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "优化orders与lineitem的连接方式，利用FILTER_INTO_JOIN规则将orders表的日期范围过滤条件(o_orderdate >= '1996-01-01' AND o_orderdate < '1996-04-01')先执行，缩小驱动表规模后再与lineitem进行半连接，降低连接代价。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将lineitem表的过滤条件l_commitdate < l_receiptdate尽早应用，结合SEMI_JOIN_FILTER_TRANSPOSE规则，在连接前对lineitem进行过滤，减少参与连接的数据量，降低全表扫描代价。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "应用AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则，考虑将GROUP BY操作与连接操作重排序，先对orders表按o_orderpriority分组过滤，再与lineitem进行半连接验证，减少聚合阶段的流水线阻塞影响。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.216
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "groups": "子查询优化,连接优化,谓词简化,聚合优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_INTO_JOIN",
+    "SEMI_JOIN_FILTER_TRANSPOSE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"
+  ],
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.3,
+    "FILTER_INTO_JOIN": 0.2,
+    "SEMI_JOIN_FILTER_TRANSPOSE": 0.4,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.1
+  },
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.9,
+    "FILTER_INTO_JOIN": 0.8,
+    "SEMI_JOIN_FILTER_TRANSPOSE": 0.85,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.7
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,连接优化,谓词简化,聚合优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_INTO_JOIN",
+    "SEMI_JOIN_FILTER_TRANSPOSE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"
+  ],
+  "rewritten_sql": "SELECT o_orderpriority, COUNT(*) AS order_count\nFROM (\n    SELECT DISTINCT o.o_orderpriority, o.o_orderkey\n    FROM orders o\n    WHERE o.o_orderdate >= DATE '1996-01-01'\n      AND o.o_orderdate < DATE '1996-01-01' + INTERVAL '3' MONTH\n      AND EXISTS (\n          SELECT 1\n          FROM lineitem l\n          WHERE l.l_orderkey = o.o_orderkey\n            AND l.l_commitdate < l.l_receiptdate\n      )\n) AS filtered_orders\nGROUP BY o_orderpriority\nORDER BY o_orderpriority;",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原始SQL的EXISTS相关子查询保持为半连接形式,但在外层增加了子查询包装,先执行DISTINCT去重后再聚合。这对应FILTER_SUB_QUERY_TO_CORRELATE规则(保持相关性)、FILTER_INTO_JOIN规则(日期过滤前置)、SEMI_JOIN_FILTER_TRANSPOSE规则(lineitem过滤条件l_commitdate < l_receiptdate在EXISTS内部执行)。\n\n2. **日期过滤前置的等价性**：orders表的日期范围过滤(o_orderdate >= '1996-01-01' AND o_orderdate < '1996-04-01')在WHERE子句中先于EXISTS执行,这是标准的谓词下推优化。由于过滤条件仅涉及orders表自身列,不影响与lineitem的连接语义,结果集与原SQL等价。\n\n3. **EXISTS半连接语义保持**：EXISTS子查询的相关条件l_orderkey = o_orderkey保持不变,内部过滤条件l_commitdate < l_receiptdate在连接前对lineitem表执行。根据TPC-H Schema,l_orderkey是lineitem的主键组成部分,EXISTS语义为"存在至少一条满足条件的lineitem记录",重写后的半连接完全保持此语义。\n\n4. **DISTINCT去重的必要性与等价性**：由于lineitem表中一个o_orderkey可能对应多条记录(l_orderkey + l_linenumber为复合主键),EXISTS子查询在原SQL中只判断存在性(不重复计数orders)。重写后在子查询中使用DISTINCT (o_orderpriority, o_orderkey)确保每个订单只被计数一次,与原SQL的GROUP BY o_orderpriority聚合语义完全等价。\n\n5. **聚合操作的等价性**：原SQL对满足EXISTS条件的orders按o_orderpriority分组计数。重写后先通过子查询+DISTINCT得到去重的(o_orderpriority, o_orderkey)组合,外层再GROUP BY o_orderpriority并COUNT(*),结果与原SQL的order_count列完全一致。由于o_orderkey是orders主键,DISTINCT不会丢失任何有效订单。\n\n6. **排序语义保持**：ORDER BY o_orderpriority在外层查询执行,作用于聚合后的结果集,与原SQL排序逻辑完全一致。\n\n7. **NULL值处理**：Schema中o_orderpriority、o_orderdate、l_commitdate、l_receiptdate均为NOT NULL,不存在NULL值导致的语义差异。日期比较和EXISTS判断在有无DISTINCT的情况下行为一致。\n\n8. **AGGREGATE_JOIN_TRANSPOSE_EXTENDED应用说明**：通过将聚合操作分解为子查询内的DISTINCT(相当于预聚合去重)和外层的最终GROUP BY,减少了聚合阶段处理的重复数据量。这种转换在o_orderkey为主键的前提下保证了与原SQL的完全等价性,同时优化了执行效率。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过DISTINCT(o_orderpriority, o_orderkey)在聚合前去重，由于o_orderkey是orders表主键，每个orderkey唯一对应一个orderpriority，DISTINCT不改变分组基数，COUNT(*)结果与原SQL等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划对比：1) 核心结构未变：两者均为 lineitem 全表扫描 → HashAggregate 去重 l_orderkey → Nested Loop 探测 orders 索引；2) 重写引入额外开销：新增 Sort(o_orderpriority, o_orderkey) + Unique 节点，用于实现派生表的 DISTINCT，但原 SQL 通过 EXISTS 语义天然保证 o_orderkey 唯一性，该去重操作冗余；3) 聚合策略退化：原 SQL 使用 Hashed Aggregate（低开销），重写改为 Sorted Aggregate（需依赖前序排序，增加 Sort 成本）；4) cost 上升 2%（1928131 → 1966260），虽幅度不大但与结构退化方向一致；5) 行数估计求和微增 3%（20291376 → 20883194），无明显改善信号。结论：重写未消除相关子查询（EXISTS 仍保留），未减少扫描次数，反而引入冗余去重 + 排序开销，属于结构性退化。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 enhanced_sql 继续改写：1) 移除派生表的 DISTINCT，直接在主查询中保留 EXISTS 子查询（或彻底转为 SEMI JOIN），避免冗余去重；2) 尝试将 EXISTS 改写为 IN (SELECT l_orderkey FROM lineitem WHERE ...)，配合 HashAggregate 去重 l_orderkey 后用 Hash Semi Join 替代 Nested Loop，减少索引探测开销；3) 若优化器支持，考虑对 orders 表先按日期范围过滤后物化为 CTE，再与 lineitem 的去重结果进行 Hash Semi Join，避免重复索引扫描。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮重写引入冗余DISTINCT和Sort+Unique节点导致性能退化。当前SQL核心问题：1) lineitem全表扫描占95.4%代价，需通过索引或物化优化；2) 派生表DISTINCT完全冗余（EXISTS已保证唯一性）；3) Sort+Unique+Sorted Aggregate链路开销大于原Hashed Aggregate。优化方向：彻底移除派生表和DISTINCT，将EXISTS改写为Hash Semi Join，恢复Hashed Aggregate，减少流水线阻塞节点。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "移除派生表和DISTINCT，将EXISTS子查询改写为IN子查询或显式SEMI JOIN：SELECT o_orderpriority, COUNT(*) FROM orders o WHERE o_orderdate >= DATE '1996-01-01' AND o_orderdate < DATE '1996-04-01' AND o_orderkey IN (SELECT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate) GROUP BY o_orderpriority ORDER BY o_orderpriority。这样可避免冗余去重，让优化器选择Hash Semi Join替代Nested Loop索引探测。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "通过移除派生表的DISTINCT，让主查询直接对orders表进行GROUP BY，恢复Hashed Aggregate策略（原SQL使用），避免当前Sort+Unique+Sorted Aggregate的流水线阻塞开销（占2.5%+1.7%代价）。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "若优化器仍选择Nested Loop，考虑在lineitem子查询中先物化满足l_commitdate < l_receiptdate的l_orderkey集合（通过CTE或派生表），然后用Hash Semi Join与orders关联：WITH qualified_orders AS (SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate) SELECT o_orderpriority, COUNT(*) FROM orders o JOIN qualified_orders q ON o.o_orderkey = q.l_orderkey WHERE o_orderdate >= DATE '1996-01-01' AND o_orderdate < DATE '1996-04-01' GROUP BY o_orderpriority ORDER BY o_orderpriority。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.215
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "groups": "子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION"],
+  "rule_effect_scores": {"STRATEGY_CTE_DECOMPOSITION": 1.0},
+  "rule_effect_confidence": {"STRATEGY_CTE_DECOMPOSITION": 0.7}
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH qualified_lineitem AS (\n    SELECT DISTINCT l_orderkey\n    FROM lineitem\n    WHERE l_commitdate < l_receiptdate\n)\nSELECT o.o_orderpriority, COUNT(*) AS order_count\nFROM orders o\nWHERE o.o_orderdate >= DATE '1996-01-01'\n  AND o.o_orderdate < DATE '1996-01-01' + INTERVAL '3' MONTH\n  AND o.o_orderkey IN (SELECT l_orderkey FROM qualified_lineitem)\nGROUP BY o.o_orderpriority\nORDER BY o.o_orderpriority;",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原 SQL 中的 EXISTS 相关子查询改写为 CTE + IN 子查询。CTE qualified_lineitem 先物化满足 l_commitdate < l_receiptdate 条件的 l_orderkey 集合并去重，主查询通过 IN 子查询与 orders 表关联。\n\n2. 等价性保证 - EXISTS 到 IN 的转换：原 SQL 的 EXISTS (SELECT 1 FROM lineitem l WHERE l.l_orderkey = o.o_orderkey AND l.l_commitdate < l.l_receiptdate) 语义为"存在至少一条 lineitem 记录满足条件"。改写后的 o.o_orderkey IN (SELECT l_orderkey FROM qualified_lineitem) 语义为"o_orderkey 存在于满足条件的 l_orderkey 集合中"。由于 lineitem 表的主键为 (l_orderkey, l_linenumber)，l_orderkey 可重复，但 CTE 中的 DISTINCT 已去重，因此 IN 子查询与 EXISTS 在结果集上完全等价。\n\n3. 等价性保证 - 移除派生表 DISTINCT：原 SQL 在派生表中对 (o_orderpriority, o_orderkey) 执行 DISTINCT，但由于 orders 表的主键为 o_orderkey，每个 o_orderkey 唯一对应一个 o_orderpriority，因此该 DISTINCT 操作冗余。改写后直接在主查询中对 orders 表进行 GROUP BY o_orderpriority，结果集与原 SQL 完全一致。\n\n4. 等价性保证 - 过滤条件保持：orders 表的日期范围过滤条件 (o_orderdate >= DATE '1996-01-01' AND o_orderdate < DATE '1996-04-01') 在改写前后保持不变，作用域未改变。\n\n5. 等价性保证 - 聚合与排序：原 SQL 对派生表的 o_orderpriority 进行 GROUP BY 和 COUNT(*)，改写后直接对 orders 表的 o_orderpriority 进行 GROUP BY 和 COUNT(*)。由于移除了冗余 DISTINCT，且 o_orderkey 主键保证唯一性，聚合结果与原 SQL 完全一致。ORDER BY o_orderpriority 在改写前后保持不变。\n\n6. 易误判点说明 - CTE 物化与 Hash Semi Join：CTE qualified_lineitem 先对 lineitem 表进行过滤和去重，生成物化结果集。主查询通过 IN 子查询与 orders 表关联时，优化器可选择 Hash Semi Join 替代原 SQL 的 Nested Loop 索引探测，减少重复扫描开销。即使优化器未选择 Hash Semi Join，IN 子查询的语义仍与 EXISTS 等价，不影响结果集正确性。\n\n7. 易误判点说明 - NULL 值处理：lineitem 表的 l_orderkey 列定义为 NOT NULL，orders 表的 o_orderkey 列定义为 NOT NULL，因此 IN 子查询不涉及 NULL 值的三值逻辑问题，与 EXISTS 的语义完全一致。\n\n8. 总结：改写通过 CTE 分解策略将相关子查询去相关化，移除冗余 DISTINCT 操作，恢复 Hashed Aggregate 聚合策略，同时保持与原 SQL 在结果集、列名、数据类型、排序顺序上的完全等价性。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL将EXISTS相关子查询改写为CTE+IN子查询，语义完全等价：CTE先物化满足条件的l_orderkey集合并去重，主查询通过IN关联，与原SQL的EXISTS半连接语义一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 20291376.0 -> 8332498.0 (重写侧约为原的 41.0642%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "结构性改进明显：1) 行数估计求和从20291376降至8332498（降至41%），显著减少中间数据量；2) 引入CTE预聚合（qualified_lineitem）实现公共中间结果复用，避免重复扫描lineitem；3) 通过DISTINCT l_orderkey压缩中间结果后再JOIN，减少Nested Loop探测次数；4) 引入并行扫描（Parallel Seq Scan + Gather Merge），提升lineitem扫描效率；5) cost从1928131.72降至1461158.35（降低24%）。虽然增加了Unique/Gather Merge节点，但这是为了支持CTE物化和并行执行的必要开销，整体结构收益远超局部开销。符合DSS/OLAP场景下通过预聚合+复用减少重复计算的优化模式，已达到优化目标。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 269
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION']
+   - 优化组别: 子查询优化
+   - 估计代价: 原始=1928131.72, 重写=1461158.35，相对变化: 24.22%
+✅ 成功存储，记录ID: 2111c80b-7ccc-4c56-a27f-61cfcef3b55f
+
+🎲 UCT Math Update: 1 rules, reward=+0.1284 (cost=+0.2422, rows=+0.5894, depth=-0.6000, oc=1928131.7200, rc=1461158.3500)
+   结构分细节: rows 20291376.0->8332498.0 (score=+0.589), depth 5.0->8.0 (score=-0.600)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=1.000, conf=0.70, lambda=0.35, reward=+0.128, count=241, avg=+0.050
+
+----------------------------------------
+

@@ -318,7 +318,7 @@ class ReasoningAgent(Agent):
         
         prompt = textwrap.dedent(f"""
         <Mission>
-        你是一名经验丰富的 DBA，你的任务是基于决策Agent提供的优化方向，从规则库中挑选合适的优化规则序列。你只负责选择规则，不进行任何重写操作。
+        你是一名经验丰富的 DBA，你的任务是基于 SQL / 执行计划 / 统计信息，从全量规则库中直接挑选合适的优化规则序列。你只负责选择规则，不进行任何重写操作。
 
         1. 规则选择原则：
            - 只能选择与当前SQL结构相符且能够优化该SQL的规则
@@ -354,12 +354,12 @@ class ReasoningAgent(Agent):
         {explain_info}
 
         3. 输出要求：**只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）。字段：
-        - groups: 字符串，必须与「当前优化方向」一致："{groups_text}"
+        - groups: 字符串，填写你判断本次所选规则涉及的类别；可为单个类别或多个类别的逗号分隔字符串，不要求与 decision_advice 中的 group 保持一致
         - applied_rules: 字符串数组，按应用顺序列出规则 ID；必须来自 <rule_library>，禁止编造；若无适用规则则为 []
         - rule_effect_scores: 对象，键为 applied_rules 中的 rule_id，值为该规则预估贡献分（正数）。建议总和约为 1；若无规则则 {{}}
         - rule_effect_confidence: 对象，键为 applied_rules 中的 rule_id，值为该规则效果估计的置信度（0到1之间）
 
-        示例：{{"groups": "{groups_text}", "applied_rules": ["RULE_ID_1"], "rule_effect_scores": {{"RULE_ID_1": 1.0}}, "rule_effect_confidence": {{"RULE_ID_1": 0.8}}}}
+        示例：{{"groups": "连接优化, 谓词简化", "applied_rules": ["RULE_ID_1"], "rule_effect_scores": {{"RULE_ID_1": 1.0}}, "rule_effect_confidence": {{"RULE_ID_1": 0.8}}}}
         """)
 
         thought_chain = await self.llm.get_LLM_response_async(
@@ -650,6 +650,18 @@ class DecisionAgent(Agent):
 
 
 # Utility functions for rule management
+CATEGORY_TO_GROUP_MAPPING = {
+    "SUBQUERY_OPTIMIZATION": "子查询优化",
+    "JOIN_OPTIMIZATION": "连接优化",
+    "PREDICATE_OPTIMIZATION": "谓词简化",
+    "CONSTANT_OPTIMIZATION": "常量折叠",
+    "AGGREGATE_OPTIMIZATION": "聚合优化",
+    "PROJECTION_OPTIMIZATION": "投影优化",
+    "SORT_OPTIMIZATION": "排序优化",
+    "SET_OPERATION_OPTIMIZATION": "集合优化",
+}
+
+
 def load_rule_knowledge_base() -> dict:
     """Load rule knowledge base from Rule_Examples.json"""
     try:
@@ -667,21 +679,26 @@ def get_rules_by_groups(groups: list) -> dict:
     result = {}
 
     # Group mapping to categories in Rule_Examples.json
-    group_mapping = {
-        "子查询优化": "SUBQUERY_OPTIMIZATION",
-        "连接优化": "JOIN_OPTIMIZATION",
-        "谓词简化": "PREDICATE_OPTIMIZATION",
-        "常量折叠": "CONSTANT_OPTIMIZATION",
-        "聚合优化": "AGGREGATE_OPTIMIZATION",
-        "投影优化": "PROJECTION_OPTIMIZATION",
-        "排序优化": "SORT_OPTIMIZATION",
-        "集合优化": "SET_OPERATION_OPTIMIZATION"
-    }
+    group_mapping = {v: k for k, v in CATEGORY_TO_GROUP_MAPPING.items()}
 
     for group in groups:
         category = group_mapping.get(group)
         if category and category in rule_kb:
             result[group] = rule_kb[category].get("rules", {})
+
+    return result
+
+
+def get_all_rules() -> dict:
+    """Get the full rule library without filtering by optimization group."""
+    rule_kb = load_rule_knowledge_base()
+    result = {}
+
+    for category, category_data in rule_kb.items():
+        group_name = CATEGORY_TO_GROUP_MAPPING.get(category, category)
+        rules = category_data.get("rules", {}) if isinstance(category_data, dict) else {}
+        if isinstance(rules, dict) and rules:
+            result[group_name] = rules
 
     return result
 
@@ -747,7 +764,6 @@ class RewriteAgent(Agent):
         self,
         sql: str,
         rule_sequence: dict,
-        rule_examples: dict,
         optimization_direction: str,
         data_statistics: str,
         schema_content: Optional[str] = None,
@@ -757,16 +773,6 @@ class RewriteAgent(Agent):
         """Execute SQL rewriting based on selected rule sequence with semantic equivalence check"""
         applied_rules = rule_sequence.get("applied_rules", [])
         groups = rule_sequence.get("groups", "")
-
-        # Build rule examples text
-        examples_text = ""
-        for rule_id in applied_rules:
-            if rule_id in rule_examples:
-                examples_text += f"### {rule_id}\n"
-                for example in rule_examples[rule_id]:
-                    examples_text += f"原始查询: {example.get('original_query', '')}\n"
-                    examples_text += f"重写查询: {example.get('rewritten_query', '')}\n"
-                    examples_text += f"规则描述: {example.get('rule_description', '')}\n\n"
 
         sch = (schema_content or "").strip()
         schema_section = (
@@ -803,7 +809,6 @@ class RewriteAgent(Agent):
         1. 输入信息：
            - <base_sql>: 当前轮次的基底 SQL。第一轮它等于原始SQL；若进入下一轮，它就是上一轮 rewritten_sql
            - <rule_sequence>: 要应用的规则序列
-           - <rule_examples>: 相关规则的重写示例
            - <optimization_direction>: 优化方向
            - <统计信息>: 数据库表统计信息
            - （若下方提供）<SQL Schema>: 与当前查询相关的表 DDL
@@ -814,7 +819,6 @@ class RewriteAgent(Agent):
            - **最高优先级约束**：必须优先保证 rewritten_sql 与原始SQL在语义上完全等价；任何优化都不得以改变结果集语义为代价
            - 一次性完成全部规则的应用，不分步骤应用，最终输出重写 SQL**：直接写最终版本
            - 确保SQL的语法正确性
-           - 参考rule_examples中的示例进行重写
            - **必须保持查询语义的等价性**：重写后的SQL必须与原始SQL在语义上完全等价
            - 若提供了上一轮评估反馈，说明这是增量改写场景；必须在当前基底 SQL 的基础上继续优化，而不是回退并从原始 SQL 重新开始
            - 生成可执行的SQL
@@ -835,9 +839,6 @@ class RewriteAgent(Agent):
 
         <rule_sequence>
         {json.dumps(rule_sequence, ensure_ascii=False, indent=2)}
-
-        <rule_examples>
-        {examples_text}
 
         <optimization_direction>
         {optimization_direction}
@@ -1225,9 +1226,6 @@ class SemanticCheckAgent(Agent):
             rules_text = "\n".join(rule_lines)
         else:
             rules_text = "无"
-        rlist = list(rewrite_rules) if rewrite_rules else []
-        ex_map = get_rule_examples(rlist) if rlist else {}
-        rules_examples_text = format_rule_examples_for_semantic_check(ex_map)
         g = (str(semantic_correctness_guarantee).strip() if semantic_correctness_guarantee else "")
         s0 = (str(semantic_check).strip() if semantic_check is not None else "")
         # 新字段「语义正确性保证说明」优先；否则退化为旧名 semantic_check（同一段说明）。
@@ -1310,10 +1308,10 @@ class SemanticCheckAgent(Agent):
         2. **SQL Schema**：主键、唯一约束、函数依赖、可据此认可的等价变形（例如已知 PK 下 GROUP BY 的化简）。
         3. **索引信息**（若提供）：通常不改变关系层面的结果集语义；PRIMARY KEY/UNIQUE 类索引可辅助推断唯一性，与 Schema 一并用于等价推理。**不得以「有无非唯一索引」代替 SQL 逻辑判断是否等价**。
         4. **首轮「语义正确性保证说明」**（若提供）：**仅**作辅助线索，须与 1 逐条核对。若存在「语义修正_第N轮_必读」块，说明**当前重写 SQL 可能已按你方上一轮意见改过**——**禁止**用首轮自辩中仅适用**历史版本**的论述来否掉**已经变化后**的当前 SQL；自辩与**当前**重写 SQL 明显不符时，**忽略**不适用的自辩段。
-        5. **应用规则（ID + 文字描述 + 知识库官方示例）**：本查询**声称**依这些规则做等价改写。当「当前重写 SQL」可判定为**完全按**规则描述与**官方示例**所体现的**典型「原→重」变换**忠实套用（同构的改写模式、未在规则意图之外缩小/扩大过滤范围、未擅自改变聚合/分组/去重语义），且与 **Schema/约束** 无矛盾时，应将其视为**强等价先验**：默认倾向 `equivalent=true`，除非你能给出**明确且可核验的结果集变化证据**。
+        5. **应用规则（ID + 文字描述）**：本查询**声称**依这些规则做等价改写。当「当前重写 SQL」可判定为**完全按**规则描述所体现的典型变换意图忠实套用（同构的改写模式、未在规则意图之外缩小/扩大过滤范围、未擅自改变聚合/分组/去重语义），且与 **Schema/约束** 无矛盾时，应将其视为**强等价先验**：默认倾向 `equivalent=true`，除非你能给出**明确且可核验的结果集变化证据**。
 
         通用原则：
-        - **规则驱动等价先验**：在 Schema 不否定结论的前提下，若重写在结构上等价于「对原 SQL 应用规则 R」且与 R 的**描述 + 知识库中该 R 的示例**所示变换意图一致、无多余语义偏移，应默认采纳 `equivalent=true`；只有当你能给出**明确、具体、可复核**的反例时，才允许推翻这一先验。
+        - **规则驱动等价先验**：在 Schema 不否定结论的前提下，若重写在结构上等价于「对原 SQL 应用规则 R」且与 R 的文字描述所示变换意图一致、无多余语义偏移，应默认采纳 `equivalent=true`；只有当你能给出**明确、具体、可复核**的反例时，才允许推翻这一先验。
         - **举证责任原则**：仅当**能明确指出**会导致结果集不一致的差异时才允许判 `equivalent=false`。所谓“明确指出”是指：必须说明差异如何改变过滤范围、连接基数、重复行、NULL 语义、聚合粒度、DISTINCT/去重语义、排序/限制对结果集的影响等。若只是“结构不同”“看起来复杂”“可能有风险”，不足以判 false。
         - **结构变化不等于语义变化**：CTE 引入、相关子查询改写为 JOIN、过滤条件从 WHERE 移入 JOIN ON、常量折叠、冗余排序消除、预聚合/公共结果复用，本身都**不能**作为判 false 的依据；必须证明这些变换改变了最终结果集。
         - **证据不足时从宽**：如果你不能构造出具体结果集差异，就应判 `equivalent=true`，而不是因为怀疑或保守而判 false。
@@ -1323,7 +1321,6 @@ class SemanticCheckAgent(Agent):
         - 两层聚合折叠规则（强约束）：若原SQL形如「内层按 (K,U) 分组，外层按 K 分组」，且重写为「按 K 单层聚合」，并且每个外层聚合列都满足以下逐列等价之一：
           MIN(MIN(v))->MIN(v)，MAX(MAX(v))->MAX(v)，SUM(SUM(v))->SUM(v)，SUM(COUNT(v))->COUNT(v)，则**必须判 equivalent=true**。
         - 禁止误判：在满足上述强约束时，不能使用“计数对象不同”“中间分组行数不同”“内层多了 ename”作为不等价理由；这些只影响中间态，不影响最终结果。
-        - 不得忽略「应用规则_知识库官方示例」：当当前「原始→当前重写」与某条**官方示例**的「原→重」在规则意义上同构，且原始 SQL/当前重写 SQL 分别与示例中的「原/重」结构对应时，**应采纳该规则项下的典型等价结论**，除非有 Schema/NULL/重复行可证反例。
         - 若判 `equivalent=false`，`differences` 中每一项都必须对应一个**会改变最终结果集**的具体点；不得输出空泛差异。若做不到，请改判 `equivalent=true`。
 
         <原始 SQL>
@@ -1337,10 +1334,6 @@ class SemanticCheckAgent(Agent):
         <应用规则_规则ID与文字描述>
         {rules_text}
         </应用规则_规则ID与文字描述>
-
-        <应用规则_知识库官方示例_原始与重写成对>
-        {rules_examples_text}
-        </应用规则_知识库官方示例_原始与重写成对>
 
         **只输出一个 JSON**（不要其它文字）：
         {{

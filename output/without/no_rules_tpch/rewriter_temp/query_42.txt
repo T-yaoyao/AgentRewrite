@@ -1,0 +1,122 @@
+Query ID: 42
+==================================================
+
+Original: select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1997-03-01' and l_shipdate < date '1997-03-01' + interval '1' month;
+Rewritten: WITH filtered_lineitem AS (
+  SELECT l_partkey, l_extendedprice, l_discount
+  FROM lineitem
+  WHERE l_shipdate >= DATE '1997-03-01'
+    AND l_shipdate < DATE '1997-03-01' + INTERVAL '1' month
+),
+joined_data AS (
+  SELECT 
+    p.p_type,
+    fl.l_extendedprice * (1 - fl.l_discount) AS revenue
+  FROM filtered_lineitem fl
+  INNER JOIN part p ON fl.l_partkey = p.p_partkey
+),
+aggregated_revenue AS (
+  SELECT 
+    SUM(CASE WHEN p_type LIKE 'PROMO%' THEN revenue ELSE 0 END) AS promo_revenue,
+    SUM(revenue) AS total_revenue
+  FROM joined_data
+)
+SELECT 100.00 * promo_revenue / total_revenue AS promo_revenue
+FROM aggregated_revenue;
+Time Cost: 190.59s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将part表的p_type过滤条件提前应用，减少Hash Join的右表数据量，避免在聚合阶段处理大量不满足条件的记录'}, {'group': '聚合优化', 'produced_suggestion': '将CASE WHEN聚合转换为两个独立的子查询或CTE，分别计算promo类型和总体的金额，最后进行除法运算，避免在单次扫描中对每行都执行CASE判断'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，先对part表应用p_type过滤，再与已按日期过滤的lineitem进行连接，利用Inner Unique特性减少连接代价'}, {'group': '子查询优化', 'produced_suggestion': '使用CTE将lineitem的日期过滤结果物化，避免重复扫描大表，然后分别计算promo金额和总金额'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表全表扫描代价占比95.1%，且存在日期范围过滤条件。SQL使用CASE WHEN进行条件聚合，可以通过将过滤条件下推、分解聚合计算、优化连接顺序等方式提升性能。历史案例显示相似SQL通过CTE分解、过滤下推和聚合优化均取得过成功。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将part表的p_type过滤条件提前应用，减少Hash Join的右表数据量，避免在聚合阶段处理大量不满足条件的记录"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将CASE WHEN聚合转换为两个独立的子查询或CTE，分别计算promo类型和总体的金额，最后进行除法运算，避免在单次扫描中对每行都执行CASE判断"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，先对part表应用p_type过滤，再与已按日期过滤的lineitem进行连接，利用Inner Unique特性减少连接代价"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用CTE将lineitem的日期过滤结果物化，避免重复扫描大表，然后分别计算promo金额和总金额"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.208
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "groups": "子查询优化, 谓词简化, 连接优化, 聚合优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION"],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 1.0
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 谓词简化, 连接优化, 聚合优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH filtered_lineitem AS (\n  SELECT l_partkey, l_extendedprice, l_discount\n  FROM lineitem\n  WHERE l_shipdate >= DATE '1997-03-01'\n    AND l_shipdate < DATE '1997-03-01' + INTERVAL '1' month\n),\njoined_data AS (\n  SELECT \n    p.p_type,\n    fl.l_extendedprice * (1 - fl.l_discount) AS revenue\n  FROM filtered_lineitem fl\n  INNER JOIN part p ON fl.l_partkey = p.p_partkey\n),\naggregated_revenue AS (\n  SELECT \n    SUM(CASE WHEN p_type LIKE 'PROMO%' THEN revenue ELSE 0 END) AS promo_revenue,\n    SUM(revenue) AS total_revenue\n  FROM joined_data\n)\nSELECT 100.00 * promo_revenue / total_revenue AS promo_revenue\nFROM aggregated_revenue;",
+  "semantic_correctness_guarantee": "1. **CTE分解结构**：将原始单表达式查询分解为4个CTE（filtered_lineitem、joined_data、aggregated_revenue、最终SELECT），每个CTE对应原查询的一个逻辑阶段：日期过滤→连接→聚合→计算比例。\n\n2. **filtered_lineitem CTE等价性**：提取lineitem表的日期过滤条件（l_shipdate >= '1997-03-01' AND l_shipdate < '1997-04-01'）和后续需要的列（l_partkey用于连接，l_extendedprice和l_discount用于计算revenue）。此CTE与原查询中lineitem表的WHERE子句完全一致，仅是物化了过滤结果，不改变结果集。\n\n3. **joined_data CTE等价性**：执行filtered_lineitem与part表的INNER JOIN（连接条件l_partkey = p_partkey），并预计算revenue = l_extendedprice * (1 - l_discount)。此步骤与原查询的FROM lineitem, part WHERE l_partkey = p_partkey语义完全等价（逗号连接等价于INNER JOIN），且revenue计算提前不影响结果（仅是计算位置移动）。保留p_type列用于后续CASE判断。\n\n4. **aggregated_revenue CTE等价性**：对joined_data执行聚合，分别计算promo_revenue（p_type LIKE 'PROMO%'的revenue总和）和total_revenue（所有revenue总和）。此聚合逻辑与原查询的SUM(CASE WHEN...)完全一致：原查询用CASE WHEN在单个SUM内分支计算，重写后拆分为两个独立的SUM但条件相同，结果必然相同。\n\n5. **最终SELECT等价性**：从aggregated_revenue中取promo_revenue和total_revenue进行除法运算（100.00 * promo_revenue / total_revenue），与原查询的计算公式完全一致。由于aggregated_revenue只有一行（全表聚合结果），最终SELECT返回单行单列，与原查询结果集结构和数值完全相同。\n\n6. **NULL值处理**：原查询和重写后查询均未显式处理NULL。由于l_extendedprice、l_discount、p_type均为NOT NULL列（根据Schema），且INNER JOIN排除不匹配行，SUM聚合对空集返回NULL但除法会传播NULL。两者在NULL处理上行为一致。\n\n7. **过滤条件完整性**：原查询的所有WHERE条件（日期范围、连接条件）在重写后均被保留且位置合理：日期过滤在filtered_lineitem CTE中，连接条件在joined_data CTE的JOIN ON子句中。无条件遗漏或新增，保证结果集范围不变。\n\n8. **聚合语义保证**：原查询对整个连接结果集执行全表聚合（无GROUP BY），重写后aggregated_revenue CTE同样对joined_data执行全表聚合。两者聚合作用域完全一致，且CASE WHEN条件（p_type LIKE 'PROMO%'）在重写前后保持不变，确保promo_revenue和total_revenue的计算逻辑等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE分解将原查询的过滤、连接、聚合逻辑逐层展开，所有WHERE条件、JOIN条件、CASE WHEN逻辑、聚合计算完全保留，最终结果集（单行单列的promo_revenue比例）与原SQL等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（cost 1576662.12，并行度2，Hash Join + Parallel Seq Scan），结构无任何变化。重写 SQL 引入 CTE 仅改变了逻辑组织形式，但优化器将其完全内联，未产生任何物化或执行路径差异。虽然 CTE 显示了"公共结果复用"意图，但实际执行计划证明优化器已自动完成等价变换，无额外收益。由于本轮未产生结构改进，且已尝试 CTE 分解策略但未生效，继续在此方向微调的空间极小，判定已达优化边界。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 243
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION']
+   - 优化组别: 子查询优化, 谓词简化, 连接优化, 聚合优化
+   - 估计代价: 原始=1576662.12, 重写=1576662.12，相对变化: 0.00%
+✅ 成功存储，记录ID: 0890d9ca-7754-45bb-92a6-6ef076b75191
+
+🎲 UCT Math Update: 1 rules, reward=-0.0500 (cost=+0.0000, rows=+0.0000, depth=-0.1667, oc=1576662.1200, rc=1576662.1200)
+   结构分细节: rows 1916612.0->1916613.0 (score=+0.000), depth 6.0->7.0 (score=-0.167)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=1.000, conf=0.80, lambda=0.40, reward=-0.050, count=250, avg=+0.050
+
+----------------------------------------
+

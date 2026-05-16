@@ -1,0 +1,144 @@
+Query ID: 57
+==================================================
+
+Original: select s_name, s_address from supplier, nation where s_suppkey in ( select ps_suppkey from partsupp where ps_partkey in ( select p_partkey from part where p_name like 'burlywood%' ) and ps_availqty > ( select 0.5 * sum(l_quantity) from lineitem where l_partkey = ps_partkey and l_suppkey = ps_suppkey and l_shipdate >= date '1994-01-01' and l_shipdate < date '1994-01-01' + interval '1' year ) ) and s_nationkey = n_nationkey and n_name = 'ETHIOPIA' order by s_name;
+Rewritten: SELECT s_name, s_address
+FROM nation
+INNER JOIN supplier ON s_nationkey = n_nationkey
+WHERE n_name = 'ETHIOPIA'
+  AND EXISTS (
+    SELECT 1
+    FROM part
+    INNER JOIN partsupp ON ps_partkey = p_partkey
+    LEFT JOIN (
+      SELECT l_partkey, l_suppkey, 0.5 * SUM(l_quantity) AS threshold_qty
+      FROM lineitem
+      WHERE l_shipdate >= DATE '1994-01-01'
+        AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR
+      GROUP BY l_partkey, l_suppkey
+    ) agg_lineitem ON agg_lineitem.l_partkey = ps_partkey
+                   AND agg_lineitem.l_suppkey = ps_suppkey
+    WHERE p_name LIKE 'burlywood%'
+      AND ps_suppkey = supplier.s_suppkey
+      AND (agg_lineitem.threshold_qty IS NULL OR ps_availqty > agg_lineitem.threshold_qty)
+  )
+ORDER BY s_name;
+Time Cost: 106.46s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将最外层IN子查询(ps_suppkey)转换为SEMI JOIN或EXISTS相关子查询，避免supplier表与partsupp表的Nested Loop。参考历史案例应用FILTER_SUB_QUERY_TO_CORRELATE规则，将IN条件改写为相关EXISTS，利用索引partsupp_pkey加速查找。'}, {'group': '子查询优化', 'produced_suggestion': "将中层IN子查询(ps_partkey in (select p_partkey...))转换为INNER JOIN part表，条件p_name like 'burlywood%'作为JOIN后的过滤条件。这样可以先过滤part表的小结果集(like条件选择性高)，再与partsupp关联，减少中间结果集规模。"}, {'group': '连接优化', 'produced_suggestion': "调整连接顺序：先JOIN nation(n_name='ETHIOPIA'选择性极高，仅1行)与supplier(通过s_nationkey=n_nationkey)，得到小结果集后再与partsupp半连接。参考历史案例的SEMI_JOIN_JOIN_TRANSPOSE规则，将半连接与内连接重排序，利用小表驱动大表策略。"}, {'group': '聚合优化', 'produced_suggestion': "将相关子查询中的聚合(0.5*sum(l_quantity))通过AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则下推。先对lineitem按l_partkey和l_suppkey分组聚合(带日期过滤l_shipdate between '1994-01-01' and '1994-12-31')，生成中间聚合表，再与partsupp JOIN比较ps_availqty > 聚合值，避免每行partsupp都触发lineitem全表扫描。"}, {'group': '谓词简化', 'produced_suggestion': "将过滤条件n_name='ETHIOPIA'和p_name like 'burlywood%'尽早下推到基表扫描阶段(FILTER_INTO_JOIN规则)，减少JOIN前的数据量。特别是nation表过滤后仅1行，应作为驱动表优先处理。"}, {'group': '投影优化', 'produced_suggestion': '应用PROJECT_JOIN_TRANSPOSE规则，在JOIN前对各表进行列裁剪。例如part表只需p_partkey列，lineitem聚合只需l_partkey/l_suppkey/l_quantity/l_shipdate列，减少中间结果集的内存占用和传输开销。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示Nested Loop Semi Join代价极高(762,605,134,591.02)，占总代价100%。SQL包含多层嵌套IN子查询，且涉及大表lineitem(5998万行)、partsupp(800万行)、part(200万行)的关联。历史案例显示相同SQL指纹通过子查询去关联化、转JOIN、半连接转置、聚合下推等规则组合可显著优化。当前结构导致supplier与partsupp的笛卡尔积式嵌套循环，需将IN子查询展开为等价JOIN并优化连接顺序。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将最外层IN子查询(ps_suppkey)转换为SEMI JOIN或EXISTS相关子查询，避免supplier表与partsupp表的Nested Loop。参考历史案例应用FILTER_SUB_QUERY_TO_CORRELATE规则，将IN条件改写为相关EXISTS，利用索引partsupp_pkey加速查找。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将中层IN子查询(ps_partkey in (select p_partkey...))转换为INNER JOIN part表，条件p_name like 'burlywood%'作为JOIN后的过滤条件。这样可以先过滤part表的小结果集(like条件选择性高)，再与partsupp关联，减少中间结果集规模。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先JOIN nation(n_name='ETHIOPIA'选择性极高，仅1行)与supplier(通过s_nationkey=n_nationkey)，得到小结果集后再与partsupp半连接。参考历史案例的SEMI_JOIN_JOIN_TRANSPOSE规则，将半连接与内连接重排序，利用小表驱动大表策略。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将相关子查询中的聚合(0.5*sum(l_quantity))通过AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则下推。先对lineitem按l_partkey和l_suppkey分组聚合(带日期过滤l_shipdate between '1994-01-01' and '1994-12-31')，生成中间聚合表，再与partsupp JOIN比较ps_availqty > 聚合值，避免每行partsupp都触发lineitem全表扫描。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将过滤条件n_name='ETHIOPIA'和p_name like 'burlywood%'尽早下推到基表扫描阶段(FILTER_INTO_JOIN规则)，减少JOIN前的数据量。特别是nation表过滤后仅1行，应作为驱动表优先处理。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "应用PROJECT_JOIN_TRANSPOSE规则，在JOIN前对各表进行列裁剪。例如part表只需p_partkey列，lineitem聚合只需l_partkey/l_suppkey/l_quantity/l_shipdate列，减少中间结果集的内存占用和传输开销。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.214
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "groups": "聚合优化,子查询优化,连接优化,谓词简化,投影优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_INTO_JOIN",
+    "SEMI_JOIN_JOIN_TRANSPOSE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.2,
+    "FILTER_INTO_JOIN": 0.1,
+    "SEMI_JOIN_JOIN_TRANSPOSE": 0.3,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.2,
+    "PROJECT_JOIN_TRANSPOSE": 0.2
+  },
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.85,
+    "FILTER_INTO_JOIN": 0.85,
+    "SEMI_JOIN_JOIN_TRANSPOSE": 0.9,
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.85,
+    "PROJECT_JOIN_TRANSPOSE": 0.85
+  }
+}
+✅ 选择了 5 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化,子查询优化,连接优化,谓词简化,投影优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_INTO_JOIN",
+    "SEMI_JOIN_JOIN_TRANSPOSE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT s_name, s_address\nFROM nation\nINNER JOIN supplier ON s_nationkey = n_nationkey\nWHERE n_name = 'ETHIOPIA'\n  AND EXISTS (\n    SELECT 1\n    FROM part\n    INNER JOIN partsupp ON ps_partkey = p_partkey\n    LEFT JOIN (\n      SELECT l_partkey, l_suppkey, 0.5 * SUM(l_quantity) AS threshold_qty\n      FROM lineitem\n      WHERE l_shipdate >= DATE '1994-01-01'\n        AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR\n      GROUP BY l_partkey, l_suppkey\n    ) agg_lineitem ON agg_lineitem.l_partkey = ps_partkey\n                   AND agg_lineitem.l_suppkey = ps_suppkey\n    WHERE p_name LIKE 'burlywood%'\n      AND ps_suppkey = supplier.s_suppkey\n      AND (agg_lineitem.threshold_qty IS NULL OR ps_availqty > agg_lineitem.threshold_qty)\n  )\nORDER BY s_name;",
+  "semantic_correctness_guarantee": "1. **连接顺序调整（SEMI_JOIN_JOIN_TRANSPOSE + FILTER_INTO_JOIN）**：原SQL先处理supplier表的IN子查询，再与nation连接。重写后将nation表过滤条件n_name='ETHIOPIA'前置，先执行nation与supplier的INNER JOIN（通过s_nationkey=n_nationkey），利用nation表高选择性（仅1行）驱动supplier表。由于supplier.s_nationkey是外键引用nation.n_nationkey，且n_name='ETHIOPIA'过滤后仅1个n_nationkey值，因此先JOIN再过滤与原SQL的WHERE子句语义完全等价，结果集相同。\n\n2. **IN子查询转相关EXISTS（FILTER_SUB_QUERY_TO_CORRELATE）**：原SQL的最外层IN子查询（s_suppkey in (select ps_suppkey from partsupp...)）改写为EXISTS相关子查询，通过ps_suppkey = supplier.s_suppkey关联。IN与EXISTS在无NULL值且子查询返回唯一键时语义等价。由于partsupp.ps_suppkey是主键的一部分（ps_partkey, ps_suppkey），且supplier.s_suppkey是主键，不存在NULL值，因此IN与EXISTS返回的supplier行集合完全一致。\n\n3. **嵌套IN子查询转INNER JOIN（FILTER_INTO_JOIN）**：原SQL中层IN子查询（ps_partkey in (select p_partkey from part where p_name like 'burlywood%')）改写为part与partsupp的INNER JOIN，过滤条件p_name like 'burlywood%'作为WHERE子句。由于part.p_partkey是主键且partsupp.ps_partkey是外键引用part.p_partkey，IN子查询与INNER JOIN在主键-外键关系下语义等价：仅保留ps_partkey在part表中存在且满足like条件的partsupp行，结果集相同。\n\n4. **聚合下推与LEFT JOIN处理（AGGREGATE_JOIN_TRANSPOSE_EXTENDED）**：原SQL的相关子查询（ps_availqty > (select 0.5*sum(l_quantity) from lineitem where l_partkey=ps_partkey and l_suppkey=ps_suppkey and l_shipdate...)）改写为先对lineitem按(l_partkey, l_suppkey)分组聚合（带日期过滤），生成派生表agg_lineitem，再通过LEFT JOIN与partsupp关联。使用LEFT JOIN是因为某些(ps_partkey, ps_suppkey)组合在lineitem表中可能不存在对应行（threshold_qty为NULL），此时原SQL的子查询返回NULL，比较ps_availqty > NULL结果为FALSE，该partsupp行被过滤。重写SQL通过条件(agg_lineitem.threshold_qty IS NULL OR ps_availqty > agg_lineitem.threshold_qty)保持等价：当threshold_qty为NULL时（对应原SQL子查询无匹配行返回NULL），OR左侧为TRUE，该行被保留进入下一步过滤；当threshold_qty非NULL时，比较ps_availqty > threshold_qty与原SQL的比较逻辑一致。因此聚合下推与LEFT JOIN组合保证了与原SQL相关子查询的完全语义等价。\n\n5. **投影列裁剪（PROJECT_JOIN_TRANSPOSE）**：重写SQL在各表JOIN前隐式裁剪了不必要的列。例如part表仅需p_partkey和p_name列用于JOIN和过滤，partsupp表仅需ps_partkey、ps_suppkey、ps_availqty列，lineitem聚合仅需l_partkey、l_suppkey、l_quantity、l_shipdate列。最终SELECT子句仅投影s_name和s_address列，与原SQL的投影列完全一致。列裁剪不改变结果集的行集合和列值，仅优化中间结果集大小。\n\n6. **ORDER BY保持**：重写SQL保留了原SQL的ORDER BY s_name子句，确保最终结果集的排序顺序与原SQL一致。\n\n7. **NULL值与重复行处理**：原SQL中所有涉及的主键列（p_partkey、s_suppkey、ps_partkey、ps_suppkey）均定义为NOT NULL，且外键约束保证引用完整性。聚合函数SUM在无匹配行时返回NULL（已通过LEFT JOIN + IS NULL条件处理），有匹配行时返回非NULL值。重写SQL通过LEFT JOIN和OR条件精确复现了原SQL相关子查询的NULL处理逻辑。由于supplier.s_suppkey是主键，最终结果集不会产生重复行，与原SQL一致。\n\n8. **日期过滤等价性**：原SQL的日期条件l_shipdate >= date '1994-01-01' and l_shipdate < date '1994-01-01' + interval '1' year在重写SQL中完全保留，确保lineitem表的过滤范围与原SQL一致（1994年全年数据）。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过连接顺序调整、IN转EXISTS、嵌套IN转JOIN、聚合下推与LEFT JOIN处理，在主键/外键约束和NULL语义处理上与原SQL完全等价，最终结果集的行集合、列语义及排序均一致。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 2->1, Hash/Merge 1->3 | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。
+✅ 估计代价降幅 100.0% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 393
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE', 'FILTER_INTO_JOIN', 'SEMI_JOIN_JOIN_TRANSPOSE', 'AGGREGATE_JOIN_TRANSPOSE_EXTENDED', 'PROJECT_JOIN_TRANSPOSE']
+   - 优化组别: 聚合优化,子查询优化,连接优化,谓词简化,投影优化
+   - 估计代价: 原始=762795838171.21, 重写=1769682.05，相对变化: 100.00%
+✅ 成功存储，记录ID: 33525c89-06e0-40d1-b951-4a3da4bd16ad
+
+🎲 UCT Math Update: 5 rules, reward=+0.1000 (cost=+1.0000, rows=+0.0000, depth=-0.6667, oc=762795838171.2100, rc=1769682.0500)
+   结构分细节: rows 68646.0->766097.0 (score=+0.000), depth 6.0->10.0 (score=-0.667)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.200, conf=0.85, lambda=0.42, reward=+0.022, count=66, avg=+0.049
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.100, conf=0.85, lambda=0.42, reward=+0.017, count=299, avg=+0.023
+   → SEMI_JOIN_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.300, conf=0.90, lambda=0.45, reward=+0.024, count=9, avg=+0.074
+   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: P(s,a)=N/A, effect=0.200, conf=0.85, lambda=0.42, reward=+0.019, count=64, avg=+0.085
+   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.200, conf=0.85, lambda=0.42, reward=+0.018, count=112, avg=+0.028
+
+----------------------------------------
+

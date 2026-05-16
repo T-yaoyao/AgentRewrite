@@ -1,0 +1,189 @@
+Query ID: 35
+==================================================
+
+Original: select l_shipmode, sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('TRUCK', 'SHIP') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1993-01-01' and l_receiptdate < date '1993-01-01' + interval '1' year group by l_shipmode order by l_shipmode;
+Rewritten: WITH filtered_lineitem AS (
+    SELECT l_orderkey, l_shipmode
+    FROM lineitem
+    WHERE l_shipmode IN ('TRUCK', 'SHIP')
+      AND l_commitdate < l_receiptdate
+      AND l_shipdate < l_commitdate
+      AND l_receiptdate >= DATE '1993-01-01'
+      AND l_receiptdate < DATE '1993-01-01' + INTERVAL '1' YEAR
+)
+SELECT l_shipmode,
+       SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) AS high_line_count,
+       SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) AS low_line_count
+FROM filtered_lineitem
+INNER JOIN orders ON filtered_lineitem.l_orderkey = orders.o_orderkey
+GROUP BY l_shipmode
+ORDER BY l_shipmode;
+Time Cost: 203.94s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将派生表改写为 CTE（WITH filtered_lineitem AS (SELECT l_orderkey, l_shipmode FROM lineitem WHERE ...)），利用 CTE 的物化语义强制优化器先完整执行 lineitem 过滤并缓存结果，再与 orders 进行 JOIN，避免 Nested Loop 对每行 lineitem 都回表 orders'}, {'group': '连接优化', 'produced_suggestion': '在 CTE 物化后，优化器可能重新评估连接方法。若 filtered_lineitem 结果集较小（如几十万行），Hash Join 或 Merge Join 将优于 Nested Loop；若数据库支持 JOIN 提示（如 PostgreSQL 的 set enable_nestloop=off 或 Oracle 的 /*+ USE_HASH */ ），可临时禁用 Nested Loop 强制 Hash Join'}, {'group': '谓词简化', 'produced_suggestion': '保持 lineitem 过滤条件在 CTE 内部，确保过滤逻辑在物化阶段完成。若 l_receiptdate 范围选择性极高（如仅占 1% 数据），可考虑在 CTE 外层再次应用该条件作为二次过滤（虽然冗余但可能触发不同的执行路径）'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表全表扫描(Seq Scan)占总代价99.9%，扫描近6000万行数据。当前使用隐式JOIN语法(FROM orders, lineitem WHERE...)，可通过显式JOIN改写并结合谓词下推优化。历史案例显示相同SQL指纹通过JOIN_TO_CORRELATE和JOIN_CONDITION_PUSH规则成功优化过3次，证明该优化路径有效。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将隐式JOIN改写为显式INNER JOIN语法，明确连接条件o_orderkey = l_orderkey，便于优化器更好地选择连接顺序和方法"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将lineitem表的所有过滤条件(l_shipmode、l_commitdate、l_receiptdate等)在JOIN前先应用，减少参与连接的数据量，降低Nested Loop代价"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "考虑先过滤lineitem表(应用日期范围和shipmode条件)，再与orders表JOIN，利用lineitem_pkey索引加速o_orderkey关联"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.221
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "groups": "谓词简化,连接优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH"],
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.6,
+    "JOIN_CONDITION_PUSH": 0.4
+  },
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.85,
+    "JOIN_CONDITION_PUSH": 0.75
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化,连接优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rewritten_sql": "SELECT l_shipmode,\n       SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) AS high_line_count,\n       SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) AS low_line_count\nFROM (\n    SELECT l_orderkey, l_shipmode\n    FROM lineitem\n    WHERE l_shipmode IN ('TRUCK', 'SHIP')\n      AND l_commitdate < l_receiptdate\n      AND l_shipdate < l_commitdate\n      AND l_receiptdate >= DATE '1993-01-01'\n      AND l_receiptdate < DATE '1993-01-01' + INTERVAL '1' YEAR\n) AS filtered_lineitem\nINNER JOIN orders ON filtered_lineitem.l_orderkey = orders.o_orderkey\nGROUP BY l_shipmode\nORDER BY l_shipmode;",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原始SQL的隐式逗号连接（FROM orders, lineitem WHERE o_orderkey = l_orderkey）改写为显式INNER JOIN语法，连接条件保持为o_orderkey = l_orderkey；同时将lineitem表的所有过滤谓词（l_shipmode、l_commitdate、l_receiptdate、l_shipdate相关条件）下推到子查询filtered_lineitem中，在JOIN前先应用。\n\n2. **连接语义等价性**：原SQL使用逗号连接+WHERE条件等价于INNER JOIN+ON条件。由于连接条件o_orderkey = l_orderkey保持不变，且orders表的o_orderkey是主键（orders_pkey），lineitem表的l_orderkey是复合主键的一部分（lineitem_pkey: l_orderkey, l_linenumber），两表通过主键-外键关系关联，改写后的INNER JOIN与原隐式连接在结果集上完全等价。\n\n3. **谓词下推的等价性**：将lineitem表的所有WHERE条件（l_shipmode IN ('TRUCK', 'SHIP')、l_commitdate < l_receiptdate、l_shipdate < l_commitdate、l_receiptdate日期范围）下推到子查询中，在JOIN前过滤。由于这些谓词仅涉及lineitem表的列，不依赖orders表的任何列，根据关系代数的选择下推规则，先过滤再连接与先连接再过滤在结果集上等价。子查询filtered_lineitem返回的l_orderkey和l_shipmode与原SQL中满足条件的lineitem行完全一致。\n\n4. **聚合与分组的等价性**：重写后的SQL保持相同的GROUP BY l_shipmode和聚合函数（SUM + CASE WHEN对o_orderpriority的条件判断）。由于连接后的结果集与原SQL一致（相同的lineitem行与对应的orders行配对），按l_shipmode分组后，每组内的o_orderpriority值分布完全相同，因此high_line_count和low_line_count的计算结果与原SQL等价。\n\n5. **投影列的完整性**：子查询filtered_lineitem投影了l_orderkey（用于JOIN）和l_shipmode（用于GROUP BY和最终SELECT）。虽然原SQL在FROM子句中引用了lineitem的其他列（l_commitdate等），但这些列仅用于WHERE过滤，不参与SELECT、GROUP BY或JOIN条件，因此子查询中不投影这些列不影响最终结果集的语义等价性。\n\n6. **ORDER BY的等价性**：重写后的SQL保持ORDER BY l_shipmode，由于分组键l_shipmode在重写前后完全一致，排序结果与原SQL等价。\n\n7. **NULL值处理**：原SQL的WHERE条件中，日期比较和IN谓词在遇到NULL时会过滤掉相应行（SQL标准行为）。重写后的子查询中保持相同的WHERE条件，NULL值处理逻辑不变。CASE WHEN中对o_orderpriority的判断，若o_orderpriority为NULL，原SQL和重写SQL均返回0（ELSE分支），语义一致。\n\n8. **易误判点说明**：有人可能担心子查询会改变连接顺序或丢失数据。但由于：(a) INNER JOIN的交换律和结合律保证连接顺序改变不影响结果集；(b) 子查询的WHERE条件与原SQL完全一致，不会多过滤或少过滤任何行；(c) orders表无过滤条件，所有满足连接条件的orders行都会参与最终结果。因此重写后的SQL在Schema约束（主键、外键）和TPC-H标准语义下，与原SQL结果集完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL将隐式逗号连接改为显式INNER JOIN，并将lineitem的过滤条件下推到子查询中；连接条件、过滤谓词、聚合逻辑、分组键和排序均保持一致，结果集完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同：两者均为 Parallel Seq Scan lineitem → Nested Loop Index Scan orders → Sort → Gather Merge → Aggregate，节点类型计数、行数估计求和(913.0)、cost(1689737.67)完全一致。重写仅将隐式 JOIN 改为派生表 + 显式 INNER JOIN，但优化器生成的物理计划未发生任何变化，过滤条件仍在 Seq Scan 节点应用，未实现"先过滤再 JOIN"的预期收益。本轮重写无结构改进，也无恶化，属于逻辑等价变换但未触发优化器路径改变。由于仍存在可执行的下一步优化方向（如引入 CTE 物化过滤结果、调整 JOIN 顺序提示、或尝试 Hash Join 替代 Nested Loop），应继续优化。",
+  "no_further_optimization": false,
+  "next_step_advice": "尝试将 lineitem 过滤结果物化为 CTE（WITH filtered_lineitem AS (...)），或添加 JOIN 方法提示（如 /*+ HashJoin(orders filtered_lineitem) */），引导优化器先完整过滤 lineitem 并物化中间结果，再与 orders 进行 Hash Join，避免 Nested Loop 对每行 lineitem 都回表 orders；若数据库支持，可测试在 l_receiptdate 或 (l_shipmode, l_receiptdate) 上创建复合索引，减少 Seq Scan 开销。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示 Seq Scan lineitem 占总代价 99.9%，过滤条件复杂且选择性高。上一轮派生表+显式JOIN未改变物理计划，优化器仍选择 Nested Loop。需采用更激进的策略：(1) 使用 CTE 物化过滤结果，强制优化器先完成 lineitem 过滤并缓存中间结果；(2) 通过 CTE 切断优化器对原始 lineitem 统计信息的依赖，引导其重新评估连接方法，避免 Nested Loop 对每行回表 orders；(3) 若 CTE 仍无效，可尝试临时表物化或添加 OFFSET 0 阻止 CTE 内联。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将派生表改写为 CTE（WITH filtered_lineitem AS (SELECT l_orderkey, l_shipmode FROM lineitem WHERE ...)），利用 CTE 的物化语义强制优化器先完整执行 lineitem 过滤并缓存结果，再与 orders 进行 JOIN，避免 Nested Loop 对每行 lineitem 都回表 orders"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "在 CTE 物化后，优化器可能重新评估连接方法。若 filtered_lineitem 结果集较小（如几十万行），Hash Join 或 Merge Join 将优于 Nested Loop；若数据库支持 JOIN 提示（如 PostgreSQL 的 set enable_nestloop=off 或 Oracle 的 /*+ USE_HASH */ ），可临时禁用 Nested Loop 强制 Hash Join"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "保持 lineitem 过滤条件在 CTE 内部，确保过滤逻辑在物化阶段完成。若 l_receiptdate 范围选择性极高（如仅占 1% 数据），可考虑在 CTE 外层再次应用该条件作为二次过滤（虽然冗余但可能触发不同的执行路径）"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "groups": "子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION"],
+  "rule_effect_scores": {"STRATEGY_CTE_DECOMPOSITION": 1.0},
+  "rule_effect_confidence": {"STRATEGY_CTE_DECOMPOSITION": 0.8}
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH filtered_lineitem AS (\n    SELECT l_orderkey, l_shipmode\n    FROM lineitem\n    WHERE l_shipmode IN ('TRUCK', 'SHIP')\n      AND l_commitdate < l_receiptdate\n      AND l_shipdate < l_commitdate\n      AND l_receiptdate >= DATE '1993-01-01'\n      AND l_receiptdate < DATE '1993-01-01' + INTERVAL '1' YEAR\n)\nSELECT l_shipmode,\n       SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) AS high_line_count,\n       SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) AS low_line_count\nFROM filtered_lineitem\nINNER JOIN orders ON filtered_lineitem.l_orderkey = orders.o_orderkey\nGROUP BY l_shipmode\nORDER BY l_shipmode;",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原 SQL 中的派生表 `(SELECT ... FROM lineitem WHERE ...) AS filtered_lineitem` 改写为 CTE `WITH filtered_lineitem AS (SELECT ...)`，过滤条件（l_shipmode、l_commitdate、l_receiptdate、l_shipdate）保持完全一致，投影列（l_orderkey, l_shipmode）不变。\n\n2. **JOIN 作用域与连接键等价性**：原 SQL 通过 `filtered_lineitem.l_orderkey = orders.o_orderkey` 进行 INNER JOIN，CTE 版本保持相同的连接条件和 INNER JOIN 语义；由于 orders.o_orderkey 是主键（PRIMARY KEY），每个 l_orderkey 最多匹配一行 orders，JOIN 结果行数与 filtered_lineitem 行数一致（1:1 映射），不会产生重复行或丢失行。\n\n3. **聚合与分组等价性**：原 SQL 和 CTE 版本均对 l_shipmode 进行 GROUP BY，聚合函数 SUM(CASE ...) 作用于 JOIN 后的结果集；由于 JOIN 是 1:1 映射且 l_shipmode 来自 lineitem（在 CTE 中已投影），分组键和聚合输入完全相同，聚合结果等价。\n\n4. **过滤条件完整性**：CTE 内部的 WHERE 子句包含原派生表的全部 5 个过滤条件（l_shipmode IN、三个日期比较、一个日期范围），条件逻辑（AND 连接）和常量值（'TRUCK', 'SHIP', DATE '1993-01-01', INTERVAL '1' YEAR）完全一致，过滤后的 lineitem 行集合相同。\n\n5. **投影列与 SELECT 列表等价性**：原 SQL 最终 SELECT 的列为 l_shipmode、high_line_count、low_line_count；CTE 版本的 SELECT 列表完全相同，l_shipmode 来自 CTE 投影，o_orderpriority 来自 JOIN 的 orders 表（通过 o_orderkey 关联），CASE 表达式逻辑不变。\n\n6. **排序等价性**：两者均以 `ORDER BY l_shipmode` 排序，l_shipmode 值域相同（仅 'TRUCK' 和 'SHIP'），排序结果一致。\n\n7. **CTE 物化语义对结果集的影响**：CTE 的物化（若优化器选择物化）仅改变执行顺序（先完整过滤 lineitem 并缓存，再 JOIN orders），不改变逻辑语义；即使优化器内联 CTE（与原派生表行为相同），结果集仍等价。由于 INNER JOIN 和过滤条件的交换律，无论是先过滤后 JOIN 还是先 JOIN 后过滤（在满足连接条件的前提下），最终结果集相同。\n\n8. **NULL 值与边界情况**：lineitem 的日期列（l_commitdate、l_receiptdate、l_shipdate）若为 NULL，比较表达式结果为 FALSE（SQL 标准），行被过滤；orders.o_orderpriority 为 NOT NULL（Schema 定义），CASE 表达式不会因 NULL 产生歧义；两版本对 NULL 的处理逻辑一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL将原SQL的隐式JOIN和WHERE过滤改写为CTE+显式INNER JOIN，过滤条件、连接键、分组聚合逻辑完全一致，且orders.o_orderkey主键保证1:1映射，结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（cost、节点类型、扫描方式、连接算法、并行度均无变化），说明优化器未采纳 CTE 物化语义，而是将 CTE 内联回原始执行路径。虽然重写 SQL 引入了 CTE 以期望物化中间结果，但实际执行计划显示：1) 仍为 Parallel Seq Scan lineitem + Nested Loop + Index Scan orders；2) 未出现 CTE Scan 或 Materialize 节点；3) cost 与行数估计完全相同（1689737.67，Plan Rows 求和均为 913）。这表明优化器判断 CTE 内联更优，未触发物化。由于本轮重写未产生结构性改进或恶化（执行计划零变化），且已尝试 CTE 物化策略但优化器拒绝采纳，继续在此方向微调（如强制物化、JOIN 提示）可能无效或需数据库特定配置支持。综合判断：当前 SQL 已达优化器认为的最优路径（Nested Loop + Index Scan 对小结果集高效），无明确进一步改进空间。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 437
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION']
+   - 优化组别: 子查询优化
+   - 估计代价: 原始=1689737.67, 重写=1689737.67，相对变化: 0.00%
+✅ 成功存储，记录ID: cd319a05-644f-48e4-820b-da76bd127074
+
+🎲 UCT Math Update: 1 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1689737.6700, rc=1689737.6700)
+   结构分细节: rows 913.0->913.0 (score=+0.000), depth 5.0->5.0 (score=+0.000)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=1.000, conf=0.80, lambda=0.40, reward=+0.000, count=247, avg=+0.051
+
+----------------------------------------
+

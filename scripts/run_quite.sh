@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/setup_env.sh"
 # Path variables (now using PROJECT_ROOT from setup_env.sh)
 INPUT_QUERIES="${PROJECT_ROOT}/dataset/queries/tpch_test.json"
 SCHEMA_FILE="${PROJECT_ROOT}/dataset/schemas/tpch_schemas.sql"
-OUTPUT_DIR="${PROJECT_ROOT}/output/tpch_claude4.5"
+OUTPUT_DIR="${PROJECT_ROOT}/output/without/no_rules_tpch"
 
 # Feature flags
 ENABLE_REWRITER="--enable_rewriter"

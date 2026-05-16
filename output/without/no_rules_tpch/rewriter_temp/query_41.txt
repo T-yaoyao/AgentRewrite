@@ -1,0 +1,183 @@
+Query ID: 41
+==================================================
+
+Original: select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1997-10-01' and l_shipdate < date '1997-10-01' + interval '1' month;
+Rewritten: SELECT 100.00 * SUM(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%') / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue
+FROM lineitem
+INNER JOIN part ON l_partkey = p_partkey
+WHERE l_shipdate >= DATE '1997-10-01'
+  AND l_shipdate < DATE '1997-10-01' + INTERVAL '1' month;
+Time Cost: 369.29s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "合并promo_part和total_part子查询为单个查询块：使用聚合函数的FILTER子句(PostgreSQL 9.4+)或CASE WHEN在单次扫描中同时计算promo_sum和total_sum。具体结构：SELECT 100.00 * SUM(l_extendedprice*(1-l_discount)) FILTER(WHERE p_type LIKE 'PROMO%') / SUM(l_extendedprice*(1-l_discount)) FROM lineitem JOIN part ON l_partkey=p_partkey WHERE l_shipdate BETWEEN '1997-10-01' AND '1997-10-31'。此方案将lineitem扫描从2次降为1次，part扫描从2次降为1次，消除CROSS JOIN协调开销。"}, {'group': '连接优化', 'produced_suggestion': "在合并后的单次扫描架构中，确保part表的p_type过滤条件参与连接优化：若part表有p_type索引，优化器可能选择Index Scan；若无索引但p_type选择性高(PROMO%约占16%)，可考虑先过滤part再连接(派生表方式：FROM lineitem JOIN (SELECT p_partkey, p_type FROM part WHERE p_type LIKE 'PROMO%' OR 1=1) p ON ...)，但需注意OR 1=1确保total_sum计算正确性，实际应直接在聚合层用FILTER区分，避免连接层过滤影响total计算。"}, {'group': '谓词简化', 'produced_suggestion': "简化日期谓词：将l_shipdate >= DATE '1997-10-01' AND l_shipdate < DATE '1997-10-01' + INTERVAL '1' month改写为l_shipdate BETWEEN '1997-10-01' AND '1997-10-31'(若数据库支持且语义等价)，或保持原形式但确保l_shipdate上有索引以利用范围扫描。当前两次Seq Scan均应用此过滤(Filter行)，合并后单次扫描可直接受益于索引(若存在lineitem(l_shipdate)索引)。"}, {'group': '聚合优化', 'produced_suggestion': "使用FILTER子句替代CASE WHEN进行条件聚合：SUM(expr) FILTER(WHERE condition)比SUM(CASE WHEN condition THEN expr ELSE 0 END)更高效(避免ELSE分支计算)且语义更清晰。在合并后的单次扫描中，分子用SUM(...) FILTER(WHERE p_type LIKE 'PROMO%')，分母用SUM(...)无FILTER，确保单次聚合Pass完成两个计算，避免多次分组开销。"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表全表扫描代价占比95.1%，且存在日期范围过滤条件。虽然历史案例建议使用CTE分解和过滤下推，但当前SQL结构简单，更适合通过谓词优化和连接优化来提升性能。主要优化方向：1) 将part表的p_type过滤条件提前应用以减少Hash Join的数据量；2) 优化CASE表达式的计算逻辑；3) 考虑将隐式JOIN改写为显式JOIN以便优化器更好地选择连接顺序。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将part表的p_type LIKE 'PROMO%'条件作为WHERE子句显式过滤，减少参与Hash Join的part表数据量，从而降低连接代价"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将隐式逗号连接改写为显式INNER JOIN，并调整连接顺序：先过滤lineitem的日期条件和part的类型条件，再执行连接，利用过滤后的较小结果集进行Hash Join"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将CASE WHEN表达式中的条件判断前置到JOIN条件或WHERE子句中，避免在聚合阶段对大量数据进行条件判断，可考虑拆分为两个子查询分别计算promo和total，最后做除法"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.208
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "groups": "谓词简化, 聚合优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "AGGREGATE_CASE_TO_FILTER"],
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.4,
+    "AGGREGATE_CASE_TO_FILTER": 0.6
+  },
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.6,
+    "AGGREGATE_CASE_TO_FILTER": 0.8
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 聚合优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "AGGREGATE_CASE_TO_FILTER"
+  ],
+  "rewritten_sql": "SELECT 100.00 * promo_sum / total_sum AS promo_revenue\nFROM (\n  SELECT \n    SUM(l_extendedprice * (1 - l_discount)) AS promo_sum\n  FROM lineitem\n  INNER JOIN part ON l_partkey = p_partkey\n  WHERE l_shipdate >= DATE '1997-10-01'\n    AND l_shipdate < DATE '1997-10-01' + INTERVAL '1' month\n    AND p_type LIKE 'PROMO%'\n) promo_part\nCROSS JOIN (\n  SELECT \n    SUM(l_extendedprice * (1 - l_discount)) AS total_sum\n  FROM lineitem\n  INNER JOIN part ON l_partkey = p_partkey\n  WHERE l_shipdate >= DATE '1997-10-01'\n    AND l_shipdate < DATE '1997-10-01' + INTERVAL '1' month\n) total_part;",
+  "semantic_correctness_guarantee": "1. **FILTER_INTO_JOIN规则应用**：将原SQL中CASE WHEN的p_type LIKE 'PROMO%'条件从聚合表达式内部提取到WHERE子句，形成promo_part子查询；该条件原本在SUM内部通过CASE WHEN判断每行是否满足条件来决定是否累加，现在改为在JOIN后直接过滤满足条件的行再累加，两者在数学上等价（过滤后累加 = 条件累加）。\n\n2. **AGGREGATE_CASE_TO_FILTER规则应用**：将原SQL中的单个聚合表达式拆分为两个独立子查询promo_part和total_part，分别计算分子（PROMO类型的收入）和分母（所有类型的收入），最后在外层做除法；原SQL的SUM(CASE...)结构在逻辑上等同于对满足条件的行求和，拆分后promo_part仅对p_type LIKE 'PROMO%'的行求和，total_part对所有行求和，与原SQL的分子分母计算完全一致。\n\n3. **连接语义保持**：原SQL使用逗号连接（隐式CROSS JOIN + WHERE过滤），重写后改为显式INNER JOIN ON l_partkey = p_partkey，两者在有等值连接条件时语义完全等价；两个子查询都应用相同的连接条件和日期过滤条件（l_shipdate >= '1997-10-01' AND l_shipdate < '1997-11-01'），确保处理的数据范围一致。\n\n4. **聚合范围等价性**：原SQL对lineitem和part连接后满足日期条件的所有行进行聚合，重写后total_part子查询处理完全相同的行集（相同的JOIN条件和日期过滤），promo_part子查询在此基础上额外增加p_type条件，这正是原SQL中CASE WHEN为真的行集；因此promo_sum对应原SQL分子，total_sum对应原SQL分母。\n\n5. **NULL值处理一致性**：l_extendedprice和l_discount列在Schema中定义为NOT NULL，因此l_extendedprice * (1 - l_discount)不会产生NULL；原SQL的CASE WHEN在条件不满足时返回0（不影响SUM结果），重写后promo_part直接过滤掉不满足条件的行（SUM不包含这些行等价于加0），两者对NULL和非PROMO行的处理结果一致。\n\n6. **除法运算等价性**：原SQL计算100.00 * SUM(条件值) / SUM(总值)，重写后计算100.00 * promo_sum / total_sum，由于promo_sum和total_sum分别对应原SQL的分子分母聚合结果，且CROSS JOIN确保两个子查询各返回一行标量值，因此除法运算的操作数完全相同，结果等价。\n\n7. **易误判点说明**：虽然拆分为两个子查询会导致lineitem和part的连接执行两次，但这是性能优化的代价，不影响语义等价性；两个子查询通过CROSS JOIN组合，由于各自只返回一个聚合值（单行单列），CROSS JOIN结果仍为一行，与原SQL的单行聚合结果结构一致；最终SELECT子句的promo_revenue列名和计算公式与原SQL完全相同，确保结果集的列名、数据类型和值都保持一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "两SQL等价：原SQL用CASE WHEN在聚合内条件累加，重写后拆分为两个子查询分别计算分子（PROMO类型收入）和分母（总收入），再做除法；过滤后累加与条件累加数学等价，CROSS JOIN组合两个标量聚合结果与原SQL单行聚合一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL将原本单次扫描+CASE聚合拆分为两个独立子查询(promo_part和total_part)，导致lineitem表被扫描两次(原1次→现2次)，part表也被扫描两次。虽然promo_part子查询通过WHERE p_type LIKE 'PROMO%'过滤减少了part表参与连接的行数(从833333降至134680)，但total_part子查询仍需全表扫描part并连接lineitem。结构上：①lineitem重复扫描(Seq Scan出现2次vs原1次)；②part重复扫描(原1次Hash扫描→现promo_part的Seq Scan+Filter + total_part的Index Only Scan)；③顶层引入Nested Loop连接两个聚合结果，增加协调开销。成本从1576662.12升至3116150.58(增幅97.6%)，与结构退化一致。行数估计求和从1916612升至2331145(增21.6%)，反映重复扫描导致的数据处理量增加。改进点：promo_part子查询成功将p_type过滤前置，减少该分支连接行数(124971→20197)，但未能补偿重复扫描的整体代价。结论：拆分子查询虽局部优化过滤，但引入重复扫描的结构性退化，整体恶化明显。",
+  "no_further_optimization": false,
+  "next_step_advice": "回退到单次扫描架构：保留原SQL的单次lineitem+part连接结构，但在连接前对part表应用p_type LIKE 'PROMO%'的过滤条件(通过派生表或CTE预过滤part)，然后在聚合层使用CASE WHEN或FILTER子句分别计算promo和total，避免重复扫描lineitem和part。具体可尝试：WITH filtered_part AS (SELECT p_partkey, p_type FROM part), joined AS (SELECT l_extendedprice*(1-l_discount) AS revenue, p_type FROM lineitem JOIN filtered_part ON l_partkey=p_partkey WHERE l_shipdate条件) SELECT 1000*SUM(revenue) FILTER(WHERE p_type LIKE 'PROMO%')/SUM(revenue) FROM joined，或直接在原SQL基础上将part表改为(SELECT p_partkey, p_type FROM part)派生表，保持单次连接+CASE聚合模式。"
+}
+```
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "当前SQL因拆分子查询导致lineitem表被扫描两次(各占48.1%代价)，part表也被扫描两次(Seq Scan占1.6% + Index Only Scan占1.3%)，总代价3116150.58远高于原始单次扫描架构(1576662.12)。核心问题：promo_part和total_part子查询独立执行，无法共享lineitem扫描结果。优化方向：回退到单次扫描+条件聚合模式，在单次lineitem扫描基础上通过FILTER或CASE WHEN分别计算promo和total，消除重复扫描开销。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "合并promo_part和total_part子查询为单个查询块：使用聚合函数的FILTER子句(PostgreSQL 9.4+)或CASE WHEN在单次扫描中同时计算promo_sum和total_sum。具体结构：SELECT 100.00 * SUM(l_extendedprice*(1-l_discount)) FILTER(WHERE p_type LIKE 'PROMO%') / SUM(l_extendedprice*(1-l_discount)) FROM lineitem JOIN part ON l_partkey=p_partkey WHERE l_shipdate BETWEEN '1997-10-01' AND '1997-10-31'。此方案将lineitem扫描从2次降为1次，part扫描从2次降为1次，消除CROSS JOIN协调开销。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "在合并后的单次扫描架构中，确保part表的p_type过滤条件参与连接优化：若part表有p_type索引，优化器可能选择Index Scan；若无索引但p_type选择性高(PROMO%约占16%)，可考虑先过滤part再连接(派生表方式：FROM lineitem JOIN (SELECT p_partkey, p_type FROM part WHERE p_type LIKE 'PROMO%' OR 1=1) p ON ...)，但需注意OR 1=1确保total_sum计算正确性，实际应直接在聚合层用FILTER区分，避免连接层过滤影响total计算。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "简化日期谓词：将l_shipdate >= DATE '1997-10-01' AND l_shipdate < DATE '1997-10-01' + INTERVAL '1' month改写为l_shipdate BETWEEN '1997-10-01' AND '1997-10-31'(若数据库支持且语义等价)，或保持原形式但确保l_shipdate上有索引以利用范围扫描。当前两次Seq Scan均应用此过滤(Filter行)，合并后单次扫描可直接受益于索引(若存在lineitem(l_shipdate)索引)。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "使用FILTER子句替代CASE WHEN进行条件聚合：SUM(expr) FILTER(WHERE condition)比SUM(CASE WHEN condition THEN expr ELSE 0 END)更高效(避免ELSE分支计算)且语义更清晰。在合并后的单次扫描中，分子用SUM(...) FILTER(WHERE p_type LIKE 'PROMO%')，分母用SUM(...)无FILTER，确保单次聚合Pass完成两个计算，避免多次分组开销。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.219
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "groups": "子查询优化,聚合优化",
+  "applied_rules": ["AGGREGATE_CASE_TO_FILTER"],
+  "rule_effect_scores": {
+    "AGGREGATE_CASE_TO_FILTER": 1.0
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_CASE_TO_FILTER": 0.9
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,聚合优化",
+  "applied_rules": [
+    "AGGREGATE_CASE_TO_FILTER"
+  ],
+  "rewritten_sql": "SELECT 100.00 * SUM(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%') / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM lineitem\nINNER JOIN part ON l_partkey = p_partkey\nWHERE l_shipdate >= DATE '1997-10-01'\n  AND l_shipdate < DATE '1997-10-01' + INTERVAL '1' month;",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原SQL中的两个独立子查询(promo_part和total_part)及其CROSS JOIN合并为单个查询块，使用FILTER子句在单次聚合中同时计算分子(promo_sum)和分母(total_sum)。具体地，promo_part子查询的SUM(l_extendedprice*(1-l_discount)) WHERE p_type LIKE 'PROMO%'改写为SUM(...) FILTER(WHERE p_type LIKE 'PROMO%')，total_part子查询的SUM(l_extendedprice*(1-l_discount))改写为无FILTER的SUM(...)，两者在同一SELECT中并列计算。\n\n2. 连接与过滤作用域等价性：原SQL在promo_part子查询中对lineitem JOIN part应用WHERE l_shipdate范围过滤和p_type LIKE 'PROMO%'过滤，在total_part子查询中仅应用WHERE l_shipdate范围过滤。重写SQL将l_shipdate范围过滤提升至外层WHERE子句(作用于lineitem JOIN part的结果集)，p_type LIKE 'PROMO%'过滤下推至FILTER子句内部(仅作用于分子聚合)。由于FILTER子句在PostgreSQL语义下等价于在聚合前对每行应用条件判断(满足条件的行参与该聚合，不满足的行被该聚合忽略但仍参与其他无FILTER的聚合)，因此SUM(...) FILTER(WHERE p_type LIKE 'PROMO%')与原promo_part子查询的WHERE p_type LIKE 'PROMO%'在结果集上完全等价(均对满足p_type条件的行求和)，SUM(...)无FILTER与原total_part子查询在结果集上完全等价(对所有满足l_shipdate条件的行求和，不受p_type限制)。\n\n3. 聚合结果与CROSS JOIN等价性：原SQL通过CROSS JOIN将promo_part的单行结果(promo_sum)与total_part的单行结果(total_sum)笛卡尔积连接，再计算100.00*promo_sum/total_sum。重写SQL在单个SELECT中直接计算100.00*SUM(...) FILTER(...)/SUM(...)，由于两个SUM聚合均作用于同一FROM子句的结果集(lineitem JOIN part WHERE l_shipdate条件)，且无GROUP BY子句(全表聚合返回单行)，因此分子SUM(...) FILTER(WHERE p_type LIKE 'PROMO%')的值等于原promo_sum，分母SUM(...)的值等于原total_sum，最终表达式100.00*分子/分母与原SQL的100.00*promo_sum/total_sum在数值上完全等价。\n\n4. 日期谓词与连接键等价性：原SQL在两个子查询中均使用WHERE l_shipdate >= DATE '1997-10-01' AND l_shipdate < DATE '1997-10-01' + INTERVAL '1' month，重写SQL将此谓词提升至外层WHERE子句，作用于lineitem JOIN part的结果集。由于lineitem表的l_shipdate列在原SQL的两个子查询中均被相同谓词过滤，提升至外层不改变过滤逻辑(仍对所有连接后的行应用相同日期范围条件)。连接键l_partkey=p_partkey在原SQL的两个子查询中均使用INNER JOIN part ON l_partkey=p_partkey，重写SQL保持相同连接条件，确保连接语义不变。\n\n5. NULL值与除零处理：原SQL和重写SQL均未显式处理分母为0的情况(若l_shipdate范围内无数据则total_sum为NULL，导致除法结果为NULL)。由于SUM聚合在无行匹配时返回NULL(而非0)，原SQL的total_sum和重写SQL的SUM(...)在空结果集下均为NULL，除法行为一致。FILTER子句对NULL值的处理与WHERE子句一致(NULL被视为FALSE，不参与聚合)，因此p_type为NULL的行在原SQL的promo_part子查询中被WHERE p_type LIKE 'PROMO%'排除，在重写SQL中被FILTER(WHERE p_type LIKE 'PROMO%')排除，行为等价。\n\n6. 单次扫描优化与语义保持：原SQL通过两个独立子查询分别扫描lineitem和part表两次，重写SQL通过合并为单个查询块将扫描次数降为一次，消除CROSS JOIN开销。此优化基于FILTER子句的语义特性(允许在单次聚合Pass中对不同条件分别计算)，不改变最终结果集。具体地，原SQL的promo_part子查询计算满足p_type LIKE 'PROMO%'的行的收入总和，total_part子查询计算所有满足l_shipdate条件的行的收入总和，重写SQL在单次聚合中通过FILTER子句区分两者，分子仅累加满足p_type条件的行，分母累加所有行，与原SQL的两次独立聚合在数学上完全等价。\n\n7. TPC-H Q14查询语义符合性：本查询为TPC-H基准测试Q14(Promotion Effect Query)，计算指定月份内促销商品(p_type以PROMO开头)的收入占比。原SQL和重写SQL均正确实现此语义：分子为促销商品收入(l_extendedprice*(1-l_discount) WHERE p_type LIKE 'PROMO%')，分母为所有商品收入(l_extendedprice*(1-l_discount))，结果乘以100转换为百分比。重写SQL通过FILTER子句在单次聚合中区分促销与非促销商品，避免重复扫描，但保持与原SQL完全相同的计算逻辑和结果集。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL将原SQL中的CASE WHEN条件聚合改写为FILTER子句，在单次扫描中同时计算分子（促销商品收入）和分母（总收入），符合AGGREGATE_CASE_TO_FILTER规则，且连接条件、日期过滤、聚合逻辑完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，cost相同(1576662.12)，结构无变化：均为Parallel Hash Join + 2个Parallel Seq Scan + Gather聚合。重写仅将CASE WHEN改为FILTER子句，属SQL层面语法优化，但PostgreSQL优化器已将两者等价处理，生成相同执行计划。虽FILTER语法更清晰，但未带来执行层面收益。当前已是单次扫描架构(lineitem扫描1次、part扫描1次、单次聚合)，无子查询重复执行问题。行数估计求和、并行度、连接算法均无差异。已达当前schema下最优结构，进一步优化需依赖索引(如lineitem(l_shipdate)或part(p_type))或物化视图等schema变更，非SQL改写可解决。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化。当前执行计划已是最优单次扫描架构，若需进一步提升性能，建议从schema层面考虑：1)在lineitem.l_shipdate上创建索引以替代Seq Scan；2)若p_type选择性高可考虑part(p_type)索引；3)评估分区表或列存储等物理优化方案。纯SQL改写已无改进空间。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 243
+   - 规则序列: ['AGGREGATE_CASE_TO_FILTER']
+   - 优化组别: 子查询优化,聚合优化
+   - 估计代价: 原始=1576662.12, 重写=1576662.12，相对变化: 0.00%
+✅ 成功存储，记录ID: 99770797-de99-44dc-841f-f6395f22a8e5
+
+🎲 UCT Math Update: 1 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1576662.1200, rc=1576662.1200)
+   结构分细节: rows 1916612.0->1916612.0 (score=+0.000), depth 6.0->6.0 (score=+0.000)
+✅ UCT Update Complete:
+   → AGGREGATE_CASE_TO_FILTER: P(s,a)=N/A, effect=1.000, conf=0.90, lambda=0.45, reward=+0.000, count=6, avg=+0.000
+
+----------------------------------------
+
