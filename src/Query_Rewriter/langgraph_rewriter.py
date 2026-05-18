@@ -24,6 +24,7 @@ from src.Rewrite_Middleware.middleware import (
     DBMS_EXPLAIN_Tool,
     DBMS_RAW_EXPLAIN_JSON_Tool,
     DBMS_Syntax_Tool,
+    Equivalence_Check_Tool,
     _normalize_sql_text,
 )
 from src.Rewrite_Middleware.plan_structure_compare import compare_explain_plan_structures
@@ -240,6 +241,53 @@ class LangGraphQueryRewriter:
         except Exception:
             pass
         return 0.0
+
+    @staticmethod
+    def _parse_equivalence_tool_result(raw_result: Any) -> Dict[str, str]:
+        """
+        Normalize sqlsolver/Equivalence_Check_Tool output.
+
+        Returns status in {"equivalent", "not_equivalent", "unknown"} and keeps
+        the raw tool output as the reason so rewrite repair can use it.
+        """
+        if raw_result is None:
+            return {"status": "unknown", "reason": "Equivalence_Check_Tool returned no output."}
+
+        text = str(raw_result).strip()
+        if not text:
+            return {"status": "unknown", "reason": "Equivalence_Check_Tool returned empty output."}
+
+        lowered = text.lower()
+        compact = re.sub(r"[\s_\-]+", "", lowered)
+
+        if "unknown" in lowered or "timeout" in lowered:
+            return {"status": "unknown", "reason": text}
+
+        negative_patterns = (
+            r"\bneq\b",
+            r"\bnot\s+equiv(?:alent)?\b",
+            r"\bnon[-\s]?equiv(?:alent)?\b",
+            r"\bnot\s+equal\b",
+            r"\bfalse\b",
+            r"\bcounter\s*example\b",
+            r"\bcounterexample\b",
+        )
+        if compact in {"neq", "noteq", "notequivalent", "false"} or any(
+            re.search(pattern, lowered) for pattern in negative_patterns
+        ):
+            return {"status": "not_equivalent", "reason": text}
+
+        positive_patterns = (
+            r"\beq\b",
+            r"\bequiv(?:alent)?\b",
+            r"\btrue\b",
+        )
+        if compact in {"eq", "equiv", "equivalent", "true"} or any(
+            re.search(pattern, lowered) for pattern in positive_patterns
+        ):
+            return {"status": "equivalent", "reason": text}
+
+        return {"status": "unknown", "reason": text}
 
     @staticmethod
     def _count_sql_subquery_markers(sql_text: str) -> int:
@@ -608,7 +656,7 @@ class LangGraphQueryRewriter:
                 g = a.get("group")
                 if g:
                     adv_groups.append(g)
-            ctx = self.bandit.extract_context(initial_sql, expl, adv_groups)
+            ctx = self.bandit.extract_context(initial_sql, expl, adv_groups, state.get("data_statistics"))
             uct_info["context_vector"] = ctx.tolist()
         try:
             context = np.array(uct_info["context_vector"], dtype=np.float32)
@@ -817,7 +865,7 @@ class LangGraphQueryRewriter:
                 )
             
             # ====== Bandit scoring (single-pass generation + bandit sorting) ======
-            context = self.bandit.extract_context(base_sql, explain_info, [])
+            context = self.bandit.extract_context(base_sql, explain_info, groups, state.get("data_statistics"))
             scored_rules = self.bandit.score_rules(lib, context)
             
             # Build UCT-scored rule library for LLM
@@ -979,6 +1027,116 @@ class LangGraphQueryRewriter:
         last_rejected: Optional[str] = None
         last_reject_msg: Optional[str] = None
         last_reject_diffs: Optional[List[Dict[str, Any]]] = None
+
+        async def _syntax_repair_after_semantic_fix(candidate_sql: str) -> Optional[str]:
+            candidate = _state_sql(candidate_sql)
+            for _s in range(self.MAX_SYNTAX_AFTER_SEMANTIC):
+                syn = await DBMS_Syntax_Tool(self.dbms, candidate)
+                if syn.get("flag", syn.get("valid", True)):
+                    return _state_sql(candidate)
+                err = syn.get("error", "")
+                prev = dict(rr)
+                prev["rewritten_sql"] = candidate
+                prev["error_info"] = err
+                async with self.llm_semaphore:
+                    candidate = _state_sql(
+                        await self.rewrite_agent.iterative_rewrite(
+                            state["initial_sql"],
+                            err,
+                            prev,
+                            data_statistics=stats,
+                            index_info=idx,
+                        )
+                        or candidate
+                    )
+            return None
+
+        # First use the deterministic equivalence checker. Only fall back to
+        # LLM semantic audit when the tool cannot decide (UNKNOWN/timeout/error).
+        deterministic_unknown = False
+        for attempt_i in range(self.MAX_SEMANTIC_FIX):
+            try:
+                raw_eq = await Equivalence_Check_Tool(
+                    state["initial_sql"],
+                    cur,
+                    state.get("schema_file", self.schema_file),
+                    timeout=10,
+                    verbose=False,
+                )
+            except Exception as ex:
+                raw_eq = f"UNKNOWN_EXCEPTION: {ex}"
+
+            parsed_eq = self._parse_equivalence_tool_result(raw_eq)
+            status = parsed_eq["status"]
+            reason = parsed_eq["reason"]
+            tool_out = {
+                "checker": "Equivalence_Check_Tool",
+                "equivalent": status == "equivalent",
+                "status": status,
+                "message": reason,
+                "attempt": attempt_i + 1,
+            }
+            trace.append({"node": "semantic_check", "output": tool_out})
+
+            if status == "equivalent":
+                rr["rewritten_sql"] = _state_sql(cur)
+                print("✅ 确定性等价验证通过")
+                return {
+                    "current_rewrite_result": rr,
+                    "semantic_equivalent": True,
+                    "semantic_equivalence_message": reason,
+                    "semantic_equivalence_differences": [],
+                    "agent_trace": trace,
+                }
+
+            if status == "unknown":
+                deterministic_unknown = True
+                print(f"ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: {reason}")
+                break
+
+            diffs = [
+                {
+                    "type": "确定性等价验证失败",
+                    "description": reason,
+                    "location": "Equivalence_Check_Tool",
+                }
+            ]
+            last_chk = {"equivalent": False, "message": reason, "differences": diffs}
+            last_rejected = cur
+            last_reject_msg = reason
+            last_reject_diffs = diffs
+            print(f"❌ 确定性等价验证不通过: {reason}")
+
+            async with self.llm_semaphore:
+                fixed = await self.rewrite_agent.semantic_fix(
+                    state["initial_sql"],
+                    cur,
+                    rules,
+                    diffs,
+                )
+            if not fixed:
+                break
+            fixed_sql = await _syntax_repair_after_semantic_fix(fixed)
+            if not fixed_sql:
+                break
+            cur = fixed_sql
+
+        if not deterministic_unknown:
+            rr["rewritten_sql"] = _state_sql(state["initial_sql"])
+            rollback_out = {
+                "equivalent": False,
+                "rolled_back": True,
+                "checker": "Equivalence_Check_Tool",
+            }
+            trace.append({"node": "semantic_check", "output": rollback_out})
+            return {
+                "current_rewrite_result": rr,
+                "semantic_equivalent": False,
+                "semantic_equivalence_message": (last_chk or {}).get("message", "") or "",
+                "semantic_equivalence_differences": (last_chk or {}).get("differences") or [],
+                "agent_trace": trace,
+            }
+
         for attempt_i in range(self.MAX_SEMANTIC_FIX):
             async with self.llm_semaphore:
                 chk = await self.semantic_check_agent.check_equivalence(
@@ -1018,31 +1176,10 @@ class LangGraphQueryRewriter:
                 )
             if not fixed:
                 break
-            candidate = _state_sql(fixed)
-            syntax_ok = False
-            for _s in range(self.MAX_SYNTAX_AFTER_SEMANTIC):
-                syn = await DBMS_Syntax_Tool(self.dbms, candidate)
-                if syn.get("flag", syn.get("valid", True)):
-                    cur = _state_sql(candidate)
-                    syntax_ok = True
-                    break
-                err = syn.get("error", "")
-                prev = dict(rr)
-                prev["rewritten_sql"] = candidate
-                prev["error_info"] = err
-                async with self.llm_semaphore:
-                    candidate = _state_sql(
-                        await self.rewrite_agent.iterative_rewrite(
-                            state["initial_sql"],
-                            err,
-                            prev,
-                            data_statistics=stats,
-                            index_info=idx,
-                        )
-                        or candidate
-                    )
-            if not syntax_ok:
+            fixed_sql = await _syntax_repair_after_semantic_fix(fixed)
+            if not fixed_sql:
                 break
+            cur = fixed_sql
 
         rr["rewritten_sql"] = _state_sql(state["initial_sql"])
         rollback_out = {"equivalent": False, "rolled_back": True}

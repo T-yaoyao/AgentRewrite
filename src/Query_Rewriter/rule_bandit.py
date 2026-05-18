@@ -9,14 +9,18 @@ import json
 import os
 import re
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 from pathlib import Path
 
-# Context layout: SQL fingerprint hash + plan bottleneck operators + advice groups
+# Context layout:
+# SQL fingerprint hash + plan bottleneck operators + advice groups + anonymized table row-count stats
 FINGERPRINT_HASH_DIM = 32
 PLAN_BOTTLENECK_DIM = 24
 ADVICE_DIM = 8
-DEFAULT_CONTEXT_DIM = FINGERPRINT_HASH_DIM + PLAN_BOTTLENECK_DIM + ADVICE_DIM
+TABLE_ROW_BUCKET_DIM = 12
+TABLE_ROW_AGG_DIM = 4
+TABLE_STATS_DIM = TABLE_ROW_BUCKET_DIM + TABLE_ROW_AGG_DIM
+DEFAULT_CONTEXT_DIM = FINGERPRINT_HASH_DIM + PLAN_BOTTLENECK_DIM + ADVICE_DIM + TABLE_STATS_DIM
 
 # Plan report: operator name inside full-width brackets 【…】
 _BRACKET_OP_RE = re.compile(r"【([^】]+)】")
@@ -264,14 +268,135 @@ class RuleBandit:
         vec = np.minimum(vec, 1.0)
         return vec
 
-    def extract_context(self, sql: str, explain_info: str, advice_groups: List[str]) -> np.ndarray:
+    @staticmethod
+    def _extract_table_order(sql: str) -> List[str]:
         """
-        Extract context feature vector from SQL fingerprint, plan bottlenecks, and advice groups.
+        Extract participating base table names in SQL appearance order.
 
-        Features (DEFAULT_CONTEXT_DIM = 64):
+        Real names are used only for matching row-count statistics; the feature
+        encoder anonymizes them by position as t1, t2, ..., tn.
+        """
+        text = str(sql or "")
+        if not text.strip():
+            return []
+        text = re.sub(r"--[^\n]*", " ", text)
+        text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+        text = re.sub(r"'(?:''|[^'])*'", " ", text)
+        pat = re.compile(
+            r"(?is)\b(?:FROM|JOIN|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|"
+            r"CROSS\s+JOIN|UPDATE|INTO)\s+"
+            r"(?:ONLY\s+)?"
+            r"(?:(\w+)\s*\.\s*)?(\w+)"
+        )
+        skip = {
+            "select", "where", "group", "order", "having", "limit", "offset",
+            "union", "except", "intersect", "on", "using", "lateral", "unnest",
+            "values", "case", "when", "set", "dual", "generate_series",
+        }
+        seen = set()
+        ordered: List[str] = []
+        for match in pat.finditer(text):
+            schema, name = match.group(1), match.group(2)
+            if not name:
+                continue
+            base = name.lower()
+            if base in skip:
+                continue
+            qualified = f"{schema.lower()}.{base}" if schema else base
+            if qualified in seen:
+                continue
+            seen.add(qualified)
+            ordered.append(qualified)
+        return ordered
+
+    @staticmethod
+    def _parse_table_row_counts(data_statistics: Any) -> Dict[str, float]:
+        """
+        Parse [[table_name, row_count], ...] or a JSON string into a table->rows map.
+        Both qualified and base table names are registered for matching.
+        """
+        if data_statistics is None:
+            return {}
+        stats_obj = data_statistics
+        if isinstance(data_statistics, str):
+            try:
+                stats_obj = json.loads(data_statistics)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        if not isinstance(stats_obj, list):
+            return {}
+
+        row_counts: Dict[str, float] = {}
+        for row in stats_obj:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            table_name = str(row[0]).strip().lower()
+            if not table_name:
+                continue
+            try:
+                count = float(row[1])
+            except (TypeError, ValueError):
+                continue
+            if count < 0:
+                count = 0.0
+            row_counts[table_name] = count
+            if "." in table_name:
+                row_counts.setdefault(table_name.rsplit(".", 1)[-1], count)
+        return row_counts
+
+    @staticmethod
+    def _table_row_count_features(sql: str, data_statistics: Any) -> np.ndarray:
+        """
+        Encode all participating tables' row counts after anonymizing table names.
+
+        Real table names are mapped by SQL appearance order to t1..tn. Every
+        participating table contributes log1p(row_count) to a fixed hash bucket
+        keyed only by its anonymous name, so no real table name enters context.
+        """
+        vec = np.zeros(TABLE_STATS_DIM, dtype=np.float32)
+        tables = RuleBandit._extract_table_order(sql)
+        if not tables:
+            return vec
+
+        row_counts = RuleBandit._parse_table_row_counts(data_statistics)
+        log_rows: List[float] = []
+        for idx, table_name in enumerate(tables, start=1):
+            base = table_name.rsplit(".", 1)[-1]
+            rows = row_counts.get(table_name, row_counts.get(base, 0.0))
+            log_row = float(np.log1p(max(rows, 0.0)))
+            log_rows.append(log_row)
+
+            anon_name = f"t{idx}"
+            digest = hashlib.sha256(anon_name.encode("utf-8")).digest()
+            bucket = int.from_bytes(digest[:2], "big") % TABLE_ROW_BUCKET_DIM
+            vec[bucket] += min(log_row / 30.0, 1.0)
+
+        vec[:TABLE_ROW_BUCKET_DIM] = np.minimum(vec[:TABLE_ROW_BUCKET_DIM], 1.0)
+        arr = np.asarray(log_rows, dtype=np.float32)
+        agg_start = TABLE_ROW_BUCKET_DIM
+        vec[agg_start] = min(np.log1p(len(tables)) / np.log1p(64.0), 1.0)
+        vec[agg_start + 1] = min(float(np.max(arr)) / 30.0, 1.0)
+        vec[agg_start + 2] = min(float(np.mean(arr)) / 30.0, 1.0)
+        vec[agg_start + 3] = min(float(np.min(arr)) / 30.0, 1.0)
+        return vec
+
+    def extract_context(
+        self,
+        sql: str,
+        explain_info: str,
+        advice_groups: List[str],
+        data_statistics: Any = None,
+    ) -> np.ndarray:
+        """
+        Extract context feature vector from SQL fingerprint, plan bottlenecks,
+        advice groups, and anonymized participating table row-count statistics.
+
+        Features (DEFAULT_CONTEXT_DIM = 80):
         - 32 dims: SHA256 bytes of SQLFingerprintGenerator template (project SQL fingerprint)
         - 24 dims: 【】中的算子名（稳定哈希分桶），邻近有代价占比则按占比加权
         - 8 dims: advice group indicators
+        - 16 dims: participating table row-count stats. Real table names are
+          anonymized by SQL appearance order as t1..tn before hashing.
 
         Returns:
             L2-normalized feature vector of length context_dim
@@ -294,7 +419,8 @@ class RuleBandit:
             dtype=np.float32,
         )
 
-        features = np.concatenate([fp, plan, advice], axis=0)
+        table_stats = self._table_row_count_features(sql, data_statistics)
+        features = np.concatenate([fp, plan, advice, table_stats], axis=0)
         if features.shape[0] != self.context_dim:
             raise ValueError(
                 f"Context length {features.shape[0]} != context_dim {self.context_dim}"
