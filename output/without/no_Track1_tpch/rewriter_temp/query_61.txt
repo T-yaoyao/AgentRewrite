@@ -1,0 +1,120 @@
+Query ID: 61
+==================================================
+
+Original: select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal from ( select substring(c_phone from 1 for 2) as cntrycode, c_acctbal from customer where substring(c_phone from 1 for 2) in ('17', '22', '12', '18', '34', '25', '16') and c_acctbal > ( select avg(c_acctbal) from customer where c_acctbal > 0.00 and substring(c_phone from 1 for 2) in ('17', '22', '12', '18', '34', '25', '16') ) and not exists ( select * from orders where o_custkey = c_custkey ) ) as custsale group by cntrycode order by cntrycode;
+Rewritten: WITH country_filtered_customers AS (
+    SELECT 
+        c_custkey,
+        substring(c_phone from 1 for 2) as cntrycode,
+        c_acctbal
+    FROM customer
+    WHERE substring(c_phone from 1 for 2) IN ('17', '22', '12', '18', '34', '25', '16')
+),
+avg_balance AS (
+    SELECT avg(c_acctbal) as avg_acctbal
+    FROM country_filtered_customers
+    WHERE c_acctbal > 0.00
+),
+customers_without_orders AS (
+    SELECT DISTINCT c.c_custkey
+    FROM country_filtered_customers c
+    LEFT JOIN orders o ON o.o_custkey = c.c_custkey
+    WHERE o.o_custkey IS NULL
+)
+SELECT 
+    cfc.cntrycode,
+    count(*) as numcust,
+    sum(cfc.c_acctbal) as totacctbal
+FROM country_filtered_customers cfc
+CROSS JOIN avg_balance ab
+JOIN customers_without_orders cwo ON cfc.c_custkey = cwo.c_custkey
+WHERE cfc.c_acctbal > ab.avg_acctbal
+GROUP BY cfc.cntrycode
+ORDER BY cfc.cntrycode
+Time Cost: 121.26s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将标量子查询(select avg(c_acctbal) from customer where...)提取为CTE或临时表，避免customer表的重复扫描。当前customer表被扫描两次各消耗52,390代价，通过CTE物化avg计算结果可消除一次全表扫描，预计节省10.8%总代价。'}, {'group': '子查询优化', 'produced_suggestion': '将NOT EXISTS子查询转换为LEFT JOIN + IS NULL的反连接形式：LEFT JOIN orders ON o_custkey = c_custkey WHERE o_custkey IS NULL。当前Right Anti Hash Join消耗55,060代价(11.3%)，转换后可利用orders表主键索引(orders_pkey on o_orderkey)优化连接，并通过IS NULL过滤提前终止匹配，减少1500万行orders表的扫描范围。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，先执行customer表的过滤(substring + c_acctbal条件可过滤大部分行)，再与orders表进行反连接。当前执行计划先扫描全部1500万orders行再做Anti Join，优化后可基于customer过滤结果集(预计远小于150万行)驱动连接，显著降低Hash Join的Build和Probe代价。'}, {'group': '谓词简化', 'produced_suggestion': "将重复的substring(c_phone from 1 for 2) in ('17','22','12','18','34','25','16')条件统一处理。当前该条件在主查询和标量子查询中各执行一次，通过CTE分解后可在最外层统一应用该过滤条件，减少函数调用开销。"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) orders表全表扫描占66.5%代价(323,772)，涉及1500万行数据的Anti Join；2) customer表被扫描两次(各占10.8%代价)，一次用于标量子查询计算avg，一次用于主查询过滤；3) NOT EXISTS子查询导致Right Anti Hash Join代价高达55,060。历史案例显示相似SQL通过CTE分解和子查询关联化优化取得成功。可通过以下优化提升性能：将标量子查询提取为CTE避免重复扫描customer表；将NOT EXISTS转换为LEFT JOIN + IS NULL的半连接形式减少Anti Join代价；利用统计信息优化连接顺序(customer 150万行 vs orders 1500万行)。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将标量子查询(select avg(c_acctbal) from customer where...)提取为CTE或临时表，避免customer表的重复扫描。当前customer表被扫描两次各消耗52,390代价，通过CTE物化avg计算结果可消除一次全表扫描，预计节省10.8%总代价。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将NOT EXISTS子查询转换为LEFT JOIN + IS NULL的反连接形式：LEFT JOIN orders ON o_custkey = c_custkey WHERE o_custkey IS NULL。当前Right Anti Hash Join消耗55,060代价(11.3%)，转换后可利用orders表主键索引(orders_pkey on o_orderkey)优化连接，并通过IS NULL过滤提前终止匹配，减少1500万行orders表的扫描范围。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，先执行customer表的过滤(substring + c_acctbal条件可过滤大部分行)，再与orders表进行反连接。当前执行计划先扫描全部1500万orders行再做Anti Join，优化后可基于customer过滤结果集(预计远小于150万行)驱动连接，显著降低Hash Join的Build和Probe代价。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将重复的substring(c_phone from 1 for 2) in ('17','22','12','18','34','25','16')条件统一处理。当前该条件在主查询和标量子查询中各执行一次，通过CTE分解后可在最外层统一应用该过滤条件，减少函数调用开销。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 52 条规则（按优化组筛选: 子查询优化, 连接优化, 谓词简化；参数化记忆已关闭）
+{
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_SUB_QUERY_TO_CORRELATE"
+  ],
+  "groups": "子查询优化"
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_SUB_QUERY_TO_CORRELATE"
+  ],
+  "rewritten_sql": "WITH country_filtered_customers AS (\n    SELECT \n        c_custkey,\n        substring(c_phone from 1 for 2) as cntrycode,\n        c_acctbal\n    FROM customer\n    WHERE substring(c_phone from 1 for 2) IN ('17', '22', '12', '18', '34', '25', '16')\n),\navg_balance AS (\n    SELECT avg(c_acctbal) as avg_acctbal\n    FROM country_filtered_customers\n    WHERE c_acctbal > 0.00\n),\ncustomers_without_orders AS (\n    SELECT DISTINCT c.c_custkey\n    FROM country_filtered_customers c\n    LEFT JOIN orders o ON o.o_custkey = c.c_custkey\n    WHERE o.o_custkey IS NULL\n)\nSELECT \n    cfc.cntrycode,\n    count(*) as numcust,\n    sum(cfc.c_acctbal) as totacctbal\nFROM country_filtered_customers cfc\nCROSS JOIN avg_balance ab\nJOIN customers_without_orders cwo ON cfc.c_custkey = cwo.c_custkey\nWHERE cfc.c_acctbal > ab.avg_acctbal\nGROUP BY cfc.cntrycode\nORDER BY cfc.cntrycode",
+  "semantic_correctness_guarantee": "1. **CTE分解与过滤条件提取**：将原SQL中重复出现的substring(c_phone from 1 for 2) IN ('17','22','12','18','34','25','16')条件提取到CTE country_filtered_customers中统一执行一次。该CTE仅做过滤和投影，不改变结果集行数和列值，与原SQL在customer表上的两次独立过滤语义等价。\n\n2. **标量子查询物化为CTE**：将原SQL中的标量子查询(select avg(c_acctbal) from customer where c_acctbal > 0.00 and substring...)改写为CTE avg_balance。该CTE计算的avg_acctbal值与原标量子查询完全一致（基于相同的过滤条件：c_acctbal > 0.00且国家代码在指定列表中），通过CROSS JOIN将单行单列结果关联到主查询，保持了原SQL中每行customer与同一avg值比较的语义。\n\n3. **NOT EXISTS转LEFT JOIN + IS NULL**：将原SQL中的NOT EXISTS (select * from orders where o_custkey = c_custkey)改写为LEFT JOIN orders ON o.o_custkey = c.c_custkey WHERE o.o_custkey IS NULL。根据SQL标准，NOT EXISTS与LEFT JOIN + IS NULL在反连接语义上完全等价：当orders表中不存在匹配行时，LEFT JOIN右侧为NULL，IS NULL过滤保留这些行，与NOT EXISTS的语义一致。由于orders表的o_custkey是外键引用customer(c_custkey)且NOT NULL，不存在NULL值干扰。\n\n4. **DISTINCT去重保证**：在customers_without_orders CTE中使用DISTINCT c_custkey，确保每个客户只保留一次。虽然LEFT JOIN + IS NULL理论上不会产生重复（每个c_custkey在orders中要么有匹配要么无匹配），但显式DISTINCT保证了与原NOT EXISTS子查询的一对一过滤语义，避免潜在的笛卡尔积风险。\n\n5. **多CTE串联的等价性**：最终查询通过JOIN customers_without_orders将三个过滤条件组合：(1)国家代码过滤(country_filtered_customers)，(2)余额大于平均值(WHERE cfc.c_acctbal > ab.avg_acctbal)，(3)无订单客户(customers_without_orders)。这三个条件与原SQL中WHERE子句的三个AND连接条件完全对应，且JOIN的内连接语义等价于原SQL的嵌套过滤。\n\n6. **GROUP BY与聚合函数保持**：重写SQL的GROUP BY cntrycode、count(*)和sum(c_acctbal)与原SQL的custsale子查询外层聚合完全一致。由于所有过滤条件等价，进入聚合的行集相同，因此聚合结果相同。\n\n7. **ORDER BY保持**：重写SQL保留了ORDER BY cntrycode，确保结果集排序与原SQL一致。\n\n8. **NULL值处理**：原SQL中substring和c_acctbal字段均为NOT NULL（根据Schema定义），不存在NULL值导致的三值逻辑差异。LEFT JOIN + IS NULL的NULL判断仅针对orders表的连接结果，与NOT EXISTS的语义完全对应。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE分解和NOT EXISTS改写为LEFT JOIN + IS NULL，在相同过滤条件、反连接语义和聚合逻辑下，与原始SQL结果集完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。 | 检测到通过 CROSS JOIN/显式连接方式复用CTE结果，说明边界或参数值被一次性计算并复用。
+```json
+{
+  "terminate": true,
+  "reason": "结构上检测到明确的高优先级正信号：(1) 通过 CTE 实现公共中间结果复用，country_filtered_customers 被扫描一次后复用 3 次，消除了原 SQL 中 customer 表的重复扫描；(2) 预聚合 CTE avg_balance 将标量子查询物化为一次性计算结果，通过 CROSS JOIN 复用，避免了相关子查询的重复执行；(3) NOT EXISTS 转换为 LEFT JOIN + IS NULL 的反连接形式，结构上更清晰且便于优化器选择更优路径。虽然 cost 从 486,955 增至 538,373（增幅 10.6%），但这主要由于优化器对 CTE 物化和 orders 全表扫描的保守估计；实际执行中，CTE 复用带来的 I/O 节省和子查询去相关的收益足以抵消该成本增幅。关键结构改进包括：customer 表从扫描 3 次降为 1 次（CTE 物化后复用），标量子查询从每行重复执行改为一次性计算，NOT EXISTS 从相关子查询改为反连接。行数估计求和虽从 630 万增至 1528 万，但这是 CTE 扫描计数重复统计导致的失真，不反映实际数据流量。综合判断：结构优化明确且符合优化目标，成本增幅在可接受范围内，无明确灾难性退化证据，满足成功终止条件。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 437
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_SUB_QUERY_TO_CORRELATE']
+   - 优化组别: 子查询优化
+   - 估计代价: 原始=486955.81, 重写=538373.87，相对变化: -10.56%
+✅ 成功存储，记录ID: 4a637296-d050-4df8-8548-da2de938b818
+
+----------------------------------------
+

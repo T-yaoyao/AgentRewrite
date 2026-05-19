@@ -1,0 +1,85 @@
+Query ID: 37
+==================================================
+
+Original: select c_count, count(*) as custdist from ( select c_custkey, count(o_orderkey) from customer left outer join orders on c_custkey = o_custkey and o_comment not like '%special%requests%' group by c_custkey ) as c_orders (c_custkey, c_count) group by c_count order by custdist desc, c_count desc;
+Rewritten: SELECT c_count, COUNT(*) AS custdist FROM ( SELECT c.c_custkey, COUNT(o.o_orderkey) AS c_count FROM customer c LEFT OUTER JOIN orders o ON c.c_custkey = o.o_custkey AND o.o_comment NOT LIKE '%special%requests%' GROUP BY c.c_custkey ) AS c_orders GROUP BY c_count ORDER BY custdist DESC, c_count DESC;
+Time Cost: 751.34s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将LEFT OUTER JOIN的ON条件中的过滤谓词'o_comment not like '%special%requests%'拆分：保留连接条件o_custkey = c_custkey在ON中，将过滤条件下推为独立WHERE子句或转换为INNER JOIN+UNION NULL处理，减少orders表扫描行数(当前15M行全扫)"}, {'group': '聚合优化', 'produced_suggestion': '应用AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则：将内层聚合COUNT(o_orderkey) GROUP BY c_custkey与LEFT OUTER JOIN的顺序调整，先对orders按o_custkey预聚合(结合过滤条件)，再与customer做LEFT JOIN，减少JOIN后的聚合数据量'}, {'group': '连接优化', 'produced_suggestion': '考虑将LEFT OUTER JOIN转换为等价的INNER JOIN UNION ALL形式：先INNER JOIN获取有订单的客户统计，再UNION ALL补充无订单客户(c_count=0)，利用orders_pkey索引加速INNER JOIN路径'}, {'group': '投影优化', 'produced_suggestion': '在子查询c_orders中仅投影必需列c_custkey和c_count，避免携带customer表的其他列通过多层聚合算子，减少Sort和Aggregate的内存开销(当前Sort代价12.1%)'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) orders表全表扫描(22.4%代价)且带过滤条件，2) 多层聚合操作累计代价高达56.5%，3) LEFT OUTER JOIN后立即GROUP BY的模式可优化。历史案例显示相同SQL指纹通过FILTER_INTO_JOIN和AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则组合可获得显著提升。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将LEFT OUTER JOIN的ON条件中的过滤谓词'o_comment not like '%special%requests%'拆分：保留连接条件o_custkey = c_custkey在ON中，将过滤条件下推为独立WHERE子句或转换为INNER JOIN+UNION NULL处理，减少orders表扫描行数(当前15M行全扫)"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "应用AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则：将内层聚合COUNT(o_orderkey) GROUP BY c_custkey与LEFT OUTER JOIN的顺序调整，先对orders按o_custkey预聚合(结合过滤条件)，再与customer做LEFT JOIN，减少JOIN后的聚合数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "考虑将LEFT OUTER JOIN转换为等价的INNER JOIN UNION ALL形式：先INNER JOIN获取有订单的客户统计，再UNION ALL补充无订单客户(c_count=0)，利用orders_pkey索引加速INNER JOIN路径"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在子查询c_orders中仅投影必需列c_custkey和c_count，避免携带customer表的其他列通过多层聚合算子，减少Sort和Aggregate的内存开销(当前Sort代价12.1%)"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 67 条规则（按优化组筛选: 谓词简化, 聚合优化, 连接优化, 投影优化；参数化记忆已关闭）
+{"applied_rules": ["FILTER_INTO_JOIN", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "PROJECT_JOIN_TRANSPOSE"], "groups": "谓词简化, 聚合优化, 投影优化"}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 聚合优化, 投影优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT c_count, COUNT(*) AS custdist\nFROM (\n  SELECT c.c_custkey, COALESCE(o_agg.order_count, 0) AS c_count\n  FROM (\n    SELECT c_custkey\n    FROM customer\n  ) AS c\n  LEFT OUTER JOIN (\n    SELECT o_custkey, COUNT(o_orderkey) AS order_count\n    FROM orders\n    WHERE o_comment NOT LIKE '%special%requests%'\n    GROUP BY o_custkey\n  ) AS o_agg\n  ON c.c_custkey = o_agg.o_custkey\n) AS c_orders\nGROUP BY c_count\nORDER BY custdist DESC, c_count DESC;",
+  "semantic_correctness_guarantee": "1. **FILTER_INTO_JOIN应用**：将原LEFT OUTER JOIN的ON条件中的过滤谓词'o_comment NOT LIKE '%special%requests%'从ON子句移入orders表的子查询WHERE子句。由于LEFT JOIN语义要求保留左表所有行，将右表过滤条件放在ON中与放在右表子查询WHERE中等价：两种写法都是先过滤orders表再执行LEFT JOIN，对于不满足过滤条件的orders行，LEFT JOIN结果中对应列为NULL。\n\n2. **AGGREGATE_JOIN_TRANSPOSE_EXTENDED应用**：将原本在JOIN后执行的COUNT(o_orderkey) GROUP BY c_custkey聚合操作，改为在JOIN前对orders表预聚合。原SQL是先LEFT JOIN再对每个c_custkey统计o_orderkey数量；重写SQL是先对orders按o_custkey分组统计order_count，再LEFT JOIN到customer。由于orders表的主键是o_orderkey且外键o_custkey引用customer(c_custkey)，每个订单唯一属于一个客户，因此先聚合再JOIN与先JOIN再聚合在结果上等价：对于有订单的客户，两种方式统计的订单数相同；对于无订单的客户，原SQL的COUNT(o_orderkey)返回0（因LEFT JOIN后o_orderkey为NULL），重写SQL通过COALESCE(o_agg.order_count, 0)也返回0。\n\n3. **PROJECT_JOIN_TRANSPOSE应用**：在customer侧子查询中仅投影c_custkey列，在orders聚合子查询中仅投影o_custkey和聚合结果order_count。原SQL的子查询c_orders已经只输出c_custkey和c_count两列，重写后保持相同的输出列集合，只是将投影下推到JOIN的输入侧，减少JOIN过程中携带的数据量。\n\n4. **LEFT JOIN与COALESCE的等价性**：原SQL中，对于customer表中没有匹配订单的行，LEFT JOIN后o_orderkey为NULL，COUNT(o_orderkey)返回0（COUNT忽略NULL值）。重写SQL中，对于没有匹配的customer行，o_agg.order_count为NULL，COALESCE(o_agg.order_count, 0)返回0，与原SQL语义一致。\n\n5. **外层聚合的等价性**：原SQL和重写SQL的外层都是对c_count进行GROUP BY并统计每个c_count值的出现次数（custdist）。由于内层子查询c_orders输出的c_count列语义完全相同（都是每个客户的订单数量），外层聚合结果必然相同。\n\n6. **排序的等价性**：ORDER BY custdist DESC, c_count DESC在两个SQL中完全一致，作用于相同语义的结果集，排序结果相同。\n\n7. **NULL值处理的正确性**：原SQL中LEFT JOIN后未匹配行的o_orderkey为NULL，COUNT(o_orderkey)对NULL不计数返回0。重写SQL中通过WHERE过滤后的orders预聚合，未匹配的customer行在LEFT JOIN后o_agg.order_count为NULL，COALESCE显式转换为0，保证了NULL值处理的语义等价性。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+❌ 确定性等价验证不通过: NEQ
+```json
+{"fixed_sql": "SELECT c_count, COUNT(*) AS custdist FROM ( SELECT c.c_custkey, COUNT(o.o_orderkey) AS c_count FROM customer c LEFT OUTER JOIN orders o ON c.c_custkey = o.o_custkey AND o.o_comment NOT LIKE '%special%requests%' GROUP BY c.c_custkey ) AS c_orders GROUP BY c_count ORDER BY custdist DESC, c_count DESC;", "note": "将过滤条件从子查询WHERE移回JOIN ON子句，并对o_orderkey直接COUNT而非先聚合再COALESCE，确保NULL值处理与原始SQL一致"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，无任何结构变化。对比显示：1) 节点类型、扫描方式、连接算法、聚合策略、并行度完全相同；2) cost完全相同(1518251.14)；3) 行数估计求和相同(21849150.0)；4) 重写仅为表别名变更(customer→c, orders→o)，未触发任何优化器行为改变。本轮应用的规则(FILTER_INTO_JOIN/AGGREGATE_JOIN_TRANSPOSE_EXTENDED/PROJECT_JOIN_TRANSPOSE)均未生效，说明优化器已识别原SQL为最优形态或当前规则不适用此场景。继续迭代无意义。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 265
+   - 规则序列: ['FILTER_INTO_JOIN', 'AGGREGATE_JOIN_TRANSPOSE_EXTENDED', 'PROJECT_JOIN_TRANSPOSE']
+   - 优化组别: 谓词简化, 聚合优化, 投影优化
+   - 估计代价: 原始=1518251.14, 重写=1518251.14，相对变化: 0.00%
+✅ 成功存储，记录ID: 76f89aa7-3d2c-4fb8-8c41-5193ca6c33fa
+
+----------------------------------------
+

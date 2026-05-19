@@ -1,0 +1,95 @@
+Query ID: 45
+==================================================
+
+Original: select p_brand, p_type, p_size, count(distinct ps_suppkey) as supplier_cnt from partsupp, part where p_partkey = ps_partkey and p_brand <> 'Brand#33' and p_type not like 'SMALL BRUSHED%' and p_size in (28, 8, 22, 14, 19, 44, 47, 45) and ps_suppkey not in ( select s_suppkey from supplier where s_comment like '%Customer%Complaints%' ) group by p_brand, p_type, p_size order by supplier_cnt desc, p_brand, p_type, p_size;
+Rewritten: WITH excluded_suppliers AS (
+  SELECT s_suppkey
+  FROM supplier
+  WHERE s_comment LIKE '%Customer%Complaints%'
+),
+filtered_part AS (
+  SELECT p_partkey, p_brand, p_type, p_size
+  FROM part
+  WHERE p_brand <> 'Brand#33'
+    AND p_type NOT LIKE 'SMALL BRUSHED%'
+    AND p_size IN (28, 8, 22, 14, 19, 44, 47, 45)
+)
+SELECT p_brand, p_type, p_size, COUNT(DISTINCT ps_suppkey) AS supplier_cnt
+FROM partsupp
+JOIN filtered_part ON partsupp.ps_partkey = filtered_part.p_partkey
+LEFT JOIN excluded_suppliers ON partsupp.ps_suppkey = excluded_suppliers.s_suppkey
+WHERE excluded_suppliers.s_suppkey IS NULL
+GROUP BY p_brand, p_type, p_size
+ORDER BY supplier_cnt DESC, p_brand, p_type, p_size
+Time Cost: 67.07s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将NOT IN子查询转换为LEFT ANTI JOIN或NOT EXISTS相关子查询。当前NOT IN导致对partsupp的8M行每行都进行哈希探测(SubPlan 1)，代价高达169K。转换为LEFT ANTI JOIN后可利用supplier表的主键索引，避免哈希子计划的构建和探测开销，同时优化器可以更好地调整连接顺序。参考历史案例的FILTER_SUB_QUERY_TO_CORRELATE规则，该转换在相似场景下命中率100%。'}, {'group': '连接优化', 'produced_suggestion': "调整连接顺序，优先过滤小表。当前执行计划先扫描part表(2M行)和partsupp表(8M行)进行Hash Join，然后再应用NOT IN过滤。建议先将supplier表的过滤条件(s_comment like '%Customer%Complaints%')应用到supplier表(仅10万行)，然后与partsupp进行半连接过滤，最后再与part表连接。这样可以大幅减少参与Hash Join的数据量。"}, {'group': '谓词简化', 'produced_suggestion': '将part表的过滤条件(p_brand、p_type、p_size)尽早应用。当前Seq Scan虽然有Filter但代价仍达61K。如果能将这些条件与连接条件结合，或者考虑在part表上创建覆盖索引(p_partkey, p_brand, p_type, p_size)的建议，可以减少后续Hash Join的构建代价。同时p_size IN (...)条件可以考虑转换为Bitmap Index Scan如果存在合适索引。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) NOT IN子查询导致Index Only Scan上的过滤代价占比44.3%，需要对8M行数据进行哈希探测；2) part表的Seq Scan代价占比16.2%，虽然有过滤条件但未能利用索引；3) 存在多个流水线阻塞算子(Gather Merge 18.4%、Sort 7.8%和4.8%)。历史案例显示相似SQL通过FILTER_SUB_QUERY_TO_CORRELATE规则优化后有显著提升，该SQL的NOT IN子查询可转换为LEFT ANTI JOIN来避免哈希子计划的重复探测开销。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将NOT IN子查询转换为LEFT ANTI JOIN或NOT EXISTS相关子查询。当前NOT IN导致对partsupp的8M行每行都进行哈希探测(SubPlan 1)，代价高达169K。转换为LEFT ANTI JOIN后可利用supplier表的主键索引，避免哈希子计划的构建和探测开销，同时优化器可以更好地调整连接顺序。参考历史案例的FILTER_SUB_QUERY_TO_CORRELATE规则，该转换在相似场景下命中率100%。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先过滤小表。当前执行计划先扫描part表(2M行)和partsupp表(8M行)进行Hash Join，然后再应用NOT IN过滤。建议先将supplier表的过滤条件(s_comment like '%Customer%Complaints%')应用到supplier表(仅10万行)，然后与partsupp进行半连接过滤，最后再与part表连接。这样可以大幅减少参与Hash Join的数据量。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将part表的过滤条件(p_brand、p_type、p_size)尽早应用。当前Seq Scan虽然有Filter但代价仍达61K。如果能将这些条件与连接条件结合，或者考虑在part表上创建覆盖索引(p_partkey, p_brand, p_type, p_size)的建议，可以减少后续Hash Join的构建代价。同时p_size IN (...)条件可以考虑转换为Bitmap Index Scan如果存在合适索引。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 52 条规则（按优化组筛选: 子查询优化, 连接优化, 谓词简化；参数化记忆已关闭）
+{
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "STRATEGY_CTE_DECOMPOSITION"],
+  "groups": "子查询优化"
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH excluded_suppliers AS (\n  SELECT s_suppkey\n  FROM supplier\n  WHERE s_comment LIKE '%Customer%Complaints%'\n),\nfiltered_part AS (\n  SELECT p_partkey, p_brand, p_type, p_size\n  FROM part\n  WHERE p_brand <> 'Brand#33'\n    AND p_type NOT LIKE 'SMALL BRUSHED%'\n    AND p_size IN (28, 8, 22, 14, 19, 44, 47, 45)\n)\nSELECT p_brand, p_type, p_size, COUNT(DISTINCT ps_suppkey) AS supplier_cnt\nFROM partsupp\nJOIN filtered_part ON partsupp.ps_partkey = filtered_part.p_partkey\nLEFT JOIN excluded_suppliers ON partsupp.ps_suppkey = excluded_suppliers.s_suppkey\nWHERE excluded_suppliers.s_suppkey IS NULL\nGROUP BY p_brand, p_type, p_size\nORDER BY supplier_cnt DESC, p_brand, p_type, p_size",
+  "semantic_correctness_guarantee": "1. **NOT IN 子查询转换为 LEFT ANTI JOIN**：原 SQL 的 `ps_suppkey NOT IN (SELECT s_suppkey FROM supplier WHERE s_comment LIKE '%Customer%Complaints%')` 被改写为 `LEFT JOIN excluded_suppliers ON partsupp.ps_suppkey = excluded_suppliers.s_suppkey WHERE excluded_suppliers.s_suppkey IS NULL`。在 SQL 标准语义下，NOT IN 子查询当子查询结果集不含 NULL 时等价于 LEFT ANTI JOIN（即左表中在右表不存在匹配的行）。由于 supplier 表的 s_suppkey 是主键（NOT NULL 约束），子查询结果集不会包含 NULL，因此该转换保持语义等价。\n\n2. **CTE 提取过滤逻辑**：将 supplier 表的过滤条件 `s_comment LIKE '%Customer%Complaints%'` 提取为 CTE `excluded_suppliers`，将 part 表的过滤条件（p_brand、p_type、p_size）提取为 CTE `filtered_part`。这些 CTE 仅是对原表的过滤投影，不改变数据内容，只是将过滤逻辑前置并命名，便于优化器物化或内联，与原 SQL 的 WHERE 子句过滤语义完全一致。\n\n3. **连接顺序调整**：原 SQL 使用隐式内连接 `FROM partsupp, part WHERE p_partkey = ps_partkey`，重写后显式为 `FROM partsupp JOIN filtered_part ON partsupp.ps_partkey = filtered_part.p_partkey`。由于 partsupp 表的 ps_partkey 是外键引用 part 表的 p_partkey（主键），且 JOIN 条件为等值连接，两种写法在关系代数上等价，都是内连接，返回相同的匹配行集合。\n\n4. **过滤条件作用域不变**：原 SQL 在 WHERE 子句中对 part 表应用过滤条件，重写后在 CTE `filtered_part` 中应用相同条件，然后 JOIN 该 CTE。由于 JOIN 是在过滤后的结果集上进行，最终参与 GROUP BY 的行集合与原 SQL 完全一致（即满足 part 表过滤条件且 ps_suppkey 不在排除列表中的 partsupp 行）。\n\n5. **GROUP BY 和聚合函数语义保持**：重写后的 `GROUP BY p_brand, p_type, p_size` 和 `COUNT(DISTINCT ps_suppkey)` 与原 SQL 完全一致，作用在相同的行集合上，因此聚合结果相同。由于 filtered_part CTE 已投影出 p_brand、p_type、p_size 列，GROUP BY 引用这些列与原 SQL 引用 part 表的列语义等价。\n\n6. **ORDER BY 子句不变**：重写后的 `ORDER BY supplier_cnt DESC, p_brand, p_type, p_size` 与原 SQL 完全一致，排序键和排序方向相同，因此结果集的顺序相同。\n\n7. **NULL 值处理的等价性**：原 SQL 的 NOT IN 子查询在子查询结果不含 NULL 时，对于 ps_suppkey 为 NULL 的行会被过滤掉（因为 NULL NOT IN (非空集合) 返回 UNKNOWN，在 WHERE 中被视为 FALSE）。重写后的 LEFT JOIN + IS NULL 对于 ps_suppkey 为 NULL 的行，LEFT JOIN 会匹配失败（NULL 不等于任何值），excluded_suppliers.s_suppkey 为 NULL，WHERE 条件 `excluded_suppliers.s_suppkey IS NULL` 为 TRUE，该行会被保留。但由于 partsupp 表的 ps_suppkey 是外键引用 supplier 表的 s_suppkey（主键，NOT NULL），partsupp 表中不存在 ps_suppkey 为 NULL 的行，因此该差异不影响实际结果集的等价性。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 3331269.0 -> 3145242.0 (重写侧约为原的 94.4157%) | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "结构分析：1) 子计划消除：original_sql 中存在 SubPlan 1（对 supplier 表的相关子查询，每行 partsupp 都需哈希探测），enhanced_sql 通过 CTE excluded_suppliers 将其物化为一次性扫描，并改用 Anti Hash Join，消除了重复执行；2) 公共结果复用：引入 filtered_part CTE 预过滤 part 表，避免在主查询中重复应用过滤条件；3) 连接策略优化：original_sql 使用 Hash Join + SubPlan 过滤，enhanced_sql 改为 Nested Loop（part → partsupp 索引探测）+ Anti Hash Join（排除 supplier），连接顺序更合理；4) 行数估计求和：3331269 → 3145242（降至 94.4%），虽非大幅下降但配合子计划消除属正向信号；5) cost 上升 19%（382K → 455K）：仅作弱信号，不能单独否定重写。综合判断：检测到去相关（SubPlan 消除）+ CTE 复用公共中间结果 + 预聚合 CTE（filtered_part）等高优先级正信号，且无明确灾难性结构退化证据（并行度保持 2、索引探测仍存在、无主干数据量失控），符合成功终止条件 b。虽 cost 略增，但结构优先原则下应视为优秀重写。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 342
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE', 'STRATEGY_CTE_DECOMPOSITION']
+   - 优化组别: 子查询优化
+   - 估计代价: 原始=382282.42, 重写=455302.69，相对变化: -19.10%
+✅ 成功存储，记录ID: 3f8d3e5c-25a3-4fa8-84d3-2cf4c009d75d
+
+----------------------------------------
+
