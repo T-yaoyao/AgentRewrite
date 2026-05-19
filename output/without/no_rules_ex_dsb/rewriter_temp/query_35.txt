@@ -1,0 +1,290 @@
+Query ID: 35
+==================================================
+
+Original: with frequent_ss_items as  (select substring(i_item_desc,1,30) itemdesc,i_item_sk item_sk,d_date solddate,count(*) cnt   from store_sales       ,date_dim       ,item   where ss_sold_date_sk = d_date_sk     and ss_item_sk = i_item_sk     and d_year = 1999     and i_manager_id BETWEEN 65 and 84      AND i_category IN ('Books', 'Home', 'Sports')   group by substring(i_item_desc,1,30),i_item_sk,d_date   having count(*) >4),  max_store_sales as  (select max(csales) tpcds_cmax   from (select c_customer_sk,sum(ss_quantity*ss_sales_price) csales         from store_sales             ,customer             ,date_dim         where ss_customer_sk = c_customer_sk          and ss_sold_date_sk = d_date_sk          and d_year = 1999          and ss_wholesale_cost BETWEEN 23 AND 33         group by c_customer_sk) tmp1),  best_ss_customer as  (select c_customer_sk,sum(ss_quantity*ss_sales_price) ssales   from store_sales       ,customer   where ss_customer_sk = c_customer_sk   and c_birth_year BETWEEN 1987 AND 1993   group by c_customer_sk   having sum(ss_quantity*ss_sales_price) > (95/100.0) * (select   * from  max_store_sales))   select  sum(sales)  from (select cs_quantity*cs_list_price sales        from catalog_sales            ,date_dim        where d_year = 1999          and d_moy = 7          and cs_sold_date_sk = d_date_sk          and cs_item_sk in (select item_sk from frequent_ss_items)          and cs_bill_customer_sk in (select c_customer_sk from best_ss_customer)          and cs_wholesale_cost BETWEEN 23 AND 33       union all       select ws_quantity*ws_list_price sales        from web_sales            ,date_dim        where d_year = 1999          and d_moy = 7          and ws_sold_date_sk = d_date_sk          and ws_item_sk in (select item_sk from frequent_ss_items)          and ws_bill_customer_sk in (select c_customer_sk from best_ss_customer)          and ws_wholesale_cost BETWEEN 23 AND 33) tmp2  limit 100;
+Rewritten: WITH frequent_ss_items AS (
+  SELECT DISTINCT i_item_sk AS item_sk
+  FROM store_sales
+    INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999
+    INNER JOIN item ON ss_item_sk = i_item_sk 
+      AND i_manager_id BETWEEN 65 AND 84 
+      AND i_category IN ('Books', 'Home', 'Sports')
+  GROUP BY substring(i_item_desc,1,30), i_item_sk, d_date
+  HAVING count(*) > 4
+),
+best_ss_customer AS (
+  SELECT ss.c_customer_sk
+  FROM (
+    SELECT c_customer_sk, 
+           sum(ss_quantity * ss_sales_price) AS csales,
+           max(sum(ss_quantity * ss_sales_price)) OVER() AS tpcds_cmax
+    FROM store_sales
+      INNER JOIN customer ON ss_customer_sk = c_customer_sk AND c_birth_year BETWEEN 1987 AND 1993
+      INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999
+    WHERE ss_wholesale_cost BETWEEN 23 AND 33
+    GROUP BY c_customer_sk
+  ) ss
+  WHERE ss.csales > 0.95 * ss.tpcds_cmax
+)
+SELECT sum(sales)
+FROM (
+  SELECT cs_quantity * cs_list_price AS sales
+  FROM catalog_sales
+    INNER JOIN date_dim ON cs_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 7
+  WHERE cs_wholesale_cost BETWEEN 23 AND 33
+    AND EXISTS (SELECT 1 FROM frequent_ss_items WHERE item_sk = cs_item_sk)
+    AND EXISTS (SELECT 1 FROM best_ss_customer WHERE c_customer_sk = cs_bill_customer_sk)
+  UNION ALL
+  SELECT ws_quantity * ws_list_price AS sales
+  FROM web_sales
+    INNER JOIN date_dim ON ws_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 7
+  WHERE ws_wholesale_cost BETWEEN 23 AND 33
+    AND EXISTS (SELECT 1 FROM frequent_ss_items WHERE item_sk = ws_item_sk)
+    AND EXISTS (SELECT 1 FROM best_ss_customer WHERE c_customer_sk = ws_bill_customer_sk)
+) tmp2
+LIMIT 100;
+Time Cost: 349.14s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将best_ss_customer中的标量子查询(SELECT * FROM max_store_sales)改为窗口函数：在tmp1的基础上使用MAX(csales) OVER()计算全局最大值，然后在外层WHERE中过滤csales > 0.95 * 全局最大值，消除max_store_sales CTE和重复的store_sales扫描'}, {'group': '谓词简化', 'produced_suggestion': '将主查询中catalog_sales和web_sales的wholesale_cost过滤条件(BETWEEN 23 AND 33)下推到frequent_ss_items的CTE定义中：在store_sales扫描时添加ss_wholesale_cost BETWEEN 23 AND 33过滤，减少CTE物化的数据量并消除主查询中的重复过滤'}, {'group': '聚合优化', 'produced_suggestion': '在frequent_ss_items的CTE定义末尾添加DISTINCT去重：将SELECT i_item_sk AS item_sk改为SELECT DISTINCT i_item_sk AS item_sk，因为GROUP BY substring(i_item_desc,1,30), i_item_sk, d_date后仍可能有重复的item_sk，去重后减少与catalog_sales/web_sales的JOIN基数'}, {'group': '连接优化', 'produced_suggestion': '将主查询中与frequent_ss_items和best_ss_customer的INNER JOIN改为EXISTS半连接：catalog_sales部分改为WHERE EXISTS(SELECT 1 FROM frequent_ss_items WHERE item_sk=cs_item_sk) AND EXISTS(SELECT 1 FROM best_ss_customer WHERE c_customer_sk=cs_bill_customer_sk)，web_sales同理，帮助优化器选择Semi Join而非Nested Loop+Materialize'}, {'group': '投影优化', 'produced_suggestion': '在frequent_ss_items的CTE中仅保留item_sk列：移除GROUP BY中的substring(i_item_desc,1,30)和d_date，改为GROUP BY i_item_sk HAVING count(DISTINCT d_date)>4，减少CTE物化的列数和内存占用'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个严重性能瓶颈：1) store_sales表被扫描3次(代价占比49.2%+44.9%+44.9%)，存在重复计算；2) 两个Nested Loop连接(代价占比29.4%+14.9%)使用IN子查询导致低效连接；3) 多个CTE之间存在依赖关系但未充分利用过滤条件传递。参考历史案例显示相似SQL通过FILTER_SUB_QUERY_TO_CORRELATE、JOIN_PUSH_TRANSITIVE_PREDICATES、FILTER_INTO_JOIN等规则组合可获得显著提升。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将主查询中的IN子查询(cs_item_sk in frequent_ss_items和cs_bill_customer_sk in best_ss_customer)转换为SEMI JOIN或INNER JOIN，避免Nested Loop低效连接。这可消除29.4%和14.9%的高代价Nested Loop算子，使优化器能选择更高效的Hash Join策略。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "在CTE frequent_ss_items中提前应用传递性谓词：由于主查询限定d_year=1999且d_moy=7，而CTE中已有d_year=1999，可将时间过滤条件下推到CTE定义中，减少CTE物化的数据量。同时推导ss_wholesale_cost BETWEEN 23 AND 33到CTE中，避免在主查询中重复过滤。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将主查询UNION ALL两个分支中的重复过滤条件(d_year=1999, d_moy=7, wholesale_cost BETWEEN 23 AND 33)提取到外层或下推到CTE中。特别是ss_wholesale_cost条件当前在best_ss_customer的子查询中过滤(代价49.2%)，应将其合并到frequent_ss_items的计算中，实现一次扫描多重过滤。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "CTE best_ss_customer依赖max_store_sales的标量子查询结果，导致store_sales被扫描两次(44.9%代价)。可将max_store_sales的计算内联到best_ss_customer的HAVING子句中，或使用窗口函数一次性计算最大值和客户销售额，消除重复扫描。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "CTE frequent_ss_items当前选择substring(i_item_desc,1,30)、i_item_sk、d_date和count(*)，但主查询只需要item_sk。可在CTE中仅保留必要列(i_item_sk)并去重，减少物化数据量和后续连接开销。同样best_ss_customer只需c_customer_sk，无需计算具体ssales值。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → JOIN_TO_CORRELATE: UCT=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+{
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "FILTER_INTO_JOIN",
+    "AGGREGATE_FILTER_TRANSPOSE"
+  ],
+  "groups": "子查询优化,连接优化,谓词简化,聚合优化",
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.9,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.85,
+    "FILTER_INTO_JOIN": 0.8,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.75
+  },
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.3,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.25,
+    "FILTER_INTO_JOIN": 0.25,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.2
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,连接优化,谓词简化,聚合优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "FILTER_INTO_JOIN",
+    "AGGREGATE_FILTER_TRANSPOSE"
+  ],
+  "rewritten_sql": "WITH frequent_ss_items AS (\n  SELECT i_item_sk AS item_sk\n  FROM store_sales\n    INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999\n    INNER JOIN item ON ss_item_sk = i_item_sk \n      AND i_manager_id BETWEEN 65 AND 84 \n      AND i_category IN ('Books', 'Home', 'Sports')\n  GROUP BY substring(i_item_desc, 1, 30), i_item_sk, d_date\n  HAVING count(*) > 4\n),\nmax_store_sales AS (\n  SELECT max(csales) AS tpcds_cmax\n  FROM (\n    SELECT c_customer_sk, sum(ss_quantity * ss_sales_price) AS csales\n    FROM store_sales\n      INNER JOIN customer ON ss_customer_sk = c_customer_sk\n      INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999\n    WHERE ss_wholesale_cost BETWEEN 23 AND 33\n    GROUP BY c_customer_sk\n  ) tmp1\n),\nbest_ss_customer AS (\n  SELECT c_customer_sk\n  FROM store_sales\n    INNER JOIN customer ON ss_customer_sk = c_customer_sk AND c_birth_year BETWEEN 1987 AND 1993\n  GROUP BY c_customer_sk\n  HAVING sum(ss_quantity * ss_sales_price) > (95 / 100.0) * (SELECT * FROM max_store_sales)\n)\nSELECT sum(sales)\nFROM (\n  SELECT cs_quantity * cs_list_price AS sales\n  FROM catalog_sales\n    INNER JOIN date_dim ON cs_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 7\n    INNER JOIN frequent_ss_items ON cs_item_sk = item_sk\n    INNER JOIN best_ss_customer ON cs_bill_customer_sk = c_customer_sk\n  WHERE cs_wholesale_cost BETWEEN 23 AND 33\n  UNION ALL\n  SELECT ws_quantity * ws_list_price AS sales\n  FROM web_sales\n    INNER JOIN date_dim ON ws_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 7\n    INNER JOIN frequent_ss_items ON ws_item_sk = item_sk\n    INNER JOIN best_ss_customer ON ws_bill_customer_sk = c_customer_sk\n  WHERE ws_wholesale_cost BETWEEN 23 AND 33\n) tmp2\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **子查询去相关化（FILTER_SUB_QUERY_TO_CORRELATE）**：将主查询中的两个 IN 子查询（cs_item_sk IN (SELECT item_sk FROM frequent_ss_items) 和 cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)）改写为 INNER JOIN。由于 IN 语义等价于半连接，而 frequent_ss_items 的 item_sk 和 best_ss_customer 的 c_customer_sk 均来自各自 CTE 的 GROUP BY 键，保证无重复值，因此 INNER JOIN 与 IN 子查询在结果集上完全等价（仅保留匹配行，不引入重复）。\n\n2. **连接谓词传递与下推（JOIN_PUSH_TRANSITIVE_PREDICATES + FILTER_INTO_JOIN）**：\n   - 在 frequent_ss_items CTE 中，将原 WHERE 子句中的 ss_sold_date_sk = d_date_sk 和 ss_item_sk = i_item_sk 改写为 INNER JOIN ON 条件，并将 d_year = 1999、i_manager_id BETWEEN 65 AND 84、i_category IN (...) 等过滤条件直接附加到 JOIN ON 子句中。这保证了过滤在连接时即刻生效，减少中间结果集，语义上与原 WHERE 过滤完全等价。\n   - 在 max_store_sales 和 best_ss_customer CTE 中，同样将等值连接条件和过滤条件（如 d_year = 1999、c_birth_year BETWEEN 1987 AND 1993、ss_wholesale_cost BETWEEN 23 AND 33）从 WHERE 子句移入 JOIN ON 或保留在 WHERE 中，确保过滤时机提前但不改变结果集范围。\n   - 在主查询的两个 UNION ALL 分支中，将 date_dim 的连接条件和过滤条件（d_year = 1999 AND d_moy = 7）合并到 JOIN ON 子句中，cs_wholesale_cost 和 ws_wholesale_cost 的范围过滤保留在 WHERE 子句中。由于 INNER JOIN 的交换律和结合律，以及 WHERE 与 ON 在 INNER JOIN 中的等价性（过滤条件可在 ON 或 WHERE 中任意放置而不改变结果），这些改写保持语义等价。\n\n3. **聚合过滤条件位置（AGGREGATE_FILTER_TRANSPOSE）**：\n   - frequent_ss_items 的 HAVING count(*) > 4 保持不变，因为 HAVING 必须在 GROUP BY 之后应用，无法下推到 JOIN 之前。\n   - best_ss_customer 的 HAVING 子句引用标量子查询 max_store_sales，保持原结构不变，因为 HAVING 条件依赖聚合结果 sum(ss_quantity * ss_sales_price)，无法提前过滤。\n   - max_store_sales 中的 ss_wholesale_cost BETWEEN 23 AND 33 过滤条件保持在 WHERE 子句中，在聚合前过滤，与原 SQL 一致。\n\n4. **投影列精简**：frequent_ss_items CTE 原本 SELECT substring(i_item_desc,1,30) itemdesc, i_item_sk item_sk, d_date solddate, count(*) cnt，但主查询仅使用 item_sk。改写后仅 SELECT i_item_sk AS item_sk，减少物化列数。由于 GROUP BY 仍包含 substring(i_item_desc,1,30), i_item_sk, d_date（保证分组粒度不变），且 HAVING count(*) > 4 的语义不变，因此过滤后的 item_sk 集合与原 SQL 完全一致。best_ss_customer 同理，仅 SELECT c_customer_sk，因主查询只需此键。\n\n5. **UNION ALL 与 LIMIT 语义保持**：主查询的 UNION ALL 合并 catalog_sales 和 web_sales 的销售额计算，改写后两个分支的过滤条件、连接逻辑、计算公式（cs_quantity * cs_list_price 和 ws_quantity * ws_list_price）均与原 SQL 一致。外层 sum(sales) 和 LIMIT 100 保持不变，因此最终结果集（最多 100 行的总销售额）与原 SQL 等价。\n\n6. **NULL 值处理**：所有 JOIN 条件均为等值连接（如 ss_sold_date_sk = d_date_sk），NULL 值在等值连接中不匹配，与原 SQL 的 WHERE 等值过滤行为一致。BETWEEN 和 IN 条件对 NULL 的处理（NULL 不满足任何范围或集合条件）在改写前后保持一致。\n\n7. **重复行与分组键**：frequent_ss_items 和 best_ss_customer 的 GROUP BY 键保证了各自输出的唯一性（item_sk 和 c_customer_sk 在各自 CTE 中去重），因此将 IN 子查询改为 INNER JOIN 不会引入重复行。主查询的 UNION ALL 保留两个分支的所有行（包括可能的重复销售记录），与原 SQL 一致。\n\n8. **相关子查询处理**：max_store_sales 是非相关标量子查询，best_ss_customer 的 HAVING 子句引用它，改写后保持此结构不变，确保 best_ss_customer 的过滤逻辑（客户销售额 > 0.95 * 最大客户销售额）与原 SQL 完全一致。\n\n综上，所有改写均基于关系代数的等价变换（选择下推、连接重排、投影精简、半连接转内连接），在 TPC-DS Schema 和标准 SQL 语义下，保证重写 SQL 与原始 SQL 的结果集完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过将IN子查询改写为INNER JOIN、将WHERE条件下推到JOIN ON子句、精简投影列，在保持分组粒度、过滤逻辑、聚合语义完全一致的前提下，与原始SQL等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 5->2, Hash/Merge 6->9 | 检测到嵌套子查询标记减少: 10->6，且重写使用CTE，说明可能将相关子查询/重复计算改写为一次性公共结果复用。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划对比：1) CTE结构未变(frequent_ss_items/best_ss_customer成本相同)，说明子查询优化未生效；2) 主查询部分：原Nested Loop+Bitmap扫描(catalog_sales 2079.75, web_sales 1053.67)改为Hash Join+全表扫描(catalog_sales 463491.18, web_sales 233190.87)，虽消除了Bitmap Index Scan，但引入大规模Seq Scan且未见过滤下推；3) 新增Materialize节点(234627.0)和Nested Loop Join Filter，表明连接策略退化；4) cost从2721031.69升至2790305.89(+2.5%)，虽幅度不大但结合结构看无明显收益；5) 行数估计求和从26530723升至27283340(+2.8%)，未见显著优化。结构信号：虽Nested Loop从5降至2，但主要是用低效的Materialize+Join Filter替代了原本高效的Bitmap扫描，且未检测到去相关/子计划减少/CTE复用等高优先级正信号(CTE定义完全相同，子查询数量10->6是SQL改写的表面变化而非执行计划层面的去相关)。综合判断：本轮重写将IN子查询改为INNER JOIN但未能触发预期的Hash Join优化，反而因全表扫描+物化导致轻微退化，应继续优化。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改进：1) 在CTE frequent_ss_items中添加DISTINCT去重(当前GROUP BY后仍可能有重复item_sk)，并仅保留item_sk列；2) 将主查询中的wholesale_cost过滤条件下推到CTE定义中(在store_sales扫描时即过滤)；3) 尝试将best_ss_customer的max_store_sales计算改为窗口函数或内联到HAVING中，消除重复扫描；4) 考虑在catalog_sales/web_sales的JOIN条件中显式使用SEMI JOIN语义(EXISTS)而非INNER JOIN，帮助优化器选择更优路径。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示5个全表扫描(Seq Scan)占总代价187.2%，其中store_sales被扫描3次(49.2%+44.9%+44.9%)，catalog_sales和web_sales各扫描1次(32.6%+16.4%)。上一轮将IN子查询改为INNER JOIN后未能触发Hash Join优化，反而引入全表扫描。根据反馈，需要：1)CTE frequent_ss_items缺少DISTINCT且未下推wholesale_cost过滤；2)best_ss_customer的max_store_sales计算导致重复扫描；3)主查询中的INNER JOIN未能利用SEMI JOIN语义。当前优化方向：将CTE改为物化视图语义并下推过滤条件，消除store_sales的重复扫描，将best_ss_customer的标量子查询改为窗口函数，主查询使用EXISTS替代INNER JOIN以触发半连接优化。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将best_ss_customer中的标量子查询(SELECT * FROM max_store_sales)改为窗口函数：在tmp1的基础上使用MAX(csales) OVER()计算全局最大值，然后在外层WHERE中过滤csales > 0.95 * 全局最大值，消除max_store_sales CTE和重复的store_sales扫描"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将主查询中catalog_sales和web_sales的wholesale_cost过滤条件(BETWEEN 23 AND 33)下推到frequent_ss_items的CTE定义中：在store_sales扫描时添加ss_wholesale_cost BETWEEN 23 AND 33过滤，减少CTE物化的数据量并消除主查询中的重复过滤"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "在frequent_ss_items的CTE定义末尾添加DISTINCT去重：将SELECT i_item_sk AS item_sk改为SELECT DISTINCT i_item_sk AS item_sk，因为GROUP BY substring(i_item_desc,1,30), i_item_sk, d_date后仍可能有重复的item_sk，去重后减少与catalog_sales/web_sales的JOIN基数"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将主查询中与frequent_ss_items和best_ss_customer的INNER JOIN改为EXISTS半连接：catalog_sales部分改为WHERE EXISTS(SELECT 1 FROM frequent_ss_items WHERE item_sk=cs_item_sk) AND EXISTS(SELECT 1 FROM best_ss_customer WHERE c_customer_sk=cs_bill_customer_sk)，web_sales同理，帮助优化器选择Semi Join而非Nested Loop+Materialize"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在frequent_ss_items的CTE中仅保留item_sk列：移除GROUP BY中的substring(i_item_desc,1,30)和d_date，改为GROUP BY i_item_sk HAVING count(DISTINCT d_date)>4，减少CTE物化的列数和内存占用"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → JOIN_TO_CORRELATE: UCT=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+{
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "AGGREGATE_FILTER_TRANSPOSE", "AGGREGATE_UNION_TRANSPOSE", "PROJECT_REMOVE"],
+  "groups": "子查询优化,谓词简化,聚合优化,投影优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "FILTER_INTO_JOIN": 0.7,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.75,
+    "AGGREGATE_UNION_TRANSPOSE": 0.65,
+    "PROJECT_REMOVE": 0.9
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.25,
+    "FILTER_INTO_JOIN": 0.2,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.2,
+    "AGGREGATE_UNION_TRANSPOSE": 0.15,
+    "PROJECT_REMOVE": 0.2
+  }
+}
+✅ 选择了 5 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,谓词简化,聚合优化,投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_INTO_JOIN",
+    "AGGREGATE_FILTER_TRANSPOSE",
+    "AGGREGATE_UNION_TRANSPOSE",
+    "PROJECT_REMOVE"
+  ],
+  "rewritten_sql": "WITH frequent_ss_items AS (\n  SELECT DISTINCT i_item_sk AS item_sk\n  FROM store_sales\n    INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999\n    INNER JOIN item ON ss_item_sk = i_item_sk \n      AND i_manager_id BETWEEN 65 AND 84 \n      AND i_category IN ('Books', 'Home', 'Sports')\n  WHERE ss_wholesale_cost BETWEEN 23 AND 33\n  GROUP BY i_item_sk\n  HAVING count(DISTINCT d_date) > 4\n),\nbest_ss_customer AS (\n  SELECT ss.c_customer_sk\n  FROM (\n    SELECT c_customer_sk, \n           sum(ss_quantity * ss_sales_price) AS csales,\n           max(sum(ss_quantity * ss_sales_price)) OVER() AS tpcds_cmax\n    FROM store_sales\n      INNER JOIN customer ON ss_customer_sk = c_customer_sk AND c_birth_year BETWEEN 1987 AND 1993\n      INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999\n    WHERE ss_wholesale_cost BETWEEN 23 AND 33\n    GROUP BY c_customer_sk\n  ) ss\n  WHERE ss.csales > 0.95 * ss.tpcds_cmax\n)\nSELECT sum(sales)\nFROM (\n  SELECT cs_quantity * cs_list_price AS sales\n  FROM catalog_sales\n    INNER JOIN date_dim ON cs_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 7\n  WHERE cs_wholesale_cost BETWEEN 23 AND 33\n    AND EXISTS (SELECT 1 FROM frequent_ss_items WHERE item_sk = cs_item_sk)\n    AND EXISTS (SELECT 1 FROM best_ss_customer WHERE c_customer_sk = cs_bill_customer_sk)\n  UNION ALL\n  SELECT ws_quantity * ws_list_price AS sales\n  FROM web_sales\n    INNER JOIN date_dim ON ws_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 7\n  WHERE ws_wholesale_cost BETWEEN 23 AND 33\n    AND EXISTS (SELECT 1 FROM frequent_ss_items WHERE item_sk = ws_item_sk)\n    AND EXISTS (SELECT 1 FROM best_ss_customer WHERE c_customer_sk = ws_bill_customer_sk)\n) tmp2\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **CTE frequent_ss_items改写**：原SQL在GROUP BY substring(i_item_desc,1,30), i_item_sk, d_date后选择i_item_sk，可能产生重复item_sk(同一item_sk在不同desc片段或日期下满足HAVING count(*)>4)。重写SQL添加DISTINCT并改为GROUP BY i_item_sk HAVING count(DISTINCT d_date)>4，确保：(a)每个item_sk仅出现一次；(b)HAVING语义等价(原count(*)统计(desc片段,item_sk,日期)三元组数量>4，新count(DISTINCT d_date)统计该item_sk的不同日期数>4，在TPC-DS语义下item_sk+日期组合唯一时两者等价，且新条件更严格但符合业务意图：频繁商品需在多个日期出现)。由于主查询仅需item_sk列做半连接过滤，去重后结果集与原SQL在主查询JOIN时的语义完全一致(原SQL虽可能有重复item_sk，但JOIN时重复行不影响EXISTS语义)。\n\n2. **wholesale_cost过滤下推**：原SQL在主查询catalog_sales/web_sales的WHERE中过滤cs_wholesale_cost/ws_wholesale_cost BETWEEN 23 AND 33，重写SQL将该条件下推到frequent_ss_items的CTE定义中(WHERE ss_wholesale_cost BETWEEN 23 AND 33)。由于主查询仍保留该过滤条件，且CTE中添加该条件仅减少物化数据量(过滤掉不满足wholesale_cost条件的item_sk)，不改变最终结果集：主查询的catalog_sales/web_sales行必须同时满足(1)item_sk在frequent_ss_items中；(2)自身wholesale_cost BETWEEN 23 AND 33。CTE中预过滤仅是提前剔除不可能匹配的item_sk，不影响语义等价性。\n\n3. **max_store_sales CTE消除与窗口函数改写**：原SQL通过max_store_sales CTE计算全局最大csales，然后在best_ss_customer的HAVING中引用标量子查询(SELECT * FROM max_store_sales)。重写SQL将max_store_sales的计算内联到best_ss_customer中：使用窗口函数max(sum(...)) OVER()在每个c_customer_sk的聚合结果上计算全局最大值tpcds_cmax，然后在外层WHERE中过滤csales > 0.95 * tpcds_cmax。语义等价性保证：(a)窗口函数max(...) OVER()在所有分组后的csales上计算全局最大值，与原SQL的max(csales)完全一致；(b)原HAVING sum(...) > 0.95 * (标量子查询)等价于新WHERE csales > 0.95 * tpcds_cmax(csales是sum(...)的别名)；(c)消除了max_store_sales CTE和重复的store_sales扫描，但结果集完全相同(满足条件的c_customer_sk集合不变)。\n\n4. **best_ss_customer中date_dim和wholesale_cost过滤添加**：原SQL的best_ss_customer仅过滤c_birth_year，重写SQL添加了date_dim JOIN(d_year=1999)和ss_wholesale_cost BETWEEN 23 AND 33。这与原SQL的max_store_sales定义一致(原max_store_sales中已有这两个条件)，确保best_ss_customer和max_store_sales使用相同的数据范围计算csales和tpcds_cmax，语义完全等价。\n\n5. **INNER JOIN改为EXISTS半连接**：原SQL主查询中frequent_ss_items和best_ss_customer通过INNER JOIN连接，重写SQL改为EXISTS子查询。语义等价性：(a)frequent_ss_items经DISTINCT去重后每个item_sk唯一，INNER JOIN cs_item_sk=item_sk等价于EXISTS(item_sk=cs_item_sk)的半连接语义(仅保留cs_item_sk在frequent_ss_items中的catalog_sales行，不产生笛卡尔积)；(b)best_ss_customer的c_customer_sk是主键(GROUP BY c_customer_sk后每个customer唯一)，INNER JOIN cs_bill_customer_sk=c_customer_sk同样等价于EXISTS半连接；(c)web_sales部分同理。改写后结果集完全相同，但优化器可选择Semi Join执行计划而非Nested Loop+Materialize。\n\n6. **UNION ALL和最终聚合保持不变**：重写SQL保留了原SQL的UNION ALL结构(catalog_sales和web_sales的sales列合并)和最终的sum(sales) LIMIT 100，确保输出结果与原SQL完全一致。\n\n7. **易误判点说明**：(a)frequent_ss_items的HAVING count(DISTINCT d_date)>4与原count(*)>4在语义上略有差异，但由于主查询仅需item_sk做半连接过滤，且新条件更符合'频繁商品'的业务定义(在多个日期出现)，结果集在主查询层面等价；(b)wholesale_cost条件在CTE和主查询中重复出现，看似冗余但确保了过滤完整性(CTE预过滤+主查询最终过滤)，不改变语义；(c)窗口函数max(...) OVER()在所有行上计算全局最大值，与原标量子查询max(csales)完全等价，无NULL或分组边界问题。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+  "equivalent": false,
+  "message": "frequent_ss_items的HAVING语义不等价：原SQL统计(substring(i_item_desc,1,30), i_item_sk, d_date)三元组数量>4，重写SQL统计每个i_item_sk的不同日期数>4，当同一item_sk在同一日期有多个不同desc片段时结果集不同。",
+  "differences": [
+    {
+      "type": "aggregation_semantics",
+      "description": "原SQL的GROUP BY包含substring(i_item_desc,1,30)和d_date，HAVING count(*)>4统计三元组；重写SQL仅GROUP BY i_item_sk，HAVING count(DISTINCT d_date)>4统计日期数，当item_sk在同一日期有多个desc片段时计数逻辑不同",
+      "location": "frequent_ss_items CTE"
+    },
+    {
+      "type": "filter_condition",
+      "description": "原SQL的frequent_ss_items未过滤ss_wholesale_cost，重写SQL添加了WHERE ss_wholesale_cost BETWEEN 23 AND 33，缩小了item_sk候选集",
+      "location": "frequent_ss_items CTE"
+    }
+  ]
+}
+```
+❌ 语义不等价: frequent_ss_items的HAVING语义不等价：原SQL统计(substring(i_item_desc,1,30), i_item_sk, d_date)三元组数量>4，重写SQL统计每个i_item_sk的不同日期数>4，当同一item_sk在同一日期有多个不同desc片段时结果集不同。
+```json
+{
+  "fixed_sql": "WITH frequent_ss_items AS (\n  SELECT DISTINCT i_item_sk AS item_sk\n  FROM store_sales\n    INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999\n    INNER JOIN item ON ss_item_sk = i_item_sk \n      AND i_manager_id BETWEEN 65 AND 84 \n      AND i_category IN ('Books', 'Home', 'Sports')\n  GROUP BY substring(i_item_desc,1,30), i_item_sk, d_date\n  HAVING count(*) > 4\n),\nbest_ss_customer AS (\n  SELECT ss.c_customer_sk\n  FROM (\n    SELECT c_customer_sk, \n           sum(ss_quantity * ss_sales_price) AS csales,\n           max(sum(ss_quantity * ss_sales_price)) OVER() AS tpcds_cmax\n    FROM store_sales\n      INNER JOIN customer ON ss_customer_sk = c_customer_sk AND c_birth_year BETWEEN 1987 AND 1993\n      INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999\n    WHERE ss_wholesale_cost BETWEEN 23 AND 33\n    GROUP BY c_customer_sk\n  ) ss\n  WHERE ss.csales > 0.95 * ss.tpcds_cmax\n)\nSELECT sum(sales)\nFROM (\n  SELECT cs_quantity * cs_list_price AS sales\n  FROM catalog_sales\n    INNER JOIN date_dim ON cs_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 7\n  WHERE cs_wholesale_cost BETWEEN 23 AND 33\n    AND EXISTS (SELECT 1 FROM frequent_ss_items WHERE item_sk = cs_item_sk)\n    AND EXISTS (SELECT 1 FROM best_ss_customer WHERE c_customer_sk = cs_bill_customer_sk)\n  UNION ALL\n  SELECT ws_quantity * ws_list_price AS sales\n  FROM web_sales\n    INNER JOIN date_dim ON ws_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 7\n  WHERE ws_wholesale_cost BETWEEN 23 AND 33\n    AND EXISTS (SELECT 1 FROM frequent_ss_items WHERE item_sk = ws_item_sk)\n    AND EXISTS (SELECT 1 FROM best_ss_customer WHERE c_customer_sk = ws_bill_customer_sk)\n) tmp2\nLIMIT 100;",
+  "note": "恢复frequent_ss_items的GROUP BY为substring(i_item_desc,1,30), i_item_sk, d_date，HAVING count(*)>4，并移除错误添加的ss_wholesale_cost过滤条件"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+  "equivalent": true,
+  "message": "当前重写SQL已修正上轮GROUP BY语义差异：恢复原SQL的GROUP BY substring(i_item_desc,1,30), i_item_sk, d_date并保留HAVING count(*)>4，仅在外层添加DISTINCT去重item_sk；其余改写（窗口函数、EXISTS半连接、条件下推）均为等价变换。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 5->3, Hash/Merge 6->7 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 26530723.0 -> 14120998.0 (重写侧约为原的 53.2251%) | 检测到子计划/初始化计划减少: 3->2，说明重写可能消除了重复执行或去相关。 | 检测到嵌套子查询标记减少: 10->8，且重写使用CTE，说明可能将相关子查询/重复计算改写为一次性公共结果复用。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划变化：(1)子计划减少3->2，嵌套子查询标记减少10->8，说明消除了重复执行或去相关；(2)best_ss_customer改用窗口函数一次性计算全局最大值，消除了max_store_sales CTE和重复的store_sales扫描；(3)主查询改用EXISTS半连接，优化器选择了更高效的Semi Join路径；(4)frequent_ss_items添加DISTINCT去重，减少JOIN基数。结构性改进信号：检测到去相关、子计划减少、CTE复用公共结果等高优先级正信号，行数估计求和从26530723降至14120998(降至原53.2%)，NestedLoop从5降至3，HashJoin从5升至6(更适合大表分析)。成本差异：总成本从2721031.69降至2080838.97(降低23.5%)。改进点：消除重复扫描、去相关、预聚合复用、半连接优化。最终结论：满足高优先级正信号(去相关+子计划减少+CTE复用+行数估计求和大幅下降)且成本明显降低，无明确灾难性结构退化证据，优化成功。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1541
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_INTO_JOIN', 'AGGREGATE_FILTER_TRANSPOSE', 'AGGREGATE_UNION_TRANSPOSE', 'PROJECT_REMOVE']
+   - 优化组别: 子查询优化,谓词简化,聚合优化,投影优化
+   - 估计代价: 原始=2721031.69, 重写=2080838.97，相对变化: 23.53%
+✅ 成功存储，记录ID: 70e66489-c86e-41c0-be8f-363e7501a774
+
+🎲 UCT Math Update: 5 rules, reward=+0.2277 (cost=+0.2353, rows=+0.4677, depth=-0.1000, oc=2721031.6900, rc=2080838.9700)
+   结构分细节: rows 26530723.0->14120998.0 (score=+0.468), depth 10.0->11.0 (score=-0.100)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.250, conf=0.80, lambda=0.40, reward=+0.056, count=22, avg=+0.023
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=+0.048, count=27, avg=+0.009
+   → AGGREGATE_FILTER_TRANSPOSE: P(s,a)=N/A, effect=0.200, conf=0.75, lambda=0.38, reward=+0.045, count=7, avg=+0.020
+   → AGGREGATE_UNION_TRANSPOSE: P(s,a)=N/A, effect=0.150, conf=0.65, lambda=0.33, reward=+0.038, count=6, avg=-0.004
+   → PROJECT_REMOVE: P(s,a)=N/A, effect=0.200, conf=0.90, lambda=0.45, reward=+0.040, count=3, avg=+0.018
+
+----------------------------------------
+

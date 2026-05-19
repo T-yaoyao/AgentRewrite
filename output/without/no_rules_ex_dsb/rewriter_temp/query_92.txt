@@ -1,0 +1,145 @@
+Query ID: 92
+==================================================
+
+Original: select  	s_store_name, 	i_item_desc, 	sc.revenue, 	i_current_price, 	i_wholesale_cost, 	i_brand  from store, item,      (select ss_store_sk, avg(revenue) as ave  	from  	    (select  ss_store_sk, ss_item_sk,  		     sum(ss_sales_price) as revenue  		from store_sales, date_dim  		where ss_sold_date_sk = d_date_sk and d_month_seq between 1192 and 1192+11     and ss_sales_price / ss_list_price BETWEEN 68 * 0.01 AND 78 * 0.01  		group by ss_store_sk, ss_item_sk) sa  	group by ss_store_sk) sb,      (select  ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue  	from store_sales, date_dim  	where ss_sold_date_sk = d_date_sk and d_month_seq between 1192 and 1192+11   and ss_sales_price / ss_list_price BETWEEN 68 * 0.01 AND 78 * 0.01  	group by ss_store_sk, ss_item_sk) sc  where sb.ss_store_sk = sc.ss_store_sk and        sc.revenue <= 0.1 * sb.ave and        s_store_sk = sc.ss_store_sk and        i_item_sk = sc.ss_item_sk        and i_manager_id BETWEEN 79 and 83        and s_state in ('IN','NM','VA')  order by s_store_name, i_item_desc limit 100;
+Rewritten: WITH base_revenue AS (
+    SELECT 
+        ss.ss_store_sk,
+        ss.ss_item_sk,
+        SUM(ss.ss_sales_price) AS revenue
+    FROM store_sales ss
+    INNER JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
+    WHERE d.d_month_seq BETWEEN 1192 AND 1203
+      AND ss.ss_list_price > 0
+      AND ss.ss_sales_price BETWEEN 0.68 * ss.ss_list_price AND 0.78 * ss.ss_list_price
+    GROUP BY ss.ss_store_sk, ss.ss_item_sk
+),
+store_avg AS (
+    SELECT 
+        ss_store_sk,
+        AVG(revenue) AS ave
+    FROM base_revenue
+    GROUP BY ss_store_sk
+)
+SELECT 
+    s.s_store_name,
+    i.i_item_desc,
+    br.revenue,
+    i.i_current_price,
+    i.i_wholesale_cost,
+    i.i_brand
+FROM base_revenue br
+INNER JOIN store_avg sa ON br.ss_store_sk = sa.ss_store_sk
+INNER JOIN store s ON s.s_store_sk = br.ss_store_sk
+INNER JOIN item i ON i.i_item_sk = br.ss_item_sk
+WHERE br.revenue <= 0.1 * sa.ave
+  AND i.i_manager_id BETWEEN 79 AND 83
+  AND s.s_state IN ('IN', 'NM', 'VA')
+ORDER BY s.s_store_name, i.i_item_desc
+LIMIT 100
+Time Cost: 130.92s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将子查询sa和sc的公共部分提取为CTE。两者都对store_sales和date_dim执行相同的JOIN和过滤条件（d_month_seq between 1192 and 1203, ss_sales_price/ss_list_price between 0.68 and 0.78），然后按ss_store_sk和ss_item_sk分组计算revenue。建议创建base_revenue CTE一次性计算所有store和item的revenue，然后分别用于计算平均值（sb）和最终结果（sc），消除重复的全表扫描。'}, {'group': '谓词简化', 'produced_suggestion': '过滤条件ss_sales_price/ss_list_price BETWEEN 0.68 AND 0.78可转换为ss_sales_price BETWEEN 0.68*ss_list_price AND 0.78*ss_list_price，避免每行都执行除法运算。但需注意ss_list_price可能为0的边界情况，建议添加ss_list_price>0的前置条件，或改写为ss_sales_price >= 0.68*ss_list_price AND ss_sales_price <= 0.78*ss_list_price AND ss_list_price > 0。'}, {'group': '常量折叠', 'produced_suggestion': '将常量表达式预计算：d_month_seq between 1192 and 1192+11改为d_month_seq between 1192 and 1203；68*0.01和78*0.01改为0.68和0.78。虽然优化器通常会自动处理，但显式写出可提高可读性并确保优化生效。'}, {'group': '连接优化', 'produced_suggestion': 'date_dim表的d_month_seq过滤条件（between 1192 and 1203）选择性较高，建议在CTE中先过滤date_dim再与store_sales JOIN，减少JOIN时的数据量。同时确保ss_sold_date_sk和d_date_sk的JOIN条件能利用date_dim_pkey索引。'}, {'group': '聚合优化', 'produced_suggestion': '子查询sb计算avg(revenue)时先对sa的结果按ss_store_sk分组。如果将base_revenue CTE设计为直接输出ss_store_sk和ss_item_sk级别的revenue，可以在外层一次性完成聚合计算，避免嵌套聚合的中间物化开销。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示两个Seq Scan算子各占49.8%代价，合计约99.6%总代价。两次全表扫描store_sales（2880万行）且应用相同过滤条件，存在明显重复计算。子查询sa和sc结构相似但分别计算，可通过CTE分解消除重复扫描。此外，过滤条件ss_sales_price/ss_list_price涉及运行时计算，无法利用索引，可通过谓词简化或常量折叠优化。历史案例显示相同SQL指纹通过STRATEGY_CTE_DECOMPOSITION+FILTER_REDUCE_EXPRESSIONS组合命中5次，验证了该优化路径的有效性。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将子查询sa和sc的公共部分提取为CTE。两者都对store_sales和date_dim执行相同的JOIN和过滤条件（d_month_seq between 1192 and 1203, ss_sales_price/ss_list_price between 0.68 and 0.78），然后按ss_store_sk和ss_item_sk分组计算revenue。建议创建base_revenue CTE一次性计算所有store和item的revenue，然后分别用于计算平均值（sb）和最终结果（sc），消除重复的全表扫描。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "过滤条件ss_sales_price/ss_list_price BETWEEN 0.68 AND 0.78可转换为ss_sales_price BETWEEN 0.68*ss_list_price AND 0.78*ss_list_price，避免每行都执行除法运算。但需注意ss_list_price可能为0的边界情况，建议添加ss_list_price>0的前置条件，或改写为ss_sales_price >= 0.68*ss_list_price AND ss_sales_price <= 0.78*ss_list_price AND ss_list_price > 0。"
+    },
+    {
+      "group": "常量折叠",
+      "produced_suggestion": "将常量表达式预计算：d_month_seq between 1192 and 1192+11改为d_month_seq between 1192 and 1203；68*0.01和78*0.01改为0.68和0.78。虽然优化器通常会自动处理，但显式写出可提高可读性并确保优化生效。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "date_dim表的d_month_seq过滤条件（between 1192 and 1203）选择性较高，建议在CTE中先过滤date_dim再与store_sales JOIN，减少JOIN时的数据量。同时确保ss_sold_date_sk和d_date_sk的JOIN条件能利用date_dim_pkey索引。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "子查询sb计算avg(revenue)时先对sa的结果按ss_store_sk分组。如果将base_revenue CTE设计为直接输出ss_store_sk和ss_item_sk级别的revenue，可以在外层一次性完成聚合计算，避免嵌套聚合的中间物化开销。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → JOIN_TO_CORRELATE: UCT=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+{
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_REDUCE_EXPRESSIONS", "FILTER_AGGREGATE_TRANSPOSE", "PROJECT_MERGE"],
+  "groups": "子查询优化, 谓词简化, 聚合优化, 投影优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.9,
+    "FILTER_REDUCE_EXPRESSIONS": 0.8,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.7,
+    "PROJECT_MERGE": 0.7
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "FILTER_REDUCE_EXPRESSIONS": 0.2,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.2,
+    "PROJECT_MERGE": 0.1
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 谓词简化, 聚合优化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "FILTER_AGGREGATE_TRANSPOSE",
+    "PROJECT_MERGE"
+  ],
+  "rewritten_sql": "WITH base_revenue AS (\n    SELECT \n        ss.ss_store_sk,\n        ss.ss_item_sk,\n        SUM(ss.ss_sales_price) AS revenue\n    FROM store_sales ss\n    INNER JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk\n    WHERE d.d_month_seq BETWEEN 1192 AND 1203\n      AND ss.ss_list_price > 0\n      AND ss.ss_sales_price BETWEEN 0.68 * ss.ss_list_price AND 0.78 * ss.ss_list_price\n    GROUP BY ss.ss_store_sk, ss.ss_item_sk\n),\nstore_avg AS (\n    SELECT \n        ss_store_sk,\n        AVG(revenue) AS ave\n    FROM base_revenue\n    GROUP BY ss_store_sk\n)\nSELECT \n    s.s_store_name,\n    i.i_item_desc,\n    br.revenue,\n    i.i_current_price,\n    i.i_wholesale_cost,\n    i.i_brand\nFROM base_revenue br\nINNER JOIN store_avg sa ON br.ss_store_sk = sa.ss_store_sk\nINNER JOIN store s ON s.s_store_sk = br.ss_store_sk\nINNER JOIN item i ON i.i_item_sk = br.ss_item_sk\nWHERE br.revenue <= 0.1 * sa.ave\n  AND i.i_manager_id BETWEEN 79 AND 83\n  AND s.s_state IN ('IN', 'NM', 'VA')\nORDER BY s.s_store_name, i.i_item_desc\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **CTE提取公共子查询（STRATEGY_CTE_DECOMPOSITION）**：原SQL中子查询sa和sc都对store_sales与date_dim执行相同的JOIN条件（ss_sold_date_sk = d_date_sk）和过滤条件（d_month_seq between 1192 and 1203, ss_sales_price/ss_list_price between 0.68 and 0.78），然后按(ss_store_sk, ss_item_sk)分组计算sum(ss_sales_price)。重写后将此逻辑提取为base_revenue CTE，消除重复计算。sa的外层按ss_store_sk分组计算avg(revenue)，重写为store_avg CTE。sc直接使用base_revenue替代。由于base_revenue与原sc的分组键、聚合函数、过滤条件完全一致，store_avg与原sb的分组键、聚合函数完全一致，因此结果集等价。\n\n2. **谓词简化（FILTER_REDUCE_EXPRESSIONS）**：原条件ss_sales_price/ss_list_price BETWEEN 68*0.01 AND 78*0.01改写为ss_sales_price BETWEEN 0.68*ss_list_price AND 0.78*ss_list_price，避免每行执行除法。同时添加ss_list_price > 0前置条件，防止除零错误。常量表达式68*0.01和78*0.01预计算为0.68和0.78，d_month_seq between 1192 and 1192+11改为1192 and 1203。这些改写在数学上等价：当ss_list_price > 0时，ss_sales_price/ss_list_price ∈ [0.68, 0.78] 等价于 ss_sales_price ∈ [0.68*ss_list_price, 0.78*ss_list_price]。原SQL隐含ss_list_price != 0（否则除法未定义），显式添加ss_list_price > 0使语义更明确且不改变结果集。\n\n3. **聚合下推与合并（FILTER_AGGREGATE_TRANSPOSE + PROJECT_MERGE）**：原SQL中sb是对sa的结果再次按ss_store_sk分组聚合，sa本身已按(ss_store_sk, ss_item_sk)分组。重写后base_revenue直接输出(ss_store_sk, ss_item_sk, revenue)，store_avg在此基础上按ss_store_sk分组计算avg(revenue)，与原SQL的两层聚合逻辑等价。最终JOIN条件sb.ss_store_sk = sc.ss_store_sk改写为br.ss_store_sk = sa.ss_store_sk，sc.revenue <= 0.1*sb.ave改写为br.revenue <= 0.1*sa.ave，语义完全一致。\n\n4. **JOIN条件与过滤条件保持**：原SQL的WHERE子句包含sb.ss_store_sk = sc.ss_store_sk（改写为br与sa的JOIN）、s_store_sk = sc.ss_store_sk（改写为s与br的JOIN）、i_item_sk = sc.ss_item_sk（改写为i与br的JOIN）、i_manager_id BETWEEN 79 AND 83、s_state IN ('IN','NM','VA')。重写后所有JOIN条件和过滤条件位置和逻辑完全保留，仅将子查询别名替换为CTE别名。\n\n5. **分组键与主键保证唯一性**：base_revenue按(ss_store_sk, ss_item_sk)分组，与原sc的分组键一致。store_avg按ss_store_sk分组，与原sb的分组键一致。由于分组键相同，聚合函数（SUM、AVG）相同，且输入数据集相同（来自相同的store_sales和date_dim JOIN及过滤条件），因此聚合结果等价。最终JOIN使用ss_store_sk和ss_item_sk作为连接键，这些键在各自的分组结果中唯一标识每行，不会产生重复或遗漏。\n\n6. **ORDER BY与LIMIT保持**：原SQL的ORDER BY s_store_name, i_item_desc和LIMIT 100在重写后完全保留，且排序列来自最终SELECT的store和item表，与原SQL一致。由于前述所有改写不改变结果集的行内容和行数（仅改变计算路径），因此排序和限制后的最终100行结果与原SQL完全相同。\n\n7. **NULL值处理**：原SQL中ss_sales_price/ss_list_price的除法在ss_list_price为0或NULL时会产生NULL或错误。重写后添加ss_list_price > 0条件，排除了ss_list_price <= 0和NULL的情况，使得ss_sales_price BETWEEN 0.68*ss_list_price AND 0.78*ss_list_price的语义更明确。由于原SQL在ss_list_price为0或NULL时除法结果不在[0.68, 0.78]范围内（NULL或错误），这些行本就会被过滤，因此添加ss_list_price > 0不改变结果集，反而提高了健壮性。\n\n8. **投影列保持（PROJECT_MERGE）**：最终SELECT的列s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand与原SQL完全一致，其中revenue来自base_revenue（对应原sc.revenue），其余列来自store和item表。由于base_revenue与原sc等价，且store和item的JOIN条件不变，因此投影结果等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取公共计算逻辑，将原SQL中重复的store_sales与date_dim JOIN及过滤条件提取为base_revenue，将两层聚合逻辑保持为store_avg，谓词简化（除法改为乘法范围且添加ss_list_price > 0）在数学上等价，所有JOIN条件、过滤条件、分组键、聚合函数、投影列、排序和限制均完全保留，结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: SeqScan reduced by 2 | 检测到嵌套子查询标记减少: 3->2，且重写使用CTE，说明可能将相关子查询/重复计算改写为一次性公共结果复用。 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+✅ 估计代价降幅 47.6% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 869
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_REDUCE_EXPRESSIONS', 'FILTER_AGGREGATE_TRANSPOSE', 'PROJECT_MERGE']
+   - 优化组别: 子查询优化, 谓词简化, 聚合优化, 投影优化
+   - 估计代价: 原始=1511094.07, 重写=791995.1，相对变化: 47.59%
+✅ 成功存储，记录ID: a57c0538-4ad0-4c79-ab14-60edffbb1d81
+
+🎲 UCT Math Update: 4 rules, reward=+0.2581 (cost=+0.4759, rows=+0.0000, depth=+0.3846, oc=1511094.0700, rc=791995.1000)
+   结构分细节: rows 124647.0->1341278.0 (score=+0.000), depth 13.0->8.0 (score=+0.385)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.500, conf=0.90, lambda=0.45, reward=+0.098, count=62, avg=+0.016
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.200, conf=0.80, lambda=0.40, reward=+0.060, count=26, avg=+0.007
+   → FILTER_AGGREGATE_TRANSPOSE: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=+0.057, count=10, avg=+0.023
+   → PROJECT_MERGE: P(s,a)=N/A, effect=0.100, conf=0.70, lambda=0.35, reward=+0.044, count=1, avg=+0.044
+
+----------------------------------------
+

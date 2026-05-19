@@ -877,18 +877,6 @@ class RewriteAgent(Agent):
         </上一轮评估反馈（重点修复）>
 """
 
-        rule_examples = get_rule_examples(applied_rules, current_sql=sql, max_per_rule=RULE_EXAMPLES_MAX_PER_RULE)
-        rule_examples_text = format_rule_examples_for_semantic_check(rule_examples)
-        rule_examples_section = (
-            f"""
-        <规则知识库示例（按当前SQL与示例原始SQL的指纹余弦相似度筛选；每个规则Top-1）>
-        {rule_examples_text}
-        </规则知识库示例>
-"""
-            if rule_examples
-            else ""
-        )
-
         prompt = textwrap.dedent(f"""
         <Mission>
         你是一名经验丰富的 DBA，你的任务是按照指定的规则序列对SQL进行重写。
@@ -901,7 +889,6 @@ class RewriteAgent(Agent):
            - （若下方提供）<SQL Schema>: 与当前查询相关的表 DDL
            - （若下方提供）<索引信息>: 表索引信息
            - （若下方提供）<上一轮评估反馈（重点修复）>: 未改进/恶化原因与下一步改进建议，必须优先处理
-           - （若下方提供）<规则知识库示例>: 与当前 SQL 结构最相似的规则示例，可参考其改写模式，但必须以当前 SQL 语义为准
 
         2. 重写要求：
            - **最高优先级约束**：必须优先保证 rewritten_sql 与原始SQL在语义上完全等价；任何优化都不得以改变结果集语义为代价
@@ -933,7 +920,7 @@ class RewriteAgent(Agent):
 
         <统计信息>
         {data_statistics}
-{schema_section}{idx_section}{previous_feedback_section}{rule_examples_section}
+{schema_section}{idx_section}{previous_feedback_section}
         5. **只输出一个 JSON 对象**（不要 <rewrite> 标签、不要 markdown）。字段：
            - groups: 字符串 "{groups}"
            - applied_rules: 数组，与当前序列一致：{json.dumps(applied_rules, ensure_ascii=False)}

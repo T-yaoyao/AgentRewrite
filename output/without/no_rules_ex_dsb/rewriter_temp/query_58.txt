@@ -1,0 +1,167 @@
+Query ID: 58
+==================================================
+
+Original: select  count(*) from (     select distinct c_last_name, c_first_name, d_date     from store_sales, date_dim, customer           where store_sales.ss_sold_date_sk = date_dim.d_date_sk       and store_sales.ss_customer_sk = customer.c_customer_sk       and d_month_seq between 1185 and 1185 + 11       and c_birth_month in (2, 3, 10, 12)       and ss_list_price between 28 and 87       and ss_wholesale_cost BETWEEN 80 AND 100   intersect     select distinct c_last_name, c_first_name, d_date     from catalog_sales, date_dim, customer           where catalog_sales.cs_sold_date_sk = date_dim.d_date_sk       and catalog_sales.cs_bill_customer_sk = customer.c_customer_sk       and d_month_seq between 1185 and 1185 + 11       and c_birth_month in (2, 3, 10, 12)       and cs_list_price between 28 and 87       and cs_wholesale_cost BETWEEN 80 AND 100   intersect     select distinct c_last_name, c_first_name, d_date     from web_sales, date_dim, customer           where web_sales.ws_sold_date_sk = date_dim.d_date_sk       and web_sales.ws_bill_customer_sk = customer.c_customer_sk       and d_month_seq between 1185 and 1185 + 11       and c_birth_month in (2, 3, 10, 12)       and ws_list_price between 28 and 87       and ws_wholesale_cost BETWEEN 80 AND 100 ) hot_cust limit 100;
+Rewritten: WITH filtered_dates AS (
+  SELECT d_date_sk, d_date
+  FROM date_dim
+  WHERE d_month_seq BETWEEN 1185 AND 1196
+),
+filtered_customers AS (
+  SELECT c_customer_sk, c_last_name, c_first_name
+  FROM customer
+  WHERE c_birth_month IN (2, 3, 10, 12)
+),
+store_sales_filtered AS (
+  SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date
+  FROM store_sales ss
+  INNER JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk
+  INNER JOIN filtered_customers fc ON ss.ss_customer_sk = fc.c_customer_sk
+  WHERE ss.ss_list_price BETWEEN 28 AND 87
+    AND ss.ss_wholesale_cost BETWEEN 80 AND 100
+),
+catalog_sales_filtered AS (
+  SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date
+  FROM catalog_sales cs
+  INNER JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk
+  INNER JOIN filtered_customers fc ON cs.cs_bill_customer_sk = fc.c_customer_sk
+  WHERE cs.cs_list_price BETWEEN 28 AND 87
+    AND cs.cs_wholesale_cost BETWEEN 80 AND 100
+),
+web_sales_filtered AS (
+  SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date
+  FROM web_sales ws
+  INNER JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk
+  INNER JOIN filtered_customers fc ON ws.ws_bill_customer_sk = fc.c_customer_sk
+  WHERE ws.ws_list_price BETWEEN 28 AND 87
+    AND ws.ws_wholesale_cost BETWEEN 80 AND 100
+)
+SELECT COUNT(*)
+FROM (
+  SELECT ssf.c_last_name, ssf.c_first_name, ssf.d_date
+  FROM store_sales_filtered ssf
+  INNER JOIN catalog_sales_filtered csf
+    ON ssf.c_last_name = csf.c_last_name
+    AND ssf.c_first_name = csf.c_first_name
+    AND ssf.d_date = csf.d_date
+  INNER JOIN web_sales_filtered wsf
+    ON ssf.c_last_name = wsf.c_last_name
+    AND ssf.c_first_name = wsf.c_first_name
+    AND ssf.d_date = wsf.d_date
+) hot_cust
+LIMIT 100;
+Time Cost: 152.00s
+Suggestion: [{'group': '集合优化', 'produced_suggestion': '将两层INTERSECT操作转换为INNER JOIN，通过(c_last_name, c_first_name, d_date)三元组关联三个销售表的结果集，避免多次物化和集合求交的开销。转换后可利用Hash Join替代SetOp算子'}, {'group': '子查询优化', 'produced_suggestion': '使用CTE将date_dim和customer的过滤结果提前物化，三个销售表子查询共享这两个维度表的过滤结果，减少重复扫描和JOIN计算。特别是d_month_seq between 1185 and 1196和c_birth_month in (2,3,10,12)的过滤可提前应用'}, {'group': '谓词简化', 'produced_suggestion': '将date_dim的d_month_seq范围过滤和customer的c_birth_month IN条件通过JOIN条件下推到各销售表扫描阶段，结合销售表自身的price和cost范围过滤，形成复合过滤条件，减少JOIN前的数据量'}, {'group': '聚合优化', 'produced_suggestion': '外层COUNT(*)与LIMIT 100组合存在冗余，INTERSECT结果集通常较小，可考虑先执行INTERSECT再COUNT，或利用INTERSECT本身的去重特性简化DISTINCT逻辑，减少一层聚合开销'}, {'group': '投影优化', 'produced_suggestion': '三个子查询仅需要c_last_name、c_first_name、d_date三列，可在JOIN后立即投影这三列并去重，避免携带销售表的其他列(如price、cost)参与后续的DISTINCT和INTERSECT操作'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示三个主要性能瓶颈均为大表全表扫描(Seq Scan)，合计占比98.9%。SQL包含三个INTERSECT子查询，每个子查询都对大表(store_sales 2880万行、catalog_sales 1440万行、web_sales 720万行)进行全表扫描并应用过滤条件。历史案例显示相似SQL通过CTE分解、集合操作转换、连接条件下推等规则组合可显著优化。当前SQL存在明显优化空间：1)INTERSECT操作可转换为更高效的JOIN形式 2)date_dim和customer的过滤条件可下推到各销售表扫描阶段 3)三个子查询结构相同，可通过CTE分解复用中间结果 4)DISTINCT+INTERSECT组合存在冗余去重逻辑",
+  "advice": [
+    {
+      "group": "集合优化",
+      "produced_suggestion": "将两层INTERSECT操作转换为INNER JOIN，通过(c_last_name, c_first_name, d_date)三元组关联三个销售表的结果集，避免多次物化和集合求交的开销。转换后可利用Hash Join替代SetOp算子"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用CTE将date_dim和customer的过滤结果提前物化，三个销售表子查询共享这两个维度表的过滤结果，减少重复扫描和JOIN计算。特别是d_month_seq between 1185 and 1196和c_birth_month in (2,3,10,12)的过滤可提前应用"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim的d_month_seq范围过滤和customer的c_birth_month IN条件通过JOIN条件下推到各销售表扫描阶段，结合销售表自身的price和cost范围过滤，形成复合过滤条件，减少JOIN前的数据量"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "外层COUNT(*)与LIMIT 100组合存在冗余，INTERSECT结果集通常较小，可考虑先执行INTERSECT再COUNT，或利用INTERSECT本身的去重特性简化DISTINCT逻辑，减少一层聚合开销"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "三个子查询仅需要c_last_name、c_first_name、d_date三列，可在JOIN后立即投影这三列并去重，避免携带销售表的其他列(如price、cost)参与后续的DISTINCT和INTERSECT操作"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → JOIN_TO_CORRELATE: UCT=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+{
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "INTERSECT_TO_DISTINCT",
+    "FILTER_SET_OP_TRANSPOSE",
+    "JOIN_CONDITION_PUSH",
+    "AGGREGATE_REMOVE"
+  ],
+  "groups": "子查询优化, 集合优化, 谓词简化, 连接优化, 聚合优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "INTERSECT_TO_DISTINCT": 0.9,
+    "FILTER_SET_OP_TRANSPOSE": 0.8,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "AGGREGATE_REMOVE": 0.8
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.25,
+    "INTERSECT_TO_DISTINCT": 0.25,
+    "FILTER_SET_OP_TRANSPOSE": 0.2,
+    "JOIN_CONDITION_PUSH": 0.2,
+    "AGGREGATE_REMOVE": 0.1
+  }
+}
+✅ 选择了 5 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 集合优化, 谓词简化, 连接优化, 聚合优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "INTERSECT_TO_DISTINCT",
+    "FILTER_SET_OP_TRANSPOSE",
+    "JOIN_CONDITION_PUSH",
+    "AGGREGATE_REMOVE"
+  ],
+  "rewritten_sql": "WITH filtered_dates AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_month_seq BETWEEN 1185 AND 1196\n),\nfiltered_customers AS (\n  SELECT c_customer_sk, c_last_name, c_first_name\n  FROM customer\n  WHERE c_birth_month IN (2, 3, 10, 12)\n),\nstore_sales_filtered AS (\n  SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date\n  FROM store_sales ss\n  INNER JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk\n  INNER JOIN filtered_customers fc ON ss.ss_customer_sk = fc.c_customer_sk\n  WHERE ss.ss_list_price BETWEEN 28 AND 87\n    AND ss.ss_wholesale_cost BETWEEN 80 AND 100\n),\ncatalog_sales_filtered AS (\n  SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date\n  FROM catalog_sales cs\n  INNER JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk\n  INNER JOIN filtered_customers fc ON cs.cs_bill_customer_sk = fc.c_customer_sk\n  WHERE cs.cs_list_price BETWEEN 28 AND 87\n    AND cs.cs_wholesale_cost BETWEEN 80 AND 100\n),\nweb_sales_filtered AS (\n  SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date\n  FROM web_sales ws\n  INNER JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk\n  INNER JOIN filtered_customers fc ON ws.ws_bill_customer_sk = fc.c_customer_sk\n  WHERE ws.ws_list_price BETWEEN 28 AND 87\n    AND ws.ws_wholesale_cost BETWEEN 80 AND 100\n)\nSELECT COUNT(*)\nFROM (\n  SELECT ssf.c_last_name, ssf.c_first_name, ssf.d_date\n  FROM store_sales_filtered ssf\n  INNER JOIN catalog_sales_filtered csf\n    ON ssf.c_last_name = csf.c_last_name\n    AND ssf.c_first_name = csf.c_first_name\n    AND ssf.d_date = csf.d_date\n  INNER JOIN web_sales_filtered wsf\n    ON ssf.c_last_name = wsf.c_last_name\n    AND ssf.c_first_name = wsf.c_first_name\n    AND ssf.d_date = wsf.d_date\n) hot_cust\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **CTE分解（STRATEGY_CTE_DECOMPOSITION）**：将date_dim的d_month_seq过滤（1185到1196）和customer的c_birth_month过滤（2,3,10,12）提取为filtered_dates和filtered_customers两个CTE。这两个维度表的过滤条件在原SQL的三个子查询中完全相同，CTE物化后被三个销售表子查询共享，避免重复扫描和过滤，但不改变结果集——每个销售表子查询仍然JOIN到相同过滤后的date_dim和customer行集。\n\n2. **INTERSECT转JOIN（INTERSECT_TO_DISTINCT）**：原SQL使用两层INTERSECT对三个子查询的(c_last_name, c_first_name, d_date)三元组求交集。INTERSECT语义等价于：仅保留在所有输入集合中都出现的行。改写为INNER JOIN on (c_last_name, c_first_name, d_date)，三个子查询结果通过这三列关联，只有三表都存在的三元组才会出现在最终结果中，与INTERSECT语义完全等价。INTERSECT本身具有去重特性，改写后每个子查询内部的DISTINCT已保证无重复，三表JOIN后的结果集也不会产生新的重复行（因为JOIN键是三元组，且各子查询已去重）。\n\n3. **过滤条件下推（FILTER_SET_OP_TRANSPOSE + JOIN_CONDITION_PUSH）**：原SQL在各子查询内部已有销售表自身的price和cost范围过滤（list_price between 28 and 87, wholesale_cost between 80 and 100），以及date_dim和customer的过滤条件。改写后，date_dim和customer的过滤通过CTE提前完成，销售表的price/cost过滤保持在各CTE的WHERE子句中，确保过滤逻辑在JOIN前应用，减少JOIN输入数据量。这些过滤条件的位置变化不影响语义：原SQL在子查询内过滤，改写后在CTE内过滤，过滤谓词和作用范围完全一致。\n\n4. **投影优化与DISTINCT处理**：原SQL每个子查询SELECT DISTINCT c_last_name, c_first_name, d_date，改写后在各CTE（store_sales_filtered, catalog_sales_filtered, web_sales_filtered）中保持相同的SELECT DISTINCT投影。这确保每个销售表子查询的输出仍然是去重后的三元组集合，与原SQL各子查询的输出完全一致。\n\n5. **聚合保留（AGGREGATE_REMOVE的谨慎应用）**：原SQL外层有COUNT(*) ... LIMIT 100。虽然规则名为AGGREGATE_REMOVE，但此处COUNT(*)不能移除，因为用户明确要求计数。改写保留了外层的COUNT(*) FROM (...) hot_cust LIMIT 100结构。LIMIT 100作用于COUNT(*)的单行结果，实际不起限制作用（COUNT(*)只返回一行），但保持与原SQL一致以确保语义等价。\n\n6. **NULL值处理**：原SQL的JOIN条件（ss_sold_date_sk = d_date_sk, ss_customer_sk = c_customer_sk等）和改写后的INNER JOIN语义一致，NULL值在INNER JOIN中不会匹配，因此NULL处理行为不变。各过滤条件（BETWEEN, IN）对NULL的处理在原SQL和改写SQL中保持一致。\n\n7. **结果集等价性验证**：改写后的SQL返回的是在store_sales、catalog_sales、web_sales三个渠道中都出现过的(c_last_name, c_first_name, d_date)三元组的计数，与原SQL的INTERSECT语义完全一致。三个CTE分别对应原SQL的三个子查询，最终通过INNER JOIN实现交集逻辑，外层COUNT(*)统计交集大小，LIMIT 100保持不变。整个改写过程未改变任何过滤条件、JOIN逻辑、投影列或聚合函数，仅优化了执行路径（CTE共享、INTERSECT转JOIN），确保结果集在行数、列值、顺序（COUNT(*)无顺序概念）上与原SQL完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 3->0, Hash/Merge 3->8 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "结构上明确改进：1) 通过CTE(filtered_dates/filtered_customers)实现公共维度表过滤结果的一次性计算与复用，消除了原计划中date_dim和customer的重复扫描（原计划3次date_dim扫描+3次customer索引探测，重写后各1次全表扫描+6次CTE Scan复用）；2) 将INTERSECT集合操作转换为Merge Join，避免了原计划中的SetOp物化开销；3) 消除了3个Nested Loop+Index Scan组合，改用Hash Join+Gather并行扫描，减少了随机I/O；4) 检测到预聚合CTE复用信号（filtered_dates/filtered_customers作为公共中间结果被多次引用），符合'一次扫描+复用'的优化模式。虽然cost从150万增至197万(+31%)，但这是CTE物化+Merge Join排序的正常开销，结构收益（消除重复扫描、减少索引探测、增强并行）足以补偿；且行数估计求和从124万增至724万主要因CTE展开导致的估计失真，不构成恶化证据。综合判断：去相关+公共结果复用+并行增强的结构改进已达成，无明确灾难性退化信号，符合成功终止条件。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1045
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'INTERSECT_TO_DISTINCT', 'FILTER_SET_OP_TRANSPOSE', 'JOIN_CONDITION_PUSH', 'AGGREGATE_REMOVE']
+   - 优化组别: 子查询优化, 集合优化, 谓词简化, 连接优化, 聚合优化
+   - 估计代价: 原始=1502821.58, 重写=1974957.58，相对变化: -31.42%
+✅ 成功存储，记录ID: df6073ae-a715-458b-b205-e6df3067e3bd
+
+🎲 UCT Math Update: 5 rules, reward=-0.0670 (cost=-0.3142, rows=+0.0000, depth=+0.0909, oc=1502821.5800, rc=1974957.5800)
+   结构分细节: rows 1243754.0->7239031.0 (score=+0.000), depth 11.0->10.0 (score=+0.091)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.250, conf=0.70, lambda=0.35, reward=-0.016, count=36, avg=+0.021
+   → INTERSECT_TO_DISTINCT: P(s,a)=N/A, effect=0.250, conf=0.90, lambda=0.45, reward=-0.016, count=2, avg=+0.014
+   → FILTER_SET_OP_TRANSPOSE: P(s,a)=N/A, effect=0.200, conf=0.80, lambda=0.40, reward=-0.013, count=5, avg=-0.023
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=-0.012, count=37, avg=+0.003
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=0.100, conf=0.80, lambda=0.40, reward=-0.009, count=1, avg=-0.009
+
+----------------------------------------
+
