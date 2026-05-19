@@ -876,6 +876,13 @@ class RewriteAgent(Agent):
         {json.dumps(previous_feedback, ensure_ascii=False, indent=2)}
         </上一轮评估反馈（重点修复）>
 """
+        rule_examples = get_rule_examples(applied_rules, current_sql=sql)
+        rule_examples_text = format_rule_examples_for_semantic_check(rule_examples)
+        rule_examples_section = f"""
+        <规则示例库_examples（按已选规则匹配，供改写参考）>
+        {rule_examples_text}
+        </规则示例库_examples（按已选规则匹配，供改写参考）>
+"""
 
         prompt = textwrap.dedent(f"""
         <Mission>
@@ -888,10 +895,12 @@ class RewriteAgent(Agent):
            - <统计信息>: 数据库表统计信息
            - （若下方提供）<SQL Schema>: 与当前查询相关的表 DDL
            - （若下方提供）<索引信息>: 表索引信息
+           - <规则示例库_examples>: 与已选规则对应的标准「原始查询 -> 重写查询」示例，只能作为模式参考，不能照抄示例中的表名、列名或谓词
            - （若下方提供）<上一轮评估反馈（重点修复）>: 未改进/恶化原因与下一步改进建议，必须优先处理
 
         2. 重写要求：
            - **最高优先级约束**：必须优先保证 rewritten_sql 与原始SQL在语义上完全等价；任何优化都不得以改变结果集语义为代价
+           - 参考 <规则示例库_examples> 中每条规则的典型改写模式和等价性注意点，但必须结合当前 SQL、Schema 和统计信息重新判断适用性
            - 一次性完成全部规则的应用，不分步骤应用，最终输出重写 SQL**：直接写最终版本
            - 确保SQL的语法正确性
            - **必须保持查询语义的等价性**：重写后的SQL必须与原始SQL在语义上完全等价
@@ -920,7 +929,7 @@ class RewriteAgent(Agent):
 
         <统计信息>
         {data_statistics}
-{schema_section}{idx_section}{previous_feedback_section}
+{schema_section}{idx_section}{rule_examples_section}{previous_feedback_section}
         5. **只输出一个 JSON 对象**（不要 <rewrite> 标签、不要 markdown）。字段：
            - groups: 字符串 "{groups}"
            - applied_rules: 数组，与当前序列一致：{json.dumps(applied_rules, ensure_ascii=False)}
@@ -1301,6 +1310,14 @@ class SemanticCheckAgent(Agent):
             rules_text = "\n".join(rule_lines)
         else:
             rules_text = "无"
+        rule_examples = get_rule_examples(rewrite_rules or [], current_sql=original_sql)
+        rule_examples_text = format_rule_examples_for_semantic_check(rule_examples)
+        rule_examples_ctx = textwrap.dedent(f"""
+
+            <应用规则_examples（知识库标准示例，仅作等价模式参考）>
+            {rule_examples_text}
+            </应用规则_examples（知识库标准示例，仅作等价模式参考）>
+            """)
         g = (str(semantic_correctness_guarantee).strip() if semantic_correctness_guarantee else "")
         s0 = (str(semantic_check).strip() if semantic_check is not None else "")
         # 新字段「语义正确性保证说明」优先；否则退化为旧名 semantic_check（同一段说明）。
@@ -1384,6 +1401,7 @@ class SemanticCheckAgent(Agent):
         3. **索引信息**（若提供）：通常不改变关系层面的结果集语义；PRIMARY KEY/UNIQUE 类索引可辅助推断唯一性，与 Schema 一并用于等价推理。**不得以「有无非唯一索引」代替 SQL 逻辑判断是否等价**。
         4. **首轮「语义正确性保证说明」**（若提供）：**仅**作辅助线索，须与 1 逐条核对。若存在「语义修正_第N轮_必读」块，说明**当前重写 SQL 可能已按你方上一轮意见改过**——**禁止**用首轮自辩中仅适用**历史版本**的论述来否掉**已经变化后**的当前 SQL；自辩与**当前**重写 SQL 明显不符时，**忽略**不适用的自辩段。
         5. **应用规则（ID + 文字描述）**：本查询**声称**依这些规则做等价改写。当「当前重写 SQL」可判定为**完全按**规则描述所体现的典型变换意图忠实套用（同构的改写模式、未在规则意图之外缩小/扩大过滤范围、未擅自改变聚合/分组/去重语义），且与 **Schema/约束** 无矛盾时，应将其视为**强等价先验**：默认倾向 `equivalent=true`，除非你能给出**明确且可核验的结果集变化证据**。
+        6. **应用规则 examples**：若提供了知识库标准示例，可参考其中「原始 -> 重写」的等价模式和注意点；但示例中的表名、列名和谓词只是模板，不得替代对当前两条 SQL 的实际语义判断。
 
         通用原则：
         - **规则驱动等价先验**：在 Schema 不否定结论的前提下，若重写在结构上等价于「对原 SQL 应用规则 R」且与 R 的文字描述所示变换意图一致、无多余语义偏移，应默认采纳 `equivalent=true`；只有当你能给出**明确、具体、可复核**的反例时，才允许推翻这一先验。
@@ -1409,6 +1427,7 @@ class SemanticCheckAgent(Agent):
         <应用规则_规则ID与文字描述>
         {rules_text}
         </应用规则_规则ID与文字描述>
+        {rule_examples_ctx}
 
         **只输出一个 JSON**（不要其它文字）：
         {{
