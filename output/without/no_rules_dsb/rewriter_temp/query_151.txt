@@ -1,0 +1,204 @@
+Query ID: 151
+==================================================
+
+Original: select min(item1.i_item_sk),     min(item2.i_item_sk),     min(s1.ss_ticket_number),     min(s1.ss_item_sk) FROM item AS item1, item AS item2, store_sales AS s1, store_sales AS s2, date_dim, customer, customer_address, customer_demographics WHERE item1.i_item_sk < item2.i_item_sk AND s1.ss_ticket_number = s2.ss_ticket_number AND s1.ss_item_sk = item1.i_item_sk and s2.ss_item_sk = item2.i_item_sk AND s1.ss_customer_sk = c_customer_sk and c_current_addr_sk = ca_address_sk and c_current_cdemo_sk = cd_demo_sk AND d_year between 1998 and 1998 + 1 and d_date_sk = s1.ss_sold_date_sk and item1.i_category in ('Jewelry', 'Music') and item2.i_manager_id between 77 and 96 and cd_marital_status = 'W' and cd_education_status = 'Primary' and s1.ss_list_price between 236 and 250 and s2.ss_list_price between 236 and 250 ;
+Rewritten: WITH date_filtered AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year BETWEEN 1998 AND 1999
+),
+item1_filtered AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_category IN ('Jewelry', 'Music')
+),
+item2_filtered AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_manager_id BETWEEN 77 AND 96
+),
+cd_filtered AS (
+  SELECT cd_demo_sk
+  FROM customer_demographics
+  WHERE cd_marital_status = 'W'
+    AND cd_education_status = 'Primary'
+),
+s1_filtered AS (
+  SELECT ss_sold_date_sk, ss_item_sk, ss_ticket_number, ss_customer_sk
+  FROM store_sales
+  WHERE ss_list_price BETWEEN 236 AND 250
+),
+s2_filtered AS (
+  SELECT ss_item_sk, ss_ticket_number
+  FROM store_sales
+  WHERE ss_list_price BETWEEN 236 AND 250
+)
+SELECT
+  MIN(item1_filtered.i_item_sk) AS min_item1_sk,
+  MIN(item2_filtered.i_item_sk) AS min_item2_sk,
+  MIN(s1_filtered.ss_ticket_number) AS min_ticket_number,
+  MIN(s1_filtered.ss_item_sk) AS min_s1_item_sk
+FROM date_filtered
+INNER JOIN s1_filtered ON date_filtered.d_date_sk = s1_filtered.ss_sold_date_sk
+INNER JOIN item1_filtered ON s1_filtered.ss_item_sk = item1_filtered.i_item_sk
+INNER JOIN customer ON s1_filtered.ss_customer_sk = customer.c_customer_sk
+INNER JOIN cd_filtered ON customer.c_current_cdemo_sk = cd_filtered.cd_demo_sk
+INNER JOIN s2_filtered ON s1_filtered.ss_ticket_number = s2_filtered.ss_ticket_number
+INNER JOIN item2_filtered ON s2_filtered.ss_item_sk = item2_filtered.i_item_sk
+  AND item1_filtered.i_item_sk < item2_filtered.i_item_sk
+INNER JOIN customer_address ON customer.c_current_addr_sk = customer_address.ca_address_sk
+Time Cost: 155.16s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将date_dim的d_year BETWEEN 1998 AND 1999过滤改写为派生表(SELECT d_date_sk FROM date_dim WHERE d_year BETWEEN 1998 AND 1999)，在基表扫描层完成过滤后再参与JOIN，避免在Hash节点的Filter中过滤；同理将item1的i_category IN ('Jewelry','Music')、item2的i_manager_id BETWEEN 77 AND 96、customer_demographics的cd_marital_status='W' AND cd_education_status='Primary'改写为派生表，确保过滤条件在各自基表扫描时执行，减少JOIN输入行数"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：优先连接高选择性小表date_dim(过滤后约423行)和item1(过滤后约2632行)，再关联大表s1(当前扫描206667行)；具体顺序为：先date_dim派生表⋈s1(利用d_date_sk=ss_sold_date_sk索引)，再⋈item1派生表(利用ss_item_sk=i_item_sk索引)，再⋈customer_demographics派生表(利用c_current_cdemo_sk=cd_demo_sk索引)，最后⋈s2；将s1.ss_list_price BETWEEN 236 AND 250和s2.ss_list_price BETWEEN 236 AND 250移到各自派生表的WHERE子句中，在扫描层过滤'}, {'group': '子查询优化', 'produced_suggestion': '将s1和s2改写为派生表，在派生表内完成ss_list_price过滤和必要列投影：(SELECT ss_sold_date_sk,ss_item_sk,ss_ticket_number,ss_customer_sk FROM store_sales WHERE ss_list_price BETWEEN 236 AND 250) AS s1，避免在JOIN后的Filter中过滤；利用s1.ss_ticket_number=s2.ss_ticket_number的等值条件，将s1过滤后的ticket_number集合通过派生表传递给s2：(SELECT ss_item_sk,ss_ticket_number FROM store_sales WHERE ss_list_price BETWEEN 236 AND 250 AND ss_ticket_number IN (SELECT ss_ticket_number FROM s1派生表)) AS s2，减少s2的Index Scan范围'}, {'group': '投影优化', 'produced_suggestion': '在每个派生表中立即裁剪不必要的列，只保留连接键+过滤列+最终MIN的4个列：date_dim派生表只投影d_date_sk；item1派生表只投影i_item_sk；item2派生表只投影i_item_sk；customer派生表只投影c_customer_sk,c_current_cdemo_sk,c_current_addr_sk；customer_demographics派生表只投影cd_demo_sk；customer_address派生表只投影ca_address_sk；s1派生表投影ss_sold_date_sk,ss_item_sk,ss_ticket_number,ss_customer_sk；s2派生表投影ss_item_sk,ss_ticket_number；减少Hash Join的内存占用和数据传输量'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) store_sales表的全表扫描(Seq Scan)占总代价78.6%，过滤条件ss_list_price仅在扫描后应用；2) Nested Loop连接占18.9%代价，连接顺序可能不是最优；3) 隐式JOIN语法导致优化器难以选择最佳连接顺序；4) 多个过滤条件未充分下推到数据源层；5) 相似历史案例显示通过FILTER_INTO_JOIN、JOIN_CONDITION_PUSH等规则可显著优化此类查询",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将隐式JOIN改写为显式JOIN语法，明确连接顺序：优先连接高选择性的小表(date_dim年份过滤、customer_demographics人口统计过滤、item分类过滤)，再关联大表store_sales。建议顺序：date_dim → item1(category过滤) → item2(manager_id过滤) → customer_demographics → customer → customer_address → s1 → s2"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将过滤条件尽早下推到基表扫描层：1) item1.i_category IN ('Jewelry','Music')应在item表首次访问时过滤；2) item2.i_manager_id BETWEEN 77 AND 96应在item表第二次访问时过滤；3) d_year BETWEEN 1998 AND 1999应在date_dim扫描时过滤；4) cd_marital_status='W' AND cd_education_status='Primary'应在customer_demographics扫描时过滤；5) ss_list_price过滤条件应通过JOIN条件传递到s1和s2的扫描层"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用JOIN_CONDITION_PUSH规则将等值连接条件下推：1) s1.ss_sold_date_sk = d_date_sk与d_year过滤结合，限制s1扫描范围；2) s1.ss_item_sk = item1.i_item_sk与item1分类过滤结合；3) s2.ss_item_sk = item2.i_item_sk与item2 manager_id过滤结合；4) 利用s1.ss_ticket_number = s2.ss_ticket_number的等值条件，在s1过滤后再关联s2"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "应用JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE规则，从等值连接条件推导NOT NULL过滤：1) 从s1.ss_sold_date_sk = d_date_sk推导s1.ss_sold_date_sk IS NOT NULL；2) 从s1.ss_item_sk = item1.i_item_sk推导s1.ss_item_sk IS NOT NULL；3) 从s1.ss_customer_sk = c_customer_sk推导s1.ss_customer_sk IS NOT NULL，这些NOT NULL条件可进一步减少扫描行数"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "应用PROJECT_JOIN_TRANSPOSE规则，将MIN聚合函数的投影列尽早裁剪：在每个JOIN节点只保留后续操作需要的列(连接键+过滤列+最终MIN的4个列)，减少中间结果集大小，特别是在store_sales大表扫描后立即裁剪不必要的列"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "优化MIN聚合逻辑：由于查询只需要4个MIN值且没有GROUP BY，可以考虑在JOIN早期阶段就应用LIMIT 1优化(如果item1.i_item_sk < item2.i_item_sk能保证有序)，或者将MIN(常量列)的计算提前到子查询中，减少最终聚合的数据量"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "简化和合并范围条件：1) d_year BETWEEN 1998 AND 1999可改写为d_year IN (1998,1999)便于索引查找；2) s1.ss_list_price和s2.ss_list_price的BETWEEN条件完全相同，可以提取为公共过滤条件；3) item1.i_item_sk < item2.i_item_sk的不等式条件应在item自连接时尽早应用"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "参考历史案例应用JOIN_PUSH_TRANSITIVE_PREDICATES规则：从s1.ss_ticket_number = s2.ss_ticket_number和各自的过滤条件，推导传递性谓词。例如，如果s1通过date_dim过滤了日期范围，可以将该约束传递到s2，即使s2没有直接关联date_dim"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "SELECT\n  MIN(item1.i_item_sk) AS min_item1_sk,\n  MIN(item2.i_item_sk) AS min_item2_sk,\n  MIN(s1.ss_ticket_number) AS min_ticket_number,\n  MIN(s1.ss_item_sk) AS min_s1_item_sk\nFROM\n  date_dim\n  INNER JOIN store_sales AS s1 ON d_date_sk = s1.ss_sold_date_sk\n    AND d_year BETWEEN 1998 AND 1999\n    AND s1.ss_list_price BETWEEN 236 AND 250\n  INNER JOIN item AS item1 ON s1.ss_item_sk = item1.i_item_sk\n    AND item1.i_category IN ('Jewelry', 'Music')\n  INNER JOIN store_sales AS s2 ON s1.ss_ticket_number = s2.ss_ticket_number\n    AND s2.ss_list_price BETWEEN 236 AND 250\n  INNER JOIN item AS item2 ON s2.ss_item_sk = item2.i_item_sk\n    AND item2.i_manager_id BETWEEN 77 AND 96\n    AND item1.i_item_sk < item2.i_item_sk\n  INNER JOIN customer ON s1.ss_customer_sk = c_customer_sk\n  INNER JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk\n    AND cd_marital_status = 'W'\n    AND cd_education_status = 'Primary'\n  INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk;",
+  "semantic_correctness_guarantee": "1. **隐式JOIN改为显式INNER JOIN**：原SQL使用逗号分隔的隐式笛卡尔积+WHERE过滤，现改为显式INNER JOIN语法。由于所有连接条件都是等值且WHERE中无OR逻辑，隐式JOIN与显式INNER JOIN在语义上完全等价，结果集相同。\n\n2. **连接顺序调整与过滤条件下推**：将过滤条件从WHERE子句移至对应的JOIN ON子句中，实现谓词下推。例如d_year BETWEEN 1998 AND 1999紧跟date_dim连接、item1.i_category过滤紧跟item1连接、cd_marital_status和cd_education_status过滤紧跟customer_demographics连接。这不改变语义，因为INNER JOIN的ON条件与WHERE条件在逻辑上等价（都要求条件为真才保留行）。\n\n3. **item1.i_item_sk < item2.i_item_sk位置调整**：原SQL在WHERE中，现移至item2的JOIN ON子句。由于这是INNER JOIN且该条件涉及item1和item2两表，放在item2连接时执行与放在最终WHERE执行语义完全相同，都是过滤掉不满足条件的行对。\n\n4. **s1和s2的ss_list_price过滤**：原SQL在WHERE中对两个store_sales别名分别过滤BETWEEN 236 AND 250，现分别下推到s1和s2的JOIN ON子句。INNER JOIN语义保证只有同时满足连接条件和过滤条件的行才会保留，与原WHERE过滤等价。\n\n5. **MIN聚合列别名添加**：为4个MIN表达式添加了列别名（min_item1_sk等），这不改变聚合结果值，只是增加输出列的可读性，语义保持不变。\n\n6. **连接链路完整性**：保留了所有原SQL的连接关系：date_dim→s1（通过ss_sold_date_sk）、s1→item1（通过ss_item_sk）、s1→s2（通过ss_ticket_number）、s2→item2（通过ss_item_sk）、s1→customer（通过ss_customer_sk）、customer→customer_demographics（通过c_current_cdemo_sk）、customer→customer_address（通过c_current_addr_sk）。所有等值连接键和外键关系均未改变。\n\n7. **无GROUP BY的MIN聚合**：原SQL和重写SQL都对全表结果集计算4个MIN值，无分组逻辑。由于INNER JOIN过滤后的结果集行数相同，MIN聚合的输入数据集完全一致，因此4个MIN值必然相同。\n\n8. **NULL值处理**：INNER JOIN会自动过滤连接键为NULL的行（等值条件NULL=NULL为假），与原SQL的WHERE等值过滤行为一致。所有过滤条件（BETWEEN、IN、等值比较）在NULL值处理上与原SQL保持相同语义。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "两SQL在语义上完全等价：重写SQL将隐式笛卡尔积改为显式INNER JOIN并下推过滤条件，所有连接关系、过滤谓词、聚合逻辑均保持一致，最终结果集的4个MIN值必然相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划几乎完全相同：两者均采用相同的连接顺序(date_dim→s1→item1→customer→customer_demographics→item2→s2→customer_address)、相同的扫描方式(4个Seq Scan、4个Index Scan)、相同的连接算法(2个Hash Join、5个Nested Loop)、相同的并行度(Workers Planned=2)、相同的Materialize节点；行数估计求和仅微增13行(276591→276604，增幅0.005%)；cost微增103(880225.52→880328.6，增幅0.01%)。重写仅将隐式JOIN改为显式INNER JOIN语法，但未触发任何结构性优化：过滤条件未下推到基表扫描层(date_dim/item1/item2仍在Hash节点内过滤，customer_demographics仍在Index Scan的Filter中过滤)、连接顺序未调整(仍先扫描大表store_sales再关联小表date_dim)、未应用JOIN_CONDITION_PUSH或传递性谓词推导、未裁剪投影列。本轮重写未实现optimization_advice中的任何建议，仍有明确改进空间。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：1)将date_dim的d_year过滤、item1的i_category过滤、item2的i_manager_id过滤、customer_demographics的cd_marital_status/cd_education_status过滤改写为派生表或CTE，在基表扫描层完成过滤后再参与JOIN，避免在Hash/Index Scan的Filter中过滤；2)调整连接顺序，优先连接高选择性小表(date_dim过滤后约423行、item1过滤后约2632行)，再关联大表store_sales(当前扫描206667行)；3)利用s1.ss_ticket_number=s2.ss_ticket_number的等值条件，将s1过滤后的ticket_number集合传递给s2，减少s2的Index Scan范围；4)在每个JOIN节点后立即裁剪不必要的列，只保留连接键+过滤列+最终MIN的4个列。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划存在明显性能瓶颈：1)s1表全表扫描(Seq Scan)代价占比78.6%(692193.53)，扫描206667行后仅过滤出3.5%数据(7233行)，ss_list_price范围过滤未利用索引；2)s1⋈s2的Nested Loop代价占比18.9%(166443.29)，虽然Inner Unique=true但仍需对s1的每行执行s2的Index Scan；3)上一轮重写未实现任何结构性优化，过滤条件仍在JOIN后执行(date_dim的d_year、item1的i_category、item2的i_manager_id、customer_demographics的cd_marital_status/cd_education_status均在Hash/Index Scan的Filter中)，未下推到基表扫描层；4)连接顺序未优化，仍先扫描大表s1(206667行)再关联小表date_dim(过滤后约423行)；5)未利用传递性谓词推导减少s2扫描范围。需通过谓词下推、连接顺序调整、派生表优化来消除瓶颈。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim的d_year BETWEEN 1998 AND 1999过滤改写为派生表(SELECT d_date_sk FROM date_dim WHERE d_year BETWEEN 1998 AND 1999)，在基表扫描层完成过滤后再参与JOIN，避免在Hash节点的Filter中过滤；同理将item1的i_category IN ('Jewelry','Music')、item2的i_manager_id BETWEEN 77 AND 96、customer_demographics的cd_marital_status='W' AND cd_education_status='Primary'改写为派生表，确保过滤条件在各自基表扫描时执行，减少JOIN输入行数"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接高选择性小表date_dim(过滤后约423行)和item1(过滤后约2632行)，再关联大表s1(当前扫描206667行)；具体顺序为：先date_dim派生表⋈s1(利用d_date_sk=ss_sold_date_sk索引)，再⋈item1派生表(利用ss_item_sk=i_item_sk索引)，再⋈customer_demographics派生表(利用c_current_cdemo_sk=cd_demo_sk索引)，最后⋈s2；将s1.ss_list_price BETWEEN 236 AND 250和s2.ss_list_price BETWEEN 236 AND 250移到各自派生表的WHERE子句中，在扫描层过滤"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将s1和s2改写为派生表，在派生表内完成ss_list_price过滤和必要列投影：(SELECT ss_sold_date_sk,ss_item_sk,ss_ticket_number,ss_customer_sk FROM store_sales WHERE ss_list_price BETWEEN 236 AND 250) AS s1，避免在JOIN后的Filter中过滤；利用s1.ss_ticket_number=s2.ss_ticket_number的等值条件，将s1过滤后的ticket_number集合通过派生表传递给s2：(SELECT ss_item_sk,ss_ticket_number FROM store_sales WHERE ss_list_price BETWEEN 236 AND 250 AND ss_ticket_number IN (SELECT ss_ticket_number FROM s1派生表)) AS s2，减少s2的Index Scan范围"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在每个派生表中立即裁剪不必要的列，只保留连接键+过滤列+最终MIN的4个列：date_dim派生表只投影d_date_sk；item1派生表只投影i_item_sk；item2派生表只投影i_item_sk；customer派生表只投影c_customer_sk,c_current_cdemo_sk,c_current_addr_sk；customer_demographics派生表只投影cd_demo_sk；customer_address派生表只投影ca_address_sk；s1派生表投影ss_sold_date_sk,ss_item_sk,ss_ticket_number,ss_customer_sk；s2派生表投影ss_item_sk,ss_ticket_number；减少Hash Join的内存占用和数据传输量"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH date_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year BETWEEN 1998 AND 1999\n),\nitem1_filtered AS (\n  SELECT i_item_sk\n  FROM item\n  WHERE i_category IN ('Jewelry', 'Music')\n),\nitem2_filtered AS (\n  SELECT i_item_sk\n  FROM item\n  WHERE i_manager_id BETWEEN 77 AND 96\n),\ncd_filtered AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'W'\n    AND cd_education_status = 'Primary'\n),\ns1_filtered AS (\n  SELECT ss_sold_date_sk, ss_item_sk, ss_ticket_number, ss_customer_sk\n  FROM store_sales\n  WHERE ss_list_price BETWEEN 236 AND 250\n),\ns2_filtered AS (\n  SELECT ss_item_sk, ss_ticket_number\n  FROM store_sales\n  WHERE ss_list_price BETWEEN 236 AND 250\n)\nSELECT\n  MIN(item1_filtered.i_item_sk) AS min_item1_sk,\n  MIN(item2_filtered.i_item_sk) AS min_item2_sk,\n  MIN(s1_filtered.ss_ticket_number) AS min_ticket_number,\n  MIN(s1_filtered.ss_item_sk) AS min_s1_item_sk\nFROM date_filtered\nINNER JOIN s1_filtered ON date_filtered.d_date_sk = s1_filtered.ss_sold_date_sk\nINNER JOIN item1_filtered ON s1_filtered.ss_item_sk = item1_filtered.i_item_sk\nINNER JOIN customer ON s1_filtered.ss_customer_sk = customer.c_customer_sk\nINNER JOIN cd_filtered ON customer.c_current_cdemo_sk = cd_filtered.cd_demo_sk\nINNER JOIN s2_filtered ON s1_filtered.ss_ticket_number = s2_filtered.ss_ticket_number\nINNER JOIN item2_filtered ON s2_filtered.ss_item_sk = item2_filtered.i_item_sk\n  AND item1_filtered.i_item_sk < item2_filtered.i_item_sk\nINNER JOIN customer_address ON customer.c_current_addr_sk = customer_address.ca_address_sk",
+  "semantic_correctness_guarantee": "1. 过滤条件下推：将原SQL中date_dim的d_year BETWEEN 1998 AND 1999、item表的i_category IN ('Jewelry','Music')和i_manager_id BETWEEN 77 AND 96、customer_demographics的cd_marital_status='W' AND cd_education_status='Primary'、store_sales的ss_list_price BETWEEN 236 AND 250改写为独立CTE(date_filtered/item1_filtered/item2_filtered/cd_filtered/s1_filtered/s2_filtered)，在基表扫描层完成过滤后再参与JOIN；这些过滤条件均为原SQL中INNER JOIN的ON子句或WHERE子句的一部分，提前过滤不改变INNER JOIN的语义(INNER JOIN会自动过滤不满足条件的行)。\n\n2. 列投影裁剪：每个CTE只保留后续JOIN所需的连接键列和最终MIN聚合所需的列(date_filtered只投影d_date_sk、item1_filtered/item2_filtered只投影i_item_sk、cd_filtered只投影cd_demo_sk、s1_filtered投影ss_sold_date_sk/ss_item_sk/ss_ticket_number/ss_customer_sk、s2_filtered投影ss_item_sk/ss_ticket_number)；由于最终SELECT只对4个列做MIN聚合，且所有JOIN均为INNER JOIN(不涉及外连接的NULL填充)，裁剪其他列不影响结果集。\n\n3. 连接顺序调整：将原SQL的连接顺序从(date_dim→s1→item1→customer→customer_demographics→item2→s2→customer_address)调整为(date_filtered→s1_filtered→item1_filtered→customer→cd_filtered→s2_filtered→item2_filtered→customer_address)；由于所有连接均为INNER JOIN且连接条件为等值条件，根据INNER JOIN的交换律和结合律，调整连接顺序不改变结果集；新顺序优先连接高选择性小表(date_filtered过滤后约423行、item1_filtered过滤后约2632行)，再关联大表s1_filtered，符合优化器的最佳实践。\n\n4. 等值连接条件保持：所有原SQL中的等值连接条件(d_date_sk=ss_sold_date_sk、ss_item_sk=i_item_sk、ss_customer_sk=c_customer_sk、c_current_cdemo_sk=cd_demo_sk、ss_ticket_number=ss_ticket_number、c_current_addr_sk=ca_address_sk)和不等值条件(item1.i_item_sk<item2.i_item_sk)均完整保留在重写SQL的INNER JOIN ON子句中，确保连接语义不变。\n\n5. 聚合函数保持：最终SELECT子句的4个MIN聚合函数(MIN(item1.i_item_sk)、MIN(item2.i_item_sk)、MIN(s1.ss_ticket_number)、MIN(s1.ss_item_sk))及其别名完全保留，且由于INNER JOIN的结果集与原SQL一致，MIN聚合的输入行集相同，因此聚合结果相同。\n\n6. 无GROUP BY/DISTINCT/外连接/相关子查询：原SQL和重写SQL均无GROUP BY子句(全表聚合)、无DISTINCT、无LEFT/RIGHT/FULL OUTER JOIN(全部为INNER JOIN)、无相关子查询，因此不涉及分组语义、去重语义、NULL填充语义或子查询作用域的变化；CTE的引入仅为物化过滤后的中间结果，不改变最终结果集的行数和列值。\n\n7. 语法正确性：重写SQL使用标准CTE语法(WITH...AS)和INNER JOIN语法，所有表别名和列引用均正确(item表拆分为item1_filtered和item2_filtered、store_sales表拆分为s1_filtered和s2_filtered)，确保可执行且无歧义。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE将过滤条件下推和列裁剪,但所有INNER JOIN连接条件、不等值条件及MIN聚合函数均完整保留,连接顺序调整不改变INNER JOIN结果集,两SQL等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "重写SQL通过CTE显式组织公共中间结果，检测到预聚合CTE/子查询复用信号，这是高优先级正信号。执行计划结构基本一致：Nested Loop 5次、Hash Join 2次、Seq Scan 4次、Index Scan 4次，并行度保持2 workers，无明显结构退化。行数估计求和从276591降至275368（降幅0.4%），cost从880225.52降至870536.31（降幅1.1%），虽然降幅不大，但结合CTE复用意图和无灾难性退化证据，符合成功终止条件。当前重写已将过滤条件下推至CTE内部，JOIN顺序和访问路径未发生恶化，进一步优化空间有限。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 728
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=880225.52, 重写=870536.31，相对变化: 1.10%
+✅ 成功存储，记录ID: ffd7e91c-5524-4760-9d95-050ff066591e
+
+----------------------------------------
+

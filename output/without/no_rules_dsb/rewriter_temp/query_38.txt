@@ -1,0 +1,179 @@
+Query ID: 38
+==================================================
+
+Original: select   i_item_id  ,i_item_desc  ,s_store_id  ,s_store_name  ,min(ss_net_profit) as store_sales_profit  ,min(sr_net_loss) as store_returns_loss  ,min(cs_net_profit) as catalog_sales_profit  from  store_sales  ,store_returns  ,catalog_sales  ,date_dim d1  ,date_dim d2  ,date_dim d3  ,store  ,item  where  d1.d_moy = 6  and d1.d_year = 2002  and d1.d_date_sk = ss_sold_date_sk  and i_item_sk = ss_item_sk  and s_store_sk = ss_store_sk  and ss_customer_sk = sr_customer_sk  and ss_item_sk = sr_item_sk  and ss_ticket_number = sr_ticket_number  and sr_returned_date_sk = d2.d_date_sk  and d2.d_moy               between 6 and  6 + 2  and d2.d_year              = 2002  and sr_customer_sk = cs_bill_customer_sk  and sr_item_sk = cs_item_sk  and cs_sold_date_sk = d3.d_date_sk  and d3.d_moy               between 6 and  6 + 2  and d3.d_year              = 2002  group by  i_item_id  ,i_item_desc  ,s_store_id  ,s_store_name  order by  i_item_id  ,i_item_desc  ,s_store_id  ,s_store_name  limit 100;
+Rewritten: WITH filtered_dates AS (
+  SELECT d_date_sk, d_moy, d_year
+  FROM date_dim
+  WHERE d_year = 2002 AND d_moy BETWEEN 6 AND 8
+)
+SELECT
+  i_item_id,
+  i_item_desc,
+  s_store_id,
+  s_store_name,
+  MIN(ss_net_profit) AS store_sales_profit,
+  MIN(sr_net_loss) AS store_returns_loss,
+  MIN(cs_net_profit) AS catalog_sales_profit
+FROM store_sales
+INNER JOIN filtered_dates d1 ON d1.d_date_sk = ss_sold_date_sk AND d1.d_moy = 6
+INNER JOIN item ON i_item_sk = ss_item_sk
+INNER JOIN store ON s_store_sk = ss_store_sk
+INNER JOIN store_returns ON sr_customer_sk = ss_customer_sk
+  AND sr_item_sk = ss_item_sk
+  AND sr_ticket_number = ss_ticket_number
+  AND sr_returned_date_sk IS NOT NULL
+INNER JOIN filtered_dates d2 ON d2.d_date_sk = sr_returned_date_sk
+INNER JOIN catalog_sales ON cs_bill_customer_sk = sr_customer_sk
+  AND cs_item_sk = sr_item_sk
+  AND cs_sold_date_sk IS NOT NULL
+INNER JOIN filtered_dates d3 ON d3.d_date_sk = cs_sold_date_sk
+WHERE ss_customer_sk IS NOT NULL
+  AND ss_store_sk IS NOT NULL
+GROUP BY i_item_id, i_item_desc, s_store_id, s_store_name
+ORDER BY i_item_id, i_item_desc, s_store_id, s_store_name
+LIMIT 100
+Time Cost: 173.38s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '彻底移除所有CTE（filtered_dates/filtered_store_sales/filtered_store_returns/filtered_catalog_sales），将过滤条件直接内联到主查询的JOIN和WHERE子句中。CTE物化阻止了优化器将date_dim的高选择性过滤（d_year=2002 AND d_moy BETWEEN 6 AND 8，预估仅92行）下推到事实表索引扫描，导致catalog_sales和store_returns被迫全表扫描。内联后优化器可选择：date_dim索引扫描→通过外键索引（如sr_returned_date_sk/cs_sold_date_sk）回表→利用store_sales_pkey/store_returns_pkey精准定位，避免大表全扫。'}, {'group': '连接优化', 'produced_suggestion': "调整JOIN顺序为索引驱动模式：1) 先JOIN date_dim(d_year=2002 AND d_moy=6)得到小结果集d1；2) 通过store_sales_pkey索引扫描匹配ss_sold_date_sk，利用复合主键(ss_item_sk, ss_ticket_number)的选择性；3) 再JOIN store_returns，通过store_returns_pkey索引定位(sr_item_sk, sr_ticket_number)匹配行；4) 最后JOIN catalog_sales时，已过滤到极小结果集，即使需要扫描也代价可控。避免当前'先全扫大表再Hash Join'的低效模式，恢复原计划的Nested Loop+索引访问路径。"}, {'group': '谓词简化', 'produced_suggestion': "将IS NOT NULL条件从CTE的WHERE子句移到主查询的JOIN条件中（如'ss_sold_date_sk IS NOT NULL AND d1.d_date_sk = ss_sold_date_sk'合并为'INNER JOIN date_dim d1 ON d1.d_date_sk = ss_sold_date_sk'，INNER JOIN天然过滤NULL）。这样优化器可将NOT NULL隐含条件与date_dim的过滤条件（d_year=2002）组合，选择索引扫描路径。当前CTE中的显式IS NOT NULL过滤在物化边界处无法与后续JOIN条件合并，导致优化器错误估计需全表扫描后再过滤。"}, {'group': '连接优化', 'produced_suggestion': '利用复合主键索引的前缀选择性：store_sales_pkey(ss_item_sk, ss_ticket_number)和store_returns_pkey(sr_item_sk, sr_ticket_number)可通过等值连接条件(sr_item_sk=ss_item_sk AND sr_ticket_number=ss_ticket_number)触发Index Scan。当前CTE策略破坏了这一路径，导致优化器选择Hash Join。改为直接JOIN后，优化器可识别：先通过date_dim过滤得到少量ss_sold_date_sk，再用主键索引定位store_sales行，然后用匹配的(item_sk, ticket_number)在store_returns主键索引中精准查找，避免720万行全扫。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) store_returns全表扫描占83.6%代价(148,910.03)，2) Nested Loop连接占9.6%代价(17,032.29)，3) 多个date_dim表(d1/d2/d3)的过滤条件可以提前下推。结合相似历史案例(相似度1.0)成功应用的规则序列，该SQL可通过过滤条件下推、连接条件优化、IS NOT NULL派生过滤等重写优化显著提升性能。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim表(d1/d2/d3)的过滤条件(d_moy/d_year)通过FILTER_INTO_JOIN规则下推到基表扫描层，减少参与连接的数据量。特别是d2表的过滤条件应在Hash Join前应用，避免全表参与哈希构建。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "应用JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE派生IS NOT NULL过滤条件：由于存在INNER JOIN，可为ss_sold_date_sk、sr_returned_date_sk、cs_sold_date_sk等外键列派生NOT NULL过滤，提前过滤空值行，减少store_returns全表扫描的有效行数。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "应用JOIN_CONDITION_PUSH规则优化连接顺序：优先执行date_dim的过滤和连接(小表且有索引)，将过滤后的d_date_sk作为驱动条件，避免store_returns(7.2M行)与store_sales(28.8M行)的大表Nested Loop连接成为瓶颈。建议调整为：date_dim过滤 → 与事实表连接 → 再进行事实表间连接。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "应用PROJECT_JOIN_TRANSPOSE规则将投影操作下推：在连接前对store_sales/store_returns/catalog_sales仅保留必要列(ss_net_profit、sr_net_loss、cs_net_profit及连接键)，减少Nested Loop和Hash Join的数据传输量。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑应用STRATEGY_CTE_DECOMPOSITION将复杂多表连接分解为CTE：将store_sales与store_returns的匹配逻辑(基于customer_sk/item_sk/ticket_number)提取为CTE，避免重复计算，同时便于优化器选择更优的连接策略。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_dates AS (\n  SELECT d_date_sk, d_moy, d_year\n  FROM date_dim\n  WHERE d_year = 2002 AND d_moy BETWEEN 6 AND 8\n),\nfiltered_store_sales AS (\n  SELECT ss_item_sk, ss_customer_sk, ss_ticket_number, ss_store_sk, ss_net_profit, ss_sold_date_sk\n  FROM store_sales\n  WHERE ss_sold_date_sk IS NOT NULL\n    AND ss_customer_sk IS NOT NULL\n    AND ss_item_sk IS NOT NULL\n    AND ss_store_sk IS NOT NULL\n),\nfiltered_store_returns AS (\n  SELECT sr_item_sk, sr_customer_sk, sr_ticket_number, sr_net_loss, sr_returned_date_sk\n  FROM store_returns\n  WHERE sr_returned_date_sk IS NOT NULL\n    AND sr_customer_sk IS NOT NULL\n    AND sr_item_sk IS NOT NULL\n),\nfiltered_catalog_sales AS (\n  SELECT cs_item_sk, cs_bill_customer_sk, cs_net_profit, cs_sold_date_sk\n  FROM catalog_sales\n  WHERE cs_sold_date_sk IS NOT NULL\n    AND cs_bill_customer_sk IS NOT NULL\n    AND cs_item_sk IS NOT NULL\n)\nSELECT\n  i_item_id,\n  i_item_desc,\n  s_store_id,\n  s_store_name,\n  MIN(ss_net_profit) AS store_sales_profit,\n  MIN(sr_net_loss) AS store_returns_loss,\n  MIN(cs_net_profit) AS catalog_sales_profit\nFROM filtered_store_sales\nINNER JOIN filtered_dates d1 ON d1.d_date_sk = ss_sold_date_sk AND d1.d_moy = 6\nINNER JOIN item ON i_item_sk = ss_item_sk\nINNER JOIN store ON s_store_sk = ss_store_sk\nINNER JOIN filtered_store_returns ON sr_customer_sk = ss_customer_sk\n  AND sr_item_sk = ss_item_sk\n  AND sr_ticket_number = ss_ticket_number\nINNER JOIN filtered_dates d2 ON d2.d_date_sk = sr_returned_date_sk\nINNER JOIN filtered_catalog_sales ON cs_bill_customer_sk = sr_customer_sk\n  AND cs_item_sk = sr_item_sk\nINNER JOIN filtered_dates d3 ON d3.d_date_sk = cs_sold_date_sk\nGROUP BY i_item_id, i_item_desc, s_store_id, s_store_name\nORDER BY i_item_id, i_item_desc, s_store_id, s_store_name\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **CTE提取与谓词下推**：将date_dim的过滤条件(d_year=2002 AND d_moy BETWEEN 6 AND 8)提取为CTE filtered_dates，避免重复扫描date_dim三次。原SQL中d1要求d_moy=6，d2和d3要求d_moy BETWEEN 6 AND 8，重写后在各自JOIN时保留d1.d_moy=6的额外约束，确保d1仅匹配6月数据，d2和d3匹配6-8月数据，语义完全一致。\n\n2. **事实表投影与NOT NULL过滤**：为store_sales、store_returns、catalog_sales创建CTE，仅保留连接键和聚合所需列(ss_net_profit、sr_net_loss、cs_net_profit)，减少数据传输量。同时显式添加IS NOT NULL过滤(如ss_sold_date_sk IS NOT NULL)，因为原SQL的INNER JOIN隐含要求这些外键非空，提前过滤可减少参与连接的行数，不改变最终结果集。\n\n3. **连接顺序调整**：优先将小表filtered_dates(经过滤后的date_dim)与事实表连接，利用date_dim主键索引快速定位符合时间条件的记录。原SQL采用隐式连接顺序可能导致大表store_sales(28.8M行)与store_returns先做笛卡尔积，重写后明确先过滤时间维度再关联事实表，减少中间结果集大小。\n\n4. **GROUP BY与聚合语义保持**：原SQL按i_item_id、i_item_desc、s_store_id、s_store_name分组并计算MIN(ss_net_profit)、MIN(sr_net_loss)、MIN(cs_net_profit)。重写后GROUP BY子句和聚合函数完全一致，因为CTE仅做投影和过滤，不改变分组键的唯一性和聚合计算逻辑。\n\n5. **多表连接条件等价性**：原SQL通过WHERE子句连接store_sales、store_returns、catalog_sales(基于customer_sk、item_sk、ticket_number)。重写后改为显式INNER JOIN并保留相同连接条件(sr_customer_sk=ss_customer_sk AND sr_item_sk=ss_item_sk AND sr_ticket_number=ss_ticket_number，以及cs_bill_customer_sk=sr_customer_sk AND cs_item_sk=sr_item_sk)，INNER JOIN的交换律和结合律保证结果集不变。\n\n6. **ORDER BY与LIMIT保持**：重写后ORDER BY子句和LIMIT 100与原SQL完全一致，确保返回相同的前100条排序结果。\n\n7. **NULL值处理**：原SQL的INNER JOIN会自动过滤连接键为NULL的行。重写后在CTE中显式添加IS NOT NULL过滤，提前剔除这些行，逻辑等价且性能更优。由于MIN聚合函数忽略NULL值，即使某些net_profit/net_loss列为NULL，聚合结果也与原SQL一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取公共过滤逻辑、显式INNER JOIN和IS NOT NULL过滤,在保持连接条件、分组键、聚合函数、排序和LIMIT完全一致的前提下优化执行路径,不改变最终结果集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 6->3, Hash/Merge 1->4 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "结构上明确恶化。虽然重写引入了CTE复用filtered_dates（高优先级正信号），但执行计划显示：1) 行数估计求和从300万激增至2260万（7.5倍），说明中间结果膨胀严重；2) Nested Loop从6降至3，但Hash Join从1增至4，且catalog_sales全表扫描（1427万行）和store_returns全表扫描（670万行）成为新瓶颈，原计划中通过索引高效过滤的路径被破坏；3) 原计划利用store_sales_pkey索引精准定位（Plan Rows=1），重写后变为全表扫描后再Hash Join，丧失了索引选择性优势；4) cost从17.8万增至83.9万（4.7倍），虽cost为弱信号，但结合上述结构退化（大表全扫、索引路径丢失、中间结果膨胀）可作为辅助佐证；5) 原计划的Parallel Seq Scan和Gather Merge并行能力在重写后未得到保留。综合判断：CTE复用意图良好，但实际执行计划显示过滤下推失效、索引访问路径丢失、大表全扫成为主瓶颈，属于明确的灾难性结构退化。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续优化：1) 保留filtered_dates CTE（复用有效），但将其他CTE（filtered_store_sales/filtered_store_returns/filtered_catalog_sales）的IS NOT NULL过滤改为在JOIN条件中内联，避免全表扫描；2) 恢复原计划的索引驱动路径：先通过date_dim过滤得到小结果集，再用store_sales_pkey索引定位匹配行，而非先全扫store_returns/catalog_sales；3) 调整JOIN顺序为：filtered_dates(d2) → store_returns(索引或位图扫描sr_returned_date_sk) → store_sales(索引扫描pkey) → filtered_dates(d1) → store/item → catalog_sales(位图扫描cs_item_sk) → filtered_dates(d3)；4) 移除filtered_store_sales等CTE，改为直接在JOIN中应用NOT NULL条件，让优化器选择索引路径；5) 确保store_sales与store_returns的连接使用索引而非全表扫描后Hash Join。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE策略导致灾难性退化（catalog_sales和store_returns全表扫描成为主瓶颈，占比84.1%），需彻底改变思路。当前执行计划显示：1) catalog_sales全扫1440万行（61.3%代价）和store_returns全扫720万行（22.8%代价）是核心问题；2) 索引访问路径完全丢失，原计划中store_sales_pkey的精准定位能力未被利用；3) Hash Join链路过长（4个Hash Join累计占比15%），中间结果膨胀严重。根本原因：CTE物化阻止了优化器将date_dim过滤条件下推到事实表，导致大表先全扫再过滤。正确方向：移除所有CTE物化屏障，改为内联子查询或直接JOIN，让优化器自主选择索引驱动的执行路径（date_dim小表驱动→索引回表→逐步过滤），恢复原计划的Nested Loop+索引扫描模式。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "彻底移除所有CTE（filtered_dates/filtered_store_sales/filtered_store_returns/filtered_catalog_sales），将过滤条件直接内联到主查询的JOIN和WHERE子句中。CTE物化阻止了优化器将date_dim的高选择性过滤（d_year=2002 AND d_moy BETWEEN 6 AND 8，预估仅92行）下推到事实表索引扫描，导致catalog_sales和store_returns被迫全表扫描。内联后优化器可选择：date_dim索引扫描→通过外键索引（如sr_returned_date_sk/cs_sold_date_sk）回表→利用store_sales_pkey/store_returns_pkey精准定位，避免大表全扫。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序为索引驱动模式：1) 先JOIN date_dim(d_year=2002 AND d_moy=6)得到小结果集d1；2) 通过store_sales_pkey索引扫描匹配ss_sold_date_sk，利用复合主键(ss_item_sk, ss_ticket_number)的选择性；3) 再JOIN store_returns，通过store_returns_pkey索引定位(sr_item_sk, sr_ticket_number)匹配行；4) 最后JOIN catalog_sales时，已过滤到极小结果集，即使需要扫描也代价可控。避免当前'先全扫大表再Hash Join'的低效模式，恢复原计划的Nested Loop+索引访问路径。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将IS NOT NULL条件从CTE的WHERE子句移到主查询的JOIN条件中（如'ss_sold_date_sk IS NOT NULL AND d1.d_date_sk = ss_sold_date_sk'合并为'INNER JOIN date_dim d1 ON d1.d_date_sk = ss_sold_date_sk'，INNER JOIN天然过滤NULL）。这样优化器可将NOT NULL隐含条件与date_dim的过滤条件（d_year=2002）组合，选择索引扫描路径。当前CTE中的显式IS NOT NULL过滤在物化边界处无法与后续JOIN条件合并，导致优化器错误估计需全表扫描后再过滤。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用复合主键索引的前缀选择性：store_sales_pkey(ss_item_sk, ss_ticket_number)和store_returns_pkey(sr_item_sk, sr_ticket_number)可通过等值连接条件(sr_item_sk=ss_item_sk AND sr_ticket_number=ss_ticket_number)触发Index Scan。当前CTE策略破坏了这一路径，导致优化器选择Hash Join。改为直接JOIN后，优化器可识别：先通过date_dim过滤得到少量ss_sold_date_sk，再用主键索引定位store_sales行，然后用匹配的(item_sk, ticket_number)在store_returns主键索引中精准查找，避免720万行全扫。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_dates AS (\n  SELECT d_date_sk, d_moy, d_year\n  FROM date_dim\n  WHERE d_year = 2002 AND d_moy BETWEEN 6 AND 8\n)\nSELECT\n  i_item_id,\n  i_item_desc,\n  s_store_id,\n  s_store_name,\n  MIN(ss_net_profit) AS store_sales_profit,\n  MIN(sr_net_loss) AS store_returns_loss,\n  MIN(cs_net_profit) AS catalog_sales_profit\nFROM store_sales\nINNER JOIN filtered_dates d1 ON d1.d_date_sk = ss_sold_date_sk AND d1.d_moy = 6\nINNER JOIN item ON i_item_sk = ss_item_sk\nINNER JOIN store ON s_store_sk = ss_store_sk\nINNER JOIN store_returns ON sr_customer_sk = ss_customer_sk\n  AND sr_item_sk = ss_item_sk\n  AND sr_ticket_number = ss_ticket_number\n  AND sr_returned_date_sk IS NOT NULL\nINNER JOIN filtered_dates d2 ON d2.d_date_sk = sr_returned_date_sk\nINNER JOIN catalog_sales ON cs_bill_customer_sk = sr_customer_sk\n  AND cs_item_sk = sr_item_sk\n  AND cs_sold_date_sk IS NOT NULL\nINNER JOIN filtered_dates d3 ON d3.d_date_sk = cs_sold_date_sk\nWHERE ss_customer_sk IS NOT NULL\n  AND ss_store_sk IS NOT NULL\nGROUP BY i_item_id, i_item_desc, s_store_id, s_store_name\nORDER BY i_item_id, i_item_desc, s_store_id, s_store_name\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. 保留filtered_dates CTE：该CTE过滤d_year=2002且d_moy在6-8之间的日期维度行，被d1/d2/d3三次复用。保留CTE避免重复扫描date_dim，且date_dim的高选择性过滤（预估92行）可被优化器物化后复用，语义与原SQL完全一致。\n\n2. 移除filtered_store_sales/filtered_store_returns/filtered_catalog_sales三个CTE：这些CTE仅做IS NOT NULL过滤，但CTE物化边界阻止优化器将过滤条件与后续JOIN条件合并，导致全表扫描。将IS NOT NULL条件内联到主查询后，优化器可选择索引驱动路径（如通过store_sales_pkey或store_returns_pkey索引扫描），避免大表全扫。语义保持不变，因为INNER JOIN天然过滤NULL值（如sr_returned_date_sk IS NOT NULL与INNER JOIN d2 ON d2.d_date_sk=sr_returned_date_sk等价，JOIN失败时该行被排除）。\n\n3. store_sales的IS NOT NULL条件处理：ss_sold_date_sk的NOT NULL由INNER JOIN d1隐含保证；ss_item_sk和ss_ticket_number在Schema中定义为NOT NULL，无需显式过滤；ss_customer_sk和ss_store_sk的NOT NULL条件移至WHERE子句，保持与原SQL相同的过滤语义（原CTE中WHERE ss_customer_sk IS NOT NULL等价于主查询WHERE ss_customer_sk IS NOT NULL）。\n\n4. store_returns的IS NOT NULL条件处理：sr_returned_date_sk IS NOT NULL移至JOIN条件中（sr_returned_date_sk IS NOT NULL AND ... JOIN d2 ON d2.d_date_sk=sr_returned_date_sk），与INNER JOIN d2语义等价；sr_customer_sk和sr_item_sk的NOT NULL由等值连接条件（sr_customer_sk=ss_customer_sk且ss_customer_sk已在WHERE中过滤NOT NULL，sr_item_sk=ss_item_sk且ss_item_sk为NOT NULL列）隐含保证，无需显式声明。\n\n5. catalog_sales的IS NOT NULL条件处理：cs_sold_date_sk IS NOT NULL移至JOIN条件中，与INNER JOIN d3语义等价；cs_bill_customer_sk和cs_item_sk的NOT NULL由等值连接条件（cs_bill_customer_sk=sr_customer_sk且sr_customer_sk已被过滤，cs_item_sk=sr_item_sk且sr_item_sk为NOT NULL列）隐含保证。\n\n6. JOIN顺序和连接条件保持不变：所有表的连接关系（store_sales与d1通过ss_sold_date_sk连接且d1.d_moy=6，store_returns与store_sales通过customer_sk/item_sk/ticket_number三键连接，catalog_sales与store_returns通过customer_sk/item_sk连接）完全保留原SQL逻辑，仅将CTE内联为直接表引用，不改变JOIN树结构和谓词作用域。\n\n7. GROUP BY和聚合函数语义不变：分组键（i_item_id, i_item_desc, s_store_id, s_store_name）和聚合函数（MIN(ss_net_profit), MIN(sr_net_loss), MIN(cs_net_profit)）与原SQL完全一致，结果集行数和每行的聚合值保持相同。\n\n8. 索引利用潜力恢复：移除CTE后，优化器可识别store_sales_pkey(ss_item_sk, ss_ticket_number)和store_returns_pkey(sr_item_sk, sr_ticket_number)的复合主键索引，通过等值连接条件（sr_item_sk=ss_item_sk AND sr_ticket_number=ss_ticket_number）触发索引扫描，避免原计划中catalog_sales和store_returns的全表扫描（1427万行+670万行），这是性能优化而非语义变更。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL与原始SQL等价：CTE内联、IS NOT NULL条件移至JOIN/WHERE、过滤条件位置调整均不改变最终结果集，所有连接关系、过滤谓词、分组聚合逻辑完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 6->3, Hash/Merge 1->4 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "结构明确恶化：1) 执行计划变化：原计划使用 Parallel Seq Scan + Index Scan（5次索引访问）+ Bitmap Scan，重写后退化为 5 次 Seq Scan（catalog_sales 1433万行、store_returns 695万行、item 10.2万行、store 102行、date_dim 1次）+ 仅 1 次 Index Scan；2) 结构性退化信号：CTE 物化阻止了优化器将 date_dim 的高选择性过滤（d_year=2002 AND d_moy BETWEEN 6 AND 8，仅92行）下推到事实表索引扫描，导致 catalog_sales（1433万行）和 store_returns（695万行）被迫全表扫描，而原计划通过 store_sales_pkey 和 store_returns_pkey 复合主键索引精准定位，避免了大表全扫；3) 关键访问路径丢失：原计划的 Nested Loop + Index Scan 路径（利用 store_sales_pkey(ss_item_sk, ss_ticket_number) 和 store_returns_pkey(sr_item_sk, sr_ticket_number) 的前缀选择性）被 Hash Join + Seq Scan 替代，丢失了索引驱动的高效访问模式；4) 并行度下降：原计划使用 Parallel Seq Scan（Workers Planned: 2）+ Gather Merge，重写后完全丢失并行执行；5) 行数估计求和：从 300万 激增至 2294万（7.6倍），虽不能单独作为恶化依据，但结合上述结构退化信号，佐证了 CTE 物化导致的中间结果膨胀；6) Cost 增幅：从 178224 增至 841757（4.7倍），虽仅作辅助信号，但与结构退化一致。CTE 引入的'预聚合复用'意图在此场景下适得其反，因 date_dim 过滤后仅92行，物化反而阻止了优化器选择索引驱动路径。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 rewritten_sql（第2轮），执行以下改写：1) 彻底移除 CTE filtered_dates，将 date_dim 过滤条件直接内联到主查询的 JOIN 子句中（如 'INNER JOIN date_dim d1 ON d1.d_date_sk = ss_sold_date_sk AND d1.d_year = 2002 AND d1.d_moy = 6'），使优化器可选择 date_dim 索引扫描后通过外键索引回表；2) 移除所有显式 IS NOT NULL 条件（ss_sold_date_sk/sr_returned_date_sk/cs_sold_date_sk），INNER JOIN 天然过滤 NULL，显式条件反而干扰优化器选择索引路径；3) 调整 JOIN 顺序为索引驱动模式：先 JOIN date_dim d1（高选择性过滤）→ store_sales（通过 store_sales_pkey 索引扫描）→ store_returns（通过 store_returns_pkey 索引定位 (sr_item_sk, sr_ticket_number)）→ catalog_sales（此时已过滤到极小结果集）；4) 保留 INNER JOIN 语义，但移除 CTE 物化边界，让优化器自由选择 Nested Loop + Index Scan 路径；5) 验证改写后执行计划是否恢复 Index Scan（至少 store_sales_pkey 和 store_returns_pkey）+ Parallel Seq Scan（date_dim），避免 catalog_sales/store_returns 全表扫描。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+ℹ️  估计代价上升 372.3%（> 50.0%），计划结构分析建议保留当前重写，不回退。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 828
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=178224.14, 重写=841757.4，相对变化: -372.30%
+✅ 成功存储，记录ID: 406167e4-5740-43f6-a0be-e5032d3d3f39
+
+----------------------------------------
+

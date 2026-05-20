@@ -1,0 +1,191 @@
+Query ID: 28
+==================================================
+
+Original: select  i_brand_id brand_id, i_brand brand, i_manufact_id, i_manufact,  	sum(ss_ext_sales_price) ext_price   from date_dim, store_sales, item,customer,customer_address,store   where  d_date_sk = ss_sold_date_sk     and ss_item_sk = i_item_sk     and ss_customer_sk = c_customer_sk     and c_current_addr_sk = ca_address_sk     and ss_store_sk = s_store_sk     AND i_category  = 'Home'     and d_year=2002     and d_moy = 8     and substring(ca_zip,1,5) <> substring(s_zip,1,5)     and ca_state  = 'GA'     and c_birth_month = 4     and ss_wholesale_cost BETWEEN 80 AND 100  group by i_brand       ,i_brand_id       ,i_manufact_id       ,i_manufact  order by ext_price desc          ,i_brand          ,i_brand_id          ,i_manufact_id          ,i_manufact limit 100 ;
+Rewritten: SELECT
+  i.i_brand_id AS brand_id,
+  i.i_brand AS brand,
+  i.i_manufact_id,
+  i.i_manufact,
+  SUM(ss.ss_ext_sales_price) AS ext_price
+FROM store_sales ss
+INNER JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
+  AND d.d_year = 2002 AND d.d_moy = 8
+INNER JOIN item i ON ss.ss_item_sk = i.i_item_sk
+  AND i.i_category = 'Home'
+INNER JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk
+  AND c.c_birth_month = 4
+INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+  AND ca.ca_state = 'GA'
+INNER JOIN store s ON ss.ss_store_sk = s.s_store_sk
+WHERE ss.ss_wholesale_cost BETWEEN 80 AND 100
+  AND LEFT(ca.ca_zip, 5) <> LEFT(s.s_zip, 5)
+GROUP BY i.i_brand, i.i_brand_id, i.i_manufact_id, i.i_manufact
+ORDER BY ext_price DESC, i.i_brand, i.i_brand_id, i.i_manufact_id, i.i_manufact
+LIMIT 100
+Time Cost: 192.50s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将 filtered_dates、filtered_items、filtered_customers 三个 CTE 改写为 EXISTS 半连接形式，直接在 store_sales 的 WHERE 子句中使用 EXISTS (SELECT 1 FROM date_dim WHERE d_date_sk = ss.ss_sold_date_sk AND d_year = 2002 AND d_moy = 8)，强制优化器先评估维度表过滤条件的选择性，避免 CTE 内联后失去过滤优先级'}, {'group': '连接优化', 'produced_suggestion': "将 filtered_customers 中的 customer 与 customer_address 的连接拆分，在主查询中直接连接 customer 和 customer_address，并将 ca_state = 'GA' 和 c_birth_month = 4 作为独立的 WHERE 条件，减少嵌套连接层级，让优化器有更多连接顺序选择空间"}, {'group': '谓词简化', 'produced_suggestion': '将 SUBSTRING(ca.ca_zip, 1, 5) <> SUBSTRING(s.s_zip, 1, 5) 条件前置到 store 和 customer_address 的连接条件中，改写为 LEFT(ca.ca_zip, 5) <> LEFT(s.s_zip, 5)（LEFT 函数通常比 SUBSTRING 更高效），并考虑将该条件与其他过滤条件合并，减少后期过滤开销'}, {'group': '连接优化', 'produced_suggestion': "调整连接顺序，优先连接高选择性的维度表（date_dim 过滤后约 31 行，item 过滤 i_category='Home' 预计选择性高），将 store_sales 作为最后连接的表，通过 Nested Loop + Index Scan 方式探测事实表，而非当前的全表扫描后连接"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示store_sales表的全表扫描(Seq Scan)占总代价的98.6%，这是主要性能瓶颈。该查询涉及6表连接，存在多个过滤条件可以下推优化。参考历史案例显示相似SQL通过FILTER_INTO_JOIN、JOIN_CONDITION_PUSH、JOIN_PUSH_TRANSITIVE_PREDICATES和STRATEGY_CTE_DECOMPOSITION规则组合取得了优化效果。当前SQL可以通过以下方式优化：1)将date_dim和item的过滤条件尽早应用以减少连接数据量；2)优化连接顺序，先连接小表和有选择性过滤的表；3)将谓词条件下推到连接前执行；4)利用传递性谓词减少数据扫描。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim的过滤条件(d_year=2002 AND d_moy=8)和item的过滤条件(i_category='Home')下推到各自表的扫描阶段，在连接前过滤数据。将customer的c_birth_month=4和customer_address的ca_state='GA'条件也尽早应用，减少参与连接的数据量。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接date_dim(73049行，有年月过滤)和store_sales，然后连接item(有类别过滤)，再连接customer和customer_address(有州和生日月过滤)，最后连接store。这样可以利用维度表的过滤条件尽早减少事实表store_sales的数据量。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用传递性谓词优化：从date_dim的d_year=2002和d_moy=8条件，可以推导出d_date_sk的取值范围，将此范围条件传递到store_sales.ss_sold_date_sk上，配合ss_wholesale_cost BETWEEN 80 AND 100条件，减少store_sales的扫描量。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑将高选择性的过滤条件(date_dim、item、customer_address)先通过CTE或子查询物化，获得符合条件的主键集合，然后再与store_sales进行半连接，避免store_sales的全表扫描参与多表连接。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_dates AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2002 AND d_moy = 8\n),\nfiltered_items AS (\n  SELECT i_item_sk, i_brand_id, i_brand, i_manufact_id, i_manufact\n  FROM item\n  WHERE i_category = 'Home'\n),\nfiltered_customers AS (\n  SELECT c.c_customer_sk\n  FROM customer c\n  INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\n  WHERE ca.ca_state = 'GA' AND c.c_birth_month = 4\n)\nSELECT\n  fi.i_brand_id AS brand_id,\n  fi.i_brand AS brand,\n  fi.i_manufact_id,\n  fi.i_manufact,\n  SUM(ss.ss_ext_sales_price) AS ext_price\nFROM store_sales ss\nINNER JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk\nINNER JOIN filtered_items fi ON ss.ss_item_sk = fi.i_item_sk\nINNER JOIN filtered_customers fc ON ss.ss_customer_sk = fc.c_customer_sk\nINNER JOIN store s ON ss.ss_store_sk = s.s_store_sk\nINNER JOIN customer_address ca ON fc.c_customer_sk IN (\n  SELECT c_customer_sk FROM customer WHERE c_current_addr_sk = ca.ca_address_sk\n)\nWHERE ss.ss_wholesale_cost BETWEEN 80 AND 100\n  AND SUBSTRING(ca.ca_zip, 1, 5) <> SUBSTRING(s.s_zip, 1, 5)\nGROUP BY fi.i_brand, fi.i_brand_id, fi.i_manufact_id, fi.i_manufact\nORDER BY ext_price DESC, fi.i_brand, fi.i_brand_id, fi.i_manufact_id, fi.i_manufact\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. CTE物化高选择性过滤：将date_dim的d_year=2002和d_moy=8条件提取为filtered_dates CTE，将item的i_category='Home'条件提取为filtered_items CTE，将customer与customer_address的连接及ca_state='GA'和c_birth_month=4条件提取为filtered_customers CTE。这三个CTE分别返回符合条件的主键集合，与原SQL在各表上应用相同谓词，不改变过滤语义。\n\n2. 连接顺序调整与提前过滤：原SQL使用隐式逗号连接，优化器可能选择次优连接顺序。重写SQL通过显式INNER JOIN，先让store_sales与小规模的filtered_dates、filtered_items、filtered_customers进行连接，利用主键索引和过滤后的小数据集减少中间结果。所有连接条件(ss_sold_date_sk=d_date_sk, ss_item_sk=i_item_sk, ss_customer_sk=c_customer_sk, ss_store_sk=s_store_sk)保持不变，连接类型均为INNER JOIN，与原SQL等价。\n\n3. customer_address连接处理：原SQL中customer通过c_current_addr_sk与customer_address的ca_address_sk连接。重写SQL在filtered_customers CTE中已完成此连接并应用ca_state='GA'过滤。主查询中需再次引用customer_address以获取ca_zip用于与store的s_zip比较。通过子查询确保customer_address与已过滤的customer关联，保持原有连接语义。\n\n4. WHERE子句谓词保留：ss_wholesale_cost BETWEEN 80 AND 100和SUBSTRING(ca_zip,1,5)<>SUBSTRING(s_zip,1,5)两个谓词在重写SQL的WHERE子句中完整保留，作用于相同的表和列，过滤逻辑不变。\n\n5. GROUP BY与聚合函数：原SQL按i_brand, i_brand_id, i_manufact_id, i_manufact分组并计算SUM(ss_ext_sales_price)。重写SQL的GROUP BY子句使用filtered_items CTE中的对应列(fi.i_brand等)，这些列通过ss_item_sk=i_item_sk的等值连接传递，分组维度与原SQL完全一致，聚合函数SUM(ss.ss_ext_sales_price)作用于相同数据源。\n\n6. ORDER BY与LIMIT：重写SQL的ORDER BY子句按ext_price DESC, i_brand, i_brand_id, i_manufact_id, i_manufact排序，与原SQL顺序一致，LIMIT 100保持不变，确保返回相同的前100行结果。\n\n7. NULL值处理：所有连接均为INNER JOIN，NULL值在连接键上会被自然排除，与原SQL的隐式内连接行为一致。SUBSTRING和BETWEEN操作对NULL的处理逻辑在重写前后保持不变。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在customer_address连接上存在笛卡尔积风险，导致结果集可能包含重复行。",
+    "differences": [
+        {
+            "type": "JOIN语义错误",
+            "description": "重写SQL中customer_address通过子查询连接，但子查询返回的c_customer_sk与外层fc.c_customer_sk的IN条件无法正确关联customer_address，可能产生笛卡尔积或错误的行数",
+            "location": "主查询INNER JOIN customer_address ca ON fc.c_customer_sk IN (SELECT c_customer_sk FROM customer WHERE c_current_addr_sk = ca.ca_address_sk)"
+        },
+        {
+            "type": "过滤条件作用对象",
+            "description": "原SQL中ca_zip来自与customer关联的唯一customer_address行，重写SQL中ca可能匹配多个地址记录，导致SUBSTRING(ca.ca_zip,1,5)比较的数据集不同",
+            "location": "WHERE子句中的ca_zip引用"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在customer_address连接上存在笛卡尔积风险，导致结果集可能包含重复行。
+```json
+{
+  "fixed_sql": "WITH filtered_dates AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2002 AND d_moy = 8\n),\nfiltered_items AS (\n  SELECT i_item_sk, i_brand_id, i_brand, i_manufact_id, i_manufact\n  FROM item\n  WHERE i_category = 'Home'\n),\nfiltered_customers AS (\n  SELECT c.c_customer_sk, c.c_current_addr_sk\n  FROM customer c\n  INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\n  WHERE ca.ca_state = 'GA' AND c.c_birth_month = 4\n)\nSELECT\n  fi.i_brand_id AS brand_id,\n  fi.i_brand AS brand,\n  fi.i_manufact_id,\n  fi.i_manufact,\n  SUM(ss.ss_ext_sales_price) AS ext_price\nFROM store_sales ss\nINNER JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk\nINNER JOIN filtered_items fi ON ss.ss_item_sk = fi.i_item_sk\nINNER JOIN filtered_customers fc ON ss.ss_customer_sk = fc.c_customer_sk\nINNER JOIN store s ON ss.ss_store_sk = s.s_store_sk\nINNER JOIN customer_address ca ON fc.c_current_addr_sk = ca.ca_address_sk\nWHERE ss.ss_wholesale_cost BETWEEN 80 AND 100\n  AND SUBSTRING(ca.ca_zip, 1, 5) <> SUBSTRING(s.s_zip, 1, 5)\nGROUP BY fi.i_brand, fi.i_brand_id, fi.i_manufact_id, fi.i_manufact\nORDER BY ext_price DESC, fi.i_brand, fi.i_brand_id, fi.i_manufact_id, fi.i_manufact\nLIMIT 100",
+  "note": "将filtered_customers CTE增加c_current_addr_sk字段，主查询中用fc.c_current_addr_sk直接JOIN customer_address，移除错误的子查询IN条件，确保ca_zip来自customer关联的唯一地址"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正customer_address连接：在filtered_customers CTE中保留c_current_addr_sk，主查询通过fc.c_current_addr_sk = ca.ca_address_sk直接连接，消除了上轮的笛卡尔积风险，与原SQL语义完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（cost 701809.67，结构一致），说明 PostgreSQL 优化器将 CTE 内联后生成了与原 SQL 相同的执行计划。重写 SQL 引入了 3 个 CTE（filtered_dates、filtered_items、filtered_customers），意图通过预过滤减少连接数据量，但优化器未采纳该策略，仍选择原有的 Nested Loop + Hash Join 路径。结构上无改进也无恶化，但 CTE 未发挥预期作用。下一步应尝试强制物化 CTE 或改用派生表 + LATERAL，或调整连接顺序提示，迫使优化器先执行高选择性过滤。",
+  "no_further_optimization": false,
+  "next_step_advice": "在 CTE 定义后添加 MATERIALIZED 关键字（如 WITH filtered_dates AS MATERIALIZED (...)）强制物化，防止优化器内联；或改用派生表结合 LATERAL 语法，显式控制连接顺序；或尝试将 date_dim 和 item 的过滤条件改写为 EXISTS 半连接，引导优化器先执行维度表过滤再扫描 store_sales。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示 store_sales 全表扫描占总代价 98.6%（692,193.53），过滤条件 ss_wholesale_cost BETWEEN 80 AND 100 在扫描后应用。上一轮 CTE 被优化器内联，未改变执行路径。当前瓶颈是事实表 store_sales 缺乏有效过滤前置，需要通过半连接改写将维度表高选择性过滤转换为 EXISTS 子查询，引导优化器先执行维度表过滤再探测事实表，同时将 ss_wholesale_cost 条件与连接条件结合，利用索引扫描替代全表扫描。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将 filtered_dates、filtered_items、filtered_customers 三个 CTE 改写为 EXISTS 半连接形式，直接在 store_sales 的 WHERE 子句中使用 EXISTS (SELECT 1 FROM date_dim WHERE d_date_sk = ss.ss_sold_date_sk AND d_year = 2002 AND d_moy = 8)，强制优化器先评估维度表过滤条件的选择性，避免 CTE 内联后失去过滤优先级"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将 filtered_customers 中的 customer 与 customer_address 的连接拆分，在主查询中直接连接 customer 和 customer_address，并将 ca_state = 'GA' 和 c_birth_month = 4 作为独立的 WHERE 条件，减少嵌套连接层级，让优化器有更多连接顺序选择空间"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将 SUBSTRING(ca.ca_zip, 1, 5) <> SUBSTRING(s.s_zip, 1, 5) 条件前置到 store 和 customer_address 的连接条件中，改写为 LEFT(ca.ca_zip, 5) <> LEFT(s.s_zip, 5)（LEFT 函数通常比 SUBSTRING 更高效），并考虑将该条件与其他过滤条件合并，减少后期过滤开销"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先连接高选择性的维度表（date_dim 过滤后约 31 行，item 过滤 i_category='Home' 预计选择性高），将 store_sales 作为最后连接的表，通过 Nested Loop + Index Scan 方式探测事实表，而非当前的全表扫描后连接"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "SELECT\n  i.i_brand_id AS brand_id,\n  i.i_brand AS brand,\n  i.i_manufact_id,\n  i.i_manufact,\n  SUM(ss.ss_ext_sales_price) AS ext_price\nFROM store_sales ss\nINNER JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk\n  AND d.d_year = 2002 AND d.d_moy = 8\nINNER JOIN item i ON ss.ss_item_sk = i.i_item_sk\n  AND i.i_category = 'Home'\nINNER JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk\n  AND c.c_birth_month = 4\nINNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\n  AND ca.ca_state = 'GA'\nINNER JOIN store s ON ss.ss_store_sk = s.s_store_sk\nWHERE ss.ss_wholesale_cost BETWEEN 80 AND 100\n  AND LEFT(ca.ca_zip, 5) <> LEFT(s.s_zip, 5)\nGROUP BY i.i_brand, i.i_brand_id, i.i_manufact_id, i.i_manufact\nORDER BY ext_price DESC, i.i_brand, i.i_brand_id, i.i_manufact_id, i.i_manufact\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. 移除了所有 CTE（filtered_dates、filtered_items、filtered_customers），将过滤条件直接下推到各表的 JOIN ON 子句中。原 CTE 的作用是预过滤维度表，但上一轮反馈显示优化器将其内联后执行计划与原 SQL 完全相同，说明 CTE 未被物化且未改变连接顺序。本次改写将过滤条件直接嵌入 JOIN ON，语义上等价于 INNER JOIN + WHERE 的组合，不改变结果集。\n\n2. date_dim 的过滤条件 d_year = 2002 AND d_moy = 8 从 CTE 的 WHERE 子句移至主查询的 JOIN ON 子句（ss.ss_sold_date_sk = d.d_date_sk AND d.d_year = 2002 AND d.d_moy = 8）。由于是 INNER JOIN，ON 子句中的过滤条件与 WHERE 子句中的过滤条件语义完全等价，不会产生额外的行或遗漏行。\n\n3. item 的过滤条件 i_category = 'Home' 从 CTE 移至 JOIN ON 子句（ss.ss_item_sk = i.i_item_sk AND i.i_category = 'Home'）。同样，INNER JOIN 的 ON 条件与 WHERE 条件等价，且 i_category 是 item 表的列，不涉及 NULL 语义变化（若 i_category 为 NULL，则 i_category = 'Home' 为 FALSE，该行不会被连接，与原 SQL 一致）。\n\n4. customer 和 customer_address 的连接从 CTE 中的嵌套连接改为主查询中的两个独立 INNER JOIN。原 CTE 中 customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk WHERE ca.ca_state = 'GA' AND c.c_birth_month = 4，现改写为主查询中 customer c ON ss.ss_customer_sk = c.c_customer_sk AND c.c_birth_month = 4，以及 customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_state = 'GA'。由于都是 INNER JOIN，连接顺序和条件位置的调整不改变最终结果集：只有同时满足 c.c_birth_month = 4 和 ca.ca_state = 'GA' 且 c.c_current_addr_sk = ca.ca_address_sk 的行才会被保留。\n\n5. 将 SUBSTRING(ca.ca_zip, 1, 5) <> SUBSTRING(s.s_zip, 1, 5) 改写为 LEFT(ca.ca_zip, 5) <> LEFT(s.s_zip, 5)。LEFT 函数与 SUBSTRING(str, 1, n) 在 PostgreSQL 中语义完全等价（均返回字符串前 n 个字符），且 LEFT 通常有更好的优化器支持。该条件仍保留在 WHERE 子句中，因为它涉及两个表（ca 和 s）的列比较，放在 WHERE 中更清晰，且不影响语义。\n\n6. GROUP BY 和 ORDER BY 子句保持不变，仍按 i_brand、i_brand_id、i_manufact_id、i_manufact 分组和排序，LIMIT 100 保持不变。聚合函数 SUM(ss.ss_ext_sales_price) 的作用域未改变，仍对满足所有连接和过滤条件的 store_sales 行进行求和。\n\n7. 所有 INNER JOIN 的连接键和过滤条件均保持原有逻辑，未引入新的连接或遗漏任何连接。原 SQL 中 filtered_customers 的 CTE 已经包含了 customer 和 customer_address 的连接，主查询中又有 INNER JOIN customer_address ca ON fc.c_current_addr_sk = ca.ca_address_sk，实际上是冗余连接（fc 已经关联了 ca，主查询再次连接 ca 是为了使用 ca.ca_zip）。本次改写保持了这一逻辑：customer c 连接 customer_address ca，然后在 WHERE 中使用 ca.ca_zip，与原 SQL 的数据流完全一致。\n\n8. 本次改写的核心目标是移除 CTE 并将过滤条件下推到 JOIN ON 子句，期望优化器能更早应用高选择性过滤（如 d_year = 2002 AND d_moy = 8 预计过滤到约 31 行），从而减少后续连接的数据量。由于所有改写均在 INNER JOIN 框架内进行，且未改变任何谓词的逻辑或作用域，结果集与原 SQL 完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL将CTE内联并将过滤条件下推到JOIN ON子句，所有INNER JOIN的连接键、过滤谓词、聚合维度、排序和LIMIT均与原SQL一致，LEFT函数与SUBSTRING(str,1,n)语义等价，结果集完全相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（cost 701809.67，结构节点类型/数量/顺序均相同），说明重写 SQL 未产生任何实质性改进。虽然将 SUBSTRING 改为 LEFT、显式 INNER JOIN 语法、过滤条件前置到 ON 子句等改写在语义上更清晰，但优化器生成的执行计划与原 SQL 完全相同：相同的并行 Seq Scan、相同的 Hash Join、相同的 Nested Loop + Index Scan 顺序、相同的 Gather Merge 聚合策略。行数估计求和（2289364）也完全一致。这表明优化器已将两种写法规范化为相同的内部表示，当前重写未触发任何执行路径变化。结合 optimization_context 显示本轮为 round 2 且 groups='no_rule'，说明已无可应用的规则组，继续迭代无意义。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 606
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=701809.67, 重写=701809.67，相对变化: 0.00%
+✅ 成功存储，记录ID: d507f73e-7836-48ee-a6a7-e3091a16095b
+
+----------------------------------------
+

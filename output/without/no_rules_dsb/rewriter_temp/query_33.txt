@@ -1,0 +1,185 @@
+Query ID: 33
+==================================================
+
+Original: select min(i_brand_id), min(i_manufact_id),  	min(ss_ext_sales_price)  from date_dim, store_sales, item,customer,customer_address,store  where d_date_sk = ss_sold_date_sk    and ss_item_sk = i_item_sk    and ss_customer_sk = c_customer_sk    and c_current_addr_sk = ca_address_sk    and ss_store_sk = s_store_sk    AND i_category  = 'Books'    and d_year=1999    and d_moy = 7    and substring(ca_zip,1,5) <> substring(s_zip,1,5)    and ca_state  = 'IN'    and c_birth_month = 10    and ss_wholesale_cost BETWEEN 57 AND 77  ;
+Rewritten: WITH filtered_date AS MATERIALIZED (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 1999 AND d_moy = 7
+),
+filtered_item AS MATERIALIZED (
+  SELECT i_item_sk, i_brand_id, i_manufact_id
+  FROM item
+  WHERE i_category = 'Books'
+),
+filtered_customer AS MATERIALIZED (
+  SELECT c_customer_sk, c_current_addr_sk
+  FROM customer
+  WHERE c_birth_month = 10
+),
+filtered_customer_address AS MATERIALIZED (
+  SELECT ca_address_sk, substring(ca_zip, 1, 5) AS ca_zip_prefix
+  FROM customer_address
+  WHERE ca_state = 'IN'
+),
+filtered_store AS MATERIALIZED (
+  SELECT s_store_sk, substring(s_zip, 1, 5) AS s_zip_prefix
+  FROM store
+),
+filtered_store_sales AS MATERIALIZED (
+  SELECT ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_store_sk, ss_ext_sales_price
+  FROM store_sales
+  WHERE ss_wholesale_cost BETWEEN 57 AND 77
+)
+SELECT 
+  min(fi.i_brand_id), 
+  min(fi.i_manufact_id), 
+  min(fss.ss_ext_sales_price)
+FROM filtered_date fd
+INNER JOIN filtered_item fi ON 1=1
+INNER JOIN filtered_store_sales fss ON fss.ss_sold_date_sk = fd.d_date_sk AND fss.ss_item_sk = fi.i_item_sk
+INNER JOIN filtered_customer fc ON fss.ss_customer_sk = fc.c_customer_sk
+INNER JOIN filtered_customer_address fca ON fc.c_current_addr_sk = fca.ca_address_sk
+INNER JOIN filtered_store fs ON fss.ss_store_sk = fs.s_store_sk
+WHERE fca.ca_zip_prefix <> fs.s_zip_prefix
+Time Cost: 182.01s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将substring不等条件改写为等值条件：在filtered_customer_address和filtered_store的CTE中增加派生列left(ca_zip,5)和left(s_zip,5)，主查询WHERE改为fca.ca_zip_prefix <> fs.s_zip_prefix。这样可将函数计算前置到小表过滤阶段，主JOIN使用简单列比较，提升Hash Join效率并可能触发优化器生成更优执行计划。'}, {'group': '连接优化', 'produced_suggestion': '调整JOIN顺序：先连接高选择性小表构建中间结果集，再与store_sales连接。建议顺序：filtered_date ⋈ filtered_item → 结果 ⋈ filtered_customer → 结果 ⋈ filtered_customer_address → 结果 ⋈ filtered_store → 最后 ⋈ store_sales。通过STRAIGHT_JOIN提示或重排FROM子句强制执行，减少store_sales参与连接时的数据量。'}, {'group': '谓词简化', 'produced_suggestion': '将store_sales的ss_wholesale_cost过滤条件提前到独立CTE中：创建filtered_store_sales CTE执行SELECT ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_store_sk, ss_ext_sales_price FROM store_sales WHERE ss_wholesale_cost BETWEEN 57 AND 77，将过滤前置到扫描阶段，减少后续JOIN的基表行数，降低Seq Scan代价占比。'}, {'group': '子查询优化', 'produced_suggestion': '在所有CTE定义后添加MATERIALIZED提示（PostgreSQL 12+语法：WITH filtered_date AS MATERIALIZED (...)），强制优化器物化中间结果而非内联。特别是filtered_date（73049行）和filtered_store_sales，物化后可作为Hash Join的构建端，避免重复扫描大表。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示store_sales表的全表扫描(Seq Scan)占总代价98.4%，是主要性能瓶颈。该查询涉及6表连接，存在多个过滤条件可以下推优化。历史案例显示相似SQL通过FILTER_INTO_JOIN和JOIN_CONDITION_PUSH规则获得过优化效果。当前SQL结构可通过谓词下推、连接顺序调整和过滤条件前置来减少中间结果集大小。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将store_sales表的过滤条件ss_wholesale_cost BETWEEN 57 AND 77尽早应用，建议改写为先过滤后连接的结构，减少参与连接的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先连接高选择性的小表：先连接date_dim(d_year=1999 AND d_moy=7)和item(i_category='Books')过滤后再与store_sales连接，利用索引date_dim_pkey和item_pkey"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将customer相关过滤条件(c_birth_month=10)和customer_address条件(ca_state='IN')下推到各自表的扫描阶段，在连接前减少数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将substring(ca_zip,1,5)<>substring(s_zip,1,5)条件从WHERE子句转换为JOIN条件，使其在customer_address和store连接时立即生效"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 1999 AND d_moy = 7\n),\nfiltered_item AS (\n  SELECT i_item_sk, i_brand_id, i_manufact_id\n  FROM item\n  WHERE i_category = 'Books'\n),\nfiltered_customer AS (\n  SELECT c_customer_sk, c_current_addr_sk\n  FROM customer\n  WHERE c_birth_month = 10\n),\nfiltered_customer_address AS (\n  SELECT ca_address_sk, ca_zip\n  FROM customer_address\n  WHERE ca_state = 'IN'\n),\nfiltered_store AS (\n  SELECT s_store_sk, s_zip\n  FROM store\n)\nSELECT \n  min(fi.i_brand_id), \n  min(fi.i_manufact_id), \n  min(ss.ss_ext_sales_price)\nFROM store_sales ss\nINNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk\nINNER JOIN filtered_item fi ON ss.ss_item_sk = fi.i_item_sk\nINNER JOIN filtered_customer fc ON ss.ss_customer_sk = fc.c_customer_sk\nINNER JOIN filtered_customer_address fca ON fc.c_current_addr_sk = fca.ca_address_sk\nINNER JOIN filtered_store fs ON ss.ss_store_sk = fs.s_store_sk\nWHERE ss.ss_wholesale_cost BETWEEN 57 AND 77\n  AND substring(fca.ca_zip, 1, 5) <> substring(fs.s_zip, 1, 5);",
+  "semantic_correctness_guarantee": "1. **CTE提取与谓词下推**：将原SQL中WHERE子句的各表过滤条件提取为5个CTE（filtered_date、filtered_item、filtered_customer、filtered_customer_address、filtered_store），每个CTE仅包含满足原WHERE条件的行。这些过滤条件（d_year=1999 AND d_moy=7、i_category='Books'、c_birth_month=10、ca_state='IN'）在原SQL中通过AND连接，提取到CTE后仍保持相同的过滤语义，不会改变最终参与连接的数据集。\n\n2. **连接结构保持**：原SQL使用隐式内连接（逗号分隔表+WHERE连接条件），重写SQL改为显式INNER JOIN，连接条件完全一致（ss_sold_date_sk=d_date_sk、ss_item_sk=i_item_sk、ss_customer_sk=c_customer_sk、c_current_addr_sk=ca_address_sk、ss_store_sk=s_store_sk）。内连接的交换律和结合律保证连接顺序调整不改变结果集，所有连接均为等值内连接，不涉及外连接或相关子查询。\n\n3. **store_sales表过滤条件位置**：原SQL中ss_wholesale_cost BETWEEN 57 AND 77在WHERE子句中，重写SQL将其保留在最终WHERE子句（CTE之后），确保该条件在所有连接完成后应用于store_sales表，与原SQL执行逻辑一致。由于store_sales是事实表且该条件仅涉及其自身列，位置不影响语义。\n\n4. **substring不等条件保持**：原SQL的substring(ca_zip,1,5)<>substring(s_zip,1,5)条件在重写SQL中保持在WHERE子句，作用于连接后的fca.ca_zip和fs.s_zip列。由于CTE中已分别过滤出ca_state='IN'的customer_address和所有store行，该不等条件在连接后应用与原SQL完全等价。\n\n5. **聚合函数语义不变**：原SQL和重写SQL均对i_brand_id、i_manufact_id、ss_ext_sales_price三列执行min()聚合，无GROUP BY子句，返回全局最小值。重写SQL通过CTE减少了参与连接的行数，但最终连接结果集与原SQL相同（所有过滤和连接条件完全一致），因此三个min()函数计算的输入集合相同，输出结果相同。\n\n6. **NULL值处理一致性**：原SQL的所有过滤条件（等值、BETWEEN、substring不等）在遇到NULL时行为明确（NULL不满足任何条件被过滤），重写SQL将这些条件分别应用于CTE和最终WHERE，NULL处理逻辑不变。连接条件为等值连接，NULL值不参与匹配，语义保持一致。\n\n7. **优化效果说明**：通过CTE提前过滤各维度表（date_dim从73049行过滤到约30行、item过滤到Books类别、customer过滤到10月生日、customer_address过滤到IN州），减少了与store_sales大表连接时的笛卡尔积规模，利用date_dim_pkey、item_pkey、customer_pkey等主键索引加速CTE扫描，同时保持与原SQL完全相同的结果集语义。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取过滤条件并改为显式INNER JOIN，所有连接条件、过滤谓词、聚合函数均与原SQL一致，仅改变执行结构不改变结果集语义。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（cost=703254.84，结构一致），CTE重写未被优化器采纳。原因：优化器将CTE内联后与原SQL等价，未产生实际结构改进。虽然重写SQL引入5个CTE意图复用中间结果，但EXPLAIN显示优化器仍执行相同的Nested Loop + Hash Join路径，未实现预期的"一次扫描+复用"效果。关键问题：1) store_sales全表扫描(Plan Rows=2781608)仍是主瓶颈；2) 过滤条件未充分下推，date_dim/item/customer/customer_address的过滤仍在JOIN后执行；3) substring不等条件作为Join Filter而非Hash Cond，无法利用索引。当前重写未改善结构，需继续优化。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前CTE结构继续改进：1) 在filtered_date/filtered_item CTE中增加MATERIALIZED提示强制物化，避免被内联；2) 将store_sales的ss_wholesale_cost过滤提前到独立CTE中，减少主表扫描量；3) 调整JOIN顺序：先JOIN高选择性小表(filtered_date, filtered_item)形成中间结果，再与store_sales连接；4) 将substring不等条件改写为先计算zip前缀的派生列，再用等值条件JOIN，提升Hash Join效率。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示store_sales全表扫描代价占比98.4%（692,193.53），是核心瓶颈。上一轮CTE被优化器内联未产生效果。当前需针对性解决：1) substring不等条件阻止Hash Join优化，导致最终过滤在Nested Loop中执行；2) ss_wholesale_cost范围过滤未能利用索引；3) 多表JOIN顺序未优化，大表store_sales过早参与连接。可通过谓词改写、JOIN顺序调整、派生列优化来降低扫描代价。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将substring不等条件改写为等值条件：在filtered_customer_address和filtered_store的CTE中增加派生列left(ca_zip,5)和left(s_zip,5)，主查询WHERE改为fca.ca_zip_prefix <> fs.s_zip_prefix。这样可将函数计算前置到小表过滤阶段，主JOIN使用简单列比较，提升Hash Join效率并可能触发优化器生成更优执行计划。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序：先连接高选择性小表构建中间结果集，再与store_sales连接。建议顺序：filtered_date ⋈ filtered_item → 结果 ⋈ filtered_customer → 结果 ⋈ filtered_customer_address → 结果 ⋈ filtered_store → 最后 ⋈ store_sales。通过STRAIGHT_JOIN提示或重排FROM子句强制执行，减少store_sales参与连接时的数据量。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将store_sales的ss_wholesale_cost过滤条件提前到独立CTE中：创建filtered_store_sales CTE执行SELECT ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_store_sk, ss_ext_sales_price FROM store_sales WHERE ss_wholesale_cost BETWEEN 57 AND 77，将过滤前置到扫描阶段，减少后续JOIN的基表行数，降低Seq Scan代价占比。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "在所有CTE定义后添加MATERIALIZED提示（PostgreSQL 12+语法：WITH filtered_date AS MATERIALIZED (...)），强制优化器物化中间结果而非内联。特别是filtered_date（73049行）和filtered_store_sales，物化后可作为Hash Join的构建端，避免重复扫描大表。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS MATERIALIZED (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 1999 AND d_moy = 7\n),\nfiltered_item AS MATERIALIZED (\n  SELECT i_item_sk, i_brand_id, i_manufact_id\n  FROM item\n  WHERE i_category = 'Books'\n),\nfiltered_customer AS MATERIALIZED (\n  SELECT c_customer_sk, c_current_addr_sk\n  FROM customer\n  WHERE c_birth_month = 10\n),\nfiltered_customer_address AS MATERIALIZED (\n  SELECT ca_address_sk, substring(ca_zip, 1, 5) AS ca_zip_prefix\n  FROM customer_address\n  WHERE ca_state = 'IN'\n),\nfiltered_store AS MATERIALIZED (\n  SELECT s_store_sk, substring(s_zip, 1, 5) AS s_zip_prefix\n  FROM store\n),\nfiltered_store_sales AS MATERIALIZED (\n  SELECT ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_store_sk, ss_ext_sales_price\n  FROM store_sales\n  WHERE ss_wholesale_cost BETWEEN 57 AND 77\n)\nSELECT \n  min(fi.i_brand_id), \n  min(fi.i_manufact_id), \n  min(fss.ss_ext_sales_price)\nFROM filtered_date fd\nINNER JOIN filtered_item fi ON 1=1\nINNER JOIN filtered_store_sales fss ON fss.ss_sold_date_sk = fd.d_date_sk AND fss.ss_item_sk = fi.i_item_sk\nINNER JOIN filtered_customer fc ON fss.ss_customer_sk = fc.c_customer_sk\nINNER JOIN filtered_customer_address fca ON fc.c_current_addr_sk = fca.ca_address_sk\nINNER JOIN filtered_store fs ON fss.ss_store_sk = fs.s_store_sk\nWHERE fca.ca_zip_prefix <> fs.s_zip_prefix",
+  "semantic_correctness_guarantee": "1. **MATERIALIZED提示添加**：在所有5个CTE（filtered_date、filtered_item、filtered_customer、filtered_customer_address、filtered_store）及新增的filtered_store_sales CTE中添加MATERIALIZED提示，强制优化器物化中间结果而非内联展开。这不改变语义，仅改变执行策略，确保过滤后的小结果集被物化为临时表供后续JOIN复用。\n\n2. **store_sales过滤前置**：新增filtered_store_sales CTE，将原主查询WHERE子句中的ss_wholesale_cost BETWEEN 57 AND 77条件提前到CTE内执行，仅投影后续JOIN所需的5列（ss_sold_date_sk、ss_item_sk、ss_customer_sk、ss_store_sk、ss_ext_sales_price）。语义等价性：原SQL在所有JOIN完成后过滤ss_wholesale_cost，新SQL在JOIN前过滤，由于INNER JOIN的交换律和结合律，过滤时机提前不影响最终结果集（过滤条件仅涉及store_sales自身列，不依赖JOIN后的其他表列）。\n\n3. **substring函数计算前置**：在filtered_customer_address和filtered_store CTE中，将substring(ca_zip, 1, 5)和substring(s_zip, 1, 5)计算结果存储为派生列ca_zip_prefix和s_zip_prefix，主查询WHERE子句改为fca.ca_zip_prefix <> fs.s_zip_prefix。语义等价性：substring函数对相同输入产生确定性输出，将计算从主查询移至CTE不改变比较结果；不等条件<>的逻辑保持不变。\n\n4. **JOIN顺序调整**：将FROM子句改为先连接filtered_date和filtered_item（通过笛卡尔积ON 1=1，因两表无直接关联键），再与filtered_store_sales通过复合条件连接（ss_sold_date_sk = d_date_sk AND ss_item_sk = i_item_sk）。语义等价性：原SQL通过store_sales作为驱动表分别JOIN各维度表，新SQL先构建维度表笛卡尔积再与事实表JOIN，由于INNER JOIN满足交换律和结合律，且所有JOIN条件保持不变（仅重新组合为复合条件），最终结果集相同。filtered_date和filtered_item的笛卡尔积在后续与store_sales JOIN时会被ss_sold_date_sk和ss_item_sk的等值条件自然过滤为有效组合。\n\n5. **聚合函数作用域不变**：SELECT子句的min(fi.i_brand_id)、min(fi.i_manufact_id)、min(fss.ss_ext_sales_price)三个聚合函数作用于整个结果集（无GROUP BY），与原SQL的min(fi.i_brand_id)、min(fi.i_manufact_id)、min(ss.ss_ext_sales_price)语义完全一致，仅表别名从ss改为fss以对应新CTE。\n\n6. **NULL值处理一致性**：所有JOIN均为INNER JOIN，NULL值在等值条件中不匹配会被自然过滤；不等条件fca.ca_zip_prefix <> fs.s_zip_prefix对NULL的处理与原substring比较一致（NULL <> 任何值结果为NULL，被WHERE过滤）。substring函数对NULL输入返回NULL，前置计算不改变NULL传播行为。\n\n7. **投影列完整性**：filtered_store_sales CTE投影的5列覆盖主查询所需的所有store_sales列（JOIN键ss_sold_date_sk、ss_item_sk、ss_customer_sk、ss_store_sk及聚合列ss_ext_sales_price），未遗漏任何必需列，确保后续操作可正常执行且结果正确。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE物化、过滤前置、substring计算前置和JOIN顺序调整进行了优化,但所有变换均保持语义等价:过滤条件、JOIN逻辑、聚合函数作用域完全一致,仅执行策略不同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 3->0, Hash/Merge 2->5 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写引入6个CTE实现公共结果复用，将Nested Loop(3)全部转为Hash Join(5)，消除了Index Scan(3→0)，这是典型的去相关+复用正信号。但存在明显结构退化：1)行数估计求和从278万激增至1374万(4.9倍)，说明CTE物化导致中间结果膨胀严重；2)filtered_store_sales CTE扫描667万行(原278万行)，过滤条件未能有效前置；3)主JOIN路径从小表驱动变为大CTE扫描驱动，丧失了原Index Scan的精准探测优势；4)cost从70万升至115万(63%增幅)。虽有CTE复用意图，但实际执行中filtered_store_sales未被多次引用，物化反而成为负担。综合判断：去相关信号存在但被数据膨胀抵消，属于'改进方向正确但实现失效'，不满足成功终止条件。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续优化：1)移除filtered_store_sales的MATERIALIZED提示，改为内联让优化器决定是否物化；2)调整JOIN顺序，先连接小表(filtered_date⋈filtered_item⋈filtered_customer⋈filtered_customer_address⋈filtered_store)构建高选择性中间结果，最后再与store_sales连接并应用ss_wholesale_cost过滤；3)在filtered_customer_address和filtered_store的CTE中预计算ca_zip_prefix和s_zip_prefix，主查询直接用列比较替代substring函数；4)考虑为filtered_date、filtered_item等小CTE保留MATERIALIZED，但filtered_store_sales改为派生表形式直接嵌入主查询，利用谓词下推。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+ℹ️  估计代价上升 63.1%（> 50.0%），计划结构分析建议保留当前重写，不回退。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 444
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=703254.84, 重写=1146847.92，相对变化: -63.08%
+✅ 成功存储，记录ID: 618b1ed1-4521-4081-972a-89c408af44f2
+
+----------------------------------------
+

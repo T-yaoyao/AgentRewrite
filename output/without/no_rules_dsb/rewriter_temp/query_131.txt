@@ -1,0 +1,215 @@
+Query ID: 131
+==================================================
+
+Original: select           cc_call_center_id Call_Center,         cc_name Call_Center_Name,         cc_manager Manager,         sum(cr_net_loss) Returns_Loss from         call_center,         catalog_returns,         date_dim,         customer,         customer_address,         customer_demographics,         household_demographics where         cr_call_center_sk       = cc_call_center_sk and     cr_returned_date_sk     = d_date_sk and     cr_returning_customer_sk= c_customer_sk and     cd_demo_sk              = c_current_cdemo_sk and     hd_demo_sk              = c_current_hdemo_sk and     ca_address_sk           = c_current_addr_sk and     d_year                  = 2001  and     d_moy                   = 10 and     ( (cd_marital_status       = 'M' and cd_education_status     = 'Unknown')         or(cd_marital_status       = 'W' and cd_education_status     = 'Advanced Degree')) and     hd_buy_potential like 'Unknown%' and     ca_gmt_offset           = -7 group by cc_call_center_id,cc_name,cc_manager,cd_marital_status,cd_education_status order by sum(cr_net_loss) desc;
+Rewritten: WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2001 AND d_moy = 10
+),
+filtered_customer_demographics AS (
+    SELECT cd_demo_sk, cd_marital_status, cd_education_status
+    FROM customer_demographics
+    WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')
+       OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')
+),
+filtered_household_demographics AS (
+    SELECT hd_demo_sk
+    FROM household_demographics
+    WHERE hd_buy_potential LIKE 'Unknown%'
+),
+filtered_customer_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_gmt_offset = -7
+),
+qualified_customers AS (
+    SELECT c.c_customer_sk, cd.cd_marital_status, cd.cd_education_status
+    FROM customer c
+    INNER JOIN filtered_customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk
+    INNER JOIN filtered_household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk
+    INNER JOIN filtered_customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+)
+SELECT
+    cc_call_center_id AS Call_Center,
+    cc_name AS Call_Center_Name,
+    cc_manager AS Manager,
+    SUM(cr_net_loss) AS Returns_Loss
+FROM catalog_returns
+INNER JOIN qualified_customers ON cr_returning_customer_sk = c_customer_sk
+INNER JOIN filtered_date ON cr_returned_date_sk = d_date_sk
+INNER JOIN call_center ON cr_call_center_sk = cc_call_center_sk
+GROUP BY cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status
+ORDER BY SUM(cr_net_loss) DESC
+Time Cost: 423.03s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将qualified_customers CTE中的3个IN子查询改为INNER JOIN：FROM customer INNER JOIN filtered_customer_demographics ON c_current_cdemo_sk = cd_demo_sk INNER JOIN filtered_household_demographics ON c_current_hdemo_sk = hd_demo_sk INNER JOIN filtered_customer_address ON c_current_addr_sk = ca_address_sk。这将消除Right Semi Join导致的重复扫描，让filtered_customer_demographics仅被物化和扫描一次。'}, {'group': '连接优化', 'produced_suggestion': '移除最终SELECT中对filtered_customer_demographics cd的冗余JOIN。因qualified_customers已通过JOIN过滤了c_current_cdemo_sk，最终SELECT只需JOIN qualified_customers即可获取c_current_cdemo_sk，无需再次JOIN cd表。同时从GROUP BY中移除cd.cd_marital_status和cd.cd_education_status（这两列在qualified_customers构建时已用于过滤，但未被保留到结果中，若需要这两列需在qualified_customers中SELECT出来）。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：先让qualified_customers与catalog_returns连接（通过cr_returning_customer_sk = c_customer_sk），利用预过滤后的customer集合（qualified_customers行数远小于catalog_returns的2158260行）提前过滤事实表，再连接filtered_date、call_center等小表。这将显著减少catalog_returns的有效扫描量。'}, {'group': '投影优化', 'produced_suggestion': '若GROUP BY确实需要cd_marital_status和cd_education_status，需在qualified_customers CTE中SELECT这两列（FROM customer INNER JOIN filtered_customer_demographics时SELECT cd.cd_marital_status, cd.cd_education_status），避免最终SELECT再次JOIN cd表。若不需要这两列则直接从GROUP BY中移除。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示catalog_returns全表扫描占比90.1%（51,976代价），且date_dim过滤后仍需扫描73049行（3.6%代价）。SQL存在多表星型连接模式，可通过谓词下推、连接顺序调整和过滤条件优化来减少中间结果集。历史案例显示相似SQL通过FILTER_INTO_JOIN、JOIN_CONDITION_PUSH和CTE分解获得改进。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim的过滤条件(d_year=2001 AND d_moy=10)通过子查询或CTE提前物化，减少Hash Join时date_dim的扫描行数，避免在连接阶段处理73049行"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接高选择性的小表(call_center仅24行、date_dim过滤后约200行)，将customer_demographics和household_demographics的复杂OR条件作为过滤条件下推到catalog_returns连接之前，减少事实表扫描范围"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将customer_demographics的OR条件((cd_marital_status='M' AND cd_education_status='Unknown') OR (cd_marital_status='W' AND cd_education_status='Advanced Degree'))转换为IN子查询或提前过滤，避免在大表连接后才应用复合条件"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用索引catalog_returns_pkey和外键关系，将cr_call_center_sk、cr_returned_date_sk、cr_returning_customer_sk的连接条件转换为半连接或EXISTS子查询，在扫描catalog_returns前过滤不符合条件的行"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将维度表过滤条件(customer_address.ca_gmt_offset=-7、household_demographics.hd_buy_potential LIKE 'Unknown%')通过CTE分解为独立过滤步骤，生成符合条件的customer_sk集合后再与catalog_returns连接"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 2001 AND d_moy = 10\n),\nfiltered_customer_demographics AS (\n    SELECT cd_demo_sk\n    FROM customer_demographics\n    WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n       OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n),\nfiltered_household_demographics AS (\n    SELECT hd_demo_sk\n    FROM household_demographics\n    WHERE hd_buy_potential LIKE 'Unknown%'\n),\nfiltered_customer_address AS (\n    SELECT ca_address_sk\n    FROM customer_address\n    WHERE ca_gmt_offset = -7\n),\nqualified_customers AS (\n    SELECT c_customer_sk, c_current_cdemo_sk, c_current_hdemo_sk, c_current_addr_sk\n    FROM customer\n    WHERE c_current_cdemo_sk IN (SELECT cd_demo_sk FROM filtered_customer_demographics)\n      AND c_current_hdemo_sk IN (SELECT hd_demo_sk FROM filtered_household_demographics)\n      AND c_current_addr_sk IN (SELECT ca_address_sk FROM filtered_customer_address)\n)\nSELECT\n    cc_call_center_id AS Call_Center,\n    cc_name AS Call_Center_Name,\n    cc_manager AS Manager,\n    SUM(cr_net_loss) AS Returns_Loss\nFROM catalog_returns\nINNER JOIN filtered_date ON cr_returned_date_sk = d_date_sk\nINNER JOIN call_center ON cr_call_center_sk = cc_call_center_sk\nINNER JOIN qualified_customers ON cr_returning_customer_sk = c_customer_sk\nINNER JOIN filtered_customer_demographics cd ON c_current_cdemo_sk = cd.cd_demo_sk\nGROUP BY cc_call_center_id, cc_name, cc_manager, cd.cd_demo_sk\nORDER BY SUM(cr_net_loss) DESC",
+  "semantic_correctness_guarantee": "1. **CTE提取维度表过滤**：将原SQL中date_dim、customer_demographics、household_demographics、customer_address的WHERE条件分别提取为4个独立CTE(filtered_date、filtered_customer_demographics、filtered_household_demographics、filtered_customer_address)，每个CTE仅返回满足条件的主键列。这些过滤条件与原SQL完全一致(d_year=2001 AND d_moy=10、cd复合OR条件、hd_buy_potential LIKE 'Unknown%'、ca_gmt_offset=-7)，因此过滤后的主键集合与原SQL等价。\n\n2. **qualified_customers CTE构建**：通过customer表与上述4个过滤CTE进行半连接(IN子查询)，提前筛选出同时满足所有维度表条件的customer_sk集合。由于原SQL通过INNER JOIN连接这些维度表，只有当customer的3个外键(c_current_cdemo_sk、c_current_hdemo_sk、c_current_addr_sk)同时存在于对应过滤后的维度表中时才会保留，因此qualified_customers与原SQL的customer过滤结果完全等价。\n\n3. **连接顺序调整**：重写SQL将catalog_returns作为驱动表，依次与filtered_date(高选择性，仅约200行)、call_center(24行)、qualified_customers进行INNER JOIN。原SQL的7表笛卡尔积连接在逻辑上等价于先过滤维度表再连接事实表，因此调整连接顺序不改变最终结果集，但可减少中间结果集大小。\n\n4. **GROUP BY语义保持**：原SQL的GROUP BY包含cc_call_center_id、cc_name、cc_manager、cd_marital_status、cd_education_status共5列。由于cd_marital_status和cd_education_status的组合在filtered_customer_demographics中已被OR条件限定为2种可能((M,Unknown)或(W,Advanced Degree))，且customer表通过c_current_cdemo_sk关联到唯一的cd_demo_sk，因此按cd_demo_sk分组等价于按(cd_marital_status, cd_education_status)组合分组。重写SQL在GROUP BY中使用cd.cd_demo_sk替代原2列，并在最后JOIN回filtered_customer_demographics以保持分组键的完整性，聚合结果与原SQL一致。\n\n5. **聚合函数与排序保持**：重写SQL的SELECT子句保留了原SQL的4个输出列(Call_Center、Call_Center_Name、Manager、Returns_Loss)，SUM(cr_net_loss)聚合函数和ORDER BY SUM(cr_net_loss) DESC排序逻辑完全不变，确保输出结果集的行内容和顺序与原SQL一致。\n\n6. **NULL值处理**：所有连接条件均为INNER JOIN且基于主键-外键关系，原SQL和重写SQL对NULL值的处理行为一致(NULL不匹配任何值，相应行被过滤)。CTE中的IN子查询在PostgreSQL中对NULL的语义与INNER JOIN一致(NULL IN (subquery)返回NULL，被WHERE过滤)。\n\n7. **整体等价性验证**：重写SQL通过CTE分解和连接顺序优化，将原SQL的隐式过滤逻辑显式化为多阶段过滤，但每个阶段的过滤条件、连接条件、聚合逻辑均与原SQL完全对应，不存在额外的行过滤或数据变更，因此在任何数据分布下结果集都与原SQL语义等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在GROUP BY中使用cd.cd_demo_sk替代了原SQL的cd_marital_status和cd_education_status，但cd_demo_sk是customer_demographics表的主键，一个cd_demo_sk可能对应多个(cd_marital_status, cd_education_status)组合，导致分组粒度不同，聚合结果不等价。",
+    "differences": [
+        {
+            "type": "GROUP BY语义差异",
+            "description": "原SQL按(cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status)分组，重写SQL按(cc_call_center_id, cc_name, cc_manager, cd_demo_sk)分组，cd_demo_sk作为主键无法保证与(cd_marital_status, cd_education_status)组合一对一映射",
+            "location": "GROUP BY子句"
+        },
+        {
+            "type": "结果集行数差异",
+            "description": "当同一个call center的不同customer具有相同cd_demo_sk但不同(cd_marital_status, cd_education_status)组合时,原SQL会产生多行,重写SQL会合并为一行",
+            "location": "聚合结果"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在GROUP BY中使用cd.cd_demo_sk替代了原SQL的cd_marital_status和cd_education_status，但cd_demo_sk是customer_demographics表的主键，一个cd_demo_sk可能对应多个(cd_marital_status, cd_education_status)组合，导致分组粒度不同，聚合结果不等价。
+```json
+{
+  "fixed_sql": "WITH filtered_date AS (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 2001 AND d_moy = 10\n),\nfiltered_customer_demographics AS (\n    SELECT cd_demo_sk, cd_marital_status, cd_education_status\n    FROM customer_demographics\n    WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n       OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n),\nfiltered_household_demographics AS (\n    SELECT hd_demo_sk\n    FROM household_demographics\n    WHERE hd_buy_potential LIKE 'Unknown%'\n),\nfiltered_customer_address AS (\n    SELECT ca_address_sk\n    FROM customer_address\n    WHERE ca_gmt_offset = -7\n),\nqualified_customers AS (\n    SELECT c_customer_sk, c_current_cdemo_sk, c_current_hdemo_sk, c_current_addr_sk\n    FROM customer\n    WHERE c_current_cdemo_sk IN (SELECT cd_demo_sk FROM filtered_customer_demographics)\n      AND c_current_hdemo_sk IN (SELECT hd_demo_sk FROM filtered_household_demographics)\n      AND c_current_addr_sk IN (SELECT ca_address_sk FROM filtered_customer_address)\n)\nSELECT\n    cc_call_center_id AS Call_Center,\n    cc_name AS Call_Center_Name,\n    cc_manager AS Manager,\n    SUM(cr_net_loss) AS Returns_Loss\nFROM catalog_returns\nINNER JOIN filtered_date ON cr_returned_date_sk = d_date_sk\nINNER JOIN call_center ON cr_call_center_sk = cc_call_center_sk\nINNER JOIN qualified_customers ON cr_returning_customer_sk = c_customer_sk\nINNER JOIN filtered_customer_demographics cd ON c_current_cdemo_sk = cd.cd_demo_sk\nGROUP BY cc_call_center_id, cc_name, cc_manager, cd.cd_marital_status, cd.cd_education_status\nORDER BY SUM(cr_net_loss) DESC",
+  "note": "在filtered_customer_demographics CTE中添加cd_marital_status和cd_education_status列,并在GROUP BY子句中使用这两列替换cd_demo_sk,使分组维度与原SQL一致"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已在GROUP BY中补回cd_marital_status和cd_education_status，与原SQL分组粒度完全一致，聚合结果等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 4->3, Hash/Merge 2->4 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写引入5个CTE（filtered_date、filtered_customer_demographics、filtered_household_demographics、filtered_customer_address、qualified_customers）实现维度表预过滤与公共结果复用，这是明确的正向结构改进信号。执行计划显示：1) CTE filtered_customer_demographics被物化并扫描2次（Plan Rows 107664），实现了一次计算多次复用；2) 预过滤逻辑成功下推到维度表层面；3) Hash Join数量从2增至4，Nested Loop从4降至3，说明连接策略向批量处理优化。然而存在关键问题：qualified_customers CTE中使用了IN子查询的半连接模式（Right Semi Join），导致filtered_customer_demographics被重复扫描（CTE Scan出现2次），且qualified_customers本身未被复用（仅在最终JOIN中使用1次）。Cost从57709增至112419（+95%）主要源于CTE物化开销（filtered_customer_demographics的Gather cost 49601）和重复扫描。行数估计求和从900516增至1268775（+41%），但这是CTE多次扫描导致的统计失真，非实际数据膨胀。核心改进点：维度表预过滤+CTE复用框架已建立，但qualified_customers的半连接实现引入了不必要的重复扫描。下一步应将qualified_customers改为直接JOIN各过滤CTE（避免IN子查询的半连接），并确保每个CTE仅被扫描一次。虽然本轮已有正向结构收益，但cost增幅过大且存在明显可优化空间，不应在此终止。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续优化：1) 将qualified_customers CTE中的IN子查询改为直接INNER JOIN各过滤CTE（filtered_customer_demographics、filtered_household_demographics、filtered_customer_address），消除Right Semi Join导致的重复扫描；2) 确保filtered_customer_demographics仅被物化和扫描一次；3) 考虑将qualified_customers与catalog_returns的连接提前，利用预过滤后的customer集合直接过滤事实表；4) 验证CTE物化开销是否合理，若filtered_customer_demographics过大（107664行）可考虑进一步收紧过滤条件或改为子查询让优化器自行决定物化策略。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮反馈指出qualified_customers CTE中的IN子查询导致filtered_customer_demographics被重复扫描（Right Semi Join），且qualified_customers未被复用。当前执行计划验证了这一问题：filtered_customer_demographics被物化后扫描2次（CTE Scan出现2次，各占1.9%），且最终JOIN中又重复JOIN了cd（即filtered_customer_demographics的别名）。核心问题：1) qualified_customers使用IN子查询的半连接模式效率低下；2) 最终SELECT中对filtered_customer_demographics的重复JOIN是冗余的（qualified_customers已通过IN过滤了cd_demo_sk）；3) catalog_returns全表扫描（46.2%）未能利用预过滤的customer集合提前过滤。优化方向：将qualified_customers改为直接INNER JOIN各过滤CTE（消除IN子查询），并移除最终SELECT中对cd的冗余JOIN（因qualified_customers已包含过滤后的c_current_cdemo_sk），同时调整连接顺序让qualified_customers先与catalog_returns连接以减少事实表扫描量。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将qualified_customers CTE中的3个IN子查询改为INNER JOIN：FROM customer INNER JOIN filtered_customer_demographics ON c_current_cdemo_sk = cd_demo_sk INNER JOIN filtered_household_demographics ON c_current_hdemo_sk = hd_demo_sk INNER JOIN filtered_customer_address ON c_current_addr_sk = ca_address_sk。这将消除Right Semi Join导致的重复扫描，让filtered_customer_demographics仅被物化和扫描一次。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "移除最终SELECT中对filtered_customer_demographics cd的冗余JOIN。因qualified_customers已通过JOIN过滤了c_current_cdemo_sk，最终SELECT只需JOIN qualified_customers即可获取c_current_cdemo_sk，无需再次JOIN cd表。同时从GROUP BY中移除cd.cd_marital_status和cd.cd_education_status（这两列在qualified_customers构建时已用于过滤，但未被保留到结果中，若需要这两列需在qualified_customers中SELECT出来）。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先让qualified_customers与catalog_returns连接（通过cr_returning_customer_sk = c_customer_sk），利用预过滤后的customer集合（qualified_customers行数远小于catalog_returns的2158260行）提前过滤事实表，再连接filtered_date、call_center等小表。这将显著减少catalog_returns的有效扫描量。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "若GROUP BY确实需要cd_marital_status和cd_education_status，需在qualified_customers CTE中SELECT这两列（FROM customer INNER JOIN filtered_customer_demographics时SELECT cd.cd_marital_status, cd.cd_education_status），避免最终SELECT再次JOIN cd表。若不需要这两列则直接从GROUP BY中移除。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 2001 AND d_moy = 10\n),\nfiltered_customer_demographics AS (\n    SELECT cd_demo_sk, cd_marital_status, cd_education_status\n    FROM customer_demographics\n    WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n       OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n),\nfiltered_household_demographics AS (\n    SELECT hd_demo_sk\n    FROM household_demographics\n    WHERE hd_buy_potential LIKE 'Unknown%'\n),\nfiltered_customer_address AS (\n    SELECT ca_address_sk\n    FROM customer_address\n    WHERE ca_gmt_offset = -7\n),\nqualified_customers AS (\n    SELECT c.c_customer_sk, cd.cd_marital_status, cd.cd_education_status\n    FROM customer c\n    INNER JOIN filtered_customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk\n    INNER JOIN filtered_household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk\n    INNER JOIN filtered_customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\n)\nSELECT\n    cc_call_center_id AS Call_Center,\n    cc_name AS Call_Center_Name,\n    cc_manager AS Manager,\n    SUM(cr_net_loss) AS Returns_Loss\nFROM catalog_returns\nINNER JOIN qualified_customers ON cr_returning_customer_sk = c_customer_sk\nINNER JOIN filtered_date ON cr_returned_date_sk = d_date_sk\nINNER JOIN call_center ON cr_call_center_sk = cc_call_center_sk\nGROUP BY cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status\nORDER BY SUM(cr_net_loss) DESC",
+  "semantic_correctness_guarantee": "1. **qualified_customers CTE改写（IN子查询→INNER JOIN）**：原SQL使用3个IN子查询过滤customer表（c_current_cdemo_sk IN (SELECT cd_demo_sk ...)、c_current_hdemo_sk IN (...)、c_current_addr_sk IN (...)），现改为直接INNER JOIN三个过滤CTE。由于IN子查询的半连接语义等价于INNER JOIN（当连接键非NULL且右表无重复时），且filtered_customer_demographics、filtered_household_demographics、filtered_customer_address均通过主键cd_demo_sk、hd_demo_sk、ca_address_sk过滤（索引信息显示这些表有主键约束），因此INNER JOIN不会产生笛卡尔积，结果集与IN子查询完全一致。\n\n2. **qualified_customers新增投影列（cd_marital_status、cd_education_status）**：原SQL在最终SELECT中对filtered_customer_demographics进行了冗余JOIN以获取cd_marital_status和cd_education_status用于GROUP BY。现在qualified_customers CTE已通过INNER JOIN连接filtered_customer_demographics，直接在CTE中SELECT这两列（cd.cd_marital_status、cd.cd_education_status），避免最终SELECT重复JOIN。由于qualified_customers与原SQL的customer过滤条件完全相同（仅将IN改为JOIN），且cd_marital_status和cd_education_status来自同一个filtered_customer_demographics表，因此这两列的值与原SQL一致。\n\n3. **移除最终SELECT中对filtered_customer_demographics的冗余JOIN**：原SQL在最终SELECT中有'INNER JOIN filtered_customer_demographics cd ON c_current_cdemo_sk = cd.cd_demo_sk'，现已删除。因为qualified_customers CTE已包含cd_marital_status和cd_education_status列，最终SELECT直接引用qualified_customers即可获取这两列，无需再次JOIN cd表。这消除了filtered_customer_demographics的重复扫描（上一轮反馈指出该CTE被扫描2次），且不改变结果集语义。\n\n4. **连接顺序调整（qualified_customers提前）**：将qualified_customers与catalog_returns的连接提前到filtered_date和call_center之前。由于INNER JOIN满足交换律和结合律，连接顺序不影响结果集。调整后优化器可优先利用预过滤的customer集合（qualified_customers行数远小于catalog_returns的2158260行）过滤事实表catalog_returns，减少后续连接的数据量。\n\n5. **GROUP BY子句保持完整**：原SQL的GROUP BY包含cc_call_center_id、cc_name、cc_manager、cd.cd_marital_status、cd.cd_education_status五列，现保持不变（仅将cd.前缀改为直接引用qualified_customers中的列名）。由于qualified_customers已包含这两列且值与原SQL一致（见第2点），GROUP BY的分组逻辑完全相同。\n\n6. **聚合函数和ORDER BY保持不变**：SUM(cr_net_loss)的聚合范围由FROM子句的连接结果决定，由于所有连接条件和过滤条件与原SQL等价（仅结构优化），聚合输入数据集相同，因此SUM结果相同。ORDER BY SUM(cr_net_loss) DESC的排序逻辑不变。\n\n7. **NULL值处理**：customer表的c_current_cdemo_sk、c_current_hdemo_sk、c_current_addr_sk若为NULL，原SQL的IN子查询会过滤掉这些行（IN (SELECT ...)对NULL返回UNKNOWN，WHERE子句排除），现INNER JOIN同样会过滤NULL值（JOIN条件不匹配），语义一致。catalog_returns的连接键cr_returning_customer_sk、cr_returned_date_sk、cr_call_center_sk若为NULL，原SQL和重写SQL均通过INNER JOIN过滤，行为相同。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL通过CTE预过滤和INNER JOIN改写保持了与原始SQL完全相同的过滤、连接和分组语义，所有谓词条件、连接关系、GROUP BY维度均一致，结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（节点类型、扫描方式、连接顺序、并行度均无变化），cost 仅微增 0.67（0.001%），行数估计求和几乎相同（900516 vs 900517）。重写 SQL 引入了 5 个 CTE（filtered_date、filtered_customer_demographics、filtered_household_demographics、filtered_customer_address、qualified_customers），意图通过预过滤和公共结果复用减少重复扫描，但优化器未采纳该结构，仍将 CTE 内联为原始 JOIN 顺序。关键问题：1) qualified_customers 中的 3 个 INNER JOIN 被优化器还原为 Nested Loop + Index Scan，未实现"一次物化后复用"；2) 最终 SELECT 仍对 customer_demographics 执行 Index Scan（cd_demo_sk = c.c_current_cdemo_sk），说明 qualified_customers 未能消除该表的重复访问；3) catalog_returns 仍为全表并行扫描（Plan Rows 899235），未因 qualified_customers 预过滤而减少扫描量。结构上无改进，CTE 重写未生效，但也无明确恶化（无新增高开销排序/物化、并行度保持、过滤逻辑未失效）。下一步需强制 CTE 物化（WITH ... AS MATERIALIZED）或调整 JOIN 顺序，确保 qualified_customers 先于 catalog_returns 执行并实际减少事实表扫描量。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 rewritten_sql 继续改写：1) 在 qualified_customers CTE 中添加 MATERIALIZED 提示（WITH qualified_customers AS MATERIALIZED (...)），强制优化器物化该中间结果，避免被内联为原始 Nested Loop；2) 在 qualified_customers 中 SELECT c.c_customer_sk, cd.cd_marital_status, cd.cd_education_status（保留 GROUP BY 所需列），避免最终 SELECT 再次 JOIN customer_demographics；3) 调整最终 SELECT 的 JOIN 顺序：先 FROM qualified_customers，再 INNER JOIN catalog_returns ON cr_returning_customer_sk = c_customer_sk，最后 JOIN filtered_date 和 call_center，利用预过滤后的 customer 集合（行数远小于 catalog_returns）提前过滤事实表；4) 移除最终 SELECT 中对 customer_demographics 的冗余 JOIN（因 qualified_customers 已包含所需列）。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 735
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=57709.84, 重写=57710.51，相对变化: -0.00%
+✅ 成功存储，记录ID: 0517907b-5f78-4113-8169-03d8013702da
+
+----------------------------------------
+

@@ -1,0 +1,163 @@
+Query ID: 142
+==================================================
+
+Original: select     substring(w_warehouse_name,1,20)   ,sm_type   ,cc_name   ,sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days"   ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30) and                  (cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days"   ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60) and                  (cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days"   ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90) and                  (cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days"   ,sum(case when (cs_ship_date_sk - cs_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days" from    catalog_sales   ,warehouse   ,ship_mode   ,call_center   ,date_dim where d_month_seq between 1193 and 1193 + 23 and cs_ship_date_sk   = d_date_sk and cs_warehouse_sk   = w_warehouse_sk and cs_ship_mode_sk   = sm_ship_mode_sk and cs_call_center_sk = cc_call_center_sk and cs_list_price between 77 and 106 and sm_type = 'TWO DAY' and cc_class = 'small' and w_gmt_offset = -5 group by    substring(w_warehouse_name,1,20)   ,sm_type   ,cc_name order by substring(w_warehouse_name,1,20)         ,sm_type         ,cc_name limit 100;
+Rewritten: SELECT
+  substring(w.w_warehouse_name, 1, 20) AS w_name_short,
+  sm.sm_type,
+  cc.cc_name,
+  SUM(1) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 30) AS "30 days",
+  SUM(1) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk > 30 AND cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 60) AS "31-60 days",
+  SUM(1) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk > 60 AND cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 90) AS "61-90 days",
+  SUM(1) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk > 90 AND cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 120) AS "91-120 days",
+  SUM(1) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk > 120) AS ">120 days"
+FROM (
+  SELECT cs_ship_date_sk, cs_sold_date_sk, cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk
+  FROM catalog_sales
+  WHERE cs_list_price BETWEEN 77 AND 106
+) cs
+INNER JOIN date_dim d ON cs.cs_ship_date_sk = d.d_date_sk AND d.d_month_seq BETWEEN 1193 AND 1216
+INNER JOIN warehouse w ON cs.cs_warehouse_sk = w.w_warehouse_sk AND w.w_gmt_offset = -5
+INNER JOIN ship_mode sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk AND sm.sm_type = 'TWO DAY'
+INNER JOIN call_center cc ON cs.cs_call_center_sk = cc.cc_call_center_sk AND cc.cc_class = 'small'
+GROUP BY substring(w.w_warehouse_name, 1, 20), sm.sm_type, cc.cc_name
+ORDER BY w_name_short, sm.sm_type, cc.cc_name
+LIMIT 100
+Time Cost: 124.39s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '将5个SUM(CASE WHEN ...)改写为SUM(1) FILTER(WHERE ...)形式，避免每行重复计算(cs_ship_date_sk - cs_sold_date_sk)表达式5次。例如：SUM(1) FILTER(WHERE cs_ship_date_sk - cs_sold_date_sk <= 30) AS "30 days"。这可减少CPU计算开销并提升聚合效率。'}, {'group': '连接优化', 'produced_suggestion': '将date_dim的d_month_seq范围过滤(BETWEEN 1193 AND 1216)直接合并到catalog_sales的JOIN条件中，改写为：INNER JOIN date_dim ON cs.cs_ship_date_sk = d_date_sk AND d_month_seq BETWEEN 1193 AND 1216。避免CTE被内联后仍需Memoize+Index Scan逐行探测date_dim，强制优化器在JOIN时同时应用范围过滤。'}, {'group': '连接优化', 'produced_suggestion': "调整JOIN顺序：先让小维度表(ship_mode、call_center、warehouse)通过INNER JOIN过滤后形成中间结果集，再与catalog_sales关联。具体方式：将4个维度表的过滤条件直接写在JOIN ON子句中(如ON cs.cs_ship_mode_sk = sm_ship_mode_sk AND sm_type = 'TWO DAY')，移除CTE结构，让优化器基于统计信息选择最优JOIN顺序(小表驱动大表)。"}, {'group': '谓词简化', 'produced_suggestion': '将catalog_sales的cs_list_price过滤条件(BETWEEN 77 AND 106)与其他JOIN条件合并到同一层WHERE子句，避免优化器将其延迟到全表扫描后执行。若优化器仍不改变计划，考虑将此条件改写为派生表形式：FROM (SELECT * FROM catalog_sales WHERE cs_list_price BETWEEN 77 AND 106) cs，强制优化器先过滤事实表再执行JOIN。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示catalog_sales表的全表扫描(Seq Scan)占总代价的98.9%，是主要性能瓶颈。该表有1439万行数据，当前通过Filter过滤cs_list_price范围，但未能利用索引。同时SQL包含多个JOIN和复杂的CASE聚合表达式，存在多个优化空间：1)过滤条件可以提前下推减少JOIN数据量；2)维度表的过滤条件(sm_type='TWO DAY', cc_class='small', w_gmt_offset=-5)可以先应用再JOIN；3)多个CASE WHEN聚合可以转换为更高效的FILTER聚合形式。历史案例显示相似SQL通过FILTER_INTO_JOIN、JOIN_CONDITION_PUSH、AGGREGATE_CASE_TO_FILTER等规则组合可获得显著性能提升。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将维度表的过滤条件(ship_mode.sm_type='TWO DAY', call_center.cc_class='small', warehouse.w_gmt_offset=-5, date_dim.d_month_seq范围)提前应用，在JOIN之前过滤小表，减少JOIN时的数据量。特别是sm_type、cc_class、w_gmt_offset这些高选择性条件应该尽早过滤。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序，优先JOIN已过滤的小维度表(date_dim、ship_mode、call_center、warehouse)，最后再JOIN大事实表catalog_sales。将catalog_sales的cs_list_price过滤条件与其他JOIN条件结合，形成更有效的JOIN谓词，减少中间结果集大小。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将5个CASE WHEN聚合表达式转换为FILTER子句形式，如SUM(1) FILTER(WHERE cs_ship_date_sk - cs_sold_date_sk <= 30)，这样可以避免重复计算日期差值，并且数据库优化器可以更好地并行处理多个FILTER聚合。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在JOIN之前对catalog_sales进行列裁剪，只保留必需的列(cs_ship_date_sk, cs_sold_date_sk, cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk, cs_list_price)，减少数据传输量。同时对维度表也只选择需要的列。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_month_seq BETWEEN 1193 AND 1216\n),\nfiltered_warehouse AS (\n  SELECT w_warehouse_sk, substring(w_warehouse_name, 1, 20) AS w_name_short\n  FROM warehouse\n  WHERE w_gmt_offset = -5\n),\nfiltered_ship_mode AS (\n  SELECT sm_ship_mode_sk, sm_type\n  FROM ship_mode\n  WHERE sm_type = 'TWO DAY'\n),\nfiltered_call_center AS (\n  SELECT cc_call_center_sk, cc_name\n  FROM call_center\n  WHERE cc_class = 'small'\n)\nSELECT\n  fw.w_name_short,\n  fsm.sm_type,\n  fcc.cc_name,\n  SUM(CASE WHEN (cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS \"30 days\",\n  SUM(CASE WHEN (cs.cs_ship_date_sk - cs.cs_sold_date_sk > 30) AND (cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS \"31-60 days\",\n  SUM(CASE WHEN (cs.cs_ship_date_sk - cs.cs_sold_date_sk > 60) AND (cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS \"61-90 days\",\n  SUM(CASE WHEN (cs.cs_ship_date_sk - cs.cs_sold_date_sk > 90) AND (cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS \"91-120 days\",\n  SUM(CASE WHEN (cs.cs_ship_date_sk - cs.cs_sold_date_sk > 120) THEN 1 ELSE 0 END) AS \">120 days\"\nFROM catalog_sales cs\nINNER JOIN filtered_date fd ON cs.cs_ship_date_sk = fd.d_date_sk\nINNER JOIN filtered_warehouse fw ON cs.cs_warehouse_sk = fw.w_warehouse_sk\nINNER JOIN filtered_ship_mode fsm ON cs.cs_ship_mode_sk = fsm.sm_ship_mode_sk\nINNER JOIN filtered_call_center fcc ON cs.cs_call_center_sk = fcc.cc_call_center_sk\nWHERE cs.cs_list_price BETWEEN 77 AND 106\nGROUP BY fw.w_name_short, fsm.sm_type, fcc.cc_name\nORDER BY fw.w_name_short, fsm.sm_type, fcc.cc_name\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **CTE提取维度表过滤**：将原SQL中对date_dim、warehouse、ship_mode、call_center四张维度表的WHERE条件提取为4个CTE（filtered_date、filtered_warehouse、filtered_ship_mode、filtered_call_center），每个CTE仅包含满足原WHERE条件的行。这些过滤条件（d_month_seq BETWEEN 1193 AND 1216、w_gmt_offset=-5、sm_type='TWO DAY'、cc_class='small'）与原SQL完全一致，不改变可JOIN的维度表行集。\n\n2. **JOIN语义保持**：原SQL使用隐式内连接（逗号分隔+WHERE条件），重写SQL改为显式INNER JOIN，两者语义完全等价。JOIN条件（cs_ship_date_sk=d_date_sk、cs_warehouse_sk=w_warehouse_sk、cs_ship_mode_sk=sm_ship_mode_sk、cs_call_center_sk=cc_call_center_sk）保持不变，仅从WHERE子句移至ON子句，不影响结果集。\n\n3. **catalog_sales过滤条件位置调整**：原SQL中cs_list_price BETWEEN 77 AND 106在WHERE子句中，重写SQL将其保留在主查询WHERE子句中（在JOIN之后应用），过滤时机与原SQL一致，不改变最终参与聚合的catalog_sales行集。\n\n4. **投影列预计算**：在filtered_warehouse CTE中预先计算substring(w_warehouse_name,1,20)为w_name_short，避免在GROUP BY和ORDER BY中重复计算该表达式。由于substring函数对相同输入产生确定性输出，预计算不改变分组和排序语义。\n\n5. **聚合表达式保持**：5个CASE WHEN聚合表达式（基于cs_ship_date_sk - cs_sold_date_sk的日期差值区间统计）完全保留原逻辑，包括边界条件（<=30、>30且<=60、>60且<=90、>90且<=120、>120），不改变每个分组的聚合结果。\n\n6. **GROUP BY和ORDER BY语义等价**：原SQL按substring(w_warehouse_name,1,20)、sm_type、cc_name分组和排序，重写SQL按预计算的w_name_short（等价于substring结果）、sm_type、cc_name分组和排序，分组键和排序键与原SQL一一对应，结果集顺序和分组粒度完全一致。\n\n7. **LIMIT子句保持**：LIMIT 100在重写SQL中位置和数值不变，确保最终返回行数与原SQL一致。\n\n8. **NULL值处理**：原SQL中JOIN条件和WHERE条件对NULL值的处理（等值比较中NULL不匹配NULL）在重写SQL中保持一致，INNER JOIN和WHERE过滤均排除NULL不匹配的行，不改变结果集中的NULL处理语义。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取维度表过滤和显式INNER JOIN改写，所有过滤条件、JOIN条件、聚合逻辑、分组排序键均与原SQL一致，结果集完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（cost、节点类型、扫描方式、JOIN顺序、并行度均无变化），说明优化器将CTE物化后又内联回原始形式，未产生任何结构改进。虽然重写SQL引入了4个CTE意图提前过滤维度表，但实际执行计划显示：(1) 维度表过滤仍在JOIN时进行（Seq Scan + Filter），未提前物化；(2) catalog_sales仍是Parallel Seq Scan + Filter，未受益于维度表预过滤；(3) JOIN顺序、Hash Join策略、Memoize节点、Index Scan date_dim均与原SQL一致；(4) 行数估计求和（1003083）完全相同，无数据量压缩。CTE重写未触发优化器改变执行路径，属于'无效重写'而非'恶化'，但也未达到优化目标。下一步应尝试不同改写策略。",
+  "no_further_optimization": false,
+  "next_step_advice": "当前CTE被优化器内联，未产生预期效果。下一轮建议：(1) 尝试在catalog_sales上先应用cs_list_price过滤后再JOIN（派生表或子查询形式），强制优化器先过滤事实表；(2) 将5个CASE WHEN改写为FILTER子句（SUM(1) FILTER(WHERE ...)），减少重复计算日期差值；(3) 考虑将date_dim的d_month_seq范围过滤与catalog_sales的JOIN合并为单个条件，避免Memoize + Index Scan的逐行探测；(4) 若优化器仍不改变计划，可尝试添加MATERIALIZED提示强制CTE物化，或直接在catalog_sales上建立复合索引(cs_ship_date_sk, cs_list_price)以支持索引过滤。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE被优化器内联导致无效重写。当前执行计划瓶颈仍是catalog_sales的全表扫描(458,923.89代价，占98.9%)，过滤条件cs_list_price BETWEEN 77 AND 106在扫描时执行。根据反馈建议，本轮应：(1)将CASE WHEN改写为FILTER子句减少重复计算；(2)将date_dim的d_month_seq范围过滤与catalog_sales的JOIN合并，避免Memoize逐行探测；(3)调整JOIN顺序，先过滤小维度表再与事实表关联，强制优化器改变执行路径。历史案例显示FILTER_INTO_JOIN、JOIN_CONDITION_PUSH、AGGREGATE_CASE_TO_FILTER组合在相似SQL上命中11次，证明有效。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将5个SUM(CASE WHEN ...)改写为SUM(1) FILTER(WHERE ...)形式，避免每行重复计算(cs_ship_date_sk - cs_sold_date_sk)表达式5次。例如：SUM(1) FILTER(WHERE cs_ship_date_sk - cs_sold_date_sk <= 30) AS \"30 days\"。这可减少CPU计算开销并提升聚合效率。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将date_dim的d_month_seq范围过滤(BETWEEN 1193 AND 1216)直接合并到catalog_sales的JOIN条件中，改写为：INNER JOIN date_dim ON cs.cs_ship_date_sk = d_date_sk AND d_month_seq BETWEEN 1193 AND 1216。避免CTE被内联后仍需Memoize+Index Scan逐行探测date_dim，强制优化器在JOIN时同时应用范围过滤。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序：先让小维度表(ship_mode、call_center、warehouse)通过INNER JOIN过滤后形成中间结果集，再与catalog_sales关联。具体方式：将4个维度表的过滤条件直接写在JOIN ON子句中(如ON cs.cs_ship_mode_sk = sm_ship_mode_sk AND sm_type = 'TWO DAY')，移除CTE结构，让优化器基于统计信息选择最优JOIN顺序(小表驱动大表)。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将catalog_sales的cs_list_price过滤条件(BETWEEN 77 AND 106)与其他JOIN条件合并到同一层WHERE子句，避免优化器将其延迟到全表扫描后执行。若优化器仍不改变计划，考虑将此条件改写为派生表形式：FROM (SELECT * FROM catalog_sales WHERE cs_list_price BETWEEN 77 AND 106) cs，强制优化器先过滤事实表再执行JOIN。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "SELECT\n  substring(w.w_warehouse_name, 1, 20) AS w_name_short,\n  sm.sm_type,\n  cc.cc_name,\n  SUM(1) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 30) AS \"30 days\",\n  SUM(1) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk > 30 AND cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 60) AS \"31-60 days\",\n  SUM(1) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk > 60 AND cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 90) AS \"61-90 days\",\n  SUM(1) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk > 90 AND cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 120) AS \"91-120 days\",\n  SUM(1) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk > 120) AS \">120 days\"\nFROM (\n  SELECT cs_ship_date_sk, cs_sold_date_sk, cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk\n  FROM catalog_sales\n  WHERE cs_list_price BETWEEN 77 AND 106\n) cs\nINNER JOIN date_dim d ON cs.cs_ship_date_sk = d.d_date_sk AND d.d_month_seq BETWEEN 1193 AND 1216\nINNER JOIN warehouse w ON cs.cs_warehouse_sk = w.w_warehouse_sk AND w.w_gmt_offset = -5\nINNER JOIN ship_mode sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk AND sm.sm_type = 'TWO DAY'\nINNER JOIN call_center cc ON cs.cs_call_center_sk = cc.cc_call_center_sk AND cc.cc_class = 'small'\nGROUP BY substring(w.w_warehouse_name, 1, 20), sm.sm_type, cc.cc_name\nORDER BY w_name_short, sm.sm_type, cc.cc_name\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. 移除了所有CTE结构，将catalog_sales改写为派生表形式，仅投影JOIN和聚合所需的5个外键列(cs_ship_date_sk, cs_sold_date_sk, cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk)，并在派生表内部先应用cs_list_price BETWEEN 77 AND 106过滤。由于派生表与原catalog_sales在WHERE条件相同时返回相同行集，且后续JOIN的外键列完整保留，因此不改变最终结果集的行范围。\n\n2. 将4个维度表的过滤条件从CTE中移除，直接合并到各自的JOIN ON子句中：date_dim的d_month_seq BETWEEN 1193 AND 1216、warehouse的w_gmt_offset = -5、ship_mode的sm_type = 'TWO DAY'、call_center的cc_class = 'small'。由于INNER JOIN语义下，WHERE子句过滤与JOIN ON子句过滤在逻辑上等价(均要求连接键匹配且过滤条件为真)，因此不改变连接结果。\n\n3. 将5个SUM(CASE WHEN ...)改写为SUM(1) FILTER(WHERE ...)形式。原CASE WHEN表达式在条件为真时返回1、否则返回0，SUM后统计满足条件的行数；FILTER子句在条件为真时对1求和、否则跳过该行，两者在聚合语义上完全等价，均统计满足各时间段条件的订单数量。\n\n4. 在SELECT子句中直接计算substring(w.w_warehouse_name, 1, 20)，替代CTE中预计算的w_name_short别名。由于substring函数是确定性函数，对同一w_warehouse_name输入返回相同结果，且GROUP BY和ORDER BY子句引用该表达式或其别名在语义上等价，因此不改变分组和排序逻辑。\n\n5. 保持了原SQL的INNER JOIN类型、GROUP BY分组键(仓库名前20字符、运输类型、呼叫中心名称)、ORDER BY排序键及LIMIT 100限制，确保最终输出的行集合、列结构、排序顺序和行数上限与原SQL完全一致。\n\n6. 所有日期差值计算(cs_ship_date_sk - cs_sold_date_sk)的边界条件(<=30、>30 AND <=60、>60 AND <=90、>90 AND <=120、>120)在FILTER子句中保持不变，确保5个时间段的统计逻辑与原SQL的CASE WHEN分支完全对应，不会遗漏或重复计数任何订单。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "两SQL在相同库状态和参数下返回相同结果集：重写SQL将CTE改为派生表、WHERE条件移入JOIN ON、CASE WHEN改为FILTER语法，这些变换均为等价改写，不改变过滤范围、连接基数、聚合语义或最终行集合。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（节点类型、扫描方式、连接顺序、并行度、cost均相同），重写SQL仅改变了语法表达（FILTER替代CASE、显式INNER JOIN、派生表包装catalog_sales），但优化器生成的物理计划未发生任何变化。虽然FILTER语法更简洁，但未带来结构性改进。当前计划已采用并行扫描+Hash Join+Memoize缓存，结构合理。继续重写已无明显改进空间。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 970
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=463825.48, 重写=463825.48，相对变化: 0.00%
+✅ 成功存储，记录ID: 302df68c-a997-47b5-8810-bb944e6ddc91
+
+----------------------------------------
+

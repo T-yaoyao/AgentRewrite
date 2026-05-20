@@ -1,0 +1,216 @@
+Query ID: 60
+==================================================
+
+Original: select  count(*) from (     select distinct c_last_name, c_first_name, d_date     from store_sales, date_dim, customer           where store_sales.ss_sold_date_sk = date_dim.d_date_sk       and store_sales.ss_customer_sk = customer.c_customer_sk       and d_month_seq between 1198 and 1198 + 11       and c_birth_month in (1, 3, 4, 6)       and ss_list_price between 185 and 244       and ss_wholesale_cost BETWEEN 80 AND 100   intersect     select distinct c_last_name, c_first_name, d_date     from catalog_sales, date_dim, customer           where catalog_sales.cs_sold_date_sk = date_dim.d_date_sk       and catalog_sales.cs_bill_customer_sk = customer.c_customer_sk       and d_month_seq between 1198 and 1198 + 11       and c_birth_month in (1, 3, 4, 6)       and cs_list_price between 185 and 244       and cs_wholesale_cost BETWEEN 80 AND 100   intersect     select distinct c_last_name, c_first_name, d_date     from web_sales, date_dim, customer           where web_sales.ws_sold_date_sk = date_dim.d_date_sk       and web_sales.ws_bill_customer_sk = customer.c_customer_sk       and d_month_seq between 1198 and 1198 + 11       and c_birth_month in (1, 3, 4, 6)       and ws_list_price between 185 and 244       and ws_wholesale_cost BETWEEN 80 AND 100 ) hot_cust limit 100;
+Rewritten: WITH filtered_date AS (
+  SELECT d_date_sk, d_date
+  FROM date_dim
+  WHERE d_month_seq BETWEEN 1198 AND 1209
+),
+filtered_customer AS (
+  SELECT c_customer_sk, c_last_name, c_first_name
+  FROM customer
+  WHERE c_birth_month IN (1, 3, 4, 6)
+),
+store_sales_set AS (
+  SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date
+  FROM store_sales ss
+  JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk
+  JOIN filtered_customer c ON ss.ss_customer_sk = c.c_customer_sk
+  WHERE ss.ss_list_price BETWEEN 185 AND 244
+    AND ss.ss_wholesale_cost BETWEEN 80 AND 100
+),
+catalog_sales_set AS (
+  SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date
+  FROM catalog_sales cat
+  JOIN filtered_date d ON cat.cs_sold_date_sk = d.d_date_sk
+  JOIN filtered_customer c ON cat.cs_bill_customer_sk = c.c_customer_sk
+  WHERE cat.cs_list_price BETWEEN 185 AND 244
+    AND cat.cs_wholesale_cost BETWEEN 80 AND 100
+),
+web_sales_set AS (
+  SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date
+  FROM web_sales ws
+  JOIN filtered_date d ON ws.ws_sold_date_sk = d.d_date_sk
+  JOIN filtered_customer c ON ws.ws_bill_customer_sk = c.c_customer_sk
+  WHERE ws.ws_list_price BETWEEN 185 AND 244
+    AND ws.ws_wholesale_cost BETWEEN 80 AND 100
+)
+SELECT COUNT(*)
+FROM store_sales_set s
+WHERE EXISTS (
+  SELECT 1 FROM catalog_sales_set c
+  WHERE c.c_last_name = s.c_last_name
+    AND c.c_first_name = s.c_first_name
+    AND c.d_date = s.d_date
+)
+AND EXISTS (
+  SELECT 1 FROM web_sales_set w
+  WHERE w.c_last_name = s.c_last_name
+    AND w.c_first_name = s.c_first_name
+    AND w.d_date = s.d_date
+)
+LIMIT 100;
+Time Cost: 206.81s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '将三个sales CTE中的JOIN顺序调整为：先用filtered_date和filtered_customer的交叉结果（约2,000,004行：12*166,667）作为驱动表，再通过半连接（SEMI JOIN或EXISTS）关联sales表，避免sales表全表扫描后再过滤。具体：用EXISTS (SELECT 1 FROM store_sales ss WHERE ss.ss_sold_date_sk=d.d_date_sk AND ss.ss_customer_sk=c.c_customer_sk AND ss.ss_list_price BETWEEN 185 AND 244 AND ss.ss_wholesale_cost BETWEEN 80 AND 100) 替代当前的INNER JOIN + DISTINCT模式，让优化器优先利用索引探测而非全表扫描。'}, {'group': '集合优化', 'produced_suggestion': '消除三个sales CTE中的DISTINCT操作。当前DISTINCT在大量中间结果上执行（store_sales扫描2880万行、catalog_sales扫描1440万行、web_sales扫描720万行），代价极高。通过半连接改写（EXISTS或IN子查询），将去重逻辑转移到最外层的三表INNER JOIN上（JOIN条件本身已隐含去重语义：c_last_name+c_first_name+d_date的交集），避免在每个CTE内部单独去重。'}, {'group': '谓词简化', 'produced_suggestion': '将sales表的范围过滤条件（ss_list_price BETWEEN 185 AND 244 AND ss_wholesale_cost BETWEEN 80 AND 100）与JOIN条件合并为单一谓词，确保优化器在索引选择时能同时考虑日期、客户和价格条件。若数据库支持，可将BETWEEN改写为>=和<=的AND组合（如ss_list_price>=185 AND ss_list_price<=244），部分优化器对显式比较的索引利用更优。'}, {'group': '子查询优化', 'produced_suggestion': '将最外层的三表INNER JOIN改写为两阶段过滤：第一阶段用filtered_date和filtered_customer生成候选集（c_last_name, c_first_name, d_date），第二阶段用EXISTS验证该候选集在三个sales表中均存在。具体：SELECT COUNT(*) FROM (SELECT d.d_date, c.c_last_name, c.c_first_name FROM filtered_date d CROSS JOIN filtered_customer c WHERE EXISTS(...store_sales...) AND EXISTS(...catalog_sales...) AND EXISTS(...web_sales...))。这样避免三个大CTE的物化，直接在小驱动表上执行探测。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示三个主要性能瓶颈均为大表全表扫描(Seq Scan)，合计占比99.2%。SQL使用两次INTERSECT操作连接三个相似结构的子查询，每个子查询都需要扫描大表(store_sales 2880万行、catalog_sales 1440万行、web_sales 720万行)并进行多表JOIN和DISTINCT操作。历史案例显示相同SQL指纹曾通过CTE分解、INTERSECT转换、JOIN条件下推等规则组合优化成功(命中13次)。当前可通过以下方向优化：1)将INTERSECT转换为JOIN以减少重复扫描和DISTINCT开销；2)提取公共date_dim和customer过滤条件避免重复计算；3)利用CTE分解复杂子查询提升可读性和优化器效率；4)下推过滤条件到JOIN前减少中间结果集。",
+  "advice": [
+    {
+      "group": "集合优化",
+      "produced_suggestion": "将两次INTERSECT操作转换为INNER JOIN，通过(c_last_name, c_first_name, d_date)关联三个子查询结果，避免重复的DISTINCT和集合操作开销，减少中间结果物化次数"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用CTE(WITH子句)分解三个相似结构的子查询，将公共的date_dim过滤条件(d_month_seq between 1198 and 1209)和customer过滤条件(c_birth_month in (1,3,4,6))提取到独立CTE中，避免在三个分支中重复扫描和过滤date_dim和customer表"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将sales表的范围过滤条件(list_price between 185 and 244, wholesale_cost between 80 and 100)尽早应用，在JOIN之前过滤掉不符合条件的行，减少JOIN阶段的数据量。同时考虑将customer和date_dim的过滤条件下推到各自的扫描阶段"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序，优先关联过滤后行数较少的表。建议先JOIN date_dim(过滤后约12个月)和customer(过滤后约1/3行)，再与各sales表关联，利用较小的中间结果集减少后续JOIN代价"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "由于最外层只需COUNT(*)且有LIMIT 100，可考虑在INTERSECT转JOIN后，先限制每个子查询的DISTINCT结果数量(如使用子查询LIMIT)，或者将最外层COUNT(*)改为对JOIN结果直接计数，避免不必要的完整DISTINCT物化"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_month_seq BETWEEN 1198 AND 1209\n),\nfiltered_customer AS (\n  SELECT c_customer_sk, c_last_name, c_first_name\n  FROM customer\n  WHERE c_birth_month IN (1, 3, 4, 6)\n),\nstore_sales_filtered AS (\n  SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date\n  FROM store_sales ss\n  INNER JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk\n  INNER JOIN filtered_customer c ON ss.ss_customer_sk = c.c_customer_sk\n  WHERE ss.ss_list_price BETWEEN 185 AND 244\n    AND ss.ss_wholesale_cost BETWEEN 80 AND 100\n),\ncatalog_sales_filtered AS (\n  SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date\n  FROM catalog_sales cs\n  INNER JOIN filtered_date d ON cs.cs_sold_date_sk = d.d_date_sk\n  INNER JOIN filtered_customer c ON cs.cs_bill_customer_sk = c.c_customer_sk\n  WHERE cs.cs_list_price BETWEEN 185 AND 244\n    AND cs.cs_wholesale_cost BETWEEN 80 AND 100\n),\nweb_sales_filtered AS (\n  SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date\n  FROM web_sales ws\n  INNER JOIN filtered_date d ON ws.ws_sold_date_sk = d.d_date_sk\n  INNER JOIN filtered_customer c ON ws.ws_bill_customer_sk = c.c_customer_sk\n  WHERE ws.ws_list_price BETWEEN 185 AND 244\n    AND ws.ws_wholesale_cost BETWEEN 80 AND 100\n)\nSELECT COUNT(*)\nFROM (\n  SELECT ss.c_last_name, ss.c_first_name, ss.d_date\n  FROM store_sales_filtered ss\n  INNER JOIN catalog_sales_filtered cs\n    ON ss.c_last_name = cs.c_last_name\n    AND ss.c_first_name = cs.c_first_name\n    AND ss.d_date = cs.d_date\n  INNER JOIN web_sales_filtered ws\n    ON ss.c_last_name = ws.c_last_name\n    AND ss.c_first_name = ws.c_first_name\n    AND ss.d_date = ws.d_date\n) hot_cust\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **CTE 提取公共过滤条件**：将 date_dim 的 d_month_seq BETWEEN 1198 AND 1209 过滤提取到 filtered_date CTE，将 customer 的 c_birth_month IN (1,3,4,6) 过滤提取到 filtered_customer CTE。这两个维度表在原 SQL 的三个子查询中都以相同条件被引用，提取后避免重复扫描和过滤，且过滤条件完全一致，不改变结果集。\n\n2. **三个销售表子查询结构保持**：原 SQL 中三个子查询分别对 store_sales、catalog_sales、web_sales 进行 JOIN 和 DISTINCT，重写后将它们分别封装为 store_sales_filtered、catalog_sales_filtered、web_sales_filtered 三个 CTE。每个 CTE 内部的 JOIN 条件、WHERE 过滤条件（list_price BETWEEN 185 AND 244、wholesale_cost BETWEEN 80 AND 100）与原 SQL 完全一致，DISTINCT 操作也保留在各 CTE 内部，因此每个 CTE 产生的结果集与原对应子查询完全相同。\n\n3. **INTERSECT 转换为 INNER JOIN**：原 SQL 使用两次 INTERSECT 操作求三个子查询结果的交集，即只保留同时出现在三个结果集中的 (c_last_name, c_first_name, d_date) 组合。重写后通过两次 INNER JOIN（先 JOIN store_sales_filtered 和 catalog_sales_filtered，再 JOIN web_sales_filtered）在 (c_last_name, c_first_name, d_date) 三列上进行等值连接，这在集合语义上等价于 INTERSECT：只有三个 CTE 中都存在的行才能通过两次 INNER JOIN，且 INNER JOIN 不会引入重复行（因为各 CTE 已 DISTINCT）。\n\n4. **NULL 值处理一致性**：原 SQL 中 INTERSECT 操作会自动去除 NULL 值的影响（SQL 标准中 INTERSECT 基于行比较，NULL = NULL 为 FALSE）。重写后的 INNER JOIN 在 c_last_name、c_first_name、d_date 上进行等值连接，若任一列为 NULL，则该行无法匹配成功，行为与 INTERSECT 一致。由于 customer 表的 c_last_name、c_first_name 和 date_dim 表的 d_date 通常为 NOT NULL 或业务上不为 NULL，且原 SQL 的 JOIN 条件已隐含这些列非 NULL，因此 NULL 处理不影响语义等价性。\n\n5. **最外层 COUNT(*) 和 LIMIT 100 保持**：原 SQL 对 INTERSECT 结果进行 COUNT(*) 并 LIMIT 100。重写后对 INNER JOIN 结果进行 COUNT(*) 并 LIMIT 100，由于 INNER JOIN 结果集与 INTERSECT 结果集完全相同（见第 3 点），因此 COUNT(*) 的值相同，LIMIT 100 的语义也相同（若 COUNT(*) 结果小于等于 100，LIMIT 不起作用；若大于 100，返回 100）。\n\n6. **JOIN 顺序和执行计划优化**：重写后优先 JOIN 过滤后的 date_dim（约 12 行）和 customer（约 1/3 行），再与各销售表关联，利用较小的中间结果集减少 JOIN 代价。这是执行层面的优化，不改变逻辑结果集。\n\n7. **无额外行或缺失行**：由于 DISTINCT 在各 CTE 内部完成，INNER JOIN 不会产生笛卡尔积或重复行。原 SQL 的 INTERSECT 保证结果集是三个子查询的交集且无重复，重写后的 INNER JOIN 同样保证只有三个 CTE 中都存在的唯一行才出现在最终结果中，因此结果集行数和内容完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 3->0, Hash/Merge 3->8 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写SQL通过CTE实现公共中间结果复用（filtered_date、filtered_customer），并将INTERSECT转为JOIN，消除了重复扫描date_dim和customer表，这是明确的正向结构改进。但执行计划显示：1) 行数估计求和从334,672大幅上升至2,882,084（8.6倍），说明中间结果膨胀严重；2) 索引扫描从3次降为0次，Nested Loop从3次降为0次，虽然Hash Join增加（3→7）和Merge Join引入（0→1）可能带来并行收益，但完全丢失索引访问路径；3) cost从1,498,068上升至1,669,664（增幅11.5%）。虽然CTE复用是高优先级正信号，但本轮重写引入的中间结果膨胀（行数估计求和8.6倍）和索引访问路径完全丢失，构成了明显的结构退化信号。根据原则，CTE复用不能单独抵消'明确且可验证的灾难性结构退化证据'（主干数据量失控、关键访问路径丢失）。建议下一轮在保留CTE复用的基础上，针对性优化JOIN顺序和索引利用。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：1) 保留filtered_date和filtered_customer CTE（复用收益明确）；2) 在三个sales CTE（store_sales_filtered、catalog_sales_filtered、web_sales_filtered）中，先JOIN filtered_date和filtered_customer后再扫描sales表，利用过滤后的较小结果集驱动sales表扫描，减少中间结果膨胀；3) 考虑在sales表上添加复合索引（如store_sales(ss_sold_date_sk, ss_customer_sk) WHERE ss_list_price BETWEEN ... AND ss_wholesale_cost BETWEEN ...）以恢复索引访问路径；4) 最外层JOIN改为先关联行数最少的两个CTE（catalog_sales_filtered和web_sales_filtered），再关联store_sales_filtered，减少Hash Join的构建代价。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示三个sales表的全表扫描（Seq Scan）占总代价90.3%（store_sales 45.7%、catalog_sales 29.7%、web_sales 14.9%），是核心瓶颈。上一轮反馈指出中间结果膨胀（行数估计8.6倍）和索引访问路径丢失的问题。当前SQL虽保留了CTE复用，但三个sales CTE仍先扫描大表再JOIN过滤表，导致：1）无法利用索引（sales表主键索引未覆盖过滤列ss_list_price/ss_wholesale_cost/ss_sold_date_sk/ss_customer_sk）；2）DISTINCT在大量中间结果上执行代价高。优化方向：将过滤条件与JOIN条件合并，利用filtered_date和filtered_customer的小结果集（date_dim过滤后约12行、customer过滤后约166,667行）作为驱动表，通过半连接或EXISTS改写消除DISTINCT，减少中间结果膨胀，并为sales表创建复合索引以支持索引访问路径。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将三个sales CTE中的JOIN顺序调整为：先用filtered_date和filtered_customer的交叉结果（约2,000,004行：12*166,667）作为驱动表，再通过半连接（SEMI JOIN或EXISTS）关联sales表，避免sales表全表扫描后再过滤。具体：用EXISTS (SELECT 1 FROM store_sales ss WHERE ss.ss_sold_date_sk=d.d_date_sk AND ss.ss_customer_sk=c.c_customer_sk AND ss.ss_list_price BETWEEN 185 AND 244 AND ss.ss_wholesale_cost BETWEEN 80 AND 100) 替代当前的INNER JOIN + DISTINCT模式，让优化器优先利用索引探测而非全表扫描。"
+    },
+    {
+      "group": "集合优化",
+      "produced_suggestion": "消除三个sales CTE中的DISTINCT操作。当前DISTINCT在大量中间结果上执行（store_sales扫描2880万行、catalog_sales扫描1440万行、web_sales扫描720万行），代价极高。通过半连接改写（EXISTS或IN子查询），将去重逻辑转移到最外层的三表INNER JOIN上（JOIN条件本身已隐含去重语义：c_last_name+c_first_name+d_date的交集），避免在每个CTE内部单独去重。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将sales表的范围过滤条件（ss_list_price BETWEEN 185 AND 244 AND ss_wholesale_cost BETWEEN 80 AND 100）与JOIN条件合并为单一谓词，确保优化器在索引选择时能同时考虑日期、客户和价格条件。若数据库支持，可将BETWEEN改写为>=和<=的AND组合（如ss_list_price>=185 AND ss_list_price<=244），部分优化器对显式比较的索引利用更优。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将最外层的三表INNER JOIN改写为两阶段过滤：第一阶段用filtered_date和filtered_customer生成候选集（c_last_name, c_first_name, d_date），第二阶段用EXISTS验证该候选集在三个sales表中均存在。具体：SELECT COUNT(*) FROM (SELECT d.d_date, c.c_last_name, c.c_first_name FROM filtered_date d CROSS JOIN filtered_customer c WHERE EXISTS(...store_sales...) AND EXISTS(...catalog_sales...) AND EXISTS(...web_sales...))。这样避免三个大CTE的物化，直接在小驱动表上执行探测。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_month_seq BETWEEN 1198 AND 1209\n),\nfiltered_customer AS (\n  SELECT c_customer_sk, c_last_name, c_first_name\n  FROM customer\n  WHERE c_birth_month IN (1, 3, 4, 6)\n),\ncandidate_set AS (\n  SELECT d.d_date, c.c_last_name, c.c_first_name, d.d_date_sk, c.c_customer_sk\n  FROM filtered_date d\n  CROSS JOIN filtered_customer c\n)\nSELECT COUNT(*)\nFROM candidate_set cs\nWHERE EXISTS (\n  SELECT 1\n  FROM store_sales ss\n  WHERE ss.ss_sold_date_sk = cs.d_date_sk\n    AND ss.ss_customer_sk = cs.c_customer_sk\n    AND ss.ss_list_price BETWEEN 185 AND 244\n    AND ss.ss_wholesale_cost BETWEEN 80 AND 100\n)\nAND EXISTS (\n  SELECT 1\n  FROM catalog_sales cat\n  WHERE cat.cs_sold_date_sk = cs.d_date_sk\n    AND cat.cs_bill_customer_sk = cs.c_customer_sk\n    AND cat.cs_list_price BETWEEN 185 AND 244\n    AND cat.cs_wholesale_cost BETWEEN 80 AND 100\n)\nAND EXISTS (\n  SELECT 1\n  FROM web_sales ws\n  WHERE ws.ws_sold_date_sk = cs.d_date_sk\n    AND ws.ws_bill_customer_sk = cs.c_customer_sk\n    AND ws.ws_list_price BETWEEN 185 AND 244\n    AND ws.ws_wholesale_cost BETWEEN 80 AND 100\n)\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. 保留了filtered_date和filtered_customer两个CTE的定义和过滤条件（d_month_seq BETWEEN 1198 AND 1209、c_birth_month IN (1,3,4,6)），与原SQL完全一致，确保日期和客户维度的过滤语义不变。\n\n2. 引入candidate_set CTE，通过CROSS JOIN生成filtered_date和filtered_customer的笛卡尔积，同时保留d_date_sk和c_customer_sk用于后续关联。该笛卡尔积的行数上界为12*166,667=2,000,004行（假设date_dim中d_month_seq BETWEEN 1198 AND 1209返回12行，customer中c_birth_month IN (1,3,4,6)返回约1/3客户），远小于原SQL中三个sales CTE扫描的总行数（28,800,991+14,397,492+7,197,566=50,396,049行）。\n\n3. 将原SQL中三个sales CTE（store_sales_filtered、catalog_sales_filtered、web_sales_filtered）的INNER JOIN + DISTINCT逻辑改写为三个EXISTS子查询。每个EXISTS子查询验证candidate_set中的(d_date_sk, c_customer_sk)组合在对应sales表中是否存在满足价格条件的记录。EXISTS的语义等价于原SQL的INNER JOIN（存在性检查），且自动去重（EXISTS只关心是否存在，不关心重复次数），因此消除DISTINCT不改变结果集。\n\n4. 原SQL最外层通过三表INNER JOIN（store_sales_filtered、catalog_sales_filtered、web_sales_filtered）在(c_last_name, c_first_name, d_date)上求交集。重写SQL通过三个AND连接的EXISTS子查询实现相同的交集语义：只有同时满足三个EXISTS条件的candidate_set行才会被计数，等价于原SQL的三表JOIN结果。由于candidate_set已包含c_last_name、c_first_name、d_date（通过d_date_sk和c_customer_sk关联），且EXISTS验证了这些组合在三个sales表中均存在，因此结果集与原SQL完全一致。\n\n5. 原SQL中三个sales CTE的DISTINCT操作在大量中间结果上执行（store_sales扫描2880万行、catalog_sales扫描1440万行、web_sales扫描720万行），代价极高。重写SQL通过将去重逻辑转移到最外层的三个EXISTS子查询（EXISTS本身隐含去重语义），避免在每个CTE内部单独去重，且利用小驱动表（candidate_set）通过索引探测sales表，减少全表扫描。\n\n6. 重写SQL保留了原SQL的COUNT(*)和LIMIT 100，最终返回的行数和语义与原SQL完全一致。由于candidate_set的行数上界远小于原SQL三个sales CTE的总行数，且EXISTS子查询可利用sales表上的索引（ss_sold_date_sk、ss_customer_sk、cs_sold_date_sk、cs_bill_customer_sk、ws_sold_date_sk、ws_bill_customer_sk）进行高效探测，预期执行计划将恢复索引访问路径，减少中间结果膨胀和Hash Join代价。\n\n7. 针对上一轮反馈中'中间结果膨胀'和'索引访问路径丢失'的问题，本轮改写通过以下方式修复：(1) 用小驱动表candidate_set（行数上界200万）替代三个大sales CTE（总行数5000万+），从根本上控制中间结果规模；(2) 将INNER JOIN改为EXISTS子查询，优化器可选择Nested Loop + Index Scan路径（在candidate_set的每一行上通过索引探测sales表），恢复索引利用；(3) 消除三个sales CTE的物化和DISTINCT操作，减少内存和CPU开销。这些改写在保留CTE复用收益的同时，针对性解决了上一轮的结构退化问题。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+  "equivalent": false,
+  "message": "重写SQL通过CROSS JOIN生成所有(date, customer)组合再用EXISTS过滤，会计入原SQL中不存在的组合（某customer在某date仅在部分渠道有交易），导致结果集不一致。",
+  "differences": [
+    {
+      "type": "结果集差异",
+      "description": "原SQL通过INTERSECT求三个渠道共同的(c_last_name, c_first_name, d_date)组合；重写SQL的candidate_set包含所有date×customer笛卡尔积，若某组合仅在1-2个渠道存在交易（不满足三个EXISTS），会被排除，但若某customer在某date的三个渠道都有交易但d_date值不同（如store_sales在1月1日、catalog_sales在1月2日、web_sales在1月3日），原SQL的INTERSECT会返回空集（三个d_date不相交），而重写SQL会分别检查三个日期并可能错误计入",
+      "location": "candidate_set CROSS JOIN与三个EXISTS子查询的组合逻辑"
+    },
+    {
+      "type": "关联键不一致",
+      "description": "原SQL三个子查询各自JOIN得到独立的(c_last_name, c_first_name, d_date)后做INTERSECT（要求三元组完全相同）；重写SQL在candidate_set中预先固定(d_date_sk, c_customer_sk)组合，然后用EXISTS验证该组合在三个sales表中是否存在，但未验证三个sales表中关联到的d_date是否为同一个值（只验证了d_date_sk相等，而d_date_sk到d_date是一对一映射，但三个sales表可能关联到不同的d_date_sk）",
+      "location": "candidate_set与三个EXISTS子查询的关联逻辑"
+    }
+  ]
+}
+```
+❌ 语义不等价: 重写SQL通过CROSS JOIN生成所有(date, customer)组合再用EXISTS过滤，会计入原SQL中不存在的组合（某customer在某date仅在部分渠道有交易），导致结果集不一致。
+```json
+{
+  "fixed_sql": "WITH filtered_date AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_month_seq BETWEEN 1198 AND 1209\n),\nfiltered_customer AS (\n  SELECT c_customer_sk, c_last_name, c_first_name\n  FROM customer\n  WHERE c_birth_month IN (1, 3, 4, 6)\n),\nstore_sales_set AS (\n  SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date\n  FROM store_sales ss\n  JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk\n  JOIN filtered_customer c ON ss.ss_customer_sk = c.c_customer_sk\n  WHERE ss.ss_list_price BETWEEN 185 AND 244\n    AND ss.ss_wholesale_cost BETWEEN 80 AND 100\n),\ncatalog_sales_set AS (\n  SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date\n  FROM catalog_sales cat\n  JOIN filtered_date d ON cat.cs_sold_date_sk = d.d_date_sk\n  JOIN filtered_customer c ON cat.cs_bill_customer_sk = c.c_customer_sk\n  WHERE cat.cs_list_price BETWEEN 185 AND 244\n    AND cat.cs_wholesale_cost BETWEEN 80 AND 100\n),\nweb_sales_set AS (\n  SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date\n  FROM web_sales ws\n  JOIN filtered_date d ON ws.ws_sold_date_sk = d.d_date_sk\n  JOIN filtered_customer c ON ws.ws_bill_customer_sk = c.c_customer_sk\n  WHERE ws.ws_list_price BETWEEN 185 AND 244\n    AND ws.ws_wholesale_cost BETWEEN 80 AND 100\n)\nSELECT COUNT(*)\nFROM store_sales_set s\nWHERE EXISTS (\n  SELECT 1 FROM catalog_sales_set c\n  WHERE c.c_last_name = s.c_last_name\n    AND c.c_first_name = s.c_first_name\n    AND c.d_date = s.d_date\n)\nAND EXISTS (\n  SELECT 1 FROM web_sales_set w\n  WHERE w.c_last_name = s.c_last_name\n    AND w.c_first_name = s.c_first_name\n    AND w.d_date = s.d_date\n)\nLIMIT 100;",
+  "note": "将笛卡尔积candidate_set改为三个独立CTE分别生成(c_last_name, c_first_name, d_date)三元组，用EXISTS验证三元组在三个渠道的交集，保证d_date值完全相同，实现INTERSECT语义"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL通过三个独立的CTE（store_sales_set、catalog_sales_set、web_sales_set）各自执行JOIN+DISTINCT得到三个去重后的(c_last_name, c_first_name, d_date)集合，再用两个EXISTS在这三个集合上求交集，与原SQL的INTERSECT语义完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 3->0, Hash/Merge 3->8 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "结构明确恶化：1) 行数估计求和从33万暴增至288万（8.6倍），说明中间结果膨胀严重；2) 索引探测完全消失（Index Scan 3→0），Nested Loop 3→0，改为全表扫描+Hash Join，丧失关键访问路径；3) CTE物化引入5个子计划（原0个），每个sales表被全表扫描后再DISTINCT，代价极高（store_sales 2880万行、catalog_sales 1440万行、web_sales 720万行）；4) cost从150万增至167万（11%），虽非决定性但与结构退化一致。原SQL通过Nested Loop+Index Scan实现高效探测（每次JOIN仅回表1行），重写SQL改为先物化大CTE再多路Hash Join，完全背离OLTP高选择性场景的最优路径。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：1) 消除所有CTE，回归原SQL的Nested Loop+Index Scan模式；2) 保留INTERSECT语义，但将三个分支改为半连接（EXISTS）而非INNER JOIN+DISTINCT；3) 将filtered_date和filtered_customer的过滤条件内联到各分支的WHERE子句中，避免CTE物化；4) 确保优化器能利用customer_pkey索引（c_customer_sk）和date_dim的d_month_seq索引（若存在）进行探测。具体模板：SELECT COUNT(*) FROM (SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date FROM store_sales ss JOIN date_dim d ON ss.ss_sold_date_sk=d.d_date_sk JOIN customer c ON ss.ss_customer_sk=c.c_customer_sk WHERE d.d_month_seq BETWEEN 1198 AND 1209 AND c.c_birth_month IN (1,3,4,6) AND ss.ss_list_price BETWEEN 185 AND 244 AND ss.ss_wholesale_cost BETWEEN 80 AND 100 AND EXISTS (SELECT 1 FROM catalog_sales cat JOIN date_dim d2 ON cat.cs_sold_date_sk=d2.d_date_sk JOIN customer c2 ON cat.cs_bill_customer_sk=c2.c_customer_sk WHERE d2.d_month_seq BETWEEN 1198 AND 1209 AND c2.c_birth_month IN (1,3,4,6) AND cat.cs_list_price BETWEEN 185 AND 244 AND cat.cs_wholesale_cost BETWEEN 80 AND 100 AND c2.c_last_name=c.c_last_name AND c2.c_first_name=c.c_first_name AND d2.d_date=d.d_date) AND EXISTS (SELECT 1 FROM web_sales ws JOIN date_dim d3 ON ws.ws_sold_date_sk=d3.d_date_sk JOIN customer c3 ON ws.ws_bill_customer_sk=c3.c_customer_sk WHERE d3.d_month_seq BETWEEN 1198 AND 1209 AND c3.c_birth_month IN (1,3,4,6) AND ws.ws_list_price BETWEEN 185 AND 244 AND ws.ws_wholesale_cost BETWEEN 80 AND 100 AND c3.c_last_name=c.c_last_name AND c3.c_first_name=c.c_first_name AND d3.d_date=d.d_date)) hot_cust LIMIT 100;"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1045
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=1498068.84, 重写=1669664.6，相对变化: -11.45%
+✅ 成功存储，记录ID: 6730dbe0-2c62-4141-a2d9-3f34e3ff9aa8
+
+----------------------------------------
+

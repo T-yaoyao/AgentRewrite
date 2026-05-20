@@ -1,7 +1,6 @@
 """
 LangGraph 编排的查询重写管线：
-initial_check → rule_selection → rewrite → syntax_check → semantic_check → evaluation
-→（有条件）uct_learning → END。UCT 学习更新使用纯数学公式（基于代价降低率）。
+initial_check → rewrite → syntax_check → semantic_check → evaluation
 """
 from __future__ import annotations
 
@@ -9,8 +8,6 @@ import asyncio
 import json
 import re
 from typing import Any, Dict, List, Optional, TypedDict
-
-import numpy as np
 
 from langgraph.graph import END, StateGraph
 
@@ -35,17 +32,14 @@ from src.Rewrite_Middleware.Agent_Memory_Buffer.memory_buffer import (
 )
 from src.Query_Rewriter.agent_definition import (
     DecisionAgent,
-    ReasoningAgent,
     RewriteAgent,
     SemanticCheckAgent,
-    get_all_rules,
 )
 from src.Query_Rewriter.global_memory import GlobalMemoryManager
 from src.Query_Rewriter.schema_context import (
     build_filtered_schema_content,
     filter_data_statistics_for_sql,
 )
-from src.Query_Rewriter.rule_bandit import get_rule_bandit
 from src.utils.agent_template import MessageQueue
 
 
@@ -67,7 +61,6 @@ class RewriteState(TypedDict, total=False):
     should_terminate: bool
 
     optimization_advice: List[Dict]
-    selected_rules: Optional[Dict]
     current_rewrite_result: Optional[Dict]
 
     # 与 can_optimize 同粒度：各步 Agent 的可读字段（非整包 dict）
@@ -93,9 +86,6 @@ class RewriteState(TypedDict, total=False):
 
     few_shot_examples: List
     retrieved_record_id: Optional[str]
-
-    # 评估节点写入，供 uct_learning 节点做数学更新；须显式声明否则 LangGraph 可能丢弃
-    _uct_update_info: Optional[Dict[str, Any]]
 
     final_original_costs: float
     final_rewritten_costs: float
@@ -128,9 +118,7 @@ class LangGraphQueryRewriter:
     COST_ROLLBACK_PCT = 50.0
     # If estimated cost drops by more than this fraction vs original, skip LLM evaluation and exit.
     EARLY_TERMINATE_COST_REDUCTION_RATIO = 0.40
-    EFFECT_SCORE_LAMBDA_BASE = 0.5
-    # Reward fusion: combine optimizer cost signal with plan-structure signal.
-    REWARD_COST_WEIGHT = 0.30
+    # Plan-structure metadata weights for global memory records.
     REWARD_ROWS_WEIGHT = 0.40
     REWARD_DEPTH_WEIGHT = 0.30
     # Keep rewrite when cost/plan are near-equivalent to avoid over-rollback.
@@ -154,11 +142,10 @@ class LangGraphQueryRewriter:
         self.schema_file = schema_file
         self.MAX_ITERATION_LOOP = MAX_ITERATION_LOOP
 
-        self.reasoning_agent = ReasoningAgent(message_queue)
         self.decision_agent = DecisionAgent(message_queue)
         self.rewrite_agent = RewriteAgent(message_queue)
         self.semantic_check_agent = SemanticCheckAgent(message_queue)
-        self.decision_agent.watch(["ReasoningAgent", "ExplainAgent"])
+        self.decision_agent.watch(["ExplainAgent"])
 
         self.llm_semaphore = asyncio.Semaphore(3)
         self.db_semaphore = asyncio.Semaphore(5)
@@ -170,16 +157,11 @@ class LangGraphQueryRewriter:
             print(f"⚠️ Global memory unavailable: {e}")
             self.global_memory = None
         
-        # Initialize UCT bandit components
-        self.bandit = get_rule_bandit()
-        print("✅ UCT Bandit initialized (math reward mode)")
-
         self.graph = self._build_graph()
 
     def _build_graph(self):
         g = StateGraph(RewriteState)
         g.add_node("initial_check", self._initial_check_node)
-        g.add_node("rule_selection", self._rule_selection_node)
         g.add_node("rewrite", self._rewrite_node)
         g.add_node("syntax_check", self._syntax_check_node)
         g.add_node("semantic_check", self._semantic_check_node)
@@ -189,19 +171,16 @@ class LangGraphQueryRewriter:
         g.add_conditional_edges(
             "initial_check",
             self._route_after_initial,
-            {"continue": "rule_selection", "end": END},
+            {"continue": "rewrite", "end": END},
         )
-        g.add_edge("rule_selection", "rewrite")
         g.add_edge("rewrite", "syntax_check")
         g.add_edge("syntax_check", "semantic_check")
         g.add_edge("semantic_check", "evaluation")
-        g.add_node("uct_learning", self._uct_learning_node)
         g.add_conditional_edges(
             "evaluation",
             self._route_after_eval,
-            {"again": "initial_check", "uct": "uct_learning", "end": END},
+            {"again": "initial_check", "end": END},
         )
-        g.add_edge("uct_learning", END)
         return g.compile()
 
     def _route_after_initial(self, state: RewriteState) -> str:
@@ -210,8 +189,6 @@ class LangGraphQueryRewriter:
     def _route_after_eval(self, state: RewriteState) -> str:
         if not state.get("should_terminate", True):
             return "again"
-        if state.get("_uct_update_info"):
-            return "uct"
         return "end"
 
     def _trace(self, state: RewriteState, node: str, payload: Dict[str, Any]) -> List[Dict]:
@@ -413,31 +390,6 @@ class LangGraphQueryRewriter:
             "reasons": reasons,
         }
 
-    def _uct_update_payload(
-        self,
-        sel: Dict[str, Any],
-        applied: List[str],
-        init_sql: str,
-        rw: str,
-        o_exp: Any,
-        r_exp: Any,
-        oc: float,
-        rc: float,
-    ) -> Dict[str, Any]:
-        return {
-            "applied_rules": applied,
-            "chosen_rule_prior": sel.get("chosen_rule_prior") or [],
-            "rule_effect_scores": sel.get("rule_effect_scores") or {},
-            "rule_effect_confidence": sel.get("rule_effect_confidence") or {},
-            "context_vector": sel.get("_context_vector"),
-            "original_cost": oc,
-            "rewritten_cost": rc,
-            "original_sql": init_sql,
-            "rewritten_sql": rw,
-            "original_explain": o_exp,
-            "rewritten_explain": r_exp,
-        }
-
     @staticmethod
     def _extract_plan_roots(explain_payload: Any) -> List[Dict[str, Any]]:
         """Best-effort parse EXPLAIN payload into root Plan dict list."""
@@ -548,71 +500,6 @@ class LangGraphQueryRewriter:
             "r_depth": float(r_depth),
         }
 
-    def _should_write_uct_sample(
-        self,
-        oc: float,
-        rc: float,
-        rows_score: float,
-        depth_score: float,
-    ) -> bool:
-        """
-        Write learning sample iff cost/rows/depth are not all negative.
-        Negative means strictly < 0.
-        """
-        rcost = self.bandit.compute_sequence_reward(oc, rc)
-        rrows = float(rows_score)
-        rdepth = float(depth_score)
-        return not (rcost < 0.0 and rrows < 0.0 and rdepth < 0.0)
-
-    @staticmethod
-    def _fallback_position_weights(applied: List[str], position_decay: float = 0.90) -> Dict[str, float]:
-        if not applied:
-            return {}
-        if position_decay <= 0:
-            position_decay = 1.0
-        ws = np.array([position_decay ** i for i in range(len(applied))], dtype=np.float64)
-        s = float(ws.sum()) if float(ws.sum()) > 0 else 1.0
-        return {rid: float(ws[i] / s) for i, rid in enumerate(applied)}
-
-    def _mix_llm_effect_with_confidence_gate(
-        self,
-        applied: List[str],
-        effect_scores: Dict[str, float],
-        effect_confidence: Dict[str, float],
-    ) -> Dict[str, float]:
-        """
-        Mixed weight per rule:
-            w_i = lambda_i * w_i_llm + (1-lambda_i) * w_i_fallback
-            lambda_i = lambda_base * confidence_i
-        """
-        if not applied:
-            return {}
-        fallback = self._fallback_position_weights(applied, position_decay=0.90)
-        if not effect_scores:
-            return fallback
-
-        llm = {}
-        llm_sum = 0.0
-        for rid in applied:
-            v = float(max(0.0, effect_scores.get(rid, 0.0)))
-            llm[rid] = v
-            llm_sum += v
-        if llm_sum <= 0:
-            return fallback
-        llm = {rid: (llm[rid] / llm_sum) for rid in applied}
-
-        mixed = {}
-        for rid in applied:
-            conf = float(effect_confidence.get(rid, 0.5))
-            conf = max(0.0, min(1.0, conf))
-            lambda_i = self.EFFECT_SCORE_LAMBDA_BASE * conf
-            mixed[rid] = lambda_i * llm[rid] + (1.0 - lambda_i) * fallback[rid]
-
-        total = sum(mixed.values())
-        if total <= 0:
-            return fallback
-        return {rid: (mixed[rid] / total) for rid in applied}
-
     def _is_near_equivalent_plan_and_cost(
         self,
         plan_struct: Optional[Dict[str, Any]],
@@ -641,123 +528,6 @@ class LangGraphQueryRewriter:
         # under decorrelation / CTE / pre-aggregation rewrites and should remain
         # an auxiliary reference instead of a blocking condition.
         return small_deltas
-
-    async def _apply_uct_bandit_update(self, state: RewriteState) -> None:
-        """消费 evaluation 写入的 _uct_update_info，完成纯数学 LinUCB 更新。"""
-        initial_sql = state["initial_sql"]
-        uct_info = state.get("_uct_update_info")
-        if not uct_info or not uct_info.get("applied_rules"):
-            return
-        uct_info = dict(uct_info)
-        if not uct_info.get("context_vector"):
-            expl = state.get("initial_explain_info") or ""
-            adv_groups: List[str] = []
-            for a in state.get("optimization_advice") or []:
-                g = a.get("group")
-                if g:
-                    adv_groups.append(g)
-            ctx = self.bandit.extract_context(initial_sql, expl, adv_groups, state.get("data_statistics"))
-            uct_info["context_vector"] = ctx.tolist()
-        try:
-            context = np.array(uct_info["context_vector"], dtype=np.float32)
-            oc = uct_info["original_cost"]
-            rc = uct_info["rewritten_cost"]
-            applied = uct_info["applied_rules"]
-            chosen_prior_list = uct_info.get("chosen_rule_prior") or []
-            chosen_prior_map: Dict[str, float] = {}
-            for item in chosen_prior_list:
-                if not isinstance(item, dict):
-                    continue
-                rid = item.get("rule_id")
-                pr = item.get("prior")
-                if rid and isinstance(pr, (int, float)):
-                    chosen_prior_map[str(rid)] = float(pr)
-            raw_effect_scores = uct_info.get("rule_effect_scores") or {}
-            effect_scores: Dict[str, float] = {}
-            if isinstance(raw_effect_scores, dict):
-                for rid in applied:
-                    v = raw_effect_scores.get(rid)
-                    if isinstance(v, (int, float)) and float(v) > 0:
-                        effect_scores[rid] = float(v)
-            raw_effect_conf = uct_info.get("rule_effect_confidence") or {}
-            effect_conf: Dict[str, float] = {}
-            if isinstance(raw_effect_conf, dict):
-                for rid in applied:
-                    v = raw_effect_conf.get(rid)
-                    if isinstance(v, (int, float)):
-                        effect_conf[rid] = float(max(0.0, min(1.0, float(v))))
-            mixed_weights = self._mix_llm_effect_with_confidence_gate(
-                applied,
-                effect_scores,
-                effect_conf,
-            )
-            cost_reward = self.bandit.compute_sequence_reward(oc, rc)
-            struct_detail = self._compute_structure_reward(
-                uct_info.get("original_explain"),
-                uct_info.get("rewritten_explain"),
-            )
-            rows_score = float(struct_detail.get("rows_score", 0.0))
-            depth_score = float(struct_detail.get("depth_score", 0.0))
-            sequence_reward = (
-                self.REWARD_COST_WEIGHT * cost_reward
-                + self.REWARD_ROWS_WEIGHT * rows_score
-                + self.REWARD_DEPTH_WEIGHT * depth_score
-            )
-            sequence_reward = float(max(-1.0, min(1.0, sequence_reward)))
-            print(
-                f"\n🎲 UCT Math Update: {len(applied)} rules, "
-                f"reward={sequence_reward:+.4f} "
-                f"(cost={cost_reward:+.4f}, rows={rows_score:+.4f}, depth={depth_score:+.4f}, "
-                f"oc={oc:.4f}, rc={rc:.4f})"
-            )
-            print(
-                "   结构分细节: "
-                f"rows {struct_detail.get('o_rows', 0.0):.1f}->{struct_detail.get('r_rows', 0.0):.1f} "
-                f"(score={struct_detail.get('rows_score', 0.0):+.3f}), "
-                f"depth {struct_detail.get('o_depth', 0.0):.1f}->{struct_detail.get('r_depth', 0.0):.1f} "
-                f"(score={struct_detail.get('depth_score', 0.0):+.3f})"
-            )
-            rule_rewards = self.bandit.update_with_sequence_reward(
-                applied,
-                context,
-                sequence_reward,
-                rule_weights=mixed_weights,
-            )
-            print("✅ UCT Update Complete:")
-            for rule_id, reward in rule_rewards.items():
-                stats = self.bandit.get_rule_stats(rule_id)
-                if stats:
-                    prior_str = (
-                        f"{chosen_prior_map[rule_id]:.3f}"
-                        if rule_id in chosen_prior_map
-                        else "N/A"
-                    )
-                    effect_str = (
-                        f"{effect_scores.get(rule_id, 0.0):.3f}"
-                        if effect_scores
-                        else "N/A"
-                    )
-                    conf_str = (
-                        f"{effect_conf.get(rule_id, 0.5):.2f}"
-                        if effect_conf
-                        else "N/A"
-                    )
-                    gate_lambda = (
-                        self.EFFECT_SCORE_LAMBDA_BASE * float(effect_conf.get(rule_id, 0.5))
-                        if effect_conf
-                        else 0.0
-                    )
-                    print(
-                        f"   → {rule_id}: P(s,a)={prior_str}, effect={effect_str}, conf={conf_str}, "
-                        f"lambda={gate_lambda:.2f}, reward={reward:+.3f}, "
-                        f"count={stats['count']}, avg={stats['avg_reward']:+.3f}"
-                    )
-        except Exception as be:
-            print(f"⚠️ UCT Bandit update failed: {be}")
-
-    async def _uct_learning_node(self, state: RewriteState) -> Dict[str, Any]:
-        await self._apply_uct_bandit_update(state)
-        return {}
 
     async def _initial_check_node(self, state: RewriteState) -> Dict[str, Any]:
         print("🔍 开始初始优化可行性检查...")
@@ -840,84 +610,16 @@ class LangGraphQueryRewriter:
                 "rewritten_sql": base_sql,
             }
 
-    async def _rule_selection_node(self, state: RewriteState) -> Dict[str, Any]:
-        rnd = state.get("current_round", 1)
-        print(f"🎯 第{rnd}轮规则选择 (UCT-guided)...")
-        trace = list(state.get("agent_trace") or [])
-        try:
-            base_sql = _state_sql(state.get("current_sql") or state["initial_sql"])
-            groups: List[str] = []
-            for a in state.get("optimization_advice") or []:
-                g = a.get("group")
-                if g:
-                    groups.append(g)
-            lib = get_all_rules()
-            stats = _stats_str(state["data_statistics"])
-            idx = state.get("index_info") or self.index_info
-            explain_info = state.get("initial_explain_info", "")
-            if not explain_info:
-                async with self.db_semaphore:
-                    explain = await DBMS_EXPLAIN_Tool(self.dbms, base_sql)
-                explain_info = (
-                    json.dumps(explain, ensure_ascii=False)
-                    if not isinstance(explain, str)
-                    else explain
-                )
-            
-            # ====== Bandit scoring (single-pass generation + bandit sorting) ======
-            context = self.bandit.extract_context(base_sql, explain_info, groups, state.get("data_statistics"))
-            scored_rules = self.bandit.score_rules(lib, context)
-            
-            # Build UCT-scored rule library for LLM
-            uct_scored_lib = {}
-            for group, rule_id, score, desc in scored_rules:
-                if group not in uct_scored_lib:
-                    uct_scored_lib[group] = {}
-                uct_scored_lib[group][rule_id] = (desc, score)
-            
-            print(f"📊 UCT scored {len(scored_rules)} rules")
-            top_3 = scored_rules[:3]
-            for g, rid, score, _ in top_3:
-                print(f"   → {rid}: UCT={score:.3f}")
-            
-            async with self.llm_semaphore:
-                seq = await self.reasoning_agent.select_rule_sequence(
-                    base_sql,
-                    state["optimization_advice"],
-                    uct_scored_lib,  # Pass UCT-scored library
-                    stats,
-                    explain_info,
-                    rnd,
-                    state.get("previous_feedback"),
-                    state.get("few_shot_examples") or [],
-                    index_info=idx,
-                )
-            
-            # Store context for later bandit update
-            seq["_context_vector"] = context.tolist()
-            
-            trace.append({"node": "rule_selection", "output": seq})
-            print(f"✅ 选择了 {len(seq.get('applied_rules', []))} 个规则")
-            return {"selected_rules": seq, "agent_trace": trace}
-        except Exception as e:
-            print(f"规则选择失败: {e}")
-            return {
-                "should_terminate": True,
-                "agent_trace": trace + [{"node": "rule_selection", "error": str(e)}],
-            }
-
     async def _rewrite_node(self, state: RewriteState) -> Dict[str, Any]:
-        print("🔧 开始SQL重写...")
+        print("🔧 开始无规则 SQL 重写...")
         trace = list(state.get("agent_trace") or [])
         try:
             base_sql = _state_sql(state.get("current_sql") or state["initial_sql"])
-            sel = state.get("selected_rules") or {"applied_rules": [], "groups": ""}
             stats = _stats_str(state["data_statistics"])
             idx = state.get("index_info") or self.index_info
             async with self.llm_semaphore:
-                rr = await self.rewrite_agent.rewrite_with_rule_sequence(
+                rr = await self.rewrite_agent.rewrite_without_rules(
                     base_sql,
-                    sel,
                     json.dumps(state.get("optimization_advice") or [], ensure_ascii=False),
                     stats,
                     schema_content=state.get("schema_content") or "",
@@ -1012,7 +714,7 @@ class LangGraphQueryRewriter:
         base_sql = _state_sql(state.get("current_sql") or state["initial_sql"])
         cur = _state_sql(rr.get("rewritten_sql", base_sql))
         rr["rewritten_sql"] = cur
-        rules = rr.get("applied_rules") or (state.get("selected_rules") or {}).get("applied_rules", [])
+        rules: List[str] = []
         schema = (state.get("schema_content") or "").strip()
         stats = _stats_str(state["data_statistics"])
         idx = state.get("index_info") or self.index_info
@@ -1202,9 +904,8 @@ class LangGraphQueryRewriter:
         rr = dict(state.get("current_rewrite_result") or {})
         rw = _state_sql(rr.get("rewritten_sql", init_sql))
         rr["rewritten_sql"] = rw
-        sel = state.get("selected_rules") or {}
-        groups = sel.get("groups", "")
-        applied = sel.get("applied_rules", [])
+        groups = "no_rule"
+        applied: List[str] = []
 
         try:
             async def _raw_exp(sql: str):
@@ -1455,7 +1156,7 @@ class LangGraphQueryRewriter:
                 if rw != init_sql:
                     # 本轮保留了重写 SQL：写入全局记忆（不要求估计代价下降）
                     if is_uncertain:
-                        print("ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库与 UCT 更新。")
+                        print("ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库更新。")
                     elif self.global_memory:
                         try:
                             struct_detail_for_store = self._compute_structure_reward(o_exp, r_exp)
@@ -1473,18 +1174,6 @@ class LangGraphQueryRewriter:
                             )
                         except Exception as ex:
                             print(f"⚠️ 知识库存储失败: {ex}")
-                    if not is_uncertain:
-                        struct_detail_for_gate = self._compute_structure_reward(o_exp, r_exp)
-                        should_write = self._should_write_uct_sample(
-                            oc=oc,
-                            rc=rc,
-                            rows_score=float(struct_detail_for_gate.get("rows_score", 0.0)),
-                            depth_score=float(struct_detail_for_gate.get("depth_score", 0.0)),
-                        )
-                        if applied and should_write:
-                            out["_uct_update_info"] = self._uct_update_payload(
-                                sel, applied, init_sql, rw, o_exp, r_exp, oc, rc
-                            )
                 out["rewritten_sql"] = _state_sql(out.get("rewritten_sql", rw))
                 cr = dict(out.get("current_rewrite_result") or rr)
                 cr["rewritten_sql"] = out["rewritten_sql"]
@@ -1508,7 +1197,7 @@ class LangGraphQueryRewriter:
                     )
                 if rw != init_sql:
                     if is_uncertain:
-                        print("ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库与 UCT 更新。")
+                        print("ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库更新。")
                     elif self.global_memory:
                         try:
                             struct_detail_for_store = self._compute_structure_reward(o_exp, r_exp)
@@ -1526,18 +1215,6 @@ class LangGraphQueryRewriter:
                             )
                         except Exception as ex:
                             print(f"⚠️ 知识库存储失败: {ex}")
-                    if not is_uncertain:
-                        struct_detail_for_gate = self._compute_structure_reward(o_exp, r_exp)
-                        should_write = self._should_write_uct_sample(
-                            oc=oc,
-                            rc=rc,
-                            rows_score=float(struct_detail_for_gate.get("rows_score", 0.0)),
-                            depth_score=float(struct_detail_for_gate.get("depth_score", 0.0)),
-                        )
-                        if applied and should_write:
-                            out["_uct_update_info"] = self._uct_update_payload(
-                                sel, applied, init_sql, rw, o_exp, r_exp, oc, rc
-                            )
                 out["rewritten_sql"] = _state_sql(out.get("rewritten_sql", rw))
                 cr = dict(out.get("current_rewrite_result") or rr)
                 cr["rewritten_sql"] = out["rewritten_sql"]
@@ -1589,10 +1266,7 @@ class LangGraphQueryRewriter:
             final_sql = _state_sql(state["current_rewrite_result"].get("rewritten_sql", final_sql))
         rc = state.get("final_rewritten_costs", oc)
         rate = round(((oc - rc) / oc * 100) if oc > 0 else 0.0, 2)
-        sel = state.get("selected_rules") or {}
-        rules = sel.get("applied_rules")
-        if not rules:
-            rules = None
+        rules = None
         return {
             "tpch": [
                 {
@@ -1629,7 +1303,6 @@ class LangGraphQueryRewriter:
             "can_optimize": False,
             "should_terminate": False,
             "optimization_advice": [],
-            "selected_rules": None,
             "current_rewrite_result": None,
             "initial_optimization_reason": "",
             "semantic_check_note": "",

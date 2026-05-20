@@ -1,0 +1,175 @@
+Query ID: 95
+==================================================
+
+Original: select    cd_gender,   cd_marital_status,   cd_education_status,   count(*) cnt1,   cd_purchase_estimate,   count(*) cnt2,   cd_credit_rating,   count(*) cnt3  from   customer c,customer_address ca,customer_demographics  where   c.c_current_addr_sk = ca.ca_address_sk and   ca_state in ('MS','NM','TN') and   cd_demo_sk = c.c_current_cdemo_sk   and cd_marital_status in ('W', 'S', 'W')   and cd_education_status in ('College', 'Advanced Degree') and   exists (select *           from store_sales,date_dim           where c.c_customer_sk = ss_customer_sk and                 ss_sold_date_sk = d_date_sk and                 d_year = 1999 and                 d_moy between 2 and 2+2                 and ss_list_price between 211 and 300           ) and    (not exists (select *             from web_sales,date_dim             where c.c_customer_sk = ws_bill_customer_sk and                   ws_sold_date_sk = d_date_sk and                   d_year = 1999 and                   d_moy between 2 and 2+2                   and ws_list_price between 211 and 300             ) and     not exists (select *             from catalog_sales,date_dim             where c.c_customer_sk = cs_ship_customer_sk and                   cs_sold_date_sk = d_date_sk and                   d_year = 1999 and                   d_moy between 2 and 2+2                   and cs_list_price between 211 and 300)             )  group by cd_gender,           cd_marital_status,           cd_education_status,           cd_purchase_estimate,           cd_credit_rating  order by cd_gender,           cd_marital_status,           cd_education_status,           cd_purchase_estimate,           cd_credit_rating  limit 100;
+Rewritten: WITH filtered_date AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 1999 AND d_moy BETWEEN 2 AND 4
+)
+SELECT
+  cd_gender,
+  cd_marital_status,
+  cd_education_status,
+  count(*) cnt1,
+  cd_purchase_estimate,
+  count(*) cnt2,
+  cd_credit_rating,
+  count(*) cnt3
+FROM customer c
+INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+WHERE ca.ca_state IN ('MS', 'NM', 'TN')
+  AND cd.cd_marital_status IN ('W', 'S')
+  AND cd.cd_education_status IN ('College', 'Advanced Degree')
+  AND EXISTS (
+    SELECT 1
+    FROM store_sales ss
+    INNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk
+    WHERE c.c_customer_sk = ss.ss_customer_sk
+      AND ss.ss_list_price BETWEEN 211 AND 300
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM web_sales ws
+    INNER JOIN filtered_date fd ON ws.ws_sold_date_sk = fd.d_date_sk
+    WHERE c.c_customer_sk = ws.ws_bill_customer_sk
+      AND ws.ws_list_price BETWEEN 211 AND 300
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM catalog_sales cs
+    INNER JOIN filtered_date fd ON cs.cs_sold_date_sk = fd.d_date_sk
+    WHERE c.c_customer_sk = cs.cs_ship_customer_sk
+      AND cs.cs_list_price BETWEEN 211 AND 300
+  )
+GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+LIMIT 100
+Time Cost: 196.39s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将qualified_customers CTE完全内联到主查询：1)保留filtered_date CTE复用；2)将EXISTS转换为INNER JOIN(store_sales + filtered_date)并在主查询FROM子句中执行，确保ss_customer_sk = c.c_customer_sk连接在customer表已过滤后进行；3)将两个NOT EXISTS转换为LEFT JOIN + IS NULL模式(web_sales/catalog_sales分别LEFT JOIN filtered_date)，在主查询WHERE子句中添加ws.ws_bill_customer_sk IS NULL和cs.cs_ship_customer_sk IS NULL条件，避免提前物化Anti Join结果；4)确保连接顺序为customer -> customer_address(ca_state过滤) -> customer_demographics(cd_marital_status/cd_education_status过滤) -> store_sales(EXISTS) -> web_sales(NOT EXISTS) -> catalog_sales(NOT EXISTS)，利用早期过滤减少后续连接基数'}, {'group': '谓词简化', 'produced_suggestion': "将demographics和address过滤条件前置：在主查询中先执行customer与customer_address的JOIN并立即应用ca_state IN ('MS','NM','TN')过滤，再JOIN customer_demographics并应用cd_marital_status IN ('W','S')和cd_education_status IN ('College','Advanced Degree')过滤，确保这些高选择性过滤在EXISTS/NOT EXISTS逻辑之前执行，将参与事实表连接的customer基数从50万降至数千量级，避免上一轮qualified_customers CTE中74132行的数据膨胀"}, {'group': '连接优化', 'produced_suggestion': '优化连接策略以避免上一轮的Merge Join Anti高开销：1)将NOT EXISTS的LEFT JOIN + IS NULL模式设计为Hash Left Join而非Merge Join，避免排序开销；2)在store_sales的EXISTS连接中，先将filtered_date结果(d_year=1999且d_moy BETWEEN 2 AND 4，预计91天)与store_sales JOIN，再与已过滤的customer表JOIN，利用Nested Loop + Index Scan按需探测而非全表扫描；3)确保web_sales和catalog_sales的LEFT JOIN在customer基数已大幅减少后执行，使Anti Join处理的行数从上一轮的85342+39693+28436降至数百量级'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：三个大表(store_sales 2880万行、catalog_sales 1440万行、web_sales 720万行)均进行全表扫描，总代价占比达97.2%。SQL结构存在多个可优化点：1)EXISTS和NOT EXISTS子查询可转换为半连接/反连接以利用索引；2)谓词条件(d_year=1999, d_moy between 2 and 4, list_price between 211 and 300)可下推到子查询中提前过滤；3)cd_marital_status条件存在冗余值('W'出现两次)；4)date_dim表在三个子查询中重复关联，可通过CTE复用；5)三个子查询的date_dim过滤条件完全相同，可提取为公共表达式。历史案例显示CTE分解、子查询关联化、谓词下推、连接条件推导等规则组合对此类SQL有效。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS子查询转换为SEMI JOIN，将NOT EXISTS子查询转换为ANTI JOIN，使优化器能够选择更高效的连接算法(如Hash Semi Join)并利用主键索引加速关联"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用CTE提取date_dim的公共过滤条件(d_year=1999 AND d_moy BETWEEN 2 AND 4)，避免在三个子查询中重复扫描和过滤date_dim表，减少重复计算"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "消除cd_marital_status IN ('W','S','W')中的重复值'W'，简化为IN ('W','S')，减少不必要的比较操作"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将list_price和date相关的过滤条件尽早应用到各销售表扫描阶段，在JOIN前大幅减少参与连接的数据量，降低后续Hash Join的内存和CPU开销"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先执行选择性高的过滤(ca_state IN ('MS','NM','TN')过滤customer_address，cd_marital_status/cd_education_status过滤customer_demographics)，然后再与customer表关联，减少中间结果集大小"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用传递性推导额外的连接条件，例如从c.c_customer_sk = ss_customer_sk和主键约束推导出更多等值条件，帮助优化器生成更优的连接计划"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 1999 AND d_moy BETWEEN 2 AND 4\n),\nqualified_customers AS (\n  SELECT DISTINCT c.c_customer_sk\n  FROM customer c\n  WHERE EXISTS (\n    SELECT 1\n    FROM store_sales ss\n    INNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk\n    WHERE c.c_customer_sk = ss.ss_customer_sk\n      AND ss.ss_list_price BETWEEN 211 AND 300\n  )\n  AND NOT EXISTS (\n    SELECT 1\n    FROM web_sales ws\n    INNER JOIN filtered_date fd ON ws.ws_sold_date_sk = fd.d_date_sk\n    WHERE c.c_customer_sk = ws.ws_bill_customer_sk\n      AND ws.ws_list_price BETWEEN 211 AND 300\n  )\n  AND NOT EXISTS (\n    SELECT 1\n    FROM catalog_sales cs\n    INNER JOIN filtered_date fd ON cs.cs_sold_date_sk = fd.d_date_sk\n    WHERE c.c_customer_sk = cs.cs_ship_customer_sk\n      AND cs.cs_list_price BETWEEN 211 AND 300\n  )\n)\nSELECT\n  cd_gender,\n  cd_marital_status,\n  cd_education_status,\n  count(*) cnt1,\n  cd_purchase_estimate,\n  count(*) cnt2,\n  cd_credit_rating,\n  count(*) cnt3\nFROM customer c\nINNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\nINNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk\nINNER JOIN qualified_customers qc ON c.c_customer_sk = qc.c_customer_sk\nWHERE ca.ca_state IN ('MS', 'NM', 'TN')\n  AND cd.cd_marital_status IN ('W', 'S')\n  AND cd.cd_education_status IN ('College', 'Advanced Degree')\nGROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating\nORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **CTE filtered_date 提取公共日期过滤**：原 SQL 在三个子查询中均对 date_dim 表应用相同的过滤条件（d_year=1999 AND d_moy BETWEEN 2 AND 4）。将此条件提取为 CTE，在三个子查询中复用，避免重复扫描 date_dim 表。由于过滤条件完全相同，CTE 返回的 d_date_sk 集合与原 SQL 中每个子查询内联 date_dim 的结果一致，不改变语义。\n\n2. **CTE qualified_customers 预先筛选符合条件的客户**：原 SQL 在主查询的 WHERE 子句中使用 EXISTS 和 NOT EXISTS 子查询过滤客户。将这些子查询逻辑提取到 CTE 中，预先计算出符合条件的 c_customer_sk 集合。由于 EXISTS 和 NOT EXISTS 的语义是判断是否存在匹配行，CTE 中使用 SELECT DISTINCT 确保每个符合条件的客户仅出现一次，与原 SQL 的过滤逻辑等价。\n\n3. **子查询内 date_dim 改为 INNER JOIN filtered_date**：原 SQL 在子查询中使用逗号连接 date_dim 表并在 WHERE 中关联。改写为 INNER JOIN filtered_date，将日期过滤前置到 CTE，减少子查询中的数据量。由于 INNER JOIN 与逗号连接加 WHERE 等值条件在语义上等价，且 filtered_date 的过滤条件与原 SQL 一致，结果集不变。\n\n4. **主查询中隐式 JOIN 改为显式 INNER JOIN**：原 SQL 使用逗号连接 customer、customer_address、customer_demographics 表，并在 WHERE 中指定关联条件。改写为显式 INNER JOIN，将关联条件移至 ON 子句。由于 INNER JOIN 与逗号连接加 WHERE 等值条件在 SQL 标准中语义等价，且所有关联键（c_current_addr_sk、ca_address_sk、cd_demo_sk、c_current_cdemo_sk）均为非空外键关联，不涉及 NULL 值处理差异，结果集不变。\n\n5. **主查询新增 INNER JOIN qualified_customers**：将预先筛选的客户集合通过 INNER JOIN 引入主查询，替代原 SQL 中的 EXISTS 和 NOT EXISTS 子查询。由于 qualified_customers CTE 已精确计算出符合所有子查询条件的客户，INNER JOIN 确保主查询仅处理这些客户，与原 SQL 的过滤逻辑完全等价。\n\n6. **简化 cd_marital_status 谓词**：原 SQL 中 cd_marital_status IN ('W', 'S', 'W') 包含重复值 'W'。简化为 IN ('W', 'S')，消除冗余比较。由于 IN 子句的语义是匹配任意一个值，重复值不影响结果，简化后语义不变。\n\n7. **GROUP BY 和 ORDER BY 保持不变**：原 SQL 的 GROUP BY 和 ORDER BY 子句未做任何修改，聚合维度和排序逻辑与原 SQL 完全一致。由于主查询的结果集（经过所有过滤和关联后的行）与原 SQL 等价，聚合和排序结果也完全一致。\n\n8. **LIMIT 100 保持不变**：原 SQL 的 LIMIT 子句未修改，确保最终返回的行数与原 SQL 一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 4->1, Hash/Merge 4->8 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写SQL引入CTE(filtered_date)实现date_dim公共结果复用，并通过qualified_customers CTE将EXISTS/NOT EXISTS转换为显式JOIN，消除了原SQL中的相关子查询重复执行。这是明确的去相关优化。然而，执行计划显示：1)Nested Loop从4降至1，Hash/Merge Join从4增至8，说明连接策略发生重大变化；2)qualified_customers CTE内部引入3次Merge Join Anti和多次Sort操作，产生高开销的排序物化；3)行数估计求和从195万增至614万(3.14倍)，虽然该指标可能失真，但结合计划可见qualified_customers子查询产生大量中间行(85342+39693+28436)后再做Anti Join，数据膨胀明显；4)cost从142万增至187万(+32%)。虽然检测到CTE复用和去相关正信号，但同时存在'明确且可验证的灾难性结构退化证据'：qualified_customers CTE将原本在主查询中按需执行的Anti Join提前物化，引入3次全表扫描(store_sales/catalog_sales/web_sales各一次，原SQL通过Materialize+Gather实现并行扫描)和多次高开销排序，且最终qualified_customers结果集(74132行)远大于原SQL最终输出(30行)，说明过滤下推失效。综合判断：虽有去相关收益，但qualified_customers CTE的物化策略导致数据膨胀和排序开销显著增加，结构上存在明确退化。",
+  "no_further_optimization": false,
+  "next_step_advice": "保留CTE filtered_date的复用优化，但重构qualified_customers逻辑：1)将EXISTS/NOT EXISTS转换为LEFT JOIN + IS NULL模式，避免提前物化大量中间结果；2)在主查询中保留customer/customer_address/customer_demographics的早期过滤(ca_state/cd_marital_status/cd_education_status)，确保qualified_customers仅处理已过滤的小结果集；3)考虑将Anti Join条件直接内联到主查询WHERE子句，利用优化器的Nested Loop + Materialize策略按需执行，而非提前全量物化；4)若必须使用CTE，在qualified_customers内部先JOIN customer表并应用demographics/address过滤，再执行Anti Join，减少参与Anti Join的基数。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮失败原因：qualified_customers CTE提前物化导致数据膨胀(74132行远大于最终30行)和多次高开销排序。当前执行计划显示三个事实表(store_sales/catalog_sales/web_sales)的Seq Scan占总代价90.6%(944K+459K+294K)，且list_price过滤在扫描层执行，未利用索引。核心问题：1)qualified_customers逻辑应延迟到主查询，避免提前物化大量中间结果；2)主查询demographics/address过滤(ca_state/cd_marital_status/cd_education_status)应先于EXISTS/NOT EXISTS执行，减少参与Anti Join的基数；3)事实表扫描需要索引支持或更激进的谓词下推。优化方向：将qualified_customers逻辑内联到主查询WHERE子句，利用LEFT JOIN + IS NULL替代NOT EXISTS，确保customer表先与customer_address/customer_demographics JOIN并应用过滤，再执行Anti Join，使优化器能按需执行而非全量物化。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将qualified_customers CTE完全内联到主查询：1)保留filtered_date CTE复用；2)将EXISTS转换为INNER JOIN(store_sales + filtered_date)并在主查询FROM子句中执行，确保ss_customer_sk = c.c_customer_sk连接在customer表已过滤后进行；3)将两个NOT EXISTS转换为LEFT JOIN + IS NULL模式(web_sales/catalog_sales分别LEFT JOIN filtered_date)，在主查询WHERE子句中添加ws.ws_bill_customer_sk IS NULL和cs.cs_ship_customer_sk IS NULL条件，避免提前物化Anti Join结果；4)确保连接顺序为customer -> customer_address(ca_state过滤) -> customer_demographics(cd_marital_status/cd_education_status过滤) -> store_sales(EXISTS) -> web_sales(NOT EXISTS) -> catalog_sales(NOT EXISTS)，利用早期过滤减少后续连接基数"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将demographics和address过滤条件前置：在主查询中先执行customer与customer_address的JOIN并立即应用ca_state IN ('MS','NM','TN')过滤，再JOIN customer_demographics并应用cd_marital_status IN ('W','S')和cd_education_status IN ('College','Advanced Degree')过滤，确保这些高选择性过滤在EXISTS/NOT EXISTS逻辑之前执行，将参与事实表连接的customer基数从50万降至数千量级，避免上一轮qualified_customers CTE中74132行的数据膨胀"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "优化连接策略以避免上一轮的Merge Join Anti高开销：1)将NOT EXISTS的LEFT JOIN + IS NULL模式设计为Hash Left Join而非Merge Join，避免排序开销；2)在store_sales的EXISTS连接中，先将filtered_date结果(d_year=1999且d_moy BETWEEN 2 AND 4，预计91天)与store_sales JOIN，再与已过滤的customer表JOIN，利用Nested Loop + Index Scan按需探测而非全表扫描；3)确保web_sales和catalog_sales的LEFT JOIN在customer基数已大幅减少后执行，使Anti Join处理的行数从上一轮的85342+39693+28436降至数百量级"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 1999 AND d_moy BETWEEN 2 AND 4\n)\nSELECT\n  cd_gender,\n  cd_marital_status,\n  cd_education_status,\n  count(*) cnt1,\n  cd_purchase_estimate,\n  count(*) cnt2,\n  cd_credit_rating,\n  count(*) cnt3\nFROM customer c\nINNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\nINNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk\nWHERE ca.ca_state IN ('MS', 'NM', 'TN')\n  AND cd.cd_marital_status IN ('W', 'S')\n  AND cd.cd_education_status IN ('College', 'Advanced Degree')\n  AND EXISTS (\n    SELECT 1\n    FROM store_sales ss\n    INNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk\n    WHERE c.c_customer_sk = ss.ss_customer_sk\n      AND ss.ss_list_price BETWEEN 211 AND 300\n  )\n  AND NOT EXISTS (\n    SELECT 1\n    FROM web_sales ws\n    INNER JOIN filtered_date fd ON ws.ws_sold_date_sk = fd.d_date_sk\n    WHERE c.c_customer_sk = ws.ws_bill_customer_sk\n      AND ws.ws_list_price BETWEEN 211 AND 300\n  )\n  AND NOT EXISTS (\n    SELECT 1\n    FROM catalog_sales cs\n    INNER JOIN filtered_date fd ON cs.cs_sold_date_sk = fd.d_date_sk\n    WHERE c.c_customer_sk = cs.cs_ship_customer_sk\n      AND cs.cs_list_price BETWEEN 211 AND 300\n  )\nGROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating\nORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. 保留filtered_date CTE：该CTE从date_dim表中筛选d_year=1999且d_moy BETWEEN 2 AND 4的日期主键，与原SQL中qualified_customers CTE内部的filtered_date定义完全一致，语义无变化。\n\n2. 移除qualified_customers CTE并将其逻辑内联到主查询WHERE子句：原SQL中qualified_customers通过DISTINCT c.c_customer_sk + EXISTS/NOT EXISTS组合筛选满足条件的客户主键集合，然后在主查询中通过INNER JOIN qc ON c.c_customer_sk = qc.c_customer_sk进行过滤。重写SQL将这三个EXISTS/NOT EXISTS谓词直接移至主查询WHERE子句，作用于已通过customer_address和customer_demographics过滤的customer表。由于EXISTS/NOT EXISTS的语义是判断子查询是否返回至少一行（与具体返回值无关），且子查询中的c.c_customer_sk引用外层customer表，因此内联后的相关子查询与原CTE中的非相关子查询在逻辑上等价：两者均判断同一customer_sk是否在store_sales中存在符合条件的记录、在web_sales和catalog_sales中不存在符合条件的记录。\n\n3. 维持主查询的JOIN结构和过滤条件：重写SQL保留customer INNER JOIN customer_address INNER JOIN customer_demographics的连接顺序，以及WHERE子句中的ca.ca_state IN ('MS','NM','TN')、cd.cd_marital_status IN ('W','S')、cd.cd_education_status IN ('College','Advanced Degree')三个过滤条件，与原SQL主查询完全一致。这些过滤条件在EXISTS/NOT EXISTS谓词之前执行，确保仅对满足地址和人口统计学条件的客户进行事实表探测。\n\n4. EXISTS/NOT EXISTS的相关子查询语义保持：原SQL中qualified_customers CTE内部的EXISTS子查询通过WHERE c.c_customer_sk = ss.ss_customer_sk建立与外层customer表的关联，NOT EXISTS子查询同理。重写SQL将这些子查询直接放入主查询WHERE子句后，相关性引用c.c_customer_sk仍指向主查询FROM子句中的customer表，因此每个customer行的EXISTS/NOT EXISTS判断逻辑与原SQL完全一致：对于每个通过demographics和address过滤的customer_sk，检查其在store_sales中是否存在list_price在211-300之间且日期在filtered_date范围内的记录，以及在web_sales和catalog_sales中是否不存在相同条件的记录。\n\n5. GROUP BY和聚合列保持不变：重写SQL的SELECT子句、GROUP BY子句、ORDER BY子句和LIMIT子句与原SQL主查询完全一致，均对cd_gender、cd_marital_status、cd_education_status、cd_purchase_estimate、cd_credit_rating五个维度进行分组，并计算count(*)三次（cnt1、cnt2、cnt3，虽然值相同但保留原SQL结构）。由于过滤逻辑未改变，最终参与聚合的customer行集合与原SQL相同，因此聚合结果等价。\n\n6. 优化原理说明：上一轮评估反馈指出qualified_customers CTE提前物化导致数据膨胀（74132行中间结果远大于最终30行输出）和高开销排序（3次Merge Join Anti）。重写SQL通过将EXISTS/NOT EXISTS内联到主查询WHERE子句，利用优化器的按需执行策略（Nested Loop + Materialize）：先通过customer_address和customer_demographics的高选择性过滤将customer基数从50万降至数千量级，再对每个符合条件的customer_sk执行EXISTS/NOT EXISTS探测，避免对全量customer表进行事实表扫描。由于EXISTS/NOT EXISTS的短路特性（找到一行即返回true/false），且filtered_date CTE复用减少date_dim重复扫描，预期可显著降低中间数据量和排序开销，同时保持与原SQL完全等价的结果集。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 4->3, Hash/Merge 4->5 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：1)执行计划变化：原SQL使用2个Index Scan(customer_demographics_pkey、customer_address_pkey)，重写后全部改为Seq Scan；原SQL的Nested Loop Anti Join在主干上执行，重写后通过Materialize + Nested Loop Anti实现，但引入了3个大规模Materialize节点(store_sales 104949行、web_sales 28436行、catalog_sales 39693行)；原SQL的Semi Join通过Hash Join + Parallel Seq Scan实现，重写后同样使用Hash Join但基数从1232行膨胀至104949行。2)结构性退化信号：虽然引入CTE filtered_date实现date_dim的一次扫描复用(正信号)，但主干数据流出现明显膨胀：customer_demographics从原SQL的Index Scan(逐行探测)变为Seq Scan全表扫描89962行过滤；customer_address从Index Scan变为Seq Scan 6951行；最关键的是三个事实表(store_sales/web_sales/catalog_sales)的JOIN结果被完全物化后再参与Anti Join，导致Materialize节点总计172078行(104949+28436+39693)，而原SQL通过Nested Loop + Join Filter按需探测避免了这种物化开销。3)重写改进点：CTE filtered_date消除了date_dim的重复扫描(原SQL扫描3次，重写后扫描1次)，这是唯一的正向结构收益。4)成本差异：costs从1421166.57增至1561682.17(+9.9%)，虽然增幅不大，但结合结构退化(索引访问路径完全丢失、大规模Materialize引入、主干数据膨胀)，该cost增长是结构恶化的辅助佐证而非误判。5)行数估计求和：从1953989增至5256906(+169%)，虽然该指标为弱信号，但在本案例中与结构退化方向一致(Materialize膨胀、Seq Scan替代Index Scan)，可作为辅助证据。综合判断：虽然存在CTE复用正信号，但同时出现'明确且可验证的灾难性结构退化证据'：1)关键维度表(customer_demographics/customer_address)的索引访问路径完全丢失，从精准探测变为全表扫描；2)三个事实表JOIN结果被强制物化(172078行)后再参与Anti Join，而原SQL通过Nested Loop按需探测避免物化；3)主干数据流在customer_demographics阶段从原SQL的逐行Index Scan变为89962行Seq Scan，过滤效率明显下降。根据规则'若已检测到去相关/子计划减少/CTE复用/预聚合等高优先级正信号，除非还能指出明确且可验证的灾难性结构退化证据，否则不得给出负面结论'，本案例同时满足'CTE复用正信号'和'灾难性结构退化证据'，因此判定为结构恶化，terminate=false。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：1)保留filtered_date CTE(已验证有效)；2)将customer_demographics和customer_address的过滤逻辑改为子查询或派生表，强制优化器使用索引：SELECT ... FROM customer c INNER JOIN (SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('MS','NM','TN')) ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN (SELECT cd_demo_sk, cd_gender, ... FROM customer_demographics WHERE cd_marital_status IN ('W','S') AND cd_education_status IN ('College','Advanced Degree')) cd ON cd.cd_demo_sk = c.c_current_cdemo_sk；3)将EXISTS改为INNER JOIN但避免提前物化：在主查询FROM子句中直接JOIN (SELECT DISTINCT ss_customer_sk FROM store_sales ss INNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk WHERE ss.ss_list_price BETWEEN 211 AND 300)，利用DISTINCT减少基数后再JOIN；4)将NOT EXISTS改为LEFT JOIN + WHERE IS NULL模式，但在LEFT JOIN的右表使用派生表(SELECT DISTINCT ws_bill_customer_sk FROM web_sales ... / SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales ...)，通过DISTINCT预先去重避免Materialize膨胀；5)确保连接顺序为customer -> ca(索引) -> cd(索引) -> store_sales(DISTINCT派生表) -> web_sales(LEFT JOIN DISTINCT派生表) -> catalog_sales(LEFT JOIN DISTINCT派生表)，目标是恢复索引访问路径并消除大规模Materialize节点。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1138
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=1421166.57, 重写=1561682.17，相对变化: -9.89%
+✅ 成功存储，记录ID: 4e2d9b6d-d7b6-4b05-a09e-483e80a91fe1
+
+----------------------------------------
+

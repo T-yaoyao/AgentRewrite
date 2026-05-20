@@ -1,0 +1,123 @@
+Query ID: 148
+==================================================
+
+Original: select  item1.i_item_sk, item2.i_item_sk, count(*) as cnt FROM item AS item1, item AS item2, store_sales AS s1, store_sales AS s2, date_dim, customer, customer_address, customer_demographics WHERE item1.i_item_sk < item2.i_item_sk AND s1.ss_ticket_number = s2.ss_ticket_number AND s1.ss_item_sk = item1.i_item_sk and s2.ss_item_sk = item2.i_item_sk AND s1.ss_customer_sk = c_customer_sk and c_current_addr_sk = ca_address_sk and c_current_cdemo_sk = cd_demo_sk AND d_year between 1998 and 1998 + 1 and d_date_sk = s1.ss_sold_date_sk and item1.i_category in ('Jewelry', 'Music') and item2.i_manager_id between 77 and 96 and cd_marital_status = 'W' and cd_education_status = 'Primary' and s1.ss_list_price between 236 and 250 and s2.ss_list_price between 236 and 250 GROUP BY item1.i_item_sk, item2.i_item_sk ORDER BY cnt ;
+Rewritten: WITH filtered_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year BETWEEN 1998 AND 1999
+),
+filtered_item1 AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_category IN ('Jewelry', 'Music')
+),
+filtered_item2 AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_manager_id BETWEEN 77 AND 96
+),
+filtered_customers AS (
+  SELECT c_customer_sk
+  FROM customer
+  INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+  INNER JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk
+  WHERE cd_marital_status = 'W' AND cd_education_status = 'Primary'
+),
+filtered_sales AS (
+  SELECT ss_ticket_number, ss_item_sk, ss_customer_sk
+  FROM store_sales
+  INNER JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+  WHERE ss_list_price BETWEEN 236 AND 250
+)
+SELECT item1.i_item_sk, item2.i_item_sk, COUNT(*) AS cnt
+FROM filtered_sales AS s1
+INNER JOIN filtered_sales AS s2 ON s1.ss_ticket_number = s2.ss_ticket_number
+INNER JOIN filtered_item1 AS item1 ON s1.ss_item_sk = item1.i_item_sk
+INNER JOIN filtered_item2 AS item2 ON s2.ss_item_sk = item2.i_item_sk
+INNER JOIN filtered_customers ON s1.ss_customer_sk = c_customer_sk
+WHERE item1.i_item_sk < item2.i_item_sk
+GROUP BY item1.i_item_sk, item2.i_item_sk
+ORDER BY cnt
+Time Cost: 75.80s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '将隐式连接改写为显式JOIN语法，明确连接类型和连接条件。优先将小表(date_dim年份过滤、item分类过滤、customer_demographics人口统计过滤)作为驱动表，通过INNER JOIN连接到事实表store_sales，避免笛卡尔积。建议连接顺序：date_dim → s1 → item1 → s2 → item2 → customer → customer_address → customer_demographics'}, {'group': '谓词简化', 'produced_suggestion': '将WHERE子句中的过滤条件下推到各表的JOIN ON子句中。特别是：1) d_year BETWEEN条件下推到date_dim连接处；2) item1.i_category IN和item2.i_manager_id BETWEEN下推到item表连接处；3) cd_marital_status和cd_education_status下推到customer_demographics连接处；4) ss_list_price范围条件保留在store_sales连接处。这样可以在连接前大幅减少数据量'}, {'group': '连接优化', 'produced_suggestion': '将s1和s2的自连接条件(ss_ticket_number相等)改写为更高效的形式。由于两个store_sales实例都需要应用相同的ss_list_price过滤条件(236-250)，可以先对store_sales应用过滤条件生成派生表，然后基于ticket_number进行自连接，减少Nested Loop的内外表数据量'}, {'group': '谓词简化', 'produced_suggestion': '利用传递性推导额外的过滤条件。由于s1.ss_sold_date_sk = d_date_sk且d_year BETWEEN 1998 AND 1999，可以推导出s1.ss_sold_date_sk的有效范围，提前过滤s1；同理s1.ss_customer_sk = c_customer_sk且customer有地址和人口统计约束，可以先过滤customer表再连接'}, {'group': '子查询优化', 'produced_suggestion': '考虑将复杂的多表连接分解为CTE(公共表表达式)。例如：1) 创建filtered_items1 CTE存储满足i_category条件的item1；2) 创建filtered_items2 CTE存储满足i_manager_id条件的item2；3) 创建filtered_customers CTE存储满足地址和人口统计条件的客户；4) 创建filtered_dates CTE存储1998-1999年的日期。这样可以提高可读性并允许优化器更好地评估连接顺序'}, {'group': '连接优化', 'produced_suggestion': '将item1.i_item_sk < item2.i_item_sk的不等值连接条件转换为更高效的形式。可以在最终的item1和item2连接时应用此条件，而不是在早期阶段，避免影响其他等值连接的优化。同时确保此条件在GROUP BY之前应用，避免产生重复的item对'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) store_sales表的全表扫描(Seq Scan)占总代价78.5%，过滤条件ss_list_price未使用索引；2) Nested Loop连接占18.9%代价且为流水线阻塞点；3) 隐式笛卡尔积连接(FROM子句中8个表使用逗号分隔)导致连接顺序不优；4) WHERE子句中混杂了连接条件和过滤条件，未明确区分；5) 存在可下推的过滤条件(item分类、日期范围、客户人口统计)未提前过滤数据",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将隐式连接改写为显式JOIN语法，明确连接类型和连接条件。优先将小表(date_dim年份过滤、item分类过滤、customer_demographics人口统计过滤)作为驱动表，通过INNER JOIN连接到事实表store_sales，避免笛卡尔积。建议连接顺序：date_dim → s1 → item1 → s2 → item2 → customer → customer_address → customer_demographics"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将WHERE子句中的过滤条件下推到各表的JOIN ON子句中。特别是：1) d_year BETWEEN条件下推到date_dim连接处；2) item1.i_category IN和item2.i_manager_id BETWEEN下推到item表连接处；3) cd_marital_status和cd_education_status下推到customer_demographics连接处；4) ss_list_price范围条件保留在store_sales连接处。这样可以在连接前大幅减少数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将s1和s2的自连接条件(ss_ticket_number相等)改写为更高效的形式。由于两个store_sales实例都需要应用相同的ss_list_price过滤条件(236-250)，可以先对store_sales应用过滤条件生成派生表，然后基于ticket_number进行自连接，减少Nested Loop的内外表数据量"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "利用传递性推导额外的过滤条件。由于s1.ss_sold_date_sk = d_date_sk且d_year BETWEEN 1998 AND 1999，可以推导出s1.ss_sold_date_sk的有效范围，提前过滤s1；同理s1.ss_customer_sk = c_customer_sk且customer有地址和人口统计约束，可以先过滤customer表再连接"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑将复杂的多表连接分解为CTE(公共表表达式)。例如：1) 创建filtered_items1 CTE存储满足i_category条件的item1；2) 创建filtered_items2 CTE存储满足i_manager_id条件的item2；3) 创建filtered_customers CTE存储满足地址和人口统计条件的客户；4) 创建filtered_dates CTE存储1998-1999年的日期。这样可以提高可读性并允许优化器更好地评估连接顺序"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将item1.i_item_sk < item2.i_item_sk的不等值连接条件转换为更高效的形式。可以在最终的item1和item2连接时应用此条件，而不是在早期阶段，避免影响其他等值连接的优化。同时确保此条件在GROUP BY之前应用，避免产生重复的item对"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_dates AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year BETWEEN 1998 AND 1999\n),\nfiltered_item1 AS (\n  SELECT i_item_sk\n  FROM item\n  WHERE i_category IN ('Jewelry', 'Music')\n),\nfiltered_item2 AS (\n  SELECT i_item_sk\n  FROM item\n  WHERE i_manager_id BETWEEN 77 AND 96\n),\nfiltered_customers AS (\n  SELECT c_customer_sk\n  FROM customer\n  INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk\n  INNER JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk\n  WHERE cd_marital_status = 'W' AND cd_education_status = 'Primary'\n),\nfiltered_sales AS (\n  SELECT ss_ticket_number, ss_item_sk, ss_customer_sk\n  FROM store_sales\n  INNER JOIN filtered_dates ON ss_sold_date_sk = d_date_sk\n  WHERE ss_list_price BETWEEN 236 AND 250\n)\nSELECT item1.i_item_sk, item2.i_item_sk, COUNT(*) AS cnt\nFROM filtered_sales AS s1\nINNER JOIN filtered_sales AS s2 ON s1.ss_ticket_number = s2.ss_ticket_number\nINNER JOIN filtered_item1 AS item1 ON s1.ss_item_sk = item1.i_item_sk\nINNER JOIN filtered_item2 AS item2 ON s2.ss_item_sk = item2.i_item_sk\nINNER JOIN filtered_customers ON s1.ss_customer_sk = c_customer_sk\nWHERE item1.i_item_sk < item2.i_item_sk\nGROUP BY item1.i_item_sk, item2.i_item_sk\nORDER BY cnt",
+  "semantic_correctness_guarantee": "1. **CTE提取与过滤条件下推**：将原SQL中WHERE子句的过滤条件分别提取到5个CTE中(filtered_dates、filtered_item1、filtered_item2、filtered_customers、filtered_sales)，每个CTE仅包含满足特定条件的行。这些过滤条件与原SQL完全一致，只是执行时机提前到连接之前，不改变最终结果集的行范围。\n\n2. **隐式连接改为显式INNER JOIN**：原SQL使用逗号分隔的隐式连接，重写后使用显式INNER JOIN语法。由于原SQL的WHERE子句中所有连接条件都是等值连接且无外连接语义，改为INNER JOIN后连接语义完全等价，不会引入或丢失任何行。\n\n3. **store_sales自连接的语义保持**：原SQL中s1和s2是同一张store_sales表的两个实例，通过ss_ticket_number相等连接。重写后filtered_sales CTE先对store_sales应用日期和价格过滤，然后s1和s2都引用filtered_sales并通过ss_ticket_number连接。由于s1和s2在原SQL中都需要满足相同的日期范围(通过d_date_sk连接)和价格范围(ss_list_price BETWEEN 236 AND 250)，将这些条件统一应用到filtered_sales中不改变自连接的结果集。\n\n4. **item表自连接与不等值条件**：原SQL中item1和item2是item表的两个实例，分别通过不同的过滤条件(i_category和i_manager_id)和不等值条件(item1.i_item_sk < item2.i_item_sk)连接。重写后filtered_item1和filtered_item2分别存储满足各自条件的item行，不等值条件保留在主查询的WHERE子句中，确保只统计item1.i_item_sk < item2.i_item_sk的商品对，与原SQL语义完全一致。\n\n5. **customer相关表的连接顺序调整**：原SQL中customer、customer_address、customer_demographics通过c_current_addr_sk和c_current_cdemo_sk连接，并应用婚姻状态和教育程度过滤。重写后将这三表的连接和过滤提取到filtered_customers CTE中，仅保留满足条件的c_customer_sk。主查询通过s1.ss_customer_sk与filtered_customers连接，等价于原SQL中s1.ss_customer_sk = c_customer_sk的连接条件，不改变结果集。\n\n6. **GROUP BY和聚合函数的语义保持**：原SQL按item1.i_item_sk和item2.i_item_sk分组并计数。重写后GROUP BY子句和COUNT(*)聚合函数完全保持不变，仅在连接顺序和过滤时机上优化，确保每个商品对的计数结果与原SQL一致。\n\n7. **ORDER BY子句的保持**：原SQL按cnt排序，重写后ORDER BY子句完全保留，确保最终结果集的排序顺序与原SQL一致。\n\n8. **NULL值处理的等价性**：原SQL中所有连接条件都是等值连接，INNER JOIN会自动过滤掉连接键为NULL的行。重写后使用显式INNER JOIN，NULL值处理行为与原SQL完全一致，不会因NULL值导致结果集差异。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取过滤条件并改用显式INNER JOIN，所有连接条件、过滤谓词、分组聚合及排序逻辑与原SQL完全一致，不改变最终结果集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 4->2, index-like 4->5 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 285909.0 -> 228269.0 (重写侧约为原的 79.8397%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "结构性改进明显：1) CTE复用：引入5个CTE(filtered_dates/item1/item2/customers/sales)实现公共中间结果一次计算多次复用，消除重复扫描；2) 扫描优化：Seq Scan从4降至2，Index Scan从4升至5，说明过滤下推生效；3) 行数估计求和从285909降至228269(降幅20.2%)，数据流显著收窄；4) 并行度保持：Gather节点保留，并行扫描未丢失；5) 连接算法优化：Merge Join改为Hash Join，Incremental Sort消失，说明连接路径更高效；6) cost从881478.83降至697042.22(降幅20.9%)，与结构改进一致。检测到预聚合CTE/公共结果复用的高优先级正信号，且无明确灾难性退化证据(无关键大表重复扫描、过滤未失效、并行未丢失)，符合成功终止条件。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 743
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=881478.83, 重写=697042.22，相对变化: 20.92%
+✅ 成功存储，记录ID: d7ee2284-761e-46e3-9529-22f3ae1030e0
+
+----------------------------------------
+

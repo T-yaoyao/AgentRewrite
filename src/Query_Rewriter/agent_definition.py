@@ -833,7 +833,142 @@ class RewriteAgent(Agent):
             thinking_type=os.getenv("REWRITE_MODEL_THINKING"),
             reasoning_effort=os.getenv("REWRITE_MODEL_REASONING_EFFORT"),
         ))
-        self.watch(["DecisionAgent", "ReasoningAgent"])
+        self.watch(["DecisionAgent"])
+
+    async def rewrite_without_rules(
+        self,
+        sql: str,
+        optimization_direction: str,
+        data_statistics: str,
+        schema_content: Optional[str] = None,
+        index_info: str = "",
+        previous_feedback: Optional[dict] = None,
+    ) -> dict:
+        """Directly rewrite SQL without rule selection, rule library, or rule examples."""
+        sch = (schema_content or "").strip()
+        schema_section = (
+            f"""
+        <SQL Schema（与当前查询相关的表结构）>
+        {sch}
+        </SQL Schema>
+"""
+            if sch
+            else ""
+        )
+        idx = (index_info or "").strip()
+        idx_section = (
+            f"""
+        <索引信息>
+        {idx}
+        </索引信息>
+"""
+            if idx
+            else ""
+        )
+        previous_feedback_section = ""
+        if previous_feedback:
+            previous_feedback_section = f"""
+        <上一轮评估反馈（重点修复）>
+        {json.dumps(previous_feedback, ensure_ascii=False, indent=2)}
+        </上一轮评估反馈（重点修复）>
+"""
+
+        prompt = textwrap.dedent(f"""
+        <Mission>
+        你是一名经验丰富的 DBA。当前是 no_rule 消融设置：禁止使用规则库、规则 ID、规则示例或预定义规则序列。
+        你的任务是仅基于 SQL、统计信息、Schema、索引信息和优化方向，自主生成一条语义等价且可能执行更快的 SQL。
+
+        1. 输入信息：
+           - <base_sql>: 当前轮次的基底 SQL。第一轮它等于原始SQL；若进入下一轮，它就是上一轮 rewritten_sql
+           - <optimization_direction>: 上游给出的性能瓶颈或优化方向，只能作为参考
+           - <统计信息>: 数据库表统计信息
+           - （若下方提供）<SQL Schema>: 与当前查询相关的表 DDL
+           - （若下方提供）<索引信息>: 表索引信息
+           - （若下方提供）<上一轮评估反馈（重点修复）>: 未改进/恶化原因与下一步改进建议，必须优先处理
+
+        2. 重写要求：
+           - **最高优先级约束**：必须优先保证 rewritten_sql 与原始SQL在语义上完全等价；任何优化都不得以改变结果集语义为代价
+           - 不得输出或引用任何规则 ID，不得声称应用了某条规则
+           - 可以自主使用常见 SQL 改写技巧，例如调整 JOIN 写法、提取 CTE、改写子查询、提前过滤、简化表达式或重组聚合，但必须逐条说明为什么语义保持不变
+           - 若没有把握产生更优且等价的 SQL，可以返回原 SQL
+           - 确保 SQL 语法正确、可执行
+           - 若提供了上一轮评估反馈，说明这是增量改写场景；必须在当前基底 SQL 的基础上继续优化，而不是回退并从原始 SQL 重新开始
+
+        3. **semantic_correctness_guarantee（语义正确性保证说明，必填）**：
+           用**中文**分条写清（建议 3–8 条，须可被审计员逐条对照原 SQL 与重写 SQL 独立核验），至少包含：
+           - 相对原 SQL 做了哪些结构性改写，对应到哪些谓词、JOIN、聚合、CTE 或子查询作用域。
+           - 为什么这些改写在当前 Schema 和 SQL 语义下不改变结果集；涉及 GROUP BY、DISTINCT、NULL、外连接、相关子查询时要明确说明。
+           - 若没有改写，说明保持原 SQL 的原因。
+
+        <base_sql>
+        {sql}
+
+        <optimization_direction>
+        {optimization_direction}
+
+        <统计信息>
+        {data_statistics}
+{schema_section}{idx_section}{previous_feedback_section}
+        4. **只输出一个 JSON 对象**（不要 markdown）。字段：
+           - groups: 固定为 "no_rule"
+           - applied_rules: 固定为 []
+           - rewritten_sql: 重写后的完整可执行 SQL（字符串内换行用 \\n）
+           - semantic_correctness_guarantee: 上述第 3 点说明全文
+        """)
+
+        thought_chain = await self.llm.get_LLM_response_async(
+            prompt=prompt,
+            json_format=True,
+            json_schema=STRICT_JSON_SCHEMAS["rewrite"],
+        )
+
+        try:
+            parsed, _ = parse_llm_json(thought_chain, {})
+            if parsed and parsed.get("rewritten_sql"):
+                parsed["groups"] = "no_rule"
+                parsed["applied_rules"] = []
+                _merge_rewrite_semantic_fields(parsed)
+                return parsed
+
+            extracted_sql = self._extract_sql_from_response_robust(thought_chain)
+            if extracted_sql:
+                return {
+                    "groups": "no_rule",
+                    "applied_rules": [],
+                    "rewritten_sql": extracted_sql,
+                    "semantic_correctness_guarantee": "",
+                    "semantic_check": "",
+                    "parse_error": True,
+                }
+            return {
+                "groups": "no_rule",
+                "applied_rules": [],
+                "rewritten_sql": sql,
+                "semantic_correctness_guarantee": "",
+                "semantic_check": "",
+                "parse_error": True,
+            }
+        except json.JSONDecodeError as e:
+            extracted_sql = self._extract_sql_from_response_robust(thought_chain)
+            if extracted_sql:
+                return {
+                    "groups": "no_rule",
+                    "applied_rules": [],
+                    "rewritten_sql": extracted_sql,
+                    "semantic_correctness_guarantee": "",
+                    "semantic_check": "",
+                    "parse_error": True,
+                    "error_info": f"JSON解析错误: {str(e)}",
+                }
+            return {
+                "groups": "no_rule",
+                "applied_rules": [],
+                "rewritten_sql": sql,
+                "semantic_correctness_guarantee": "",
+                "semantic_check": "",
+                "parse_error": True,
+                "error_info": f"JSON解析错误: {str(e)}",
+            }
 
     async def rewrite_with_rule_sequence(
         self,
@@ -1294,26 +1429,6 @@ class SemanticCheckAgent(Agent):
         last_rejection_message: Optional[str] = None,
         last_rejection_differences: Optional[List[Dict[str, Any]]] = None,
     ) -> dict:
-        # Build "规则ID + 规则描述" text for semantic audit context.
-        if rewrite_rules:
-            rule_kb = load_rule_knowledge_base()
-            rule_desc_map: Dict[str, str] = {}
-            if isinstance(rule_kb, dict):
-                for category_data in rule_kb.values():
-                    if not isinstance(category_data, dict):
-                        continue
-                    rules_block = category_data.get("rules", {})
-                    if isinstance(rules_block, dict):
-                        for rid, desc in rules_block.items():
-                            rule_desc_map[str(rid)] = str(desc)
-            rule_lines = []
-            for rid in rewrite_rules:
-                rid_s = str(rid)
-                desc = rule_desc_map.get(rid_s, "（规则描述缺失）")
-                rule_lines.append(f"- {rid_s}: {desc}")
-            rules_text = "\n".join(rule_lines)
-        else:
-            rules_text = "无"
         g = (str(semantic_correctness_guarantee).strip() if semantic_correctness_guarantee else "")
         s0 = (str(semantic_check).strip() if semantic_check is not None else "")
         # 新字段「语义正确性保证说明」优先；否则退化为旧名 semantic_check（同一段说明）。
@@ -1396,10 +1511,8 @@ class SemanticCheckAgent(Agent):
         2. **SQL Schema**：主键、唯一约束、函数依赖、可据此认可的等价变形（例如已知 PK 下 GROUP BY 的化简）。
         3. **索引信息**（若提供）：通常不改变关系层面的结果集语义；PRIMARY KEY/UNIQUE 类索引可辅助推断唯一性，与 Schema 一并用于等价推理。**不得以「有无非唯一索引」代替 SQL 逻辑判断是否等价**。
         4. **首轮「语义正确性保证说明」**（若提供）：**仅**作辅助线索，须与 1 逐条核对。若存在「语义修正_第N轮_必读」块，说明**当前重写 SQL 可能已按你方上一轮意见改过**——**禁止**用首轮自辩中仅适用**历史版本**的论述来否掉**已经变化后**的当前 SQL；自辩与**当前**重写 SQL 明显不符时，**忽略**不适用的自辩段。
-        5. **应用规则（ID + 文字描述）**：本查询**声称**依这些规则做等价改写。当「当前重写 SQL」可判定为**完全按**规则描述所体现的典型变换意图忠实套用（同构的改写模式、未在规则意图之外缩小/扩大过滤范围、未擅自改变聚合/分组/去重语义），且与 **Schema/约束** 无矛盾时，应将其视为**强等价先验**：默认倾向 `equivalent=true`，除非你能给出**明确且可核验的结果集变化证据**。
 
         通用原则：
-        - **规则驱动等价先验**：在 Schema 不否定结论的前提下，若重写在结构上等价于「对原 SQL 应用规则 R」且与 R 的文字描述所示变换意图一致、无多余语义偏移，应默认采纳 `equivalent=true`；只有当你能给出**明确、具体、可复核**的反例时，才允许推翻这一先验。
         - **举证责任原则**：仅当**能明确指出**会导致结果集不一致的差异时才允许判 `equivalent=false`。所谓“明确指出”是指：必须说明差异如何改变过滤范围、连接基数、重复行、NULL 语义、聚合粒度、DISTINCT/去重语义、排序/限制对结果集的影响等。若只是“结构不同”“看起来复杂”“可能有风险”，不足以判 false。
         - **结构变化不等于语义变化**：CTE 引入、相关子查询改写为 JOIN、过滤条件从 WHERE 移入 JOIN ON、常量折叠、冗余排序消除、预聚合/公共结果复用，本身都**不能**作为判 false 的依据；必须证明这些变换改变了最终结果集。
         - **证据不足时从宽**：如果你不能构造出具体结果集差异，就应判 `equivalent=true`，而不是因为怀疑或保守而判 false。
@@ -1419,9 +1532,6 @@ class SemanticCheckAgent(Agent):
         {retry_ctx}
         {schema_ctx}{index_ctx}
         {sem_ctx}
-        <应用规则_规则ID与文字描述>
-        {rules_text}
-        </应用规则_规则ID与文字描述>
 
         **只输出一个 JSON**（不要其它文字）：
         {{

@@ -1,0 +1,190 @@
+Query ID: 17
+==================================================
+
+Original: select min(ss_quantity)        ,min(ss_ext_sales_price)        ,min(ss_ext_wholesale_cost)        ,min(ss_ext_wholesale_cost)  from store_sales      ,store      ,customer_demographics      ,household_demographics      ,customer_address      ,date_dim  where s_store_sk = ss_store_sk  and  ss_sold_date_sk = d_date_sk and d_year = 2001  and((ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'S'   and cd_education_status = 'Secondary'   and ss_sales_price between 100.00 and 150.00   and hd_dep_count = 3      )or      (ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'S'   and cd_education_status = 'Secondary'   and ss_sales_price between 50.00 and 100.00   and hd_dep_count = 1      ) or      (ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'S'   and cd_education_status = '2 yr Degree'   and ss_sales_price between 150.00 and 200.00   and hd_dep_count = 1      ))  and((ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('MS', 'NY', 'VA')   and ss_net_profit between 100 and 200      ) or      (ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('MS', 'TN', 'TX')   and ss_net_profit between 150 and 300      ) or      (ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('NC', 'NM', 'OK')   and ss_net_profit between 50 and 250      )) ;
+Rewritten: SELECT 
+  MIN(ss.ss_quantity),
+  MIN(ss.ss_ext_sales_price),
+  MIN(ss.ss_ext_wholesale_cost),
+  MIN(ss.ss_ext_wholesale_cost)
+FROM date_dim d
+JOIN store_sales ss ON ss.ss_sold_date_sk = d.d_date_sk
+JOIN store s ON s.s_store_sk = ss.ss_store_sk
+JOIN customer_demographics cd ON cd.cd_demo_sk = ss.ss_cdemo_sk
+JOIN household_demographics hd ON hd.hd_demo_sk = ss.ss_hdemo_sk
+JOIN customer_address ca ON ca.ca_address_sk = ss.ss_addr_sk
+WHERE d.d_year = 2001
+  AND cd.cd_marital_status = 'S'
+  AND (
+    (cd.cd_education_status = 'Secondary' AND ss.ss_sales_price BETWEEN 100.00 AND 150.00 AND hd.hd_dep_count = 3)
+    OR (cd.cd_education_status = 'Secondary' AND ss.ss_sales_price BETWEEN 50.00 AND 100.00 AND hd.hd_dep_count = 1)
+    OR (cd.cd_education_status = '2 yr Degree' AND ss.ss_sales_price BETWEEN 150.00 AND 200.00 AND hd.hd_dep_count = 1)
+  )
+  AND ca.ca_country = 'United States'
+  AND (
+    (ca.ca_state IN ('MS', 'NY', 'VA') AND ss.ss_net_profit BETWEEN 100 AND 200)
+    OR (ca.ca_state IN ('MS', 'TN', 'TX') AND ss.ss_net_profit BETWEEN 150 AND 300)
+    OR (ca.ca_state IN ('NC', 'NM', 'OK') AND ss.ss_net_profit BETWEEN 50 AND 250)
+  )
+Time Cost: 201.73s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '移除demographic_filters和address_filters两个CTE，将其过滤条件直接内联到主查询的JOIN中。通过Hash Join连接customer_demographics、household_demographics、customer_address，避免CTE物化导致的store_sales重复扫描。保留复合主键索引（ss_item_sk, ss_ticket_number）的探测路径，而非通过EXISTS半连接破坏该路径。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：先过滤date_dim（d_year=2001，选择性高）和store（小表），再通过Hash Join连接store_sales，最后连接customer_demographics、household_demographics、customer_address。将小表过滤前置可大幅压缩store_sales的扫描范围，避免当前计划中store_sales全表扫描（2880万行）后再过滤的低效模式。'}, {'group': '谓词简化', 'produced_suggestion': '将demographic_filters中的三个OR条件（cd_education_status + ss_sales_price + hd_dep_count的组合）和address_filters中的三个OR条件（ca_state + ss_net_profit的组合）合并为单个WHERE子句，通过Hash Join的过滤条件处理，而非拆分为独立CTE。这样可以利用PostgreSQL的Hash Join优化器自动选择最优的过滤顺序，避免CTE强制物化导致的中间结果膨胀。'}, {'group': '聚合优化', 'produced_suggestion': '主查询的MIN聚合函数仅需扫描满足所有过滤条件的行，无需通过CTE预聚合。将聚合操作保留在最终的SELECT中，让优化器根据过滤后的数据量选择最优的聚合策略（如Partial Aggregate + Finalize Aggregate），避免CTE中不必要的中间聚合步骤。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示store_sales表的全表扫描占总代价99.5%，是主要性能瓶颈。SQL包含复杂的OR条件组合，可通过谓词简化、连接优化和集合优化来提升性能。历史案例显示STRATEGY_CTE_DECOMPOSITION规则在相似SQL上有效（命中17次），建议将复杂OR条件分解为UNION ALL结构，便于优化器针对每个分支独立优化。",
+  "advice": [
+    {
+      "group": "集合优化",
+      "produced_suggestion": "将复杂的OR条件分解为UNION ALL结构。当前SQL包含两层嵌套OR条件（人口统计维度3个分支×地址维度3个分支=9种组合），建议分解为9个独立的SELECT分支通过UNION ALL合并，每个分支包含确定的等值条件，便于优化器使用索引并行扫描，避免全表扫描"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "优化过滤条件的表达方式。将ss_sales_price和ss_net_profit的重叠范围合并（如ss_sales_price在50-200之间可合并为单一范围检查），减少OR分支数量。同时将过滤条件按选择性排序，将高选择性条件（如d_year=2001、ca_state IN、cd_marital_status等）前置"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先连接小表和高选择性过滤表。建议顺序：date_dim(d_year=2001过滤) -> store -> customer_address(ca_state过滤) -> customer_demographics(cd_marital_status/cd_education_status过滤) -> household_demographics(hd_dep_count过滤) -> store_sales，将大表store_sales放在最后，减少参与连接的数据量"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑使用CTE分解复杂逻辑。将人口统计条件组合和地址条件组合分别提取为独立CTE，然后与store_sales进行半连接（EXISTS或IN），避免笛卡尔积并提高可读性和优化器处理效率"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH demographic_filters AS (\n  SELECT DISTINCT ss_item_sk, ss_ticket_number\n  FROM store_sales\n  JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk\n  JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk\n  WHERE cd_marital_status = 'S'\n    AND (\n      (cd_education_status = 'Secondary' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3)\n      OR (cd_education_status = 'Secondary' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1)\n      OR (cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)\n    )\n),\naddress_filters AS (\n  SELECT DISTINCT ss_item_sk, ss_ticket_number\n  FROM store_sales\n  JOIN customer_address ON ss_addr_sk = ca_address_sk\n  WHERE ca_country = 'United States'\n    AND (\n      (ca_state IN ('MS', 'NY', 'VA') AND ss_net_profit BETWEEN 100 AND 200)\n      OR (ca_state IN ('MS', 'TN', 'TX') AND ss_net_profit BETWEEN 150 AND 300)\n      OR (ca_state IN ('NC', 'NM', 'OK') AND ss_net_profit BETWEEN 50 AND 250)\n    )\n)\nSELECT \n  MIN(ss.ss_quantity),\n  MIN(ss.ss_ext_sales_price),\n  MIN(ss.ss_ext_wholesale_cost),\n  MIN(ss.ss_ext_wholesale_cost)\nFROM store_sales ss\nJOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk\nJOIN store s ON s.s_store_sk = ss.ss_store_sk\nWHERE d.d_year = 2001\n  AND EXISTS (SELECT 1 FROM demographic_filters df WHERE df.ss_item_sk = ss.ss_item_sk AND df.ss_ticket_number = ss.ss_ticket_number)\n  AND EXISTS (SELECT 1 FROM address_filters af WHERE af.ss_item_sk = ss.ss_item_sk AND af.ss_ticket_number = ss.ss_ticket_number);",
+  "semantic_correctness_guarantee": "1. 原SQL通过隐式CROSS JOIN连接6张表，并用两层嵌套OR条件过滤。重写SQL将两层OR条件分别提取为两个CTE（demographic_filters和address_filters），每个CTE内部保持原OR逻辑不变，仅改变了计算顺序，不改变过滤语义。\n\n2. demographic_filters CTE提取了原SQL中第一层OR的三个分支（cd_marital_status='S'且三种education_status/sales_price/dep_count组合），通过半连接customer_demographics和household_demographics与store_sales，返回满足条件的(ss_item_sk, ss_ticket_number)主键对。由于原SQL要求这些条件必须同时满足（AND连接两层OR），CTE中使用DISTINCT确保每个主键对仅出现一次，与原SQL笛卡尔积后再过滤的结果集等价。\n\n3. address_filters CTE提取了原SQL中第二层OR的三个分支（ca_country='United States'且三种state/net_profit组合），同样返回满足条件的主键对。DISTINCT保证去重，避免同一销售记录因匹配多个地址条件而重复计数。\n\n4. 主查询通过EXISTS半连接两个CTE，等价于原SQL的AND逻辑：只有同时出现在demographic_filters和address_filters中的销售记录才被保留。EXISTS不引入重复行，保证每条store_sales记录最多贡献一次到MIN聚合。\n\n5. 主查询保留了date_dim和store的JOIN及d_year=2001过滤条件，位置与原SQL一致。由于MIN聚合对重复行不敏感（MIN(x)在有重复时结果不变），即使原SQL因笛卡尔积产生重复行，MIN结果与去重后一致，因此重写SQL的MIN结果与原SQL完全相同。\n\n6. 所有表连接均基于主键/外键关系（ss_sold_date_sk=d_date_sk, ss_store_sk=s_store_sk, ss_cdemo_sk=cd_demo_sk等），Schema中store_sales主键为(ss_item_sk, ss_ticket_number)，CTE通过此主键与主查询关联，确保一对一匹配，不产生额外笛卡尔积。\n\n7. 原SQL中customer_demographics、household_demographics、customer_address三张维度表在原SQL中仅用于过滤，不参与SELECT列，重写SQL将它们移入CTE后通过EXISTS引用，避免了主查询中的冗余JOIN，但通过主键约束保证了过滤条件的完整传递，语义完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL通过CTE提取过滤条件并用EXISTS半连接，但原SQL的笛卡尔积语义允许同一store_sales行因匹配多个demographic或address组合而重复参与MIN计算，而重写SQL的DISTINCT和EXISTS去重后每行最多贡献一次，当存在一对多匹配时两者结果集不同。",
+    "differences": [
+        {
+            "type": "JOIN语义差异",
+            "description": "原SQL隐式CROSS JOIN允许store_sales行因匹配多个customer_demographics/household_demographics/customer_address组合而产生重复行；重写SQL的CTE使用DISTINCT去重后用EXISTS半连接，每个(ss_item_sk,ss_ticket_number)最多保留一次",
+            "location": "demographic_filters和address_filters CTE的DISTINCT及主查询的EXISTS子句"
+        },
+        {
+            "type": "重复行处理",
+            "description": "虽然MIN聚合对重复行不敏感，但原SQL若某store_sales行不满足任何demographic或address条件则被完全过滤，而重写SQL通过EXISTS要求必须同时出现在两个CTE中；当原SQL因笛卡尔积产生的重复行中部分行满足条件、部分不满足时，过滤结果可能不同",
+            "location": "WHERE子句的AND逻辑与EXISTS半连接的等价性"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL通过CTE提取过滤条件并用EXISTS半连接，但原SQL的笛卡尔积语义允许同一store_sales行因匹配多个demographic或address组合而重复参与MIN计算，而重写SQL的DISTINCT和EXISTS去重后每行最多贡献一次，当存在一对多匹配时两者结果集不同。
+```json
+{"fixed_sql": "WITH demographic_filters AS (\n  SELECT ss_item_sk, ss_ticket_number\n  FROM store_sales\n  JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk\n  JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk\n  WHERE cd_marital_status = 'S'\n    AND (\n      (cd_education_status = 'Secondary' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3)\n      OR (cd_education_status = 'Secondary' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1)\n      OR (cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)\n    )\n),\naddress_filters AS (\n  SELECT ss_item_sk, ss_ticket_number\n  FROM store_sales\n  JOIN customer_address ON ss_addr_sk = ca_address_sk\n  WHERE ca_country = 'United States'\n    AND (\n      (ca_state IN ('MS', 'NY', 'VA') AND ss_net_profit BETWEEN 100 AND 200)\n      OR (ca_state IN ('MS', 'TN', 'TX') AND ss_net_profit BETWEEN 150 AND 300)\n      OR (ca_state IN ('NC', 'NM', 'OK') AND ss_net_profit BETWEEN 50 AND 250)\n    )\n)\nSELECT \n  MIN(ss.ss_quantity),\n  MIN(ss.ss_ext_sales_price),\n  MIN(ss.ss_ext_wholesale_cost),\n  MIN(ss.ss_ext_wholesale_cost)\nFROM store_sales ss\nJOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk\nJOIN store s ON s.s_store_sk = ss.ss_store_sk\nWHERE d.d_year = 2001\n  AND EXISTS (SELECT 1 FROM demographic_filters df WHERE df.ss_item_sk = ss.ss_item_sk AND df.ss_ticket_number = ss.ss_ticket_number)\n  AND EXISTS (SELECT 1 FROM address_filters af WHERE af.ss_item_sk = ss.ss_item_sk AND af.ss_ticket_number = ss.ss_ticket_number);", "note": "移除CTE中的DISTINCT以保留原SQL笛卡尔积产生的重复行,使MIN聚合基数与原SQL一致"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已移除CTE中的DISTINCT，通过EXISTS半连接保留原SQL笛卡尔积中所有满足条件的store_sales行参与MIN聚合，与原SQL语义等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL引入了CTE结构（demographic_filters和address_filters）并通过EXISTS半连接实现公共结果复用，这是高优先级正信号。但执行计划显示：1）行数估计求和从40.5万激增至936万（23倍），虽然该指标仅作弱参考，但结合计划结构看，重写后demographic_filters CTE内部产生了490万行中间结果（Nested Loop输出4904526行），远超原计划的最大中间结果（398082行）；2）重写后主查询通过Nested Loop Semi Join连接CTE结果，输出22206行，而原计划最终仅输出1行，说明EXISTS条件未能有效过滤；3）cost从99.7万增至128万（+28%），虽然cost仅作辅助，但结合上述结构信号看，CTE物化产生的巨大中间结果集（490万行）未能被有效复用或压缩，反而成为新的瓶颈。原计划通过Nested Loop + Index Scan精准探测customer_address和customer_demographics，中间结果控制在466行以内，而重写后CTE先全表扫描store_sales（392万行）再聚合至2.7万行，随后主查询再次索引探测store_sales产生490万行，存在明显的重复扫描和数据膨胀。虽然检测到CTE复用意图，但实际执行计划显示该复用未能生效，反而引入了灾难性的数据膨胀（490万行中间结果 vs 原计划的40万行总处理量）。综合判断：结构上明确恶化。",
+  "no_further_optimization": false,
+  "next_step_advice": "回退到原SQL的连接顺序逻辑，但保留部分CTE思路进行微调：1）将date_dim、store等小表过滤前置；2）针对OR条件，不要完全拆分为独立CTE，而是保持在主查询中通过Hash Join处理，避免CTE物化产生巨大中间结果；3）保留原计划中Nested Loop + Index Scan探测customer_address和customer_demographics的高效路径，不要通过CTE预聚合破坏该路径；4）若仍需CTE，仅针对确定能大幅压缩的维度表（如date_dim、store）建立CTE，避免对store_sales这种大事实表进行CTE物化。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE拆分导致store_sales被重复扫描3次（demographic_filters、address_filters、主查询各1次），产生490万行中间结果。当前执行计划显示：1）store_sales全表扫描代价占63.4%（81.2万），过滤条件仅针对ss_sales_price的OR条件，未能利用索引；2）两个EXISTS半连接通过Nested Loop实现，代价占20.4%+10.9%，说明CTE物化后的探测成本极高；3）customer_demographics全表扫描代价占3%（3.78万），过滤cd_marital_status和cd_education_status的OR条件。核心问题是CTE将复杂过滤条件拆分到独立子查询中，破坏了原计划中date_dim、store等小表前置过滤的高效路径，且store_sales的复合主键索引（ss_item_sk, ss_ticket_number）未能在CTE内部有效利用。需回退到单次扫描store_sales的结构，通过Hash Join处理OR条件，并前置date_dim和store的过滤以压缩数据量。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "移除demographic_filters和address_filters两个CTE，将其过滤条件直接内联到主查询的JOIN中。通过Hash Join连接customer_demographics、household_demographics、customer_address，避免CTE物化导致的store_sales重复扫描。保留复合主键索引（ss_item_sk, ss_ticket_number）的探测路径，而非通过EXISTS半连接破坏该路径。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：先过滤date_dim（d_year=2001，选择性高）和store（小表），再通过Hash Join连接store_sales，最后连接customer_demographics、household_demographics、customer_address。将小表过滤前置可大幅压缩store_sales的扫描范围，避免当前计划中store_sales全表扫描（2880万行）后再过滤的低效模式。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将demographic_filters中的三个OR条件（cd_education_status + ss_sales_price + hd_dep_count的组合）和address_filters中的三个OR条件（ca_state + ss_net_profit的组合）合并为单个WHERE子句，通过Hash Join的过滤条件处理，而非拆分为独立CTE。这样可以利用PostgreSQL的Hash Join优化器自动选择最优的过滤顺序，避免CTE强制物化导致的中间结果膨胀。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "主查询的MIN聚合函数仅需扫描满足所有过滤条件的行，无需通过CTE预聚合。将聚合操作保留在最终的SELECT中，让优化器根据过滤后的数据量选择最优的聚合策略（如Partial Aggregate + Finalize Aggregate），避免CTE中不必要的中间聚合步骤。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "SELECT \n  MIN(ss.ss_quantity),\n  MIN(ss.ss_ext_sales_price),\n  MIN(ss.ss_ext_wholesale_cost),\n  MIN(ss.ss_ext_wholesale_cost)\nFROM date_dim d\nJOIN store_sales ss ON ss.ss_sold_date_sk = d.d_date_sk\nJOIN store s ON s.s_store_sk = ss.ss_store_sk\nJOIN customer_demographics cd ON cd.cd_demo_sk = ss.ss_cdemo_sk\nJOIN household_demographics hd ON hd.hd_demo_sk = ss.ss_hdemo_sk\nJOIN customer_address ca ON ca.ca_address_sk = ss.ss_addr_sk\nWHERE d.d_year = 2001\n  AND cd.cd_marital_status = 'S'\n  AND (\n    (cd.cd_education_status = 'Secondary' AND ss.ss_sales_price BETWEEN 100.00 AND 150.00 AND hd.hd_dep_count = 3)\n    OR (cd.cd_education_status = 'Secondary' AND ss.ss_sales_price BETWEEN 50.00 AND 100.00 AND hd.hd_dep_count = 1)\n    OR (cd.cd_education_status = '2 yr Degree' AND ss.ss_sales_price BETWEEN 150.00 AND 200.00 AND hd.hd_dep_count = 1)\n  )\n  AND ca.ca_country = 'United States'\n  AND (\n    (ca.ca_state IN ('MS', 'NY', 'VA') AND ss.ss_net_profit BETWEEN 100 AND 200)\n    OR (ca.ca_state IN ('MS', 'TN', 'TX') AND ss.ss_net_profit BETWEEN 150 AND 300)\n    OR (ca.ca_state IN ('NC', 'NM', 'OK') AND ss.ss_net_profit BETWEEN 50 AND 250)\n  )",
+  "semantic_correctness_guarantee": "1. **CTE完全移除，改为直接JOIN**：原SQL通过demographic_filters和address_filters两个CTE分别扫描store_sales并通过EXISTS半连接主查询，导致store_sales被重复扫描3次（两个CTE各1次+主查询1次）。重写后将所有维度表（customer_demographics、household_demographics、customer_address）直接JOIN到主查询，每个store_sales行仅扫描1次，避免CTE物化产生的490万行中间结果。\n\n2. **连接顺序调整为小表驱动**：将date_dim（d_year=2001高选择性过滤）前置为驱动表，随后连接store_sales，再连接store（小表），最后连接维度表。原SQL通过EXISTS导致优化器无法有效利用date_dim过滤，重写后date_dim过滤可直接压缩store_sales扫描范围（通过ss_sold_date_sk索引或Hash Join）。\n\n3. **OR条件内联到WHERE子句**：原SQL将demographic_filters的3个OR条件和address_filters的3个OR条件拆分到独立CTE中，导致优化器无法全局评估过滤选择性。重写后将所有OR条件合并到主查询WHERE子句，优化器可根据统计信息选择最优的过滤顺序（如先过滤cd_marital_status='S'再评估OR条件）。\n\n4. **语义等价性保证**：原SQL通过EXISTS确保store_sales行同时满足demographic_filters和address_filters条件，重写后通过INNER JOIN实现相同逻辑——只有当store_sales行能通过ss_cdemo_sk、ss_hdemo_sk、ss_addr_sk分别连接到满足条件的customer_demographics、household_demographics、customer_address时才保留。由于所有JOIN键（ss_cdemo_sk、ss_hdemo_sk、ss_addr_sk）均为外键且维度表主键唯一，INNER JOIN与EXISTS在此场景下语义完全等价。\n\n5. **聚合函数保持不变**：主查询的MIN(ss_quantity)、MIN(ss_ext_sales_price)、MIN(ss_ext_wholesale_cost)在重写前后均对过滤后的store_sales行进行聚合，结果集完全一致。\n\n6. **NULL值处理**：原SQL的EXISTS不受NULL影响（NULL行无法匹配CTE结果），重写后的INNER JOIN同样会过滤掉ss_cdemo_sk、ss_hdemo_sk、ss_addr_sk为NULL的行（因为无法连接到维度表），语义一致。\n\n7. **回退到原计划的高效路径**：原执行计划通过Nested Loop + Index Scan精准探测维度表，中间结果控制在466行以内。重写后移除CTE物化，恢复优化器对维度表索引的利用能力，避免上一轮490万行中间结果的灾难性膨胀。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL将原SQL的隐式笛卡尔积+WHERE过滤改写为显式INNER JOIN，所有连接条件和过滤条件在语义上完全对应，聚合函数MIN保持不变，结果集一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，重写仅为语法规范化（显式JOIN、表别名），未产生任何结构性改变。节点类型、扫描方式、连接顺序、过滤逻辑、并行度、索引使用完全相同；cost差异0.77（996796.01→996796.78）可忽略；行数估计求和405501→405502几乎无变化。重写未引入任何优化收益，但也未造成恶化。由于当前计划已采用并行扫描+Hash Join+索引探测的合理路径，且optimization_context中的建议（CTE内联、连接顺序调整等）在本轮未被应用（applied_rules为空），继续迭代的边际收益极低。综合判断：当前重写为中性变更，已达优化终止条件。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1049
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=996796.01, 重写=996796.78，相对变化: -0.00%
+✅ 成功存储，记录ID: ba744b13-3fc8-4428-a99f-b17af62131d8
+
+----------------------------------------
+

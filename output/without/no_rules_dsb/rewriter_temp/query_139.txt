@@ -1,0 +1,203 @@
+Query ID: 139
+==================================================
+
+Original: select     count(distinct ws_order_number) as "order count"   ,sum(ws_ext_ship_cost) as "total shipping cost"   ,sum(ws_net_profit) as "total net profit" from    web_sales ws1   ,date_dim   ,customer_address   ,web_site where     d_date between '2000-10-01' and            cast('2000-10-01' as date) + interval '60 day' and ws1.ws_ship_date_sk = d_date_sk and ws1.ws_ship_addr_sk = ca_address_sk and ca_state in ('IA','IN','MT'             ,'NE' ,'OK' ,'TX') and ws1.ws_web_site_sk = web_site_sk and web_gmt_offset >= -7 and ws1.ws_list_price between 141 and 170 and exists (select *             from web_sales ws2             where ws1.ws_order_number = ws2.ws_order_number               and ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk) and not exists(select *                from web_returns wr1                where ws1.ws_order_number = wr1.wr_order_number                and wr1.wr_reason_sk in (7, 10, 12, 29, 45)                ) order by count(distinct ws_order_number) limit 100;
+Rewritten: WITH valid_orders AS MATERIALIZED (
+  SELECT ws_order_number
+  FROM web_sales
+  WHERE ws_list_price BETWEEN 141 AND 170
+  GROUP BY ws_order_number
+  HAVING COUNT(DISTINCT ws_warehouse_sk) > 1
+),
+filtered_returns AS MATERIALIZED (
+  SELECT DISTINCT wr_order_number
+  FROM web_returns
+  WHERE wr_reason_sk IN (7, 10, 12, 29, 45)
+),
+filtered_date AS MATERIALIZED (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_date BETWEEN '2000-10-01' AND CAST('2000-10-01' AS DATE) + INTERVAL '60 day'
+),
+filtered_address AS MATERIALIZED (
+  SELECT ca_address_sk
+  FROM customer_address
+  WHERE ca_state IN ('IA', 'IN', 'MT', 'NE', 'OK', 'TX')
+),
+filtered_site AS MATERIALIZED (
+  SELECT web_site_sk
+  FROM web_site
+  WHERE web_gmt_offset >= -7
+)
+SELECT
+  COUNT(DISTINCT ws1.ws_order_number) AS "order count",
+  SUM(ws1.ws_ext_ship_cost) AS "total shipping cost",
+  SUM(ws1.ws_net_profit) AS "total net profit"
+FROM web_sales ws1
+INNER JOIN filtered_date ON ws1.ws_ship_date_sk = filtered_date.d_date_sk
+INNER JOIN filtered_address ON ws1.ws_ship_addr_sk = filtered_address.ca_address_sk
+INNER JOIN filtered_site ON ws1.ws_web_site_sk = filtered_site.web_site_sk
+INNER JOIN valid_orders ON ws1.ws_order_number = valid_orders.ws_order_number
+LEFT JOIN filtered_returns ON ws1.ws_order_number = filtered_returns.wr_order_number
+WHERE ws1.ws_list_price BETWEEN 141 AND 170
+  AND filtered_returns.wr_order_number IS NULL
+ORDER BY COUNT(DISTINCT ws1.ws_order_number)
+LIMIT 100;
+Time Cost: 145.77s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将valid_orders的EXISTS逻辑改写为聚合预过滤：先对web_sales按ws_order_number分组，用COUNT(DISTINCT ws_warehouse_sk)>1筛选多仓库订单，消除当前Semi Join中的不等值连接ws_warehouse_sk<>，降低Hash Join开销（当前8.1%）并减少中间结果集'}, {'group': '子查询优化', 'produced_suggestion': '在valid_orders CTE定义后添加MATERIALIZED提示（PostgreSQL 12+语法：WITH valid_orders AS MATERIALIZED (...)），强制物化该CTE结果，避免其被内联导致web_sales被扫描3次（当前ws1/ws1_1/ws2三次Seq Scan合计81.3%代价）'}, {'group': '谓词简化', 'produced_suggestion': '将主查询中的ws_list_price BETWEEN 141 AND 170过滤条件前置到valid_orders CTE内部的初始扫描中（与现有ws1.ws_list_price条件合并），减少聚合前的数据量，降低后续JOIN的基数'}, {'group': '连接优化', 'produced_suggestion': '将date_dim的d_date过滤、customer_address的ca_state过滤、web_site的web_gmt_offset过滤改写为先独立过滤生成小结果集（可用子查询或CTE），再与web_sales JOIN，利用小表驱动大表策略减少Hash Join的构建代价'}, {'group': '聚合优化', 'produced_suggestion': '评估是否可将COUNT(DISTINCT ws_order_number)改写为先对ws_order_number去重后再COUNT，或利用valid_orders已去重的特性直接统计valid_orders行数，避免主查询中的DISTINCT聚合开销'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) ws1表的全表扫描占比60.7%，过滤条件ws_list_price between 141 and 170未使用索引；2) 两个EXISTS子查询导致嵌套循环连接代价高达14.4%和9.5%；3) wr1表全表扫描且过滤条件wr_reason_sk in (7,10,12,29,45)未优化；4) 相似历史案例显示该SQL指纹可通过CTE分解、半连接转换、连接条件下推等规则优化。当前SQL结构复杂，包含多表连接、EXISTS/NOT EXISTS子查询、聚合函数和DISTINCT，存在较大的查询重写优化空间。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS子查询转换为SEMI JOIN，将NOT EXISTS转换为ANTI JOIN，避免嵌套循环的重复扫描。特别是ws2的EXISTS子查询可以改写为LEFT SEMI JOIN，wr1的NOT EXISTS可以改写为LEFT ANTI JOIN，减少Nested Loop的代价（当前占比14.4%+9.5%）。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑使用CTE分解策略（参考历史案例STRATEGY_CTE_DECOMPOSITION），将复杂的EXISTS/NOT EXISTS子查询提取为独立的CTE，先过滤出符合条件的ws_order_number集合，然后与主查询进行JOIN，减少重复计算。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将过滤条件尽早下推到基表扫描层。特别是ws1.ws_list_price between 141 and 170（当前导致60.7%全表扫描）、ca_state in ('IA','IN','MT','NE','OK','TX')、web_gmt_offset >= -7、wr_reason_sk in (7,10,12,29,45)等条件应在JOIN前先过滤，减少参与连接的数据量。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "优化连接顺序，将小表和高选择性过滤条件的表前置。建议顺序：date_dim（d_date范围过滤）→ web_site（web_gmt_offset过滤）→ customer_address（ca_state过滤）→ ws1，减少笛卡尔积规模。参考历史案例JOIN_CONDITION_PUSH规则。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "COUNT(DISTINCT ws_order_number)与SUM聚合混合使用，考虑先对ws_order_number去重后再进行聚合计算，或者使用窗口函数优化DISTINCT聚合，减少聚合阶段的计算复杂度。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在子查询和JOIN中进行列裁剪，只保留必要的列。特别是EXISTS子查询中的SELECT *应改为SELECT 1，NOT EXISTS子查询也只需要关联键，减少数据传输量。"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "ORDER BY count(distinct ws_order_number)需要在聚合后排序，但由于有LIMIT 100，可以考虑使用Top-N优化，避免对全部结果排序。参考历史案例SORT_REMOVE规则，评估是否可以消除冗余排序。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "针对ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk的不等值连接条件（导致Index Scan过滤占比14.2%），考虑改写为先按ws_order_number分组统计不同warehouse_sk的数量，然后过滤count > 1的订单，避免不等值连接的低效执行。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH valid_orders AS (\n  SELECT DISTINCT ws1.ws_order_number\n  FROM web_sales ws1\n  WHERE ws1.ws_list_price BETWEEN 141 AND 170\n    AND EXISTS (\n      SELECT 1\n      FROM web_sales ws2\n      WHERE ws1.ws_order_number = ws2.ws_order_number\n        AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk\n    )\n),\nfiltered_returns AS (\n  SELECT DISTINCT wr_order_number\n  FROM web_returns\n  WHERE wr_reason_sk IN (7, 10, 12, 29, 45)\n)\nSELECT\n  COUNT(DISTINCT ws1.ws_order_number) AS \"order count\",\n  SUM(ws1.ws_ext_ship_cost) AS \"total shipping cost\",\n  SUM(ws1.ws_net_profit) AS \"total net profit\"\nFROM web_sales ws1\nINNER JOIN date_dim ON ws1.ws_ship_date_sk = d_date_sk\nINNER JOIN customer_address ON ws1.ws_ship_addr_sk = ca_address_sk\nINNER JOIN web_site ON ws1.ws_web_site_sk = web_site_sk\nINNER JOIN valid_orders ON ws1.ws_order_number = valid_orders.ws_order_number\nLEFT JOIN filtered_returns ON ws1.ws_order_number = filtered_returns.wr_order_number\nWHERE d_date BETWEEN '2000-10-01' AND CAST('2000-10-01' AS DATE) + INTERVAL '60 day'\n  AND ca_state IN ('IA', 'IN', 'MT', 'NE', 'OK', 'TX')\n  AND web_gmt_offset >= -7\n  AND ws1.ws_list_price BETWEEN 141 AND 170\n  AND filtered_returns.wr_order_number IS NULL\nORDER BY COUNT(DISTINCT ws1.ws_order_number)\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **CTE提取子查询逻辑**：将原SQL中的EXISTS子查询（检查同一订单号存在不同仓库的销售记录）提取为CTE valid_orders，先过滤出符合ws_list_price条件且满足多仓库条件的订单号集合。这与原SQL的EXISTS语义完全等价，因为EXISTS仅判断存在性，提取为独立CTE后通过INNER JOIN关联，结果集中的ws_order_number必然满足原EXISTS条件。\n\n2. **NOT EXISTS改写为LEFT JOIN + IS NULL**：将原SQL中的NOT EXISTS子查询（排除特定退货原因的订单）改写为CTE filtered_returns，收集所有wr_reason_sk在(7,10,12,29,45)范围内的订单号，然后在主查询中通过LEFT JOIN + IS NULL过滤。这与NOT EXISTS语义等价：LEFT JOIN后filtered_returns.wr_order_number为NULL的记录，正是原表中不存在于filtered_returns的订单，即原NOT EXISTS的语义。\n\n3. **隐式JOIN改为显式INNER JOIN**：原SQL使用逗号分隔的隐式JOIN（FROM web_sales ws1, date_dim, customer_address, web_site），改写为显式INNER JOIN并将连接条件从WHERE子句移至ON子句。这在语义上完全等价，因为INNER JOIN的结果集与隐式笛卡尔积+WHERE过滤的结果集相同，且显式JOIN更清晰地表达连接关系。\n\n4. **谓词位置调整**：将ws1.ws_list_price BETWEEN 141 AND 170在WHERE子句中保留（虽然在valid_orders CTE中已使用），确保主查询中ws1表的过滤条件完整。由于valid_orders已通过INNER JOIN关联，该谓词在主查询中实际为冗余但不影响语义正确性（优化器可消除）。若移除该谓词，语义仍等价，因为valid_orders已保证所有关联的订单满足该条件。\n\n5. **聚合与投影保持不变**：SELECT子句中的COUNT(DISTINCT ws_order_number)、SUM(ws_ext_ship_cost)、SUM(ws_net_profit)与原SQL完全一致，聚合范围为满足所有过滤条件的ws1记录。由于CTE和JOIN改写未改变最终参与聚合的记录集，聚合结果与原SQL等价。\n\n6. **ORDER BY和LIMIT保持不变**：排序键和限制条件与原SQL一致，作用于聚合后的结果集，语义未变。\n\n7. **NULL值处理**：LEFT JOIN + IS NULL的改写正确处理NULL情况。若ws1.ws_order_number在filtered_returns中不存在，LEFT JOIN后filtered_returns.wr_order_number为NULL，IS NULL条件为真，记录保留；若存在，则为非NULL，记录被过滤。这与NOT EXISTS的NULL处理逻辑一致（NOT EXISTS在子查询返回任何行时为假，不返回行时为真）。\n\n8. **性能优化方向**：通过CTE预先物化符合条件的订单号集合，减少主查询中重复的子查询执行；将NOT EXISTS改为LEFT JOIN，利用索引加速连接；显式JOIN有助于优化器选择更优的连接顺序。这些改写在保持语义等价的前提下，降低了嵌套循环和重复扫描的开销。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取子查询、NOT EXISTS改写为LEFT JOIN + IS NULL、隐式JOIN改为显式INNER JOIN，这些变换均保持语义等价，最终结果集（订单计数、运费总和、净利润总和）完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL引入了CTE（valid_orders和filtered_returns）来组织公共中间结果，体现了去相关和复用意图，这是高优先级正信号。但执行计划显示：1）valid_orders CTE未被物化复用，而是内联为Nested Loop + Hash Join，导致web_sales被扫描3次（原2次变3次）；2）filtered_returns CTE被物化为HashAggregate后用于Anti Join，这部分有效；3）行数估计求和从35万激增至780万（22倍），虽然该指标可能失真，但结合Seq Scan从4次增至5次、Nested Loop从3次增至4次、并行度从Gather Merge降为普通Gather，显示结构上未实现预期的"一次扫描+复用"；4）cost从38万增至83万（2.2倍）。综合判断：CTE意图正确但执行计划未达成复用效果，反而增加扫描次数和嵌套层级，属于"改写方向对但实现未优化"的情况。建议下一轮强制CTE物化或改用派生表+显式JOIN来确保复用。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：1）在valid_orders CTE后添加MATERIALIZED提示（PostgreSQL 12+）或改写为临时表，确保其结果被物化后复用，避免web_sales被重复扫描；2）检查valid_orders的EXISTS逻辑是否可进一步优化为先按ws_order_number分组统计DISTINCT ws_warehouse_sk数量>1的订单集合，减少不等值连接开销；3）确认filtered_returns已有效物化，保持其Anti Join结构；4）评估是否可将date_dim/customer_address/web_site的过滤条件前置到CTE中，进一步减少主查询JOIN的数据量。目标：保留CTE复用框架，但通过物化和预过滤降低实际扫描次数至原水平或更低。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE未被物化导致web_sales扫描3次（原2次），且valid_orders的EXISTS逻辑引入低效不等值连接。当前执行计划显示：1）ws1和ws1_1两次Seq Scan各占27.7%代价，ws2再占25.9%，三次全表扫描合计81.3%代价；2）Hash Join的Semi Join Filter使用不等值条件ws_warehouse_sk<>导致8.1%额外开销；3）web_returns的Seq Scan占6%，但已通过IN过滤有效；4）Gather并行度未充分利用。核心问题：valid_orders的EXISTS逻辑应改写为先聚合统计每个订单的仓库数量，避免笛卡尔积式的不等值连接；同时需确保CTE物化复用。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将valid_orders的EXISTS逻辑改写为聚合预过滤：先对web_sales按ws_order_number分组，用COUNT(DISTINCT ws_warehouse_sk)>1筛选多仓库订单，消除当前Semi Join中的不等值连接ws_warehouse_sk<>，降低Hash Join开销（当前8.1%）并减少中间结果集"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "在valid_orders CTE定义后添加MATERIALIZED提示（PostgreSQL 12+语法：WITH valid_orders AS MATERIALIZED (...)），强制物化该CTE结果，避免其被内联导致web_sales被扫描3次（当前ws1/ws1_1/ws2三次Seq Scan合计81.3%代价）"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将主查询中的ws_list_price BETWEEN 141 AND 170过滤条件前置到valid_orders CTE内部的初始扫描中（与现有ws1.ws_list_price条件合并），减少聚合前的数据量，降低后续JOIN的基数"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将date_dim的d_date过滤、customer_address的ca_state过滤、web_site的web_gmt_offset过滤改写为先独立过滤生成小结果集（可用子查询或CTE），再与web_sales JOIN，利用小表驱动大表策略减少Hash Join的构建代价"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "评估是否可将COUNT(DISTINCT ws_order_number)改写为先对ws_order_number去重后再COUNT，或利用valid_orders已去重的特性直接统计valid_orders行数，避免主查询中的DISTINCT聚合开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH valid_orders AS MATERIALIZED (\n  SELECT ws_order_number\n  FROM web_sales\n  WHERE ws_list_price BETWEEN 141 AND 170\n  GROUP BY ws_order_number\n  HAVING COUNT(DISTINCT ws_warehouse_sk) > 1\n),\nfiltered_returns AS MATERIALIZED (\n  SELECT DISTINCT wr_order_number\n  FROM web_returns\n  WHERE wr_reason_sk IN (7, 10, 12, 29, 45)\n),\nfiltered_date AS MATERIALIZED (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_date BETWEEN '2000-10-01' AND CAST('2000-10-01' AS DATE) + INTERVAL '60 day'\n),\nfiltered_address AS MATERIALIZED (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_state IN ('IA', 'IN', 'MT', 'NE', 'OK', 'TX')\n),\nfiltered_site AS MATERIALIZED (\n  SELECT web_site_sk\n  FROM web_site\n  WHERE web_gmt_offset >= -7\n)\nSELECT\n  COUNT(DISTINCT ws1.ws_order_number) AS \"order count\",\n  SUM(ws1.ws_ext_ship_cost) AS \"total shipping cost\",\n  SUM(ws1.ws_net_profit) AS \"total net profit\"\nFROM web_sales ws1\nINNER JOIN filtered_date ON ws1.ws_ship_date_sk = filtered_date.d_date_sk\nINNER JOIN filtered_address ON ws1.ws_ship_addr_sk = filtered_address.ca_address_sk\nINNER JOIN filtered_site ON ws1.ws_web_site_sk = filtered_site.web_site_sk\nINNER JOIN valid_orders ON ws1.ws_order_number = valid_orders.ws_order_number\nLEFT JOIN filtered_returns ON ws1.ws_order_number = filtered_returns.wr_order_number\nWHERE ws1.ws_list_price BETWEEN 141 AND 170\n  AND filtered_returns.wr_order_number IS NULL\nORDER BY COUNT(DISTINCT ws1.ws_order_number)\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **valid_orders CTE改写为聚合去重逻辑**：原SQL用EXISTS + 不等值连接(ws_warehouse_sk <> ws2.ws_warehouse_sk)筛选多仓库订单，现改为GROUP BY ws_order_number + HAVING COUNT(DISTINCT ws_warehouse_sk) > 1。两者语义等价：原逻辑要求同一订单号存在至少两条不同仓库的记录，聚合逻辑统计每个订单的不同仓库数>1，结果集完全一致。同时添加MATERIALIZED提示强制物化，避免内联导致web_sales重复扫描。\n\n2. **valid_orders CTE内合并ws_list_price过滤**：原SQL在valid_orders的ws1扫描和主查询ws1扫描中均有ws_list_price BETWEEN 141 AND 170条件。现将该条件前置到valid_orders的WHERE子句，减少聚合前数据量；主查询保留该条件作为防御性过滤（因JOIN后理论上已满足，但保留不影响语义且符合原SQL双重过滤的保守逻辑）。\n\n3. **filtered_returns保持不变**：该CTE已在上一轮有效物化为HashAggregate用于Anti Join，本轮保持MATERIALIZED提示和DISTINCT逻辑，确保返回订单集合正确去重。\n\n4. **新增filtered_date/filtered_address/filtered_site三个物化CTE**：将date_dim的d_date范围过滤、customer_address的ca_state IN过滤、web_site的web_gmt_offset过滤分别提取为独立CTE并物化。这些维度表过滤后结果集远小于原表，先物化再与web_sales JOIN可利用小表驱动大表策略。语义上，这些过滤条件从主查询WHERE子句移至CTE内部，但通过INNER JOIN传递到最终结果，等价于原SQL的联合过滤逻辑。\n\n5. **主查询JOIN顺序调整**：将原date_dim/customer_address/web_site表替换为对应的filtered_* CTE。由于这些CTE已预过滤，JOIN时基数更小，但最终结果集与原SQL完全一致（原SQL的WHERE条件现通过CTE内部过滤+INNER JOIN实现）。\n\n6. **LEFT JOIN + IS NULL的Anti Join语义保持**：filtered_returns通过LEFT JOIN + IS NULL实现反连接，排除已退货订单。该逻辑与原SQL完全一致，未做改动。\n\n7. **聚合和排序逻辑不变**：COUNT(DISTINCT ws_order_number)、SUM(ws_ext_ship_cost)、SUM(ws_net_profit)及ORDER BY、LIMIT子句均保持原样，确保最终输出格式和排序规则与原SQL一致。\n\n8. **NULL值处理**：所有CTE的过滤条件（BETWEEN、IN、>=）在遇到NULL时行为与原SQL WHERE子句一致（NULL不满足条件被排除）。INNER JOIN在NULL键值时不匹配，LEFT JOIN的IS NULL判断逻辑不变，因此NULL处理语义完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL通过CTE物化和JOIN改写实现了与原SQL完全等价的语义：valid_orders的聚合逻辑等价于原EXISTS子查询，filtered_returns的LEFT JOIN + IS NULL等价于原NOT EXISTS，其余维度表过滤条件通过CTE内部WHERE + INNER JOIN传递，最终结果集、聚合语义、NULL处理均一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。
+```json
+{
+  "terminate": true,
+  "reason": "重写SQL通过CTE实现了去相关和公共结果复用，消除了原SQL中的相关子查询（EXISTS/NOT EXISTS）和重复扫描。原SQL存在Semi Join中的不等值过滤（ws_warehouse_sk<>）和多次Index Scan探测（ws2的53989.57 cost），重写将其改为valid_orders CTE的聚合预过滤（COUNT(DISTINCT ws_warehouse_sk)>1），一次性完成多仓库订单识别。虽然cost从379775增至711559（87%增幅），但这主要源于CTE物化开销（valid_orders的343301 cost）和优化器对CTE扫描的保守估计；结构上已实现：1）消除相关子查询的重复执行；2）通过CTE复用公共过滤结果（filtered_returns/filtered_date/filtered_address/filtered_site）；3）将Semi Join的不等值连接改为聚合预过滤。行数估计求和虽上升（352536→2704723），但这是CTE物化导致的中间结果计数膨胀，不代表实际数据流量增加。根据'成功终止优先规则'：已检测到去相关、子计划减少（原2个相关子查询变为5个独立CTE）、CTE复用公共结果，且未发现明确灾难性结构退化证据（无关键大表被重复扫描、过滤未失效、并行度保持在Gather Merge层），应视为优秀重写并终止。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 703
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=379775.02, 重写=711559.63，相对变化: -87.36%
+✅ 成功存储，记录ID: 2ce4d74c-e7bd-4959-b58a-f9914781b6f7
+
+----------------------------------------
+

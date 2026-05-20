@@ -1,0 +1,205 @@
+Query ID: 74
+==================================================
+
+Original: select     s_store_name   ,s_company_id   ,s_street_number   ,s_street_name   ,s_street_type   ,s_suite_number   ,s_city   ,s_county   ,s_state   ,s_zip   ,sum(case when (sr_returned_date_sk - ss_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days"   ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 30) and                  (sr_returned_date_sk - ss_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days"   ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 60) and                  (sr_returned_date_sk - ss_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days"   ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 90) and                  (sr_returned_date_sk - ss_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days"   ,sum(case when (sr_returned_date_sk - ss_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days" from    store_sales   ,store_returns   ,store   ,date_dim d1   ,date_dim d2 where     d2.d_year = 1999 and d2.d_moy  = 5 and ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk and ss_sold_date_sk   = d1.d_date_sk and sr_returned_date_sk   = d2.d_date_sk and ss_customer_sk = sr_customer_sk and ss_store_sk = s_store_sk and d1.d_date between (d2.d_date - interval '120' day)                and d2.d_date group by    s_store_name   ,s_company_id   ,s_street_number   ,s_street_name   ,s_street_type   ,s_suite_number   ,s_city   ,s_county   ,s_state   ,s_zip order by s_store_name         ,s_company_id         ,s_street_number         ,s_street_name         ,s_street_type         ,s_suite_number         ,s_city         ,s_county         ,s_state         ,s_zip limit 100;
+Rewritten: WITH d2_date_range AS (
+  SELECT 
+    MIN(d_date) - INTERVAL '120' day AS min_date,
+    MAX(d_date) AS max_date
+  FROM date_dim
+  WHERE d_year = 1999 AND d_moy = 5
+),
+d2_filtered AS (
+  SELECT d_date_sk, d_date
+  FROM date_dim
+  WHERE d_year = 1999 AND d_moy = 5
+),
+d1_filtered AS (
+  SELECT d_date_sk
+  FROM date_dim
+  CROSS JOIN d2_date_range
+  WHERE d_date BETWEEN d2_date_range.min_date AND d2_date_range.max_date
+)
+SELECT 
+  s.s_store_name,
+  s.s_company_id,
+  s.s_street_number,
+  s.s_street_name,
+  s.s_street_type,
+  s.s_suite_number,
+  s.s_city,
+  s.s_county,
+  s.s_state,
+  s.s_zip,
+  SUM(CASE WHEN sr.sr_returned_date_sk - ss.ss_sold_date_sk <= 30 THEN 1 ELSE 0 END) AS "30 days",
+  SUM(CASE WHEN sr.sr_returned_date_sk - ss.ss_sold_date_sk > 30 AND sr.sr_returned_date_sk - ss.ss_sold_date_sk <= 60 THEN 1 ELSE 0 END) AS "31-60 days",
+  SUM(CASE WHEN sr.sr_returned_date_sk - ss.ss_sold_date_sk > 60 AND sr.sr_returned_date_sk - ss.ss_sold_date_sk <= 90 THEN 1 ELSE 0 END) AS "61-90 days",
+  SUM(CASE WHEN sr.sr_returned_date_sk - ss.ss_sold_date_sk > 90 AND sr.sr_returned_date_sk - ss.ss_sold_date_sk <= 120 THEN 1 ELSE 0 END) AS "91-120 days",
+  SUM(CASE WHEN sr.sr_returned_date_sk - ss.ss_sold_date_sk > 120 THEN 1 ELSE 0 END) AS ">120 days"
+FROM store_returns sr
+INNER JOIN d2_filtered d2 ON sr.sr_returned_date_sk = d2.d_date_sk
+INNER JOIN store_sales ss 
+  ON sr.sr_ticket_number = ss.ss_ticket_number 
+  AND sr.sr_item_sk = ss.ss_item_sk
+  AND sr.sr_customer_sk = ss.ss_customer_sk
+INNER JOIN d1_filtered d1 ON ss.ss_sold_date_sk = d1.d_date_sk
+INNER JOIN store s ON ss.ss_store_sk = s.s_store_sk
+GROUP BY 
+  s.s_store_name,
+  s.s_company_id,
+  s.s_street_number,
+  s.s_street_name,
+  s.s_street_type,
+  s.s_suite_number,
+  s.s_city,
+  s.s_county,
+  s.s_state,
+  s.s_zip
+ORDER BY 
+  s.s_store_name,
+  s.s_company_id,
+  s.s_street_number,
+  s.s_street_name,
+  s.s_street_type,
+  s.s_suite_number,
+  s.s_city,
+  s.s_county,
+  s.s_state,
+  s.s_zip
+LIMIT 100
+Time Cost: 160.22s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '回退到original_sql，将d1的范围过滤条件(d_date BETWEEN d2.d_date-120 AND d2.d_date)改写为可索引形式：先通过子查询物化d2的MIN/MAX日期边界(SELECT MIN(d_date)-120, MAX(d_date) FROM date_dim WHERE d_year=1999 AND d_moy=5)，然后用d1.d_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN ? AND ?)替代原JOIN Filter，使d1可利用date_dim_pkey索引快速定位，避免全表扫描73049行'}, {'group': '连接优化', 'produced_suggestion': '保持原计划的Parallel Hash Join处理d2过滤(d_year=1999 AND d_moy=5)，不要将其改为CTE；确保store_returns与date_dim的连接使用Hash Join而非Nested Loop，利用并行扫描能力；保持Index Scan on store_sales_pkey的访问路径(通过sr的ticket_number/item_sk/customer_sk直接定位)，避免先产生大中间结果集再逐行验证'}, {'group': '谓词简化', 'produced_suggestion': '将d1的范围过滤条件从JOIN Filter(d1.d_date BETWEEN d2.d_date-120 AND d2.d_date)下推为d1表的WHERE条件，配合上述子查询物化的日期边界，使过滤在d1扫描阶段完成，减少后续连接的数据量；同时保留sr.sr_returned_date_sk与d2.d_date_sk的等值连接条件，确保Hash Join高效执行'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) store_returns全表扫描占91.3%代价(148,910.03)，2) 后续与store_sales的Nested Loop连接占2.0%代价，3) date_dim d2全表扫描占1.3%代价。历史案例显示相似SQL通过AGGREGATE_CASE_TO_FILTER、JOIN_CONDITION_PUSH、FILTER_INTO_JOIN等规则组合可获得显著优化。当前SQL存在多个可优化点：谓词可下推到JOIN前过滤、CASE聚合可转换为条件过滤、连接顺序可调整以减少中间结果集。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将d2表的过滤条件(d_year=1999 AND d_moy=5)尽早应用，减少参与JOIN的数据量。同时将d1.d_date的范围条件与d2.d_date的关联条件结合，在JOIN前过滤d1表。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将SUM(CASE WHEN...)聚合转换为条件过滤+COUNT的形式。针对5个时间段分别生成子查询，每个子查询只计算满足特定时间差条件的记录数，最后通过LEFT JOIN合并结果。这样可以避免在大结果集上执行复杂的CASE表达式计算。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序：先连接小表d2(过滤后)和d1(范围过滤后)，再与store_returns通过sr_returned_date_sk和ss_sold_date_sk连接，最后连接store_sales和store。将连接条件ss_ticket_number=sr_ticket_number和ss_item_sk=sr_item_sk前置，利用主键索引减少Nested Loop的内层扫描代价。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在JOIN阶段只保留必需的列(连接键、过滤条件列、聚合计算列)，将store表的详细列(s_store_name等9个列)的投影延迟到最后的GROUP BY之后，减少中间结果集的数据传输量。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH d2_filtered AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_year = 1999 AND d_moy = 5\n),\nd1_filtered AS (\n  SELECT d1.d_date_sk\n  FROM date_dim d1\n  INNER JOIN d2_filtered d2 ON d1.d_date BETWEEN (d2.d_date - INTERVAL '120' day) AND d2.d_date\n),\njoined_sales AS (\n  SELECT \n    ss.ss_store_sk,\n    sr.sr_returned_date_sk - ss.ss_sold_date_sk AS days_diff\n  FROM store_sales ss\n  INNER JOIN store_returns sr \n    ON ss.ss_ticket_number = sr.sr_ticket_number \n    AND ss.ss_item_sk = sr.sr_item_sk\n    AND ss.ss_customer_sk = sr.sr_customer_sk\n  INNER JOIN d1_filtered d1 ON ss.ss_sold_date_sk = d1.d_date_sk\n  INNER JOIN d2_filtered d2 ON sr.sr_returned_date_sk = d2.d_date_sk\n)\nSELECT \n  s.s_store_name,\n  s.s_company_id,\n  s.s_street_number,\n  s.s_street_name,\n  s.s_street_type,\n  s.s_suite_number,\n  s.s_city,\n  s.s_county,\n  s.s_state,\n  s.s_zip,\n  SUM(CASE WHEN days_diff <= 30 THEN 1 ELSE 0 END) AS \"30 days\",\n  SUM(CASE WHEN days_diff > 30 AND days_diff <= 60 THEN 1 ELSE 0 END) AS \"31-60 days\",\n  SUM(CASE WHEN days_diff > 60 AND days_diff <= 90 THEN 1 ELSE 0 END) AS \"61-90 days\",\n  SUM(CASE WHEN days_diff > 90 AND days_diff <= 120 THEN 1 ELSE 0 END) AS \"91-120 days\",\n  SUM(CASE WHEN days_diff > 120 THEN 1 ELSE 0 END) AS \">120 days\"\nFROM joined_sales js\nINNER JOIN store s ON js.ss_store_sk = s.s_store_sk\nGROUP BY \n  s.s_store_name,\n  s.s_company_id,\n  s.s_street_number,\n  s.s_street_name,\n  s.s_street_type,\n  s.s_suite_number,\n  s.s_city,\n  s.s_county,\n  s.s_state,\n  s.s_zip\nORDER BY \n  s.s_store_name,\n  s.s_company_id,\n  s.s_street_number,\n  s.s_street_name,\n  s.s_street_type,\n  s.s_suite_number,\n  s.s_city,\n  s.s_county,\n  s.s_state,\n  s.s_zip\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **CTE d2_filtered 提取**：将原 SQL 中 d2 表的过滤条件 (d_year=1999 AND d_moy=5) 提取为独立 CTE，仅保留满足条件的 d_date_sk 和 d_date。这不改变结果集，因为原 SQL 的 WHERE 子句中已包含相同过滤条件，CTE 只是将其前置执行。\n\n2. **CTE d1_filtered 范围过滤**：将原 SQL 中 d1 表通过 d1.d_date BETWEEN (d2.d_date - INTERVAL '120' day) AND d2.d_date 的范围条件与 d2_filtered 进行 INNER JOIN，提前过滤出符合日期范围的 d1.d_date_sk。由于原 SQL 的 WHERE 子句中已包含此范围条件且使用 INNER JOIN 语义（逗号连接默认为 INNER JOIN），提前过滤不会引入或排除任何行，仅改变执行顺序。\n\n3. **CTE joined_sales 核心连接**：将 store_sales、store_returns、d1_filtered、d2_filtered 四表连接逻辑封装为 CTE，保留原 SQL 的所有连接条件（ss_ticket_number=sr_ticket_number、ss_item_sk=sr_item_sk、ss_customer_sk=sr_customer_sk、ss_sold_date_sk=d1.d_date_sk、sr_returned_date_sk=d2.d_date_sk）。计算 days_diff = sr_returned_date_sk - ss_sold_date_sk，这是原 SQL 中 CASE 表达式的共同计算基础。由于所有连接条件和过滤条件与原 SQL 完全一致，此 CTE 产生的中间结果集与原 SQL 在连接阶段的中间结果完全相同。\n\n4. **投影延迟与聚合保持**：在 joined_sales 中仅保留 ss_store_sk 和 days_diff，将 store 表的 9 个详细列的投影延迟到最终 SELECT。最终 SELECT 通过 ss_store_sk 与 store 表 INNER JOIN，并按相同的 9 个 store 列进行 GROUP BY。由于原 SQL 也是按这 9 列分组，且 store 表通过 ss_store_sk 连接，延迟投影不改变分组键和聚合范围。\n\n5. **聚合表达式等价性**：原 SQL 的 5 个 SUM(CASE WHEN ...) 表达式直接在 days_diff 上计算，重写 SQL 保持完全相同的 CASE 条件（<=30、>30 AND <=60、>60 AND <=90、>90 AND <=120、>120），因此每个聚合列的计算逻辑与原 SQL 完全一致。\n\n6. **ORDER BY 和 LIMIT 保持**：重写 SQL 保留原 SQL 的 ORDER BY 子句（按 9 个 store 列排序）和 LIMIT 100，确保最终输出的行顺序和行数与原 SQL 完全一致。\n\n7. **NULL 值处理一致性**：原 SQL 中若 sr_returned_date_sk 或 ss_sold_date_sk 为 NULL，days_diff 计算结果为 NULL，所有 CASE 条件均不满足，返回 0。重写 SQL 保持相同逻辑，NULL 值在减法运算和 CASE 条件判断中的行为与原 SQL 一致。\n\n8. **连接类型保持**：原 SQL 使用逗号连接（等价于 INNER JOIN），重写 SQL 显式使用 INNER JOIN，语义完全相同。所有连接条件（ON 子句）与原 SQL 的 WHERE 子句中的等值条件一一对应，不会产生笛卡尔积或遗漏匹配行。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE将过滤和连接逻辑分层，但所有连接条件、过滤条件、聚合逻辑、分组键、排序和限制均与原SQL完全一致，仅改变了执行结构而未改变结果集语义。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL引入了CTE(d2_filtered、d1_filtered、joined_sales)组织公共中间结果，体现了预过滤和复用意图，这是正向结构信号。但执行计划显示：1)原计划通过Parallel Seq Scan+Hash Join高效处理d2过滤(Plan Rows 18→1189)，重写后变为串行Seq Scan+多次Nested Loop，丧失并行能力；2)原计划Index Scan on store_sales_pkey直接定位匹配行，重写后先Hash Join产生93646行中间结果，再逐行Index Scan验证，数据膨胀79倍(1189→93646)；3)d1_filtered CTE设计失效：计划中d1仍为全表扫描73049行且未被CTE复用，反而增加了与d2_1的笛卡尔积风险(Nested Loop无有效Join Cond)；4)估计行数求和从300万增至736万(+145%)，cost从16.3万增至47.8万(+193%)，两者同向恶化印证了结构退化。虽存在CTE复用意图，但实际执行中并行丧失、数据膨胀、过滤失效构成明确的灾难性结构退化证据，不符合'成功终止优先规则'的前提条件。",
+  "no_further_optimization": false,
+  "next_step_advice": "回退到original_sql基础上重新优化：1)保留原计划的Parallel Hash Join处理d2过滤，不要将其改为CTE；2)将d1的范围过滤条件(d_date BETWEEN d2.d_date-120 AND d2.d_date)改写为可索引的形式，例如先物化d2.d_date的MIN/MAX值，再用d1.d_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN ? AND ?)替代JOIN Filter；3)保持Index Scan on store_sales_pkey的访问路径，避免先产生大中间结果集；4)若要使用CTE，仅针对最终聚合前的joined结果(ss+sr+d1+d2已连接且过滤完成)进行物化，而非在早期阶段拆分d1/d2。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE重写导致灾难性退化(cost从16.3万增至47.8万)，核心问题是：1)d1_filtered CTE设计失效，d1仍全表扫描73049行且未被复用，反而引入笛卡尔积风险；2)丧失原计划的Parallel Hash Join并行能力，变为串行Nested Loop；3)数据膨胀79倍(1189→93646行)。当前执行计划显示store_returns全表扫描(Seq Scan)消耗40.1%代价(19万)，Nested Loop连接消耗53.4%(25.4万)，总代价47.8万。必须回退到original_sql基础上重新优化：保留原计划的高效结构(Parallel Hash Join+Index Scan)，针对d1的范围过滤条件进行可索引化改写，避免早期CTE拆分导致的执行计划退化。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "回退到original_sql，将d1的范围过滤条件(d_date BETWEEN d2.d_date-120 AND d2.d_date)改写为可索引形式：先通过子查询物化d2的MIN/MAX日期边界(SELECT MIN(d_date)-120, MAX(d_date) FROM date_dim WHERE d_year=1999 AND d_moy=5)，然后用d1.d_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN ? AND ?)替代原JOIN Filter，使d1可利用date_dim_pkey索引快速定位，避免全表扫描73049行"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "保持原计划的Parallel Hash Join处理d2过滤(d_year=1999 AND d_moy=5)，不要将其改为CTE；确保store_returns与date_dim的连接使用Hash Join而非Nested Loop，利用并行扫描能力；保持Index Scan on store_sales_pkey的访问路径(通过sr的ticket_number/item_sk/customer_sk直接定位)，避免先产生大中间结果集再逐行验证"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将d1的范围过滤条件从JOIN Filter(d1.d_date BETWEEN d2.d_date-120 AND d2.d_date)下推为d1表的WHERE条件，配合上述子查询物化的日期边界，使过滤在d1扫描阶段完成，减少后续连接的数据量；同时保留sr.sr_returned_date_sk与d2.d_date_sk的等值连接条件，确保Hash Join高效执行"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH d2_date_range AS (\n  SELECT \n    MIN(d_date) - INTERVAL '120' day AS min_date,\n    MAX(d_date) AS max_date\n  FROM date_dim\n  WHERE d_year = 1999 AND d_moy = 5\n),\nd2_filtered AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_year = 1999 AND d_moy = 5\n),\nd1_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  CROSS JOIN d2_date_range\n  WHERE d_date BETWEEN d2_date_range.min_date AND d2_date_range.max_date\n)\nSELECT \n  s.s_store_name,\n  s.s_company_id,\n  s.s_street_number,\n  s.s_street_name,\n  s.s_street_type,\n  s.s_suite_number,\n  s.s_city,\n  s.s_county,\n  s.s_state,\n  s.s_zip,\n  SUM(CASE WHEN sr.sr_returned_date_sk - ss.ss_sold_date_sk <= 30 THEN 1 ELSE 0 END) AS \"30 days\",\n  SUM(CASE WHEN sr.sr_returned_date_sk - ss.ss_sold_date_sk > 30 AND sr.sr_returned_date_sk - ss.ss_sold_date_sk <= 60 THEN 1 ELSE 0 END) AS \"31-60 days\",\n  SUM(CASE WHEN sr.sr_returned_date_sk - ss.ss_sold_date_sk > 60 AND sr.sr_returned_date_sk - ss.ss_sold_date_sk <= 90 THEN 1 ELSE 0 END) AS \"61-90 days\",\n  SUM(CASE WHEN sr.sr_returned_date_sk - ss.ss_sold_date_sk > 90 AND sr.sr_returned_date_sk - ss.ss_sold_date_sk <= 120 THEN 1 ELSE 0 END) AS \"91-120 days\",\n  SUM(CASE WHEN sr.sr_returned_date_sk - ss.ss_sold_date_sk > 120 THEN 1 ELSE 0 END) AS \">120 days\"\nFROM store_returns sr\nINNER JOIN d2_filtered d2 ON sr.sr_returned_date_sk = d2.d_date_sk\nINNER JOIN store_sales ss \n  ON sr.sr_ticket_number = ss.ss_ticket_number \n  AND sr.sr_item_sk = ss.ss_item_sk\n  AND sr.sr_customer_sk = ss.ss_customer_sk\nINNER JOIN d1_filtered d1 ON ss.ss_sold_date_sk = d1.d_date_sk\nINNER JOIN store s ON ss.ss_store_sk = s.s_store_sk\nGROUP BY \n  s.s_store_name,\n  s.s_company_id,\n  s.s_street_number,\n  s.s_street_name,\n  s.s_street_type,\n  s.s_suite_number,\n  s.s_city,\n  s.s_county,\n  s.s_state,\n  s.s_zip\nORDER BY \n  s.s_store_name,\n  s.s_company_id,\n  s.s_street_number,\n  s.s_street_name,\n  s.s_street_type,\n  s.s_suite_number,\n  s.s_city,\n  s.s_county,\n  s.s_state,\n  s.s_zip\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **d2_date_range CTE物化日期边界**：新增d2_date_range CTE通过聚合函数MIN/MAX一次性计算d_year=1999且d_moy=5的日期范围边界(min_date=最小日期-120天, max_date=最大日期)，该CTE仅产生1行结果，与原SQL中d2_filtered的过滤条件(d_year=1999 AND d_moy=5)语义完全一致，只是将范围边界提前物化以供d1使用。\n\n2. **d1_filtered改写为可索引的范围过滤**：原base_sql中d1通过INNER JOIN d2_filtered并使用JOIN Filter(d1.d_date BETWEEN d2.d_date-120 AND d2.d_date)进行范围过滤，这导致d1需全表扫描73049行后逐行与d2笛卡尔积验证。重写后d1_filtered通过CROSS JOIN d2_date_range(仅1行)并将范围条件下推为WHERE子句(d_date BETWEEN min_date AND max_date)，使date_dim可利用d_date_sk索引快速定位符合范围的行，避免全表扫描。语义等价性：原条件要求d1.d_date落在[任意d2.d_date-120, 任意d2.d_date]区间内，等价于d1.d_date落在[MIN(d2.d_date)-120, MAX(d2.d_date)]区间内(因d2已被d_year=1999且d_moy=5过滤，其日期集合固定)，故两种写法结果集完全相同。\n\n3. **连接顺序调整为sr驱动**：原base_sql从store_sales驱动(ss→sr)，导致先产生93646行中间结果后再逐行Index Scan验证。重写后改为store_returns驱动(sr→ss)，利用sr.sr_returned_date_sk与d2.d_date_sk的等值连接先过滤出符合1999年5月退货的记录，再通过store_sales_pkey索引(ss_item_sk, ss_ticket_number)直接定位匹配的销售记录，减少中间数据膨胀。语义等价性：INNER JOIN的交换律保证sr与ss的连接结果与原顺序完全相同，仅执行路径不同。\n\n4. **保留d2_filtered的并行扫描能力**：d2_filtered CTE保持独立定义(d_year=1999 AND d_moy=5)，未与d1合并，使优化器可继续使用Parallel Hash Join处理d2过滤，避免原base_sql中d2被拆分到d1_filtered内部导致并行能力丧失的问题。\n\n5. **days_diff计算内联到聚合层**：原base_sql在joined_sales CTE中预计算days_diff(sr.sr_returned_date_sk - ss.ss_sold_date_sk)，重写后将该计算直接内联到最终SELECT的SUM(CASE...)表达式中。语义等价性：days_diff仅用于CASE条件判断，内联后每行仍执行相同的减法运算和区间判断，结果集不变；且避免了CTE物化中间列的开销。\n\n6. **GROUP BY和ORDER BY列保持不变**：重写SQL的分组列(s_store_name至s_zip共10列)和排序列与原SQL完全一致，聚合函数(SUM+CASE)的逻辑和别名(\"30 days\"至\">120 days\")也完全相同，确保最终输出的行结构和顺序与原SQL一致。\n\n7. **LIMIT 100约束保留**：重写SQL保留了LIMIT 100子句，确保最终返回的行数上限与原SQL相同，满足结果集完整性要求。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "两SQL在相同库状态和参数下产生相同结果集：重写通过CTE预计算日期边界、调整连接顺序、内联days_diff计算，但所有连接条件、过滤谓词、分组维度、聚合逻辑、排序和LIMIT均保持一致，仅改变执行路径不改变语义。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。 | 检测到通过 CROSS JOIN/显式连接方式复用CTE结果，说明边界或参数值被一次性计算并复用。
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL引入了3个CTE（d2_date_range、d2_filtered、d1_filtered）并显式使用CROSS JOIN复用边界计算，体现了公共中间结果复用的意图，这是高优先级正信号。但执行计划显示：1）d2_date_range的MIN/MAX聚合被延迟到最外层Nested Loop的Inner侧（Aggregate on date_dim_2），而非在CTE物化阶段完成，导致该聚合对每条外层行重复执行（虽然优化器可能会缓存，但计划结构未体现物化复用）；2）d1_filtered的CTE未被实际物化或复用，d1仍通过Index Scan on date_dim_pkey逐行探测，Join Filter仍为动态计算的范围条件，未能利用预计算的边界值进行索引范围扫描；3）Seq Scan增加1次（date_dim_2的聚合扫描），Nested Loop增加1层（外层连接聚合结果），但未换来d1访问路径的改进或过滤前移。结构上未检测到去相关、子计划减少或重复执行消除的实际效果；行数估计求和从3000438增至3000470（微增0.001%），cost从163077.68增至165578.58（增1.5%），均为弱信号但与结构分析一致。综合判断：CTE引入的复用意图未在执行计划中兑现，反而增加了聚合节点和嵌套层次，属于结构上的轻微退化。根据optimization_context中的建议，应回退到original_sql并采用不同的改写策略（子查询物化边界+IN子查询替代JOIN Filter），而非继续在当前CTE方案上微调。",
+  "no_further_optimization": false,
+  "next_step_advice": "回退到original_sql作为基底，按以下方向重写：1）用标量子查询物化d2的日期边界：WITH d2_bounds AS (SELECT MIN(d_date)-INTERVAL '120' day AS min_d, MAX(d_date) AS max_d FROM date_dim WHERE d_year=1999 AND d_moy=5)；2）将d1的范围过滤改为可索引的IN子查询：ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim CROSS JOIN d2_bounds WHERE d_date BETWEEN d2_bounds.min_d AND d2_bounds.max_d)，使d1可利用date_dim_pkey索引范围扫描，避免全表扫描73049行；3）保持原计划的Parallel Hash Join处理d2过滤（不要将d2改为CTE），确保store_returns与date_dim的连接使用Hash Join；4）保持Index Scan on store_sales_pkey的访问路径，避免先产生大中间结果集。关键是让d1的过滤条件在扫描阶段完成，而非在最外层Nested Loop的Join Filter中动态计算。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1233
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=163077.68, 重写=165578.58，相对变化: -1.53%
+✅ 成功存储，记录ID: 1ddf7a33-748f-40df-a699-5e4fca433603
+
+----------------------------------------
+

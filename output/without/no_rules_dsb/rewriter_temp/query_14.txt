@@ -1,0 +1,182 @@
+Query ID: 14
+==================================================
+
+Original: select avg(ss_quantity) ,avg(ss_ext_sales_price) ,avg(ss_ext_wholesale_cost) ,sum(ss_ext_wholesale_cost) from store_sales    ,store    ,customer_demographics    ,household_demographics    ,customer_address    ,date_dim where s_store_sk = ss_store_sk and  ss_sold_date_sk = d_date_sk and d_year = 2001 and((ss_hdemo_sk=hd_demo_sk and cd_demo_sk = ss_cdemo_sk and cd_marital_status = 'S' and cd_education_status = 'Secondary' and ss_sales_price between 100.00 and 150.00 and hd_dep_count = 3    )or    (ss_hdemo_sk=hd_demo_sk and cd_demo_sk = ss_cdemo_sk and cd_marital_status = 'S' and cd_education_status = 'Secondary' and ss_sales_price between 50.00 and 100.00 and hd_dep_count = 1    ) or    (ss_hdemo_sk=hd_demo_sk and cd_demo_sk = ss_cdemo_sk and cd_marital_status = 'S' and cd_education_status = '2 yr Degree' and ss_sales_price between 150.00 and 200.00 and hd_dep_count = 1    )) and((ss_addr_sk = ca_address_sk and ca_country = 'United States' and ca_state in ('MS', 'NY', 'VA') and ss_net_profit between 100 and 200    ) or    (ss_addr_sk = ca_address_sk and ca_country = 'United States' and ca_state in ('MS', 'TN', 'TX') and ss_net_profit between 150 and 300    ) or    (ss_addr_sk = ca_address_sk and ca_country = 'United States' and ca_state in ('NC', 'NM', 'OK') and ss_net_profit between 50 and 250    )) ;
+Rewritten: WITH filtered_date AS MATERIALIZED (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2001
+),
+filtered_address AS MATERIALIZED (
+  SELECT ca_address_sk, ca_state
+  FROM customer_address
+  WHERE ca_country = 'United States'
+    AND ca_state IN ('MS', 'NY', 'VA', 'TN', 'TX', 'NC', 'NM', 'OK')
+),
+filtered_demo AS MATERIALIZED (
+  SELECT cd_demo_sk, cd_education_status
+  FROM customer_demographics
+  WHERE cd_marital_status = 'S'
+    AND cd_education_status IN ('Secondary', '2 yr Degree')
+)
+SELECT 
+  AVG(ss_quantity),
+  AVG(ss_ext_sales_price),
+  AVG(ss_ext_wholesale_cost),
+  SUM(ss_ext_wholesale_cost)
+FROM store_sales
+INNER JOIN store ON s_store_sk = ss_store_sk
+INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+INNER JOIN filtered_demo ON cd_demo_sk = ss_cdemo_sk
+INNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk
+INNER JOIN filtered_address ON ss_addr_sk = ca_address_sk
+WHERE (
+  (cd_education_status = 'Secondary' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3)
+  OR (cd_education_status = 'Secondary' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1)
+  OR (cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)
+)
+AND (
+  (ca_state IN ('MS', 'NY', 'VA') AND ss_net_profit BETWEEN 100 AND 200)
+  OR (ca_state IN ('MS', 'TN', 'TX') AND ss_net_profit BETWEEN 150 AND 300)
+  OR (ca_state IN ('NC', 'NM', 'OK') AND ss_net_profit BETWEEN 50 AND 250)
+)
+Time Cost: 185.34s
+Suggestion: [{'group': '集合优化', 'produced_suggestion': "将WHERE子句中的复杂OR条件拆分为UNION ALL子查询：针对三组(cd_education_status,ss_sales_price,hd_dep_count)条件与三组(ca_state,ss_net_profit)条件的组合，生成9个独立SELECT子查询(每个子查询包含一组精确条件)，每个子查询执行简单范围过滤后UNION ALL合并，最外层对合并结果执行AVG/SUM聚合。示例结构：SELECT AVG(ss_quantity)... FROM (SELECT ss_quantity... WHERE cd_education_status='Secondary' AND ss_sales_price BETWEEN 100 AND 150 AND hd_dep_count=3 AND ca_state IN('MS','NY','VA') AND ss_net_profit BETWEEN 100 AND 200 UNION ALL SELECT... WHERE cd_education_status='Secondary' AND ss_sales_price BETWEEN 50 AND 100 AND hd_dep_count=1 AND ca_state IN('MS','NY','VA') AND ss_net_profit BETWEEN 100 AND 200 UNION ALL ...[共9个子查询]) AS combined"}, {'group': '谓词简化', 'produced_suggestion': "在UNION ALL拆分后，每个子查询的WHERE条件简化为单一条件组合(无OR)，将cd_education_status/ca_state的IN条件转换为等值条件(如cd_education_status='Secondary' AND ca_state='MS')，ss_sales_price/ss_net_profit的BETWEEN条件保持不变。这样每个子查询的Filter条件变为：cd_education_status=常量 AND ss_sales_price BETWEEN x AND y AND hd_dep_count=常量 AND ca_state=常量 AND ss_net_profit BETWEEN m AND n，便于优化器选择索引扫描或分区裁剪"}, {'group': '连接优化', 'produced_suggestion': '在每个UNION ALL子查询内部，调整JOIN顺序：先JOIN filtered_demo(cd_education_status已固定为单值)和filtered_address(ca_state已固定为单值)，利用Index Scan快速定位小结果集，再JOIN household_demographics(hd_dep_count已固定)和filtered_date(d_year=2001)，最后JOIN store_sales并应用ss_sales_price/ss_net_profit范围过滤。通过将维度表过滤前置，减少store_sales扫描基数，避免全表扫描'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示store_sales表的全表扫描占总代价99.5%，是主要性能瓶颈。SQL存在复杂的OR条件组合，包括多个维度表的笛卡尔积式连接和重复的连接条件。历史案例显示FILTER_INTO_JOIN规则在相似SQL上有效（命中6次）。可通过谓词简化、连接优化和子查询优化来改善性能。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将复杂的OR条件拆解并下推到各维度表的连接条件中，减少store_sales表的过滤负担。特别是将cd_marital_status='S'、d_year=2001、ca_country='United States'等高选择性条件提前过滤"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "消除重复的连接条件（ss_hdemo_sk=hd_demo_sk和ss_addr_sk=ca_address_sk在OR子句中重复出现），将其提取到WHERE子句顶层，避免多次连接判断"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将三组OR条件拆分为UNION ALL子查询，每个子查询处理一种特定的customer_demographics和household_demographics组合，利用更精确的过滤条件减少数据量后再聚合"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先连接小表和高选择性过滤条件的表（date_dim的d_year=2001、customer_address的ca_state IN条件），减少与大表store_sales的连接基数"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "合并重叠的ss_sales_price和ss_net_profit范围条件，简化为更宽松的单一范围检查（ss_sales_price BETWEEN 50.00 AND 200.00, ss_net_profit BETWEEN 50 AND 300），将精确匹配留给维度表过滤"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2001\n),\nfiltered_address AS (\n  SELECT ca_address_sk, ca_state\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('MS', 'NY', 'VA', 'TN', 'TX', 'NC', 'NM', 'OK')\n),\nfiltered_demo AS (\n  SELECT cd_demo_sk, cd_education_status\n  FROM customer_demographics\n  WHERE cd_marital_status = 'S'\n    AND cd_education_status IN ('Secondary', '2 yr Degree')\n)\nSELECT \n  AVG(ss_quantity),\n  AVG(ss_ext_sales_price),\n  AVG(ss_ext_wholesale_cost),\n  SUM(ss_ext_wholesale_cost)\nFROM store_sales\nINNER JOIN store ON s_store_sk = ss_store_sk\nINNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk\nINNER JOIN filtered_demo ON cd_demo_sk = ss_cdemo_sk\nINNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk\nINNER JOIN filtered_address ON ss_addr_sk = ca_address_sk\nWHERE (\n  (cd_education_status = 'Secondary' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3)\n  OR (cd_education_status = 'Secondary' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1)\n  OR (cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)\n)\nAND (\n  (ca_state IN ('MS', 'NY', 'VA') AND ss_net_profit BETWEEN 100 AND 200)\n  OR (ca_state IN ('MS', 'TN', 'TX') AND ss_net_profit BETWEEN 150 AND 300)\n  OR (ca_state IN ('NC', 'NM', 'OK') AND ss_net_profit BETWEEN 50 AND 250)\n)",
+  "semantic_correctness_guarantee": "1. **CTE提取高选择性过滤**：将date_dim的d_year=2001、customer_address的ca_country='United States'和ca_state IN(...)、customer_demographics的cd_marital_status='S'和cd_education_status IN(...)提取为CTE预过滤。这些条件在原SQL的WHERE子句中已存在，仅是提前执行，不改变最终结果集的行范围。\n\n2. **消除重复连接条件**：原SQL在三组OR子句中重复出现ss_hdemo_sk=hd_demo_sk、cd_demo_sk=ss_cdemo_sk、ss_addr_sk=ca_address_sk。重写后将这些连接条件提升到主查询的INNER JOIN子句中，每个连接仅执行一次。由于原SQL的OR逻辑要求这些连接必须成立（每个OR分支都包含相同的连接条件），提升后语义完全等价。\n\n3. **OR条件结构保持**：原SQL包含两组嵌套OR条件（人口统计维度和地址维度）。重写后保持相同的OR逻辑结构，仅将已提取到CTE或JOIN中的冗余谓词从OR子句中移除。例如cd_marital_status='S'已在filtered_demo中过滤，OR子句中仅保留cd_education_status、ss_sales_price、hd_dep_count的组合判断。\n\n4. **聚合函数不变**：SELECT子句的AVG(ss_quantity)、AVG(ss_ext_sales_price)、AVG(ss_ext_wholesale_cost)、SUM(ss_ext_wholesale_cost)保持不变，作用于相同的过滤后行集。\n\n5. **INNER JOIN语义**：原SQL使用逗号分隔的隐式内连接，重写为显式INNER JOIN。在WHERE条件完全相同的情况下，两者语义等价（均为内连接且过滤条件一致）。\n\n6. **NULL值处理**：原SQL的连接和过滤条件均为等值或范围判断，不涉及IS NULL或外连接。重写后的INNER JOIN和WHERE条件对NULL值的处理逻辑与原SQL一致（NULL不满足等值或BETWEEN条件，被自动过滤）。\n\n7. **ca_state范围合并**：filtered_address的ca_state IN包含原SQL三组OR中的所有州（MS、NY、VA、TN、TX、NC、NM、OK），确保不遗漏任何符合条件的地址记录。具体的州与ss_net_profit范围的匹配逻辑保留在主查询的WHERE OR子句中，语义完全对应原SQL。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE预过滤和显式JOIN消除了冗余连接条件,但保持了相同的过滤逻辑和聚合语义,结果集完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划几乎完全相同，CTE未被物化或复用。重写引入了3个CTE（filtered_date、filtered_address、filtered_demo），但优化器将其内联回原始形式，未产生实质性结构改进。对比显示：1）节点类型分布完全一致（Seq Scan 4次、Index Scan 2次、Hash Join 3次、Nested Loop 2次）；2）行数估计求和从405501降至405472（仅0.007%微降，可忽略）；3）cost从996796.04降至996774.02（仅0.002%微降，可忽略）；4）关键扫描路径未变：store_sales仍为Parallel Seq Scan过滤398082行，date_dim/household_demographics仍为Seq Scan构建Hash表，customer_address/customer_demographics仍为Index Scan逐行探测；5）customer_address的Index Scan Filter增加了冗余条件'ca_state = ANY ('{MS,NY,VA,TN,TX,NC,NM,OK}'::bpchar[])'，但未改变过滤逻辑；6）customer_demographics的Index Scan Filter增加了冗余条件'cd_education_status = ANY ('{Secondary,\"2 yr Degree\"}'::bpchar[])'，同样未改变过滤逻辑。虽然heuristic检测到'预聚合CTE'信号，但实际EXPLAIN显示CTE未被物化，仅作为内联视图被优化器展开，未产生公共结果复用效果。本轮重写未触发优化器行为变化，属于'未改进'而非'恶化'，但仍需继续优化。",
+  "no_further_optimization": false,
+  "next_step_advice": "当前CTE被优化器内联，未产生物化复用效果。下一轮应尝试：1）使用MATERIALIZED提示强制物化CTE（WITH filtered_date AS MATERIALIZED (...)），确保date_dim/customer_address/customer_demographics的过滤结果被复用；2）或采用UNION ALL拆分策略：将三组OR条件（cd_education_status + ss_sales_price + hd_dep_count的组合）拆分为3个独立子查询，每个子查询精确匹配一组条件后UNION ALL合并，避免复杂Join Filter；3）或引入临时表/派生表预聚合：先将store_sales按ss_sales_price/ss_net_profit范围分组预聚合，减少后续JOIN基数。优先尝试MATERIALIZED提示，若仍无效则转向UNION ALL拆分。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE被优化器内联未产生物化效果。当前执行计划显示store_sales全表扫描(28800991行)占99.5%代价，复杂OR条件(ss_sales_price三组范围+ss_net_profit三组范围)导致过滤效率低。根据上轮反馈，需采用UNION ALL拆分策略：将三组复合条件(cd_education_status+ss_sales_price+hd_dep_count)与三组(ca_state+ss_net_profit)的笛卡尔组合拆分为独立子查询，每个子查询精确匹配单一条件组合，避免复杂Filter，最后UNION ALL合并后聚合。此方案可将OR条件转换为多个简单等值/范围过滤，提升索引利用率并减少全表扫描代价。",
+  "advice": [
+    {
+      "group": "集合优化",
+      "produced_suggestion": "将WHERE子句中的复杂OR条件拆分为UNION ALL子查询：针对三组(cd_education_status,ss_sales_price,hd_dep_count)条件与三组(ca_state,ss_net_profit)条件的组合，生成9个独立SELECT子查询(每个子查询包含一组精确条件)，每个子查询执行简单范围过滤后UNION ALL合并，最外层对合并结果执行AVG/SUM聚合。示例结构：SELECT AVG(ss_quantity)... FROM (SELECT ss_quantity... WHERE cd_education_status='Secondary' AND ss_sales_price BETWEEN 100 AND 150 AND hd_dep_count=3 AND ca_state IN('MS','NY','VA') AND ss_net_profit BETWEEN 100 AND 200 UNION ALL SELECT... WHERE cd_education_status='Secondary' AND ss_sales_price BETWEEN 50 AND 100 AND hd_dep_count=1 AND ca_state IN('MS','NY','VA') AND ss_net_profit BETWEEN 100 AND 200 UNION ALL ...[共9个子查询]) AS combined"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "在UNION ALL拆分后，每个子查询的WHERE条件简化为单一条件组合(无OR)，将cd_education_status/ca_state的IN条件转换为等值条件(如cd_education_status='Secondary' AND ca_state='MS')，ss_sales_price/ss_net_profit的BETWEEN条件保持不变。这样每个子查询的Filter条件变为：cd_education_status=常量 AND ss_sales_price BETWEEN x AND y AND hd_dep_count=常量 AND ca_state=常量 AND ss_net_profit BETWEEN m AND n，便于优化器选择索引扫描或分区裁剪"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "在每个UNION ALL子查询内部，调整JOIN顺序：先JOIN filtered_demo(cd_education_status已固定为单值)和filtered_address(ca_state已固定为单值)，利用Index Scan快速定位小结果集，再JOIN household_demographics(hd_dep_count已固定)和filtered_date(d_year=2001)，最后JOIN store_sales并应用ss_sales_price/ss_net_profit范围过滤。通过将维度表过滤前置，减少store_sales扫描基数，避免全表扫描"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date AS MATERIALIZED (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2001\n),\nfiltered_address AS MATERIALIZED (\n  SELECT ca_address_sk, ca_state\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('MS', 'NY', 'VA', 'TN', 'TX', 'NC', 'NM', 'OK')\n),\nfiltered_demo AS MATERIALIZED (\n  SELECT cd_demo_sk, cd_education_status\n  FROM customer_demographics\n  WHERE cd_marital_status = 'S'\n    AND cd_education_status IN ('Secondary', '2 yr Degree')\n)\nSELECT \n  AVG(ss_quantity),\n  AVG(ss_ext_sales_price),\n  AVG(ss_ext_wholesale_cost),\n  SUM(ss_ext_wholesale_cost)\nFROM store_sales\nINNER JOIN store ON s_store_sk = ss_store_sk\nINNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk\nINNER JOIN filtered_demo ON cd_demo_sk = ss_cdemo_sk\nINNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk\nINNER JOIN filtered_address ON ss_addr_sk = ca_address_sk\nWHERE (\n  (cd_education_status = 'Secondary' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3)\n  OR (cd_education_status = 'Secondary' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1)\n  OR (cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)\n)\nAND (\n  (ca_state IN ('MS', 'NY', 'VA') AND ss_net_profit BETWEEN 100 AND 200)\n  OR (ca_state IN ('MS', 'TN', 'TX') AND ss_net_profit BETWEEN 150 AND 300)\n  OR (ca_state IN ('NC', 'NM', 'OK') AND ss_net_profit BETWEEN 50 AND 250)\n)",
+  "semantic_correctness_guarantee": "1. 结构性改写：在原有三个CTE（filtered_date、filtered_address、filtered_demo）的定义前增加MATERIALIZED关键字，强制PostgreSQL优化器将这些CTE物化为临时结果集，而非内联展开。其余查询结构（JOIN顺序、WHERE条件、聚合函数）完全保持不变。\n\n2. CTE作用域与语义不变性：filtered_date仍过滤d_year=2001的日期维度；filtered_address仍过滤ca_country='United States'且ca_state在指定8个州的地址维度；filtered_demo仍过滤cd_marital_status='S'且cd_education_status在('Secondary','2 yr Degree')的人口统计维度。MATERIALIZED提示仅改变优化器执行策略（从内联改为物化），不改变CTE返回的行集合，因此与这些CTE进行INNER JOIN的结果集与原SQL完全一致。\n\n3. JOIN语义保持：所有INNER JOIN的连接条件（ss_sold_date_sk=d_date_sk、cd_demo_sk=ss_cdemo_sk、ss_hdemo_sk=hd_demo_sk、ss_addr_sk=ca_address_sk、s_store_sk=ss_store_sk）未修改，连接类型未变（均为INNER JOIN，不涉及外连接的NULL扩展问题），因此JOIN后的笛卡尔积过滤结果与原SQL等价。\n\n4. WHERE子句完全保留：两组复杂OR条件（cd_education_status+ss_sales_price+hd_dep_count的三组合 与 ca_state+ss_net_profit的三组合）的逻辑表达式逐字保留，未做任何谓词重写或条件简化。由于WHERE子句在JOIN之后应用，且条件逻辑未变，过滤后的行集合与原SQL完全一致。\n\n5. 聚合函数语义不变：SELECT子句中的AVG(ss_quantity)、AVG(ss_ext_sales_price)、AVG(ss_ext_wholesale_cost)、SUM(ss_ext_wholesale_cost)四个聚合函数作用于相同的输入行集合（经过相同JOIN和WHERE过滤后的store_sales行），因此聚合结果与原SQL完全一致。无GROUP BY子句，属于全局聚合，不涉及分组语义变化。\n\n6. NULL值处理一致性：INNER JOIN会自动过滤连接键为NULL的行（如ss_sold_date_sk为NULL则无法匹配filtered_date），MATERIALIZED提示不改变这一行为。WHERE子句中的BETWEEN和IN条件对NULL的处理逻辑（NULL BETWEEN x AND y返回NULL，被WHERE过滤掉）在原SQL和重写SQL中完全一致。\n\n7. 优化目标：根据上一轮反馈，原CTE被优化器内联导致date_dim、customer_address、customer_demographics的过滤结果未被复用，每次JOIN时重复扫描。MATERIALIZED提示强制优化器先执行CTE并缓存结果，后续多次引用时直接读取物化表，减少重复扫描开销。此改写仅改变执行计划的物理层面（扫描次数、中间结果缓存），不改变逻辑层面的结果集语义，符合语义等价要求。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "MATERIALIZED 提示仅改变 CTE 的物化策略（从内联改为物化缓存），不改变 CTE 返回的行集合、JOIN 连接逻辑、WHERE 过滤条件或聚合函数语义，因此两 SQL 在相同库状态下结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 2->0, Hash/Merge 3->5 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写引入3个CTE(filtered_date/filtered_address/filtered_demo)实现公共结果复用，这是高优先级正信号；但执行计划显示：1)原SQL使用2个Index Scan(customer_address_pkey/customer_demographics_pkey)精准探测，重写后完全丢失索引访问，改为CTE Scan+Hash Join；2)原SQL并行度Parallel Aware=true在date_dim/store_sales扫描节点，重写后并行仅在CTE构建阶段，主干Hash Join无并行；3)原SQL通过Nested Loop+Index Scan实现早期过滤(Join Filter在Nested Loop层应用)，重写后Join Filter下推至最后Hash Join层，导致中间结果膨胀(Plan Rows从原SQL主干466/41行增至重写2570/39733行)；4)行数估计求和从405501增至1221641(3倍)，虽不能单独判定恶化，但结合索引丢失+并行弱化+中间膨胀，说明过滤效率下降；5)cost从996796增至1085115(+8.9%)，虽增幅不大，但结合结构退化信号，说明CTE复用未能补偿索引丢失的代价。综合判断：CTE复用意图正确，但当前实现方式导致索引访问路径丢失+过滤后置+中间膨胀，属于'未改进'而非'明确恶化'。根据optimization_context，下一步应采用UNION ALL拆分OR条件+谓词简化+JOIN顺序调整，在保留CTE复用的同时恢复索引访问能力。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：1)保留filtered_date/filtered_address/filtered_demo三个CTE的预过滤逻辑；2)将主查询拆分为9个UNION ALL子查询(对应3组cd_education_status×ss_sales_price×hd_dep_count条件与3组ca_state×ss_net_profit条件的笛卡尔积)；3)每个子查询内部：先用filtered_demo.cd_demo_sk和filtered_address.ca_address_sk作为驱动表(利用CTE Scan小结果集)，通过INNER JOIN store_sales ON ss_cdemo_sk=cd_demo_sk AND ss_addr_sk=ca_address_sk引入事实表，WHERE子句应用单一条件组(cd_education_status=常量 AND ss_sales_price BETWEEN x AND y AND hd_dep_count=常量 AND ca_state=常量 AND ss_net_profit BETWEEN m AND n)，再JOIN filtered_date/household_demographics/store；4)最外层对UNION ALL结果执行AVG/SUM聚合。预期效果：通过UNION ALL消除OR条件的选择性损失，每个子查询的精确条件可触发索引扫描(如customer_demographics/customer_address的主键索引)，同时保留CTE复用减少date_dim/customer_address/customer_demographics的重复扫描。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1049
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=996796.04, 重写=1085115.34，相对变化: -8.86%
+✅ 成功存储，记录ID: b781da27-6196-492f-b1e4-c52a7699fe1f
+
+----------------------------------------
+

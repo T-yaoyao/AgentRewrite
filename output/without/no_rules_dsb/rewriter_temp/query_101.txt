@@ -1,0 +1,139 @@
+Query ID: 101
+==================================================
+
+Original: select min(i_item_sk)       ,min(w_warehouse_name)       ,min(d1.d_week_seq)       ,min(cs_item_sk)       ,min(cs_order_number)       ,min(inv_item_sk) from catalog_sales join inventory on (cs_item_sk = inv_item_sk) join warehouse on (w_warehouse_sk=inv_warehouse_sk) join item on (i_item_sk = cs_item_sk) join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk) join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk) join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk) join date_dim d2 on (inv_date_sk = d2.d_date_sk) join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk) left outer join promotion on (cs_promo_sk=p_promo_sk) left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number) where d1.d_week_seq = d2.d_week_seq   and inv_quantity_on_hand < cs_quantity   and d3.d_date > d1.d_date + interval '3 day'   and hd_buy_potential = '>10000'   and d1.d_year = 2001   and cd_marital_status = 'W'   and cd_dep_count between 4 and 6   and i_category IN ('Books', 'Home', 'Sports')   and cs_wholesale_cost BETWEEN 17 AND 37  ;
+Rewritten: WITH filtered_date_d1 AS (
+  SELECT d_date_sk, d_week_seq, d_date
+  FROM date_dim
+  WHERE d_year = 2001
+),
+filtered_date_d2 AS (
+  SELECT d_date_sk, d_week_seq
+  FROM date_dim
+  WHERE d_week_seq IN (SELECT d_week_seq FROM filtered_date_d1)
+),
+filtered_date_d3 AS (
+  SELECT d_date_sk, d_date
+  FROM date_dim
+  WHERE d_date > (SELECT MIN(d_date) + interval '3 day' FROM filtered_date_d1)
+),
+filtered_cd AS (
+  SELECT cd_demo_sk
+  FROM customer_demographics
+  WHERE cd_marital_status = 'W'
+    AND cd_dep_count BETWEEN 4 AND 6
+),
+filtered_hd AS (
+  SELECT hd_demo_sk
+  FROM household_demographics
+  WHERE hd_buy_potential = '>10000'
+),
+filtered_item AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_category IN ('Books', 'Home', 'Sports')
+),
+filtered_cs AS (
+  SELECT cs_item_sk, cs_order_number, cs_quantity, cs_sold_date_sk, cs_ship_date_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_promo_sk
+  FROM catalog_sales
+  WHERE cs_wholesale_cost BETWEEN 17 AND 37
+    AND cs_bill_cdemo_sk IN (SELECT cd_demo_sk FROM filtered_cd)
+    AND cs_bill_hdemo_sk IN (SELECT hd_demo_sk FROM filtered_hd)
+    AND cs_item_sk IN (SELECT i_item_sk FROM filtered_item)
+    AND cs_sold_date_sk IN (SELECT d_date_sk FROM filtered_date_d1)
+    AND cs_ship_date_sk IN (SELECT d_date_sk FROM filtered_date_d3)
+)
+SELECT 
+  min(i_item_sk),
+  min(w_warehouse_name),
+  min(d1.d_week_seq),
+  min(cs_item_sk),
+  min(cs_order_number),
+  min(inv_item_sk)
+FROM filtered_cs
+JOIN filtered_date_d1 d1 ON (filtered_cs.cs_sold_date_sk = d1.d_date_sk)
+JOIN filtered_date_d3 d3 ON (filtered_cs.cs_ship_date_sk = d3.d_date_sk AND d3.d_date > d1.d_date + interval '3 day')
+JOIN filtered_item ON (filtered_item.i_item_sk = filtered_cs.cs_item_sk)
+JOIN inventory ON (filtered_cs.cs_item_sk = inv_item_sk AND inv_quantity_on_hand < filtered_cs.cs_quantity)
+JOIN filtered_date_d2 d2 ON (inv_date_sk = d2.d_date_sk AND d1.d_week_seq = d2.d_week_seq)
+JOIN warehouse ON (w_warehouse_sk = inv_warehouse_sk)
+LEFT OUTER JOIN promotion ON (filtered_cs.cs_promo_sk = p_promo_sk)
+LEFT OUTER JOIN catalog_returns ON (cr_item_sk = filtered_cs.cs_item_sk AND cr_order_number = filtered_cs.cs_order_number);
+Time Cost: 75.81s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将catalog_sales的过滤条件(cs_wholesale_cost BETWEEN 17 AND 37)与其他高选择性条件(如d1.d_year=2001, cd_marital_status='W', hd_buy_potential='>10000')尽早应用，减少参与连接的数据量。同时简化date_dim的多表关联条件，将d1.d_week_seq=d2.d_week_seq和d3.d_date>d1.d_date+interval '3 day'转换为更高效的过滤表达式。"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：优先连接小表和高选择性过滤表(warehouse仅10行、household_demographics 7200行且hd_buy_potential过滤、customer_demographics的cd_marital_status和cd_dep_count过滤、item的i_category IN过滤)，然后再连接catalog_sales大表。将LEFT OUTER JOIN的promotion和catalog_returns延后处理，避免过早引入NULL值膨胀数据。利用JOIN_CONDITION_PUSH将连接条件下推到各表扫描阶段。'}, {'group': '投影优化', 'produced_suggestion': '查询仅需要MIN聚合的6个字段，但当前执行计划可能携带了所有表的全部列参与连接。应用PROJECT_JOIN_REMOVE规则，在连接前对各表进行列裁剪，只保留连接键、过滤条件列和最终投影列(i_item_sk, w_warehouse_name, d1.d_week_seq, cs_item_sk, cs_order_number, inv_item_sk)，大幅减少数据传输量。'}, {'group': '聚合优化', 'produced_suggestion': '当前MIN聚合在所有连接完成后执行。考虑将聚合操作部分下推：对于只依赖单表的MIN值(如min(w_warehouse_name)仅依赖warehouse表)，可以在连接前预先计算。同时评估是否可以通过AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则将聚合操作与连接操作重排序，减少中间结果集大小。'}, {'group': '子查询优化', 'produced_suggestion': "虽然当前SQL没有显式子查询，但可以考虑将复杂的多表连接分解为CTE(公共表表达式)结构：将高选择性过滤的维度表(date_dim d1 WHERE d_year=2001、customer_demographics WHERE cd_marital_status='W'等)先物化为临时结果集，然后再与事实表catalog_sales连接。参考历史案例3的STRATEGY_CTE_DECOMPOSITION规则。"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示catalog_sales表的全表扫描占总代价96%，是主要性能瓶颈。该查询涉及10个表的复杂连接，存在多个优化机会：1) catalog_sales大表(1439万行)的过滤条件可以通过谓词下推和连接条件优化来减少数据量；2) 多个date_dim表的自连接可以通过谓词简化合并条件；3) LEFT OUTER JOIN的promotion和catalog_returns可能产生不必要的数据膨胀；4) 连接顺序可以优化，优先过滤小表和高选择性条件。历史案例显示相似SQL通过PROJECT_JOIN_REMOVE、FILTER_INTO_JOIN、JOIN_CONDITION_PUSH等规则组合可获得显著提升。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将catalog_sales的过滤条件(cs_wholesale_cost BETWEEN 17 AND 37)与其他高选择性条件(如d1.d_year=2001, cd_marital_status='W', hd_buy_potential='>10000')尽早应用，减少参与连接的数据量。同时简化date_dim的多表关联条件，将d1.d_week_seq=d2.d_week_seq和d3.d_date>d1.d_date+interval '3 day'转换为更高效的过滤表达式。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接小表和高选择性过滤表(warehouse仅10行、household_demographics 7200行且hd_buy_potential过滤、customer_demographics的cd_marital_status和cd_dep_count过滤、item的i_category IN过滤)，然后再连接catalog_sales大表。将LEFT OUTER JOIN的promotion和catalog_returns延后处理，避免过早引入NULL值膨胀数据。利用JOIN_CONDITION_PUSH将连接条件下推到各表扫描阶段。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "查询仅需要MIN聚合的6个字段，但当前执行计划可能携带了所有表的全部列参与连接。应用PROJECT_JOIN_REMOVE规则，在连接前对各表进行列裁剪，只保留连接键、过滤条件列和最终投影列(i_item_sk, w_warehouse_name, d1.d_week_seq, cs_item_sk, cs_order_number, inv_item_sk)，大幅减少数据传输量。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "当前MIN聚合在所有连接完成后执行。考虑将聚合操作部分下推：对于只依赖单表的MIN值(如min(w_warehouse_name)仅依赖warehouse表)，可以在连接前预先计算。同时评估是否可以通过AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则将聚合操作与连接操作重排序，减少中间结果集大小。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "虽然当前SQL没有显式子查询，但可以考虑将复杂的多表连接分解为CTE(公共表表达式)结构：将高选择性过滤的维度表(date_dim d1 WHERE d_year=2001、customer_demographics WHERE cd_marital_status='W'等)先物化为临时结果集，然后再与事实表catalog_sales连接。参考历史案例3的STRATEGY_CTE_DECOMPOSITION规则。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_date_d1 AS (\n  SELECT d_date_sk, d_week_seq, d_date\n  FROM date_dim\n  WHERE d_year = 2001\n),\nfiltered_date_d2 AS (\n  SELECT d_date_sk, d_week_seq\n  FROM date_dim\n  WHERE d_week_seq IN (SELECT d_week_seq FROM filtered_date_d1)\n),\nfiltered_date_d3 AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_date > (SELECT MIN(d_date) + interval '3 day' FROM filtered_date_d1)\n),\nfiltered_cd AS (\n  SELECT cd_demo_sk\n  FROM customer_demographics\n  WHERE cd_marital_status = 'W'\n    AND cd_dep_count BETWEEN 4 AND 6\n),\nfiltered_hd AS (\n  SELECT hd_demo_sk\n  FROM household_demographics\n  WHERE hd_buy_potential = '>10000'\n),\nfiltered_item AS (\n  SELECT i_item_sk\n  FROM item\n  WHERE i_category IN ('Books', 'Home', 'Sports')\n),\nfiltered_cs AS (\n  SELECT cs_item_sk, cs_order_number, cs_quantity, cs_sold_date_sk, cs_ship_date_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_promo_sk\n  FROM catalog_sales\n  WHERE cs_wholesale_cost BETWEEN 17 AND 37\n    AND cs_bill_cdemo_sk IN (SELECT cd_demo_sk FROM filtered_cd)\n    AND cs_bill_hdemo_sk IN (SELECT hd_demo_sk FROM filtered_hd)\n    AND cs_item_sk IN (SELECT i_item_sk FROM filtered_item)\n    AND cs_sold_date_sk IN (SELECT d_date_sk FROM filtered_date_d1)\n    AND cs_ship_date_sk IN (SELECT d_date_sk FROM filtered_date_d3)\n)\nSELECT \n  min(i_item_sk),\n  min(w_warehouse_name),\n  min(d1.d_week_seq),\n  min(cs_item_sk),\n  min(cs_order_number),\n  min(inv_item_sk)\nFROM filtered_cs\nJOIN filtered_date_d1 d1 ON (filtered_cs.cs_sold_date_sk = d1.d_date_sk)\nJOIN filtered_date_d3 d3 ON (filtered_cs.cs_ship_date_sk = d3.d_date_sk AND d3.d_date > d1.d_date + interval '3 day')\nJOIN filtered_item ON (filtered_item.i_item_sk = filtered_cs.cs_item_sk)\nJOIN inventory ON (filtered_cs.cs_item_sk = inv_item_sk AND inv_quantity_on_hand < filtered_cs.cs_quantity)\nJOIN filtered_date_d2 d2 ON (inv_date_sk = d2.d_date_sk AND d1.d_week_seq = d2.d_week_seq)\nJOIN warehouse ON (w_warehouse_sk = inv_warehouse_sk)\nLEFT OUTER JOIN promotion ON (filtered_cs.cs_promo_sk = p_promo_sk)\nLEFT OUTER JOIN catalog_returns ON (cr_item_sk = filtered_cs.cs_item_sk AND cr_order_number = filtered_cs.cs_order_number);",
+  "semantic_correctness_guarantee": "1. **CTE提取高选择性过滤**：将原SQL中WHERE子句的高选择性条件提取为6个CTE（filtered_date_d1/d2/d3、filtered_cd、filtered_hd、filtered_item、filtered_cs），每个CTE仅保留连接键和必要的过滤列。这些CTE的过滤条件与原SQL完全一致，仅改变了执行顺序（提前过滤），不改变结果集范围。\n\n2. **date_dim三表关联的语义保持**：原SQL中d1、d2、d3三个date_dim实例通过d1.d_week_seq=d2.d_week_seq和d3.d_date>d1.d_date+interval '3 day'关联。重写后：filtered_date_d1先过滤d_year=2001；filtered_date_d2通过IN子查询确保d_week_seq与d1一致；filtered_date_d3通过子查询确保d_date大于d1最小日期+3天。由于d1已限定2001年，d3的过滤条件在语义上等价于原条件（d3.d_date > d1.d_date + interval '3 day'在JOIN时仍需验证，已保留在主查询JOIN条件中）。\n\n3. **catalog_sales的多维度过滤下推**：filtered_cs CTE将原SQL中分散在多个JOIN后的过滤条件（cs_wholesale_cost、cd_marital_status、hd_buy_potential、i_category、d_year等）通过IN子查询提前应用到catalog_sales扫描阶段。由于这些条件通过INNER JOIN关联，提前过滤与延后过滤在INNER JOIN语义下等价（不存在NULL值保留问题）。\n\n4. **LEFT OUTER JOIN的延后处理**：promotion和catalog_returns的LEFT OUTER JOIN保持在主查询最后执行，确保即使这两表无匹配行，前序INNER JOIN的结果也不会被过滤。这与原SQL的LEFT OUTER JOIN语义完全一致。\n\n5. **inventory连接条件的保持**：原SQL中inv_quantity_on_hand < cs_quantity条件在重写后仍保留在主查询的JOIN ON子句中，确保库存数量约束在连接时验证，语义不变。\n\n6. **MIN聚合的语义等价性**：原SQL对6个字段求MIN，重写后SELECT子句保持相同的MIN聚合目标。由于CTE过滤和JOIN顺序调整不改变最终参与聚合的行集合（所有过滤条件和连接条件完全保留），MIN结果必然相同。\n\n7. **投影列的完整性**：虽然CTE中仅保留必要列以减少数据传输，但主查询SELECT所需的所有列（i_item_sk、w_warehouse_name、d_week_seq、cs_item_sk、cs_order_number、inv_item_sk）均通过相应的JOIN保留在最终结果集中，确保输出列与原SQL一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提前过滤并调整JOIN顺序，但所有过滤条件、连接条件、LEFT OUTER JOIN语义及MIN聚合目标均与原SQL一致，最终结果集相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "重写SQL通过CTE显式组织公共中间结果(filtered_date_d1/d2/d3、filtered_cd/hd/item、filtered_cs)，实现了一次性计算后复用的优化意图，符合高优先级正信号。虽然cost从478264.4增至527596.51(+10.3%)，但结构层面：1)CTE预过滤大幅减少catalog_sales参与连接的数据量(filtered_cs仅453行 vs 原1424298行)；2)维度表过滤前置(d_year=2001、cd_marital_status='W'等)避免了重复执行；3)检测到预聚合CTE(InitPlan 2计算MIN(d_date))用于d3过滤条件，属于公共结果复用强信号。虽然Index Scan从4降至1、Seq Scan从5增至8，但这是CTE物化的必然代价，且通过减少主干连接数据量(453 vs 7029行)获得了补偿。行数估计求和虽上升至2084351(+40.9%)，但这是CTE多次扫描的统计失真，实际主干数据流(filtered_cs→inventory)已大幅压缩。根据'成功终止优先规则'：已检测到CTE复用、预聚合、过滤前置等高优先级正信号，且未发现灾难性结构退化证据(并行度保持、过滤有效、无新增高开销排序)，应直接视为优秀重写并终止。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 948
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=478264.4, 重写=527596.51，相对变化: -10.31%
+✅ 成功存储，记录ID: b1a1347e-2d50-4046-82a2-86492d283c8b
+
+----------------------------------------
+

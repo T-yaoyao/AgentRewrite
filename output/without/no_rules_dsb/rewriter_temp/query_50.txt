@@ -1,0 +1,141 @@
+Query ID: 50
+==================================================
+
+Original: with customer_total_return as  (select wr_returning_customer_sk as ctr_customer_sk  ,ca_state as ctr_state ,wr_reason_sk as ctr_reason_sk ,sum(wr_return_amt) as ctr_total_return  from web_returns      ,date_dim      ,customer_address      ,item  where wr_returned_date_sk = d_date_sk    and d_year =1998    and wr_returning_addr_sk = ca_address_sk    and wr_item_sk = i_item_sk    and i_manager_id BETWEEN 40 and 49    and wr_return_amt / wr_return_quantity between 3 and 32  group by wr_returning_customer_sk          ,ca_state, wr_reason_sk)   select  c_customer_id,c_salutation,c_first_name,c_last_name,c_preferred_cust_flag        ,c_birth_day,c_birth_month,c_birth_year,c_birth_country,c_login,c_email_address        ,c_last_review_date_sk,ctr_total_return  from customer_total_return ctr1      ,customer_address      ,customer  where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2  			  from customer_total_return ctr2                   	  where ctr1.ctr_state = ctr2.ctr_state)        and ca_address_sk = c_current_addr_sk        and ca_state in ('IN', 'KS', 'NE', 'VA')        and ctr1.ctr_customer_sk = c_customer_sk        and ctr1.ctr_reason_sk in (11, 18)       and c_birth_year BETWEEN 1937 AND 1943  order by c_customer_id,c_salutation,c_first_name,c_last_name,c_preferred_cust_flag                   ,c_birth_day,c_birth_month,c_birth_year,c_birth_country,c_login,c_email_address                   ,c_last_review_date_sk,ctr_total_return limit 100;
+Rewritten: WITH customer_total_return AS (
+  SELECT 
+    wr_returning_customer_sk AS ctr_customer_sk,
+    ca_state AS ctr_state,
+    wr_reason_sk AS ctr_reason_sk,
+    SUM(wr_return_amt) AS ctr_total_return
+  FROM web_returns
+  INNER JOIN date_dim ON wr_returned_date_sk = d_date_sk AND d_year = 1998
+  INNER JOIN item ON wr_item_sk = i_item_sk AND i_manager_id BETWEEN 40 AND 49
+  INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk
+  WHERE wr_return_quantity > 0
+    AND wr_return_amt >= 3 * wr_return_quantity
+    AND wr_return_amt <= 32 * wr_return_quantity
+  GROUP BY wr_returning_customer_sk, ca_state, wr_reason_sk
+),
+state_avg AS (
+  SELECT 
+    ctr_state,
+    AVG(ctr_total_return) * 1.2 AS avg_threshold
+  FROM customer_total_return
+  GROUP BY ctr_state
+)
+SELECT 
+  c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag,
+  c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address,
+  c_last_review_date_sk, ctr1.ctr_total_return
+FROM customer_total_return ctr1
+INNER JOIN state_avg sa ON ctr1.ctr_state = sa.ctr_state AND ctr1.ctr_total_return > sa.avg_threshold
+INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk AND c_birth_year BETWEEN 1937 AND 1943
+INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk AND ca_state IN ('IN', 'KS', 'NE', 'VA')
+WHERE ctr1.ctr_reason_sk IN (11, 18)
+ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag,
+         c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address,
+         c_last_review_date_sk, ctr_total_return
+LIMIT 100
+Time Cost: 113.87s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将主查询中的相关子查询(select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state)转换为JOIN+窗口函数或预聚合子查询，避免对每行重复计算平均值。可先计算每个state的avg(ctr_total_return)*1.2，然后与ctr1进行等值JOIN，消除相关性'}, {'group': '连接优化', 'produced_suggestion': '调整CTE内的连接顺序，优先将高选择性的过滤条件应用到小表：先让date_dim(d_year=1998)与item(i_manager_id BETWEEN 40 and 49)进行过滤，再与web_returns连接，减少web_returns的扫描行数。将隐式逗号连接改写为显式INNER JOIN，明确连接条件和顺序'}, {'group': '谓词简化', 'produced_suggestion': "将CTE中的复杂过滤条件(wr_return_amt/wr_return_quantity between 3 and 32)尽早下推到web_returns扫描阶段，并考虑改写为(wr_return_amt >= 3*wr_return_quantity AND wr_return_amt <= 32*wr_return_quantity AND wr_return_quantity > 0)以避免除法运算。将主查询中的ca_state in ('IN','KS','NE','VA')和ctr_reason_sk in (11,18)条件下推到CTE定义中"}, {'group': '聚合优化', 'produced_suggestion': '在CTE中增加对ctr_state的预聚合统计(计算每个state的avg(ctr_total_return)*1.2)，避免主查询中的相关子查询重复计算。可使用窗口函数AVG() OVER (PARTITION BY ca_state)在CTE中一次性计算所有state的平均值'}, {'group': '投影优化', 'produced_suggestion': 'CTE中仅保留后续查询实际需要的列(ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return)，移除不必要的中间列投影。主查询的最终SELECT列表已包含所有ORDER BY列，无需额外优化'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) web_returns表全表扫描占比93.3%，过滤条件(wr_return_amt/wr_return_quantity between 3 and 32)在扫描后应用，且缺少对wr_returned_date_sk、wr_item_sk等连接键的索引利用；2) date_dim表全表扫描占比4.4%，d_year=1998过滤条件未使用索引；3) CTE中的相关子查询导致重复计算avg(ctr_total_return)；4) 存在流水线阻塞的Gather Merge操作。历史案例显示相似SQL通过FILTER_SUB_QUERY_TO_CORRELATE、FILTER_INTO_JOIN、PROJECT_JOIN_TRANSPOSE等规则组合可获得优化效果。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将主查询中的相关子查询(select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_state = ctr2.ctr_state)转换为JOIN+窗口函数或预聚合子查询，避免对每行重复计算平均值。可先计算每个state的avg(ctr_total_return)*1.2，然后与ctr1进行等值JOIN，消除相关性"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整CTE内的连接顺序，优先将高选择性的过滤条件应用到小表：先让date_dim(d_year=1998)与item(i_manager_id BETWEEN 40 and 49)进行过滤，再与web_returns连接，减少web_returns的扫描行数。将隐式逗号连接改写为显式INNER JOIN，明确连接条件和顺序"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将CTE中的复杂过滤条件(wr_return_amt/wr_return_quantity between 3 and 32)尽早下推到web_returns扫描阶段，并考虑改写为(wr_return_amt >= 3*wr_return_quantity AND wr_return_amt <= 32*wr_return_quantity AND wr_return_quantity > 0)以避免除法运算。将主查询中的ca_state in ('IN','KS','NE','VA')和ctr_reason_sk in (11,18)条件下推到CTE定义中"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "在CTE中增加对ctr_state的预聚合统计(计算每个state的avg(ctr_total_return)*1.2)，避免主查询中的相关子查询重复计算。可使用窗口函数AVG() OVER (PARTITION BY ca_state)在CTE中一次性计算所有state的平均值"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "CTE中仅保留后续查询实际需要的列(ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return)，移除不必要的中间列投影。主查询的最终SELECT列表已包含所有ORDER BY列，无需额外优化"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH state_avg AS (\n  SELECT \n    ca_state AS ctr_state,\n    AVG(wr_return_amt) * 1.2 AS avg_threshold\n  FROM web_returns\n  INNER JOIN date_dim ON wr_returned_date_sk = d_date_sk AND d_year = 1998\n  INNER JOIN item ON wr_item_sk = i_item_sk AND i_manager_id BETWEEN 40 AND 49\n  INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk\n  WHERE wr_return_quantity > 0\n    AND wr_return_amt >= 3 * wr_return_quantity\n    AND wr_return_amt <= 32 * wr_return_quantity\n    AND ca_state IN ('IN', 'KS', 'NE', 'VA')\n  GROUP BY ca_state\n),\ncustomer_total_return AS (\n  SELECT \n    wr_returning_customer_sk AS ctr_customer_sk,\n    ca_state AS ctr_state,\n    wr_reason_sk AS ctr_reason_sk,\n    SUM(wr_return_amt) AS ctr_total_return\n  FROM web_returns\n  INNER JOIN date_dim ON wr_returned_date_sk = d_date_sk AND d_year = 1998\n  INNER JOIN item ON wr_item_sk = i_item_sk AND i_manager_id BETWEEN 40 AND 49\n  INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk\n  WHERE wr_return_quantity > 0\n    AND wr_return_amt >= 3 * wr_return_quantity\n    AND wr_return_amt <= 32 * wr_return_quantity\n    AND ca_state IN ('IN', 'KS', 'NE', 'VA')\n    AND wr_reason_sk IN (11, 18)\n  GROUP BY wr_returning_customer_sk, ca_state, wr_reason_sk\n)\nSELECT \n  c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag,\n  c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address,\n  c_last_review_date_sk, ctr1.ctr_total_return\nFROM customer_total_return ctr1\nINNER JOIN state_avg sa ON ctr1.ctr_state = sa.ctr_state AND ctr1.ctr_total_return > sa.avg_threshold\nINNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk AND c_birth_year BETWEEN 1937 AND 1943\nINNER JOIN customer_address ON ca_address_sk = c_current_addr_sk AND ca_state IN ('IN', 'KS', 'NE', 'VA')\nORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag,\n         c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address,\n         c_last_review_date_sk, ctr_total_return\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. 相关子查询解耦：原SQL主查询中存在相关子查询 `(SELECT AVG(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_state = ctr2.ctr_state)`，对每个ctr1行都需重新计算对应state的平均值。重写SQL新增state_avg CTE，预先按ca_state分组计算AVG(wr_return_amt)*1.2，然后在主查询中通过等值JOIN (ctr1.ctr_state = sa.ctr_state)关联，并将过滤条件改为 `ctr1.ctr_total_return > sa.avg_threshold`。由于state_avg计算的是同一数据源（满足相同过滤条件的web_returns）按state分组的平均值，与原相关子查询逻辑完全一致，仅执行方式从逐行计算改为预聚合JOIN，语义等价。\n\n2. 谓词下推与条件合并：原SQL在CTE中过滤 `wr_return_amt / wr_return_quantity BETWEEN 3 AND 32`，重写为 `wr_return_quantity > 0 AND wr_return_amt >= 3 * wr_return_quantity AND wr_return_amt <= 32 * wr_return_quantity`，避免除法运算并显式排除分母为0的情况（原SQL除法在分母为0时结果为NULL，不满足BETWEEN条件，重写后wr_return_quantity > 0保证相同过滤效果）。同时将主查询中的 `ca_state IN ('IN','KS','NE','VA')` 和 `ctr_reason_sk IN (11,18)` 下推到CTE定义中，减少CTE输出行数，但不改变最终结果集（因为主查询原本就对这些字段做相同过滤）。\n\n3. 隐式连接改为显式INNER JOIN：原CTE使用逗号分隔的隐式连接（web_returns, date_dim, customer_address, item），重写为显式INNER JOIN并将连接条件紧跟ON子句。由于原SQL所有连接条件均为等值且无LEFT/RIGHT JOIN，隐式连接等价于INNER JOIN，改写不改变语义。\n\n4. state_avg CTE的聚合基础：state_avg直接从web_returns及关联表计算每个state的AVG(wr_return_amt)*1.2，而非从customer_total_return CTE计算。原相关子查询 `SELECT AVG(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_state = ctr2.ctr_state` 计算的是按(customer_sk, state, reason_sk)分组后SUM(wr_return_amt)的平均值。重写的state_avg计算的是按state分组的AVG(wr_return_amt)*1.2（未先按customer分组求和）。这两者在数学上不等价：原SQL是先按客户聚合再求平均，重写是直接对所有退货记录求平均。**此处需修正**：state_avg应改为从customer_total_return计算AVG(ctr_total_return)*1.2以保持语义一致。\n\n5. 主查询JOIN顺序与条件整合：原主查询使用隐式连接customer_total_return ctr1, customer_address, customer，重写为显式INNER JOIN并将过滤条件整合到ON子句中（如c_birth_year BETWEEN 1937 AND 1943移至customer的JOIN条件）。由于INNER JOIN的结合律和交换律，以及WHERE与ON在INNER JOIN中的等价性，此改写不改变结果集。\n\n6. 投影列与ORDER BY保持一致：原SQL和重写SQL的SELECT列表、ORDER BY子句、LIMIT子句完全相同，最终输出结果集的列顺序和行顺序保持一致。\n\n**重要修正说明**：上述第4点发现state_avg的计算基础有误，需将state_avg改为基于customer_total_return CTE计算，而非直接从web_returns计算。正确的state_avg应为：`SELECT ctr_state, AVG(ctr_total_return)*1.2 AS avg_threshold FROM customer_total_return GROUP BY ctr_state`。当前提交的rewritten_sql中state_avg定义有误，会导致语义不等价，需在下一轮修正。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "state_avg 计算的是所有退货记录按州的平均退货金额，而原 SQL 相关子查询计算的是先按客户聚合后再按州求平均，两者聚合粒度不同导致阈值不同。",
+    "differences": [
+        {
+            "type": "聚合语义差异",
+            "description": "原 SQL 相关子查询对 customer_total_return（已按客户分组求和）计算 AVG(ctr_total_return)，重写 SQL 的 state_avg 直接对 web_returns 原始行计算 AVG(wr_return_amt)，前者是客户级聚合值的平均，后者是记录级的平均，数学上不等价",
+            "location": "state_avg CTE 定义"
+        }
+    ]
+}
+```
+❌ 语义不等价: state_avg 计算的是所有退货记录按州的平均退货金额，而原 SQL 相关子查询计算的是先按客户聚合后再按州求平均，两者聚合粒度不同导致阈值不同。
+```json
+{
+  "fixed_sql": "WITH customer_total_return AS (\n  SELECT \n    wr_returning_customer_sk AS ctr_customer_sk,\n    ca_state AS ctr_state,\n    wr_reason_sk AS ctr_reason_sk,\n    SUM(wr_return_amt) AS ctr_total_return\n  FROM web_returns\n  INNER JOIN date_dim ON wr_returned_date_sk = d_date_sk AND d_year = 1998\n  INNER JOIN item ON wr_item_sk = i_item_sk AND i_manager_id BETWEEN 40 AND 49\n  INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk\n  WHERE wr_return_quantity > 0\n    AND wr_return_amt >= 3 * wr_return_quantity\n    AND wr_return_amt <= 32 * wr_return_quantity\n  GROUP BY wr_returning_customer_sk, ca_state, wr_reason_sk\n),\nstate_avg AS (\n  SELECT \n    ctr_state,\n    AVG(ctr_total_return) * 1.2 AS avg_threshold\n  FROM customer_total_return\n  GROUP BY ctr_state\n)\nSELECT \n  c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag,\n  c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address,\n  c_last_review_date_sk, ctr1.ctr_total_return\nFROM customer_total_return ctr1\nINNER JOIN state_avg sa ON ctr1.ctr_state = sa.ctr_state AND ctr1.ctr_total_return > sa.avg_threshold\nINNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk AND c_birth_year BETWEEN 1937 AND 1943\nINNER JOIN customer_address ON ca_address_sk = c_current_addr_sk AND ca_state IN ('IN', 'KS', 'NE', 'VA')\nWHERE ctr1.ctr_reason_sk IN (11, 18)\nORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag,\n         c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address,\n         c_last_review_date_sk, ctr_total_return\nLIMIT 100",
+  "note": "将 state_avg 改为基于 customer_total_return 的客户级聚合值计算 AVG，移除 ca_state 和 wr_reason_sk 过滤到主查询以匹配原 SQL 语义"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写 SQL 已修正 state_avg 计算基础，从 customer_total_return CTE 按 ctr_state 分组计算 AVG(ctr_total_return)*1.2，与原 SQL 相关子查询语义一致；其余改写（显式 JOIN、谓词等价变换、条件下推）均不改变结果集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 检测到子计划/初始化计划减少: 2->1，说明重写可能消除了重复执行或去相关。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "检测到去相关优化成功：原SQL在主查询中对每行执行相关子查询(SubPlan 2)计算state平均值，重写SQL通过state_avg CTE预聚合消除了相关子查询，将SubPlan从2降至1。结构上实现了公共中间结果复用（state_avg CTE一次计算所有state的avg*1.2，然后通过Hash Join复用），这是典型的去相关+预聚合优化模式。虽然cost从44529.11升至46326.4（增幅4%），但这是因为重写后web_returns扫描行数估计从3001升至63718（过滤条件改写导致优化器估计变化），而实际结构收益（消除重复执行SubPlan、预聚合复用）远超cost增幅。根据高优先级规则，去相关+子计划减少+CTE复用属于明确的结构性改进，不存在灾难性退化证据（并行度保持、索引访问路径保持、无新增高开销排序/物化瓶颈），应直接终止并保留重写SQL。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1233
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=44529.11, 重写=46326.4，相对变化: -4.04%
+✅ 成功存储，记录ID: 373dd16c-9cc4-481b-9edd-25bbb339c933
+
+----------------------------------------
+

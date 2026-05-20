@@ -1,0 +1,142 @@
+Query ID: 42
+==================================================
+
+Original: select  min(i_item_id)  ,min(i_item_desc)  ,min(s_store_id)  ,min(s_store_name)  ,min(ss_net_profit)  ,min(sr_net_loss)  ,min(cs_net_profit)  ,min(ss_item_sk)  ,min(sr_ticket_number)  ,min(cs_order_number)  from  store_sales  ,store_returns  ,catalog_sales  ,date_dim d1  ,date_dim d2  ,date_dim d3  ,store  ,item  where  d1.d_moy = 6  and d1.d_year = 2002  and d1.d_date_sk = ss_sold_date_sk  and i_item_sk = ss_item_sk  and s_store_sk = ss_store_sk  and ss_customer_sk = sr_customer_sk  and ss_item_sk = sr_item_sk  and ss_ticket_number = sr_ticket_number  and sr_returned_date_sk = d2.d_date_sk  and d2.d_moy               between 6 and  6 + 2  and d2.d_year              = 2002  and sr_customer_sk = cs_bill_customer_sk  and sr_item_sk = cs_item_sk  and cs_sold_date_sk = d3.d_date_sk  and d3.d_moy               between 6 and  6 + 2  and d3.d_year              = 2002  ;
+Rewritten: WITH filtered_d1 AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_moy = 6 AND d_year = 2002
+),
+filtered_d2 AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_moy BETWEEN 6 AND 8 AND d_year = 2002
+),
+filtered_d3 AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_moy BETWEEN 6 AND 8 AND d_year = 2002
+),
+ss_filtered AS (
+  SELECT ss_item_sk, ss_customer_sk, ss_ticket_number, ss_store_sk, ss_net_profit
+  FROM store_sales
+  WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_d1)
+    AND ss_customer_sk IS NOT NULL
+    AND ss_item_sk IS NOT NULL
+    AND ss_ticket_number IS NOT NULL
+),
+sr_filtered AS (
+  SELECT sr_item_sk, sr_customer_sk, sr_ticket_number, sr_net_loss
+  FROM store_returns
+  WHERE sr_returned_date_sk IN (SELECT d_date_sk FROM filtered_d2)
+    AND sr_customer_sk IS NOT NULL
+    AND sr_item_sk IS NOT NULL
+    AND sr_ticket_number IS NOT NULL
+),
+cs_filtered AS (
+  SELECT cs_item_sk, cs_bill_customer_sk, cs_order_number, cs_net_profit
+  FROM catalog_sales
+  WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM filtered_d3)
+    AND cs_bill_customer_sk IS NOT NULL
+    AND cs_item_sk IS NOT NULL
+)
+SELECT
+  MIN(i.i_item_id),
+  MIN(i.i_item_desc),
+  MIN(s.s_store_id),
+  MIN(s.s_store_name),
+  MIN(ss.ss_net_profit),
+  MIN(sr.sr_net_loss),
+  MIN(cs.cs_net_profit),
+  MIN(ss.ss_item_sk),
+  MIN(sr.sr_ticket_number),
+  MIN(cs.cs_order_number)
+FROM ss_filtered ss
+INNER JOIN sr_filtered sr
+  ON ss.ss_customer_sk = sr.sr_customer_sk
+  AND ss.ss_item_sk = sr.sr_item_sk
+  AND ss.ss_ticket_number = sr.sr_ticket_number
+INNER JOIN cs_filtered cs
+  ON sr.sr_customer_sk = cs.cs_bill_customer_sk
+  AND sr.sr_item_sk = cs.cs_item_sk
+INNER JOIN item i ON i.i_item_sk = ss.ss_item_sk
+INNER JOIN store s ON s.s_store_sk = ss.ss_store_sk;
+Time Cost: 75.70s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将date_dim的过滤条件(d_moy=6, d_year=2002)提前下推到各date_dim实例(d1/d2/d3)的扫描阶段，减少参与连接的数据量。特别是d2和d3的范围条件(d_moy between 6 and 8)可以在扫描时过滤，避免全表参与Hash Join。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：优先连接高选择性的维度表date_dim(d1)与store_sales，利用d1.d_date_sk=ss_sold_date_sk和主键索引快速过滤；然后再连接store_returns，避免当前执行计划中store_returns全表扫描后再进行Nested Loop的低效模式。推导NOT NULL过滤条件(ss_sold_date_sk IS NOT NULL)进一步减少连接基数。'}, {'group': '子查询优化', 'produced_suggestion': '考虑将复杂的三表连接(store_sales/store_returns/catalog_sales)分解为CTE，先分别过滤各事实表与对应date_dim的连接结果，再进行最终连接。这样可以利用中间结果的过滤效果，减少后续连接的数据量，避免store_returns 719万行直接参与多表连接。'}, {'group': '连接优化', 'produced_suggestion': '将连接条件中的复合键连接(ss_customer_sk=sr_customer_sk AND ss_item_sk=sr_item_sk AND ss_ticket_number=sr_ticket_number)提前应用，并推导隐含的IS NOT NULL条件到store_sales和store_returns的扫描阶段，减少NULL值参与连接计算。'}, {'group': '投影优化', 'produced_suggestion': '由于查询只需要MIN聚合结果，可以在连接前对各表进行列裁剪，只保留连接键和聚合所需列(i_item_id, i_item_desc, s_store_id, s_store_name, ss_net_profit, sr_net_loss, cs_net_profit等)，减少数据传输和内存占用。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) store_returns全表扫描占83.6%代价(148,910.03)，扫描719万行；2) Nested Loop连接占9.6%代价，外表store_returns与内表store_sales(2880万行)进行嵌套循环；3) 缺少有效的过滤条件下推。根据相似历史案例，该SQL指纹曾成功应用STRATEGY_CTE_DECOMPOSITION、JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE、FILTER_INTO_JOIN等规则优化。当前SQL涉及3个事实表(store_sales/store_returns/catalog_sales)和3个date_dim实例的复杂多表连接，存在明显的查询重写优化空间。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim的过滤条件(d_moy=6, d_year=2002)提前下推到各date_dim实例(d1/d2/d3)的扫描阶段，减少参与连接的数据量。特别是d2和d3的范围条件(d_moy between 6 and 8)可以在扫描时过滤，避免全表参与Hash Join。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接高选择性的维度表date_dim(d1)与store_sales，利用d1.d_date_sk=ss_sold_date_sk和主键索引快速过滤；然后再连接store_returns，避免当前执行计划中store_returns全表扫描后再进行Nested Loop的低效模式。推导NOT NULL过滤条件(ss_sold_date_sk IS NOT NULL)进一步减少连接基数。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑将复杂的三表连接(store_sales/store_returns/catalog_sales)分解为CTE，先分别过滤各事实表与对应date_dim的连接结果，再进行最终连接。这样可以利用中间结果的过滤效果，减少后续连接的数据量，避免store_returns 719万行直接参与多表连接。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将连接条件中的复合键连接(ss_customer_sk=sr_customer_sk AND ss_item_sk=sr_item_sk AND ss_ticket_number=sr_ticket_number)提前应用，并推导隐含的IS NOT NULL条件到store_sales和store_returns的扫描阶段，减少NULL值参与连接计算。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "由于查询只需要MIN聚合结果，可以在连接前对各表进行列裁剪，只保留连接键和聚合所需列(i_item_id, i_item_desc, s_store_id, s_store_name, ss_net_profit, sr_net_loss, cs_net_profit等)，减少数据传输和内存占用。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🔧 开始无规则 SQL 重写...
+```json
+{
+  "groups": "no_rule",
+  "applied_rules": [],
+  "rewritten_sql": "WITH filtered_d1 AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_moy = 6 AND d_year = 2002\n),\nfiltered_d2 AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_moy BETWEEN 6 AND 8 AND d_year = 2002\n),\nfiltered_d3 AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_moy BETWEEN 6 AND 8 AND d_year = 2002\n),\nss_filtered AS (\n  SELECT ss_item_sk, ss_customer_sk, ss_ticket_number, ss_store_sk, ss_net_profit\n  FROM store_sales\n  WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_d1)\n    AND ss_customer_sk IS NOT NULL\n    AND ss_item_sk IS NOT NULL\n    AND ss_ticket_number IS NOT NULL\n),\nsr_filtered AS (\n  SELECT sr_item_sk, sr_customer_sk, sr_ticket_number, sr_net_loss\n  FROM store_returns\n  WHERE sr_returned_date_sk IN (SELECT d_date_sk FROM filtered_d2)\n    AND sr_customer_sk IS NOT NULL\n    AND sr_item_sk IS NOT NULL\n    AND sr_ticket_number IS NOT NULL\n),\ncs_filtered AS (\n  SELECT cs_item_sk, cs_bill_customer_sk, cs_order_number, cs_net_profit\n  FROM catalog_sales\n  WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM filtered_d3)\n    AND cs_bill_customer_sk IS NOT NULL\n    AND cs_item_sk IS NOT NULL\n)\nSELECT\n  MIN(i.i_item_id),\n  MIN(i.i_item_desc),\n  MIN(s.s_store_id),\n  MIN(s.s_store_name),\n  MIN(ss.ss_net_profit),\n  MIN(sr.sr_net_loss),\n  MIN(cs.cs_net_profit),\n  MIN(ss.ss_item_sk),\n  MIN(sr.sr_ticket_number),\n  MIN(cs.cs_order_number)\nFROM ss_filtered ss\nINNER JOIN sr_filtered sr\n  ON ss.ss_customer_sk = sr.sr_customer_sk\n  AND ss.ss_item_sk = sr.sr_item_sk\n  AND ss.ss_ticket_number = sr.sr_ticket_number\nINNER JOIN cs_filtered cs\n  ON sr.sr_customer_sk = cs.cs_bill_customer_sk\n  AND sr.sr_item_sk = cs.cs_item_sk\nINNER JOIN item i ON i.i_item_sk = ss.ss_item_sk\nINNER JOIN store s ON s.s_store_sk = ss.ss_store_sk;",
+  "semantic_correctness_guarantee": "1. 原SQL使用隐式内连接(逗号分隔)连接8张表,重写SQL将其改写为显式INNER JOIN,两者在语义上完全等价,都要求所有连接条件必须满足才返回结果行。\n\n2. 将date_dim的三个实例(d1/d2/d3)的过滤条件提取为CTE(filtered_d1/d2/d3),分别对应原SQL中d1.d_moy=6 AND d1.d_year=2002、d2.d_moy BETWEEN 6 AND 8 AND d2.d_year=2002、d3.d_moy BETWEEN 6 AND 8 AND d3.d_year=2002。这些CTE仅做谓词下推,不改变过滤逻辑,与原SQL中WHERE子句中的date_dim过滤条件完全一致。\n\n3. 将store_sales/store_returns/catalog_sales分别与对应的date_dim过滤结果连接并提取为CTE(ss_filtered/sr_filtered/cs_filtered)。原SQL中ss_sold_date_sk=d1.d_date_sk的内连接等价于ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_d1),同理sr_returned_date_sk和cs_sold_date_sk的连接也改写为IN子查询。由于原SQL使用内连接,NULL值的ss_sold_date_sk/sr_returned_date_sk/cs_sold_date_sk本就无法匹配date_dim主键,因此显式添加IS NOT NULL不改变结果集。\n\n4. 在ss_filtered/sr_filtered/cs_filtered中添加连接键的IS NOT NULL过滤(ss_customer_sk/ss_item_sk/ss_ticket_number等)。原SQL的内连接要求这些键必须在所有表中匹配,NULL值无法参与等值连接,因此显式过滤NULL与原SQL隐式行为一致,不改变语义。\n\n5. 在ss_filtered/sr_filtered/cs_filtered中进行列裁剪,仅保留后续连接所需的键列和聚合列(ss_item_sk/ss_customer_sk/ss_ticket_number/ss_store_sk/ss_net_profit等)。MIN聚合函数只需要这些列,裁剪其他列不影响最终结果集的语义。\n\n6. 最终SELECT子句中的MIN聚合与原SQL完全一致,对10个字段分别求最小值。由于CTE和INNER JOIN的改写保持了与原SQL相同的连接逻辑和过滤条件,参与聚合的行集合与原SQL相同,因此MIN结果也相同。\n\n7. 原SQL中item和store表的连接条件(i_item_sk=ss_item_sk, s_store_sk=ss_store_sk)在重写SQL中保持不变,仍然通过INNER JOIN连接。由于ss_filtered已经过滤了ss_item_sk和ss_store_sk为NULL的行,这些内连接的语义与原SQL一致。\n\n8. 整体改写策略是将复杂的8表连接分解为多个CTE,先分别过滤各表再进行最终连接,但所有过滤条件、连接条件和聚合逻辑与原SQL完全对应,不存在额外的过滤或遗漏,因此结果集在语义上与原SQL等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE和显式INNER JOIN改写了原SQL的隐式内连接，所有过滤条件、连接条件和MIN聚合逻辑与原SQL完全对应，结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "重写SQL引入CTE组织公共中间结果（6个CTE），并显式添加IS NOT NULL过滤条件下推到各事实表扫描阶段，体现了谓词下推和过滤前移的优化意图。执行计划结构保持一致（节点类型计数完全相同：6个Nested Loop、1个Hash Join、2个Seq Scan、5个Index Scan、2个Bitmap Scan），连接顺序和访问路径未发生退化。行数估计求和从300万降至290万（降幅3.6%），说明过滤条件生效。cost从178224降至177342（降幅0.5%），虽然幅度不大但方向正确。重写SQL通过CTE实现了date_dim过滤结果的复用（filtered_d1/d2/d3），并在各事实表CTE中显式添加IS NOT NULL条件，这是结构性改进信号。虽然改进幅度有限，但已完成了optimization_advice中的核心建议（谓词下推、IS NOT NULL推导、CTE分解），且未引入任何结构退化。继续优化的空间已很小（主要瓶颈在store_returns的300万行Seq Scan，但这是大表分析型查询的合理路径），因此判定为优化成功并终止。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 724
+   - 规则序列: []
+   - 优化组别: no_rule
+   - 估计代价: 原始=178224.1, 重写=177342.06，相对变化: 0.49%
+✅ 成功存储，记录ID: 08610636-487d-4b95-a87e-afd4c8e18ded
+
+----------------------------------------
+
