@@ -38,7 +38,6 @@ from src.Query_Rewriter.agent_definition import (
     get_all_rules,
     get_rules_by_groups,
 )
-from src.Query_Rewriter.global_memory import GlobalMemoryManager
 from src.Query_Rewriter.schema_context import (
     build_filtered_schema_content,
     filter_data_statistics_for_sql,
@@ -122,7 +121,7 @@ class LangGraphQueryRewriter:
     COST_ROLLBACK_PCT = 50.0
     # If estimated cost drops by more than this fraction vs original, skip LLM evaluation and exit.
     EARLY_TERMINATE_COST_REDUCTION_RATIO = 0.40
-    # Plan-structure metadata weights for global memory records.
+    # Plan-structure metadata weights for evaluation bookkeeping.
     REWARD_ROWS_WEIGHT = 0.40
     REWARD_DEPTH_WEIGHT = 0.30
     # Keep rewrite when cost/plan are near-equivalent to avoid over-rollback.
@@ -155,13 +154,12 @@ class LangGraphQueryRewriter:
         self.llm_semaphore = asyncio.Semaphore(3)
         self.db_semaphore = asyncio.Semaphore(5)
 
-        try:
-            self.global_memory = GlobalMemoryManager()
-            print("✅ Global memory manager initialized")
-        except Exception as e:
-            print(f"⚠️ Global memory unavailable: {e}")
-            self.global_memory = None
-        
+        # Global memory is intentionally disabled for this ablation variant.
+        # Keep the attribute so existing branches remain simple, but do not
+        # retrieve from or write to the non-parametric memory store.
+        self.global_memory = None
+        print("🧪 All memory disabled (no Track1 / no Track2 ablation)")
+
         self.graph = self._build_graph()
 
     def _build_graph(self):
@@ -543,20 +541,7 @@ class LangGraphQueryRewriter:
         retrieved_id = None
         try:
             base_sql = _state_sql(state.get("current_sql") or state["initial_sql"])
-            if self.global_memory:
-                raw = self.global_memory.retrieve(state["initial_sql"], top_k=3)
-                filtered = [r for r in raw if r.get("score", 0) >= self.MIN_SIMILARITY]
-                if filtered:
-                    filtered.sort(key=lambda x: x.get("score", 0), reverse=True)
-                    few_shot = filtered[:3]
-                    best = filtered[0]
-                    if best.get("id"):
-                        self.global_memory.update_hit_frequency(best["id"])
-                        retrieved_id = best["id"]
-                else:
-                    print(
-                        f"🧊 历史案例相似度较低，不使用 few-shot"
-                    )
+            # Non-parametric global memory retrieval is disabled in this no-memory ablation.
             async with self.db_semaphore:
                 explain_info = await DBMS_EXPLAIN_Tool(self.dbms, base_sql)
             base_cost = self._extract_cost_from_explain(explain_info)
@@ -650,7 +635,7 @@ class LangGraphQueryRewriter:
                 )
 
             rule_count = sum(len(rules or {}) for rules in lib.values())
-            print(f"📚 加载规则库 {rule_count} 条规则（{group_note}；参数化记忆已关闭）")
+            print(f"📚 加载规则库 {rule_count} 条规则（{group_note}；记忆已关闭）")
 
             async with self.llm_semaphore:
                 seq = await self.reasoning_agent.select_rule_sequence(
@@ -1222,26 +1207,8 @@ class LangGraphQueryRewriter:
             if terminate:
                 out["should_terminate"] = True
                 if rw != init_sql:
-                    # 本轮保留了重写 SQL：写入全局记忆（不要求估计代价下降）
                     if is_uncertain:
-                        print("ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库更新。")
-                    elif self.global_memory:
-                        try:
-                            struct_detail_for_store = self._compute_structure_reward(o_exp, r_exp)
-                            self.global_memory.store_successful_optimization(
-                                original_sql=init_sql,
-                                rewritten_sql=out["rewritten_sql"],
-                                rule_sequence=applied,
-                                groups=groups,
-                                original_cost=oc,
-                                rewritten_cost=rc,
-                                metadata={
-                                    "rows_score": float(struct_detail_for_store.get("rows_score", 0.0)),
-                                    "depth_score": float(struct_detail_for_store.get("depth_score", 0.0)),
-                                },
-                            )
-                        except Exception as ex:
-                            print(f"⚠️ 知识库存储失败: {ex}")
+                        print("ℹ️ 评估不确定：保留重写 SQL，但记忆已关闭，跳过记忆更新。")
                 out["rewritten_sql"] = _state_sql(out.get("rewritten_sql", rw))
                 cr = dict(out.get("current_rewrite_result") or rr)
                 cr["rewritten_sql"] = out["rewritten_sql"]
@@ -1265,24 +1232,7 @@ class LangGraphQueryRewriter:
                     )
                 if rw != init_sql:
                     if is_uncertain:
-                        print("ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库更新。")
-                    elif self.global_memory:
-                        try:
-                            struct_detail_for_store = self._compute_structure_reward(o_exp, r_exp)
-                            self.global_memory.store_successful_optimization(
-                                original_sql=init_sql,
-                                rewritten_sql=rw,
-                                rule_sequence=applied,
-                                groups=groups,
-                                original_cost=oc,
-                                rewritten_cost=rc,
-                                metadata={
-                                    "rows_score": float(struct_detail_for_store.get("rows_score", 0.0)),
-                                    "depth_score": float(struct_detail_for_store.get("depth_score", 0.0)),
-                                },
-                            )
-                        except Exception as ex:
-                            print(f"⚠️ 知识库存储失败: {ex}")
+                        print("ℹ️ 评估不确定：保留重写 SQL，但记忆已关闭，跳过记忆更新。")
                 out["rewritten_sql"] = _state_sql(out.get("rewritten_sql", rw))
                 cr = dict(out.get("current_rewrite_result") or rr)
                 cr["rewritten_sql"] = out["rewritten_sql"]

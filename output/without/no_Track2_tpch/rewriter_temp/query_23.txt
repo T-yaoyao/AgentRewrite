@@ -1,0 +1,152 @@
+Query ID: 23
+==================================================
+
+Original: select o_year, sum(case when nation = 'FRANCE' then volume else 0 end) / sum(volume) as mkt_share from ( select extract(year from o_orderdate) as o_year, l_extendedprice * (1 - l_discount) as volume, n2.n_name as nation from part, supplier, lineitem, orders, customer, nation n1, nation n2, region where p_partkey = l_partkey and s_suppkey = l_suppkey and l_orderkey = o_orderkey and o_custkey = c_custkey and c_nationkey = n1.n_nationkey and n1.n_regionkey = r_regionkey and r_name = 'EUROPE' and s_nationkey = n2.n_nationkey and o_orderdate between date '1995-01-01' and date '1996-12-31' and p_type = 'SMALL ANODIZED TIN' ) as all_nations group by o_year order by o_year;
+Rewritten: WITH filtered_region AS (
+  SELECT r_regionkey
+  FROM region
+  WHERE r_name = 'EUROPE'
+),
+filtered_part AS (
+  SELECT p_partkey
+  FROM part
+  WHERE p_type = 'SMALL ANODIZED TIN'
+),
+filtered_orders AS (
+  SELECT o_orderkey, o_custkey, EXTRACT(YEAR FROM o_orderdate) AS o_year
+  FROM orders
+  WHERE o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'
+),
+joined_data AS (
+  SELECT 
+    fo.o_year,
+    l.l_extendedprice * (1 - l.l_discount) AS volume,
+    n2.n_name AS nation
+  FROM filtered_part fp
+  JOIN lineitem l ON fp.p_partkey = l.l_partkey
+  JOIN supplier s ON s.s_suppkey = l.l_suppkey
+  JOIN nation n2 ON s.s_nationkey = n2.n_nationkey
+  JOIN filtered_orders fo ON l.l_orderkey = fo.o_orderkey
+  JOIN customer c ON fo.o_custkey = c.c_custkey
+  JOIN nation n1 ON c.c_nationkey = n1.n_nationkey
+  JOIN filtered_region fr ON n1.n_regionkey = fr.r_regionkey
+)
+SELECT 
+  o_year,
+  SUM(volume) FILTER (WHERE nation = 'FRANCE') / SUM(volume) AS mkt_share
+FROM joined_data
+GROUP BY o_year
+ORDER BY o_year
+Time Cost: 111.81s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将子查询中的过滤条件(r_name='EUROPE', o_orderdate范围, p_type='SMALL ANODIZED TIN')提前应用到各表扫描阶段，通过WHERE子句重组使优化器能更早过滤数据。特别是orders表的日期过滤和part表的类型过滤应在JOIN前完成，可将这些条件从子查询内层移到外层或通过CTE明确过滤顺序。"}, {'group': '连接优化', 'produced_suggestion': "调整8表连接顺序，优先连接高选择性的小表：先连接region(r_name='EUROPE')→nation n1→customer，再连接part(p_type过滤)→supplier→nation n2，最后连接已过滤的orders和lineitem。这样可以先建立小的哈希表，减少后续大表JOIN时的探测代价。当前执行计划在lineitem和part之间做Hash Join代价过高(65,679.31)，应让part先与其他表连接缩小结果集。"}, {'group': '子查询优化', 'produced_suggestion': '将子查询all_nations改写为CTE或直接展开到主查询，消除子查询物化开销。同时将聚合计算(sum(case...))中的条件判断优化为过滤后的两路聚合：一路计算FRANCE的volume总和，一路计算所有volume总和，最后做除法。这样可以减少CASE表达式在大结果集上的重复计算。'}, {'group': '投影优化', 'produced_suggestion': '在子查询中仅投影后续聚合所需的列(o_year, volume, nation)，移除中间不必要的列传递。特别是在多表JOIN阶段，只SELECT参与连接条件、过滤条件和最终计算的列，减少Hash Join和物化的内存占用。例如customer表只需c_custkey和c_nationkey，不需要其他属性列。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) lineitem表全表扫描占71.6%代价(1,375,085.88)，扫描近6000万行；2) orders表全表扫描占18.5%代价(355,022.00)，扫描1500万行且带日期范围过滤；3) part表全表扫描占2.7%代价，扫描200万行且带类型过滤；4) customer表全表扫描占2.2%代价。SQL结构为多表连接(8表JOIN)且存在子查询，可通过谓词下推、连接顺序调整、过滤条件优化等查询重写技术显著降低中间结果集大小，减少扫描代价。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将子查询中的过滤条件(r_name='EUROPE', o_orderdate范围, p_type='SMALL ANODIZED TIN')提前应用到各表扫描阶段，通过WHERE子句重组使优化器能更早过滤数据。特别是orders表的日期过滤和part表的类型过滤应在JOIN前完成，可将这些条件从子查询内层移到外层或通过CTE明确过滤顺序。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整8表连接顺序，优先连接高选择性的小表：先连接region(r_name='EUROPE')→nation n1→customer，再连接part(p_type过滤)→supplier→nation n2，最后连接已过滤的orders和lineitem。这样可以先建立小的哈希表，减少后续大表JOIN时的探测代价。当前执行计划在lineitem和part之间做Hash Join代价过高(65,679.31)，应让part先与其他表连接缩小结果集。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将子查询all_nations改写为CTE或直接展开到主查询，消除子查询物化开销。同时将聚合计算(sum(case...))中的条件判断优化为过滤后的两路聚合：一路计算FRANCE的volume总和，一路计算所有volume总和，最后做除法。这样可以减少CASE表达式在大结果集上的重复计算。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在子查询中仅投影后续聚合所需的列(o_year, volume, nation)，移除中间不必要的列传递。特别是在多表JOIN阶段，只SELECT参与连接条件、过滤条件和最终计算的列，减少Hash Join和物化的内存占用。例如customer表只需c_custkey和c_nationkey，不需要其他属性列。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 55 条规则（按优化组筛选: 谓词简化, 连接优化, 子查询优化, 投影优化；LinUCB参数化记忆开启）
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCB=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCB=1.100
+   → FILTER_VALUES_MERGE: UCB=1.100
+{
+  "applied_rules": [
+    "AGGREGATE_CASE_TO_FILTER",
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "JOIN_CONDITION_PUSH",
+    "PROJECT_REMOVE"
+  ],
+  "groups": "谓词简化, 子查询优化, 连接优化, 投影优化",
+  "rule_effect_confidence": {
+    "AGGREGATE_CASE_TO_FILTER": 0.9,
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "FILTER_REDUCE_EXPRESSIONS": 0.7,
+    "JOIN_CONDITION_PUSH": 0.85,
+    "PROJECT_REMOVE": 0.75
+  },
+  "rule_effect_scores": {
+    "AGGREGATE_CASE_TO_FILTER": 0.25,
+    "STRATEGY_CTE_DECOMPOSITION": 0.25,
+    "FILTER_REDUCE_EXPRESSIONS": 0.15,
+    "JOIN_CONDITION_PUSH": 0.2,
+    "PROJECT_REMOVE": 0.15
+  }
+}
+✅ 选择了 5 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 子查询优化, 连接优化, 投影优化",
+  "applied_rules": [
+    "AGGREGATE_CASE_TO_FILTER",
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "JOIN_CONDITION_PUSH",
+    "PROJECT_REMOVE"
+  ],
+  "rewritten_sql": "WITH filtered_region AS (\n  SELECT r_regionkey\n  FROM region\n  WHERE r_name = 'EUROPE'\n),\nfiltered_part AS (\n  SELECT p_partkey\n  FROM part\n  WHERE p_type = 'SMALL ANODIZED TIN'\n),\nfiltered_orders AS (\n  SELECT o_orderkey, o_custkey, EXTRACT(YEAR FROM o_orderdate) AS o_year\n  FROM orders\n  WHERE o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'\n),\njoined_data AS (\n  SELECT \n    fo.o_year,\n    l.l_extendedprice * (1 - l.l_discount) AS volume,\n    n2.n_name AS nation\n  FROM filtered_part fp\n  JOIN lineitem l ON fp.p_partkey = l.l_partkey\n  JOIN supplier s ON s.s_suppkey = l.l_suppkey\n  JOIN nation n2 ON s.s_nationkey = n2.n_nationkey\n  JOIN filtered_orders fo ON l.l_orderkey = fo.o_orderkey\n  JOIN customer c ON fo.o_custkey = c.c_custkey\n  JOIN nation n1 ON c.c_nationkey = n1.n_nationkey\n  JOIN filtered_region fr ON n1.n_regionkey = fr.r_regionkey\n)\nSELECT \n  o_year,\n  SUM(volume) FILTER (WHERE nation = 'FRANCE') / SUM(volume) AS mkt_share\nFROM joined_data\nGROUP BY o_year\nORDER BY o_year",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原始SQL的8表连接子查询all_nations拆解为4个CTE（filtered_region、filtered_part、filtered_orders、joined_data），将过滤条件r_name='EUROPE'、p_type='SMALL ANODIZED TIN'、o_orderdate范围分别下推到各自的CTE中，joined_data CTE完成所有表的连接并投影出o_year、volume、nation三列。\n\n2. **谓词下推的等价性**：原SQL在子查询WHERE子句中的三个过滤条件（r_name='EUROPE'、o_orderdate BETWEEN...、p_type='SMALL ANODIZED TIN'）被提前到各自表的CTE中。由于这些条件仅依赖单表列且通过主键/外键连接传递，提前过滤不会改变最终JOIN结果集：region通过r_regionkey→n1.n_regionkey→c_nationkey→o_custkey连接到orders，part通过p_partkey→l_partkey连接到lineitem，orders的日期过滤直接作用于自身。所有连接条件（等值连接）保持不变，因此结果集与原SQL等价。\n\n3. **CTE展开与投影优化的等价性**：joined_data CTE仅投影后续聚合所需的三列（o_year、volume、nation），删除了中间不必要的列传递（如c_custkey、s_suppkey等仅用于连接的列）。由于这些列不参与最终的GROUP BY和聚合计算，删除它们不影响结果集。原子查询中的EXTRACT(YEAR FROM o_orderdate)和l_extendedprice*(1-l_discount)计算被保留在joined_data中，确保volume和o_year的计算逻辑与原SQL一致。\n\n4. **连接顺序调整的等价性**：重写SQL调整了连接顺序（先连接filtered_part→lineitem→supplier→nation n2→filtered_orders→customer→nation n1→filtered_region），但所有连接条件（p_partkey=l_partkey、s_suppkey=l_suppkey、l_orderkey=o_orderkey、o_custkey=c_custkey、c_nationkey=n1.n_nationkey、n1.n_regionkey=r_regionkey、s_nationkey=n2.n_nationkey）完全保留且未改变语义。由于所有连接均为INNER JOIN且连接条件为等值连接，根据关系代数的交换律和结合律，连接顺序调整不影响结果集。\n\n5. **聚合函数改写的等价性**：原SQL使用SUM(CASE WHEN nation='FRANCE' THEN volume ELSE 0 END)/SUM(volume)，重写为SUM(volume) FILTER (WHERE nation='FRANCE')/SUM(volume)。根据SQL标准，SUM(expr) FILTER (WHERE condition)等价于SUM(CASE WHEN condition THEN expr ELSE NULL END)，而SUM会忽略NULL值，因此与SUM(CASE WHEN condition THEN expr ELSE 0 END)在分子计算上等价（因为ELSE 0对SUM无贡献）。分母SUM(volume)未改变。因此mkt_share的计算逻辑与原SQL完全等价。\n\n6. **GROUP BY和ORDER BY的等价性**：重写SQL保留了原SQL的GROUP BY o_year和ORDER BY o_year，且o_year的计算逻辑（EXTRACT(YEAR FROM o_orderdate)）在joined_data CTE中与原子查询一致。因此分组和排序行为与原SQL等价。\n\n7. **NULL值处理**：原SQL中volume计算为l_extendedprice*(1-l_discount)，若l_extendedprice或l_discount为NULL则volume为NULL，SUM会忽略NULL值。重写SQL保持相同的volume计算逻辑，因此NULL值处理行为一致。nation列来自n2.n_name，若为NULL则FILTER (WHERE nation='FRANCE')不匹配，与原CASE WHEN逻辑一致（CASE WHEN NULL='FRANCE'为FALSE，返回0）。\n\n8. **主键与外键约束保证**：所有连接条件基于主键/外键关系（p_partkey、l_partkey、s_suppkey、l_orderkey、o_orderkey、o_custkey、c_custkey、c_nationkey、n_nationkey、n_regionkey、r_regionkey），确保连接的正确性和一对多/多对一关系的保持。重写SQL未改变这些连接条件，因此结果集的基数和内容与原SQL等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE分解、谓词下推和AGGREGATE_CASE_TO_FILTER改写，所有连接条件、过滤逻辑、聚合计算均与原SQL等价，结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（cost、节点类型、扫描方式、JOIN顺序、并行度均无变化），说明优化器未采纳CTE重写。虽然重写SQL引入了4个CTE（filtered_region/filtered_part/filtered_orders/joined_data）并使用FILTER子句替代CASE，但优化器将其展开后生成了与原SQL相同的执行计划。结构上无改进也无恶化，cost持平（1921221.1），行数估计求和持平（28907335.0）。由于已应用谓词简化、CTE分解、连接条件下推、投影裁剪等规则，且执行计划未发生任何变化，继续在当前方向优化已无改进空间。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+
+🎲 LinUCB Update: 5 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1921221.1000, rc=1921221.1000)
+✅ LinUCB Update Complete:
+   → AGGREGATE_CASE_TO_FILTER: prior=0.596, reward=+0.000, count=12, avg=-0.023
+   → STRATEGY_CTE_DECOMPOSITION: prior=0.385, reward=+0.000, count=111, avg=+0.021
+   → FILTER_REDUCE_EXPRESSIONS: prior=0.483, reward=+0.000, count=49, avg=+0.004
+   → JOIN_CONDITION_PUSH: prior=0.369, reward=+0.000, count=117, avg=+0.003
+   → PROJECT_REMOVE: prior=0.521, reward=+0.000, count=29, avg=+0.011
+
+----------------------------------------
+

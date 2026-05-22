@@ -1,0 +1,177 @@
+Query ID: 34
+==================================================
+
+Original: select l_shipmode, sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('REG AIR', 'AIR') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1995-01-01' and l_receiptdate < date '1995-01-01' + interval '1' year group by l_shipmode order by l_shipmode;
+Rewritten: SELECT l_shipmode,
+       SUM(CASE WHEN o_orderpriority IN ('1-URGENT', '2-HIGH') THEN 1 ELSE 0 END) AS high_line_count,
+       SUM(CASE WHEN o_orderpriority NOT IN ('1-URGENT', '2-HIGH') THEN 1 ELSE 0 END) AS low_line_count
+FROM lineitem
+INNER JOIN orders ON lineitem.l_orderkey = orders.o_orderkey
+WHERE lineitem.l_shipmode IN ('REG AIR', 'AIR')
+  AND lineitem.l_commitdate < lineitem.l_receiptdate
+  AND lineitem.l_shipdate < lineitem.l_commitdate
+  AND lineitem.l_receiptdate >= DATE '1995-01-01'
+  AND lineitem.l_receiptdate < DATE '1995-01-01' + INTERVAL '1' year
+GROUP BY l_shipmode
+ORDER BY l_shipmode
+Time Cost: 382.71s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': "消除二级聚合冗余：将内层'GROUP BY l_shipmode, o_orderkey'和外层'GROUP BY l_shipmode'合并为单层聚合'GROUP BY l_shipmode'，直接在SUM内使用CASE表达式判断o_orderpriority，避免中间聚合层的行数膨胀（当前从913行膨胀到1284行）和额外Aggregate节点开销。具体改写：SELECT l_shipmode, SUM(CASE WHEN o_orderpriority IN ('1-URGENT','2-HIGH') THEN 1 ELSE 0 END) AS high_line_count, SUM(CASE WHEN o_orderpriority NOT IN ('1-URGENT','2-HIGH') THEN 1 ELSE 0 END) AS low_line_count FROM lineitem JOIN orders ON l_orderkey=o_orderkey WHERE [过滤条件] GROUP BY l_shipmode"}, {'group': '连接优化', 'produced_suggestion': '简化连接结构：移除orders_projected和lineitem_filtered派生表包装，直接使用表名进行INNER JOIN。派生表未带来列裁剪或过滤下推收益（优化器已自动完成），反而增加逻辑复杂度。改为：FROM lineitem INNER JOIN orders ON lineitem.l_orderkey = orders.o_orderkey WHERE lineitem.[过滤条件]，保持显式JOIN语法但去除冗余嵌套'}, {'group': '投影优化', 'produced_suggestion': '在SELECT子句中仅引用必需列：lineitem需要l_orderkey（连接键）、l_shipmode（分组键）和日期列（过滤条件），orders仅需o_orderkey（连接键）和o_orderpriority（聚合条件）。当前orders_projected派生表的显式投影未带来额外收益，可依赖优化器自动列裁剪，或保留但确保不引入额外投影算子'}, {'group': '谓词简化', 'produced_suggestion': "优化CASE表达式中的谓词：将'o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH''改写为'o_orderpriority NOT IN ('1-URGENT','2-HIGH')'，语义等价但更简洁。同时确保high_priority和low_priority的CASE条件互斥且完备（当前已满足：一个用OR连接两个等值，另一个用AND连接两个不等值，覆盖所有情况）"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表全表扫描(Seq Scan)占总代价99.9%，扫描近6000万行数据。当前使用隐式JOIN语法(FROM orders, lineitem WHERE...)，优化器可能未选择最优连接顺序。可通过显式JOIN改写、谓词条件优化、以及利用索引来提升性能。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将隐式JOIN改写为显式INNER JOIN，明确连接条件o_orderkey = l_orderkey，帮助优化器选择更优的连接顺序。由于lineitem表有复杂过滤条件且数据量大，建议先过滤lineitem再与orders连接，减少连接时的数据量。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将l_shipmode的IN条件与其他日期过滤条件组合，确保过滤条件尽早应用。l_receiptdate的范围条件(>= '1995-01-01' AND < '1995-01-01' + interval '1' year)可以简化为BETWEEN表达式，提高可读性并可能触发更好的索引选择。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "当前查询从orders表只需要o_orderpriority列用于CASE表达式计算，从lineitem表需要l_orderkey(连接键)、l_shipmode(分组键)和日期列(过滤条件)。确保只投影必需列，避免传输冗余数据。在子查询或CTE中先完成过滤和投影，再进行连接和聚合。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "两个SUM(CASE...)表达式是互补关系(high vs low priority)，可以考虑先计算总数，然后用总数减去high_line_count得到low_line_count，减少一次CASE表达式计算。或者在连接前对lineitem按l_shipmode预聚合，减少连接后的数据量。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 67 条规则（按优化组筛选: 连接优化, 谓词简化, 投影优化, 聚合优化；记忆已关闭）
+{
+  "applied_rules": ["FILTER_INTO_JOIN", "AGGREGATE_CASE_TO_FILTER", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "FILTER_PROJECT_TRANSPOSE", "FILTER_REDUCE_EXPRESSIONS"],
+  "groups": "谓词简化, 连接优化, 聚合优化"
+}
+✅ 选择了 5 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 聚合优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "AGGREGATE_CASE_TO_FILTER",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "FILTER_PROJECT_TRANSPOSE",
+    "FILTER_REDUCE_EXPRESSIONS"
+  ],
+  "rewritten_sql": "SELECT l_shipmode,\n       SUM(high_priority) AS high_line_count,\n       SUM(low_priority) AS low_line_count\nFROM (\n    SELECT l_shipmode,\n           SUM(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) AS high_priority,\n           SUM(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) AS low_priority\n    FROM (\n        SELECT l_orderkey, l_shipmode\n        FROM lineitem\n        WHERE l_shipmode IN ('REG AIR', 'AIR')\n          AND l_commitdate < l_receiptdate\n          AND l_shipdate < l_commitdate\n          AND l_receiptdate >= DATE '1995-01-01'\n          AND l_receiptdate < DATE '1995-01-01' + INTERVAL '1' year\n    ) AS lineitem_filtered\n    INNER JOIN (\n        SELECT o_orderkey, o_orderpriority\n        FROM orders\n    ) AS orders_projected\n    ON lineitem_filtered.l_orderkey = orders_projected.o_orderkey\n    GROUP BY l_shipmode, orders_projected.o_orderkey\n) AS aggregated\nGROUP BY l_shipmode\nORDER BY l_shipmode",
+  "semantic_correctness_guarantee": "1. **FILTER_INTO_JOIN应用**：将lineitem表的所有过滤条件(l_shipmode IN ('REG AIR', 'AIR')、三个日期比较条件)推入子查询lineitem_filtered中，在连接前先过滤lineitem表。由于这些条件仅依赖lineitem表列，提前过滤不改变最终结果集，且减少连接时的数据量。\n\n2. **隐式JOIN改写为显式INNER JOIN**：原SQL使用逗号连接(orders, lineitem)配合WHERE中的等值条件(o_orderkey = l_orderkey)，改写为显式INNER JOIN ... ON语法。根据SQL标准，内连接的隐式与显式写法在语义上完全等价，都要求两表通过连接键匹配且满足所有WHERE条件。\n\n3. **投影优化(FILTER_PROJECT_TRANSPOSE)**：在orders侧创建子查询orders_projected，仅投影连接键o_orderkey和聚合计算所需的o_orderpriority列，避免传输orders表的其他8个列(o_custkey、o_orderstatus等)。在lineitem侧仅投影l_orderkey(连接键)和l_shipmode(分组键)。投影列的减少不影响结果集语义，因为原SQL的SELECT子句和GROUP BY子句仅使用这些列。\n\n4. **AGGREGATE_JOIN_TRANSPOSE_EXTENDED应用**：在连接后立即按(l_shipmode, o_orderkey)进行预聚合，计算每个订单在每个shipmode下的high_priority和low_priority计数。由于o_orderkey是orders表主键(PRIMARY KEY)，每个(l_shipmode, o_orderkey)组合对应唯一的o_orderpriority值，因此在此粒度上聚合CASE表达式与原SQL在最终GROUP BY l_shipmode后的结果等价。外层再按l_shipmode汇总这些预聚合值。\n\n5. **聚合语义等价性**：原SQL按l_shipmode分组并对每组内所有匹配行计算SUM(CASE ...)。改写后分两层聚合：内层按(l_shipmode, o_orderkey)聚合，外层按l_shipmode再次SUM。由于SUM的结合律(SUM(a+b) = SUM(a) + SUM(b))，两层聚合的结果与一层聚合完全相同。CASE表达式的条件(o_orderpriority的值判断)在内层聚合时已正确计算，外层仅做数值求和。\n\n6. **FILTER_REDUCE_EXPRESSIONS应用**：原SQL的WHERE条件中无恒真/恒假表达式(如1=1)，所有条件均为有效过滤条件，因此此规则在本次改写中未产生实际简化操作，保持所有原有过滤条件不变。\n\n7. **ORDER BY保持**：最外层保留ORDER BY l_shipmode，确保结果集排序与原SQL一致。由于l_shipmode是分组键且在所有聚合层级中保持，排序语义不受改写影响。\n\n8. **NULL值处理**：原SQL中o_orderpriority为NOT NULL列(根据Schema定义)，CASE表达式中的等值/不等值比较不会产生NULL导致的语义差异。日期列的比较条件在lineitem过滤阶段应用,若存在NULL值会被过滤掉(与原SQL行为一致)。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "两SQL等价。重写将lineitem过滤条件推入子查询、隐式JOIN改为显式INNER JOIN、投影优化仅保留必需列、按(l_shipmode, o_orderkey)预聚合后外层再按l_shipmode汇总，利用o_orderkey主键唯一性和SUM结合律保证聚合语义不变，最终结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划对比：1) 核心结构未变：两者均为 Parallel Seq Scan lineitem → Nested Loop Index Scan orders → Gather Merge → Sort → Aggregate，连接方式、并行度、扫描路径完全一致；2) 唯一差异：enhanced_sql 引入额外的二级 Aggregate 节点（按 l_shipmode + o_orderkey 分组），导致多一层聚合开销；3) 行数估计求和从 913 升至 1284（+40.6%），但此增幅主要源于中间聚合层的行数膨胀，非主干数据量失控；4) cost 微增 11.37（+0.007%），可忽略；5) 结构性退化信号：派生表嵌套与二级聚合未带来任何补偿收益（无去相关、无子计划消除、无公共结果复用），反而引入冗余计算层；原 SQL 已是高效的过滤后连接+单次聚合模式，重写后的'先按 orderkey 聚合再按 shipmode 聚合'逻辑错误且无必要。结论：本轮重写未改进反而引入冗余层，但未造成灾难性退化（主干扫描/连接未恶化），应继续优化。",
+  "no_further_optimization": false,
+  "next_step_advice": "回退到 original_sql 的简洁结构，保留显式 INNER JOIN 语法但移除冗余派生表和二级聚合。具体改进方向：1) 保持单层聚合（直接按 l_shipmode 分组），避免先按 orderkey 聚合的无效中间层；2) 在 lineitem 过滤后直接与 orders 连接，无需额外派生表包装；3) 可尝试将 orders 的投影下推（仅选 o_orderkey, o_orderpriority）作为内联视图，但需验证优化器是否已自动完成列裁剪；4) 若数据库支持，可测试在 lineitem 过滤条件上创建部分索引（covering l_shipmode, l_orderkey, date columns）以替代全表扫描，但需结合实际数据分布评估。核心目标：恢复原 SQL 的简洁高效结构，仅保留显式 JOIN 语法改进。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "根据上一轮反馈，二级聚合（按l_shipmode+o_orderkey分组再按l_shipmode分组）引入冗余计算层且无性能收益。执行计划显示核心瓶颈为lineitem全表扫描（代价占比99.9%），但该扫描已包含高选择性过滤条件（日期范围+shipmode+三个日期比较），优化器选择Seq Scan说明索引不存在或不适用。当前SQL存在结构性冗余：1）内层按l_shipmode+o_orderkey分组毫无意义（orderkey是唯一键，分组后每组仅1行，CASE聚合退化为普通CASE表达式）；2）外层再按l_shipmode分组才是真正需要的聚合层；3）orders_projected派生表仅投影两列但未带来优化收益。优化方向：回退到单层聚合结构，直接在lineitem过滤后与orders连接，然后按l_shipmode分组并在聚合函数内使用CASE表达式，消除中间聚合层的行数膨胀（从913→1284）和额外Aggregate节点开销。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除二级聚合冗余：将内层'GROUP BY l_shipmode, o_orderkey'和外层'GROUP BY l_shipmode'合并为单层聚合'GROUP BY l_shipmode'，直接在SUM内使用CASE表达式判断o_orderpriority，避免中间聚合层的行数膨胀（当前从913行膨胀到1284行）和额外Aggregate节点开销。具体改写：SELECT l_shipmode, SUM(CASE WHEN o_orderpriority IN ('1-URGENT','2-HIGH') THEN 1 ELSE 0 END) AS high_line_count, SUM(CASE WHEN o_orderpriority NOT IN ('1-URGENT','2-HIGH') THEN 1 ELSE 0 END) AS low_line_count FROM lineitem JOIN orders ON l_orderkey=o_orderkey WHERE [过滤条件] GROUP BY l_shipmode"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "简化连接结构：移除orders_projected和lineitem_filtered派生表包装，直接使用表名进行INNER JOIN。派生表未带来列裁剪或过滤下推收益（优化器已自动完成），反而增加逻辑复杂度。改为：FROM lineitem INNER JOIN orders ON lineitem.l_orderkey = orders.o_orderkey WHERE lineitem.[过滤条件]，保持显式JOIN语法但去除冗余嵌套"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在SELECT子句中仅引用必需列：lineitem需要l_orderkey（连接键）、l_shipmode（分组键）和日期列（过滤条件），orders仅需o_orderkey（连接键）和o_orderpriority（聚合条件）。当前orders_projected派生表的显式投影未带来额外收益，可依赖优化器自动列裁剪，或保留但确保不引入额外投影算子"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "优化CASE表达式中的谓词：将'o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH''改写为'o_orderpriority NOT IN ('1-URGENT','2-HIGH')'，语义等价但更简洁。同时确保high_priority和low_priority的CASE条件互斥且完备（当前已满足：一个用OR连接两个等值，另一个用AND连接两个不等值，覆盖所有情况）"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择...
+📚 加载规则库 67 条规则（按优化组筛选: 聚合优化, 连接优化, 投影优化, 谓词简化；记忆已关闭）
+{
+  "applied_rules": [
+    "AGGREGATE_MERGE",
+    "PROJECT_MERGE",
+    "FILTER_PROJECT_TRANSPOSE",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "groups": "聚合优化, 投影优化, 谓词简化, 连接优化"
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 投影优化, 谓词简化, 连接优化",
+  "applied_rules": [
+    "AGGREGATE_MERGE",
+    "PROJECT_MERGE",
+    "FILTER_PROJECT_TRANSPOSE",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rewritten_sql": "SELECT l_shipmode,\n       SUM(CASE WHEN o_orderpriority IN ('1-URGENT', '2-HIGH') THEN 1 ELSE 0 END) AS high_line_count,\n       SUM(CASE WHEN o_orderpriority NOT IN ('1-URGENT', '2-HIGH') THEN 1 ELSE 0 END) AS low_line_count\nFROM lineitem\nINNER JOIN orders ON lineitem.l_orderkey = orders.o_orderkey\nWHERE lineitem.l_shipmode IN ('REG AIR', 'AIR')\n  AND lineitem.l_commitdate < lineitem.l_receiptdate\n  AND lineitem.l_shipdate < lineitem.l_commitdate\n  AND lineitem.l_receiptdate >= DATE '1995-01-01'\n  AND lineitem.l_receiptdate < DATE '1995-01-01' + INTERVAL '1' year\nGROUP BY l_shipmode\nORDER BY l_shipmode",
+  "semantic_correctness_guarantee": "1. **聚合层合并（AGGREGATE_MERGE）**：原 base_sql 存在二级聚合结构（内层按 l_shipmode + o_orderkey 分组，外层按 l_shipmode 分组）。重写后消除内层聚合，直接按 l_shipmode 单层分组。等价性保证：内层聚合的 GROUP BY 包含 o_orderkey 是冗余的，因为最终外层聚合会对所有 orderkey 的结果再次求和；CASE 表达式中的 SUM 操作在单层聚合中直接统计每个 l_shipmode 对应的所有订单行，与先按 orderkey 分组再汇总的结果完全一致（加法满足结合律）。\n\n2. **派生表消除（PROJECT_MERGE）**：原 base_sql 使用 lineitem_filtered 和 orders_projected 两个派生表包装基表。重写后直接使用 lineitem 和 orders 表名，并在 WHERE 子句中应用过滤条件。等价性保证：派生表仅做列投影和过滤，未改变数据语义；优化器会自动完成列裁剪（lineitem 仅需 l_orderkey、l_shipmode 及日期列，orders 仅需 o_orderkey、o_orderpriority），显式派生表未带来额外收益；直接在主查询 WHERE 子句中应用 lineitem 过滤条件（FILTER_PROJECT_TRANSPOSE 应用），与在派生表内过滤结果集完全相同。\n\n3. **连接条件保持（JOIN_CONDITION_PUSH）**：保持 INNER JOIN 语义，连接键为 lineitem.l_orderkey = orders.o_orderkey。等价性保证：orders 表主键为 o_orderkey（见 Schema），lineitem 与 orders 的 1:N 关系通过外键约束保证；INNER JOIN 仅保留匹配行，与原 SQL 的连接逻辑完全一致；所有 lineitem 过滤条件已下推到 WHERE 子句（仅依赖 lineitem 列），不影响连接结果的正确性。\n\n4. **谓词简化（FILTER_REDUCE_EXPRESSIONS 隐含应用）**：将 CASE 表达式中的 'o_orderpriority <> \"1-URGENT\" AND o_orderpriority <> \"2-HIGH\"' 改写为 'o_orderpriority NOT IN (\"1-URGENT\", \"2-HIGH\")'。等价性保证：两种写法在 SQL 标准下语义完全等价（NOT IN 等价于对所有列表值取 <> 并用 AND 连接）；o_orderpriority 为 NOT NULL 列（见 Schema），无需处理 NULL 值的三值逻辑陷阱；两个 CASE 分支条件互斥且完备（一个用 IN，另一个用 NOT IN，覆盖所有可能值），确保每行恰好计入一个计数器。\n\n5. **结果集等价性核心验证**：最终 SELECT 子句返回 l_shipmode、high_line_count、low_line_count 三列，与原 SQL 完全一致；GROUP BY l_shipmode 确保每个运输模式对应一行汇总结果；ORDER BY l_shipmode 保持排序一致性；SUM(CASE...) 的统计逻辑未变（仅简化了谓词表达式），每个 shipmode 的高优先级和低优先级订单行数统计结果与原 SQL 完全相同。\n\n6. **关键等价点说明**：原 base_sql 的二级聚合（先按 orderkey 分组再按 shipmode 汇总）是逻辑冗余的，因为 CASE 表达式内的 SUM 操作本质是对每行进行条件计数，无需先按 orderkey 分组；单层聚合直接对过滤后的 lineitem-orders 连接结果按 shipmode 分组并统计，避免了中间聚合层的行数膨胀（从 913 行膨胀到 1284 行）和额外 Aggregate 节点开销，同时保证结果集完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "两SQL在语义上完全等价：重写将隐式逗号连接改为显式INNER JOIN，将<>条件改写为NOT IN，并消除了冗余的二级聚合结构，最终结果集（按l_shipmode分组的高/低优先级订单行数统计）完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，结构无变化：两版本均为Parallel Seq Scan lineitem + Index Scan orders的Nested Loop，过滤条件、连接方式、并行度、排序聚合策略完全相同；节点类型计数、估计行数求和(913行)、访问路径均无差异。本轮重写仅做了语法规范化（隐式JOIN改显式INNER JOIN、CASE条件改用IN/NOT IN），未触发优化器生成新计划。cost微降1.67(1689737.67→1689736.0)可忽略不计，属统计误差范围。结构上未改进也未恶化，但已无明显可优化空间：当前计划已是该查询在现有索引/统计信息下的合理选择(lineitem大表并行扫描+orders主键索引回表)，进一步优化需依赖索引调整(如l_receiptdate/l_shipmode复合索引)或物化视图等外部手段，纯SQL重写已触及瓶颈。综合判断：no_further_optimization=true，终止优化流程。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+
+----------------------------------------
+

@@ -1,0 +1,119 @@
+Query ID: 4
+==================================================
+
+Original: select s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment from part, supplier, partsupp, nation, region where p_partkey = ps_partkey and s_suppkey = ps_suppkey and p_size = 6 and p_type like '%NICKEL' and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = 'EUROPE' and ps_supplycost = ( select min(ps_supplycost) from partsupp, supplier, nation, region where p_partkey = ps_partkey and s_suppkey = ps_suppkey and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = 'EUROPE' ) order by s_acctbal desc, n_name, s_name, p_partkey limit 100;
+Rewritten: WITH europe_nations AS (
+  SELECT n_nationkey, n_name
+  FROM nation
+  JOIN region ON n_regionkey = r_regionkey
+  WHERE r_name = 'EUROPE'
+),
+europe_suppliers AS (
+  SELECT s_suppkey, s_acctbal, s_name, s_address, s_phone, s_comment, s_nationkey
+  FROM supplier
+  WHERE s_nationkey IN (SELECT n_nationkey FROM europe_nations)
+),
+filtered_parts AS (
+  SELECT p_partkey, p_mfgr
+  FROM part
+  WHERE p_size = 6 AND p_type LIKE '%NICKEL'
+),
+min_supplycost_per_part AS (
+  SELECT ps.ps_partkey, MIN(ps.ps_supplycost) AS min_cost
+  FROM partsupp ps
+  JOIN europe_suppliers es ON ps.ps_suppkey = es.s_suppkey
+  WHERE ps.ps_partkey IN (SELECT p_partkey FROM filtered_parts)
+  GROUP BY ps.ps_partkey
+)
+SELECT 
+  s.s_acctbal,
+  s.s_name,
+  n.n_name,
+  p.p_partkey,
+  p.p_mfgr,
+  s.s_address,
+  s.s_phone,
+  s.s_comment
+FROM filtered_parts p
+JOIN partsupp ps ON p.p_partkey = ps.ps_partkey
+JOIN europe_suppliers s ON ps.ps_suppkey = s.s_suppkey
+JOIN europe_nations n ON s.s_nationkey = n.n_nationkey
+JOIN min_supplycost_per_part msc ON p.p_partkey = msc.ps_partkey AND ps.ps_supplycost = msc.min_cost
+ORDER BY s.s_acctbal DESC, n.n_name, s.s_name, p.p_partkey
+LIMIT 100;
+Time Cost: 193.62s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将WHERE子句中的相关子查询(ps_supplycost = (SELECT MIN...))转换为LEFT JOIN + 聚合预计算或窗口函数ROW_NUMBER()。当前子查询在Merge Join的Join Filter中执行，可能对每个part-partsupp组合重复执行，建议先计算每个p_partkey在EUROPE区域的最小ps_supplycost，然后作为派生表JOIN回主查询'}, {'group': '连接优化', 'produced_suggestion': "调整连接顺序，优先过滤小表：先JOIN region(r_name='EUROPE')和nation得到EUROPE国家集合(约5行)，再与supplier JOIN过滤出EUROPE供应商，最后再与part和partsupp JOIN。当前执行计划先处理part和partsupp大表，建议改为先过滤维度表以减少后续JOIN的数据量"}, {'group': '谓词简化', 'produced_suggestion': "将主查询和子查询中的公共过滤条件(r_name='EUROPE', s_nationkey=n_nationkey, n_regionkey=r_regionkey)提取为CTE或派生表，避免重复计算。同时将p_size=6和p_type LIKE '%NICKEL'条件尽早应用于part表扫描以减少数据量"}, {'group': '聚合优化', 'produced_suggestion': '将子查询中的MIN(ps_supplycost)聚合改为按p_partkey分组的预聚合，使用CTE或派生表存储结果(GROUP BY p_partkey)，然后与主查询JOIN。这样可以将子查询从相关子查询(每行执行一次)转换为独立子查询(只执行一次)'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) Merge Join占比55.1%，其中包含相关子查询作为Join Filter，导致子查询可能被重复执行；2) Sort操作占比26.1%且为流水线阻塞算子；3) partsupp大表全表扫描占比12.1%。主要优化机会在于：将相关子查询转换为JOIN或窗口函数以避免重复计算，优化连接顺序以减少中间结果集，以及通过谓词下推减少数据扫描量。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将WHERE子句中的相关子查询(ps_supplycost = (SELECT MIN...))转换为LEFT JOIN + 聚合预计算或窗口函数ROW_NUMBER()。当前子查询在Merge Join的Join Filter中执行，可能对每个part-partsupp组合重复执行，建议先计算每个p_partkey在EUROPE区域的最小ps_supplycost，然后作为派生表JOIN回主查询"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先过滤小表：先JOIN region(r_name='EUROPE')和nation得到EUROPE国家集合(约5行)，再与supplier JOIN过滤出EUROPE供应商，最后再与part和partsupp JOIN。当前执行计划先处理part和partsupp大表，建议改为先过滤维度表以减少后续JOIN的数据量"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将主查询和子查询中的公共过滤条件(r_name='EUROPE', s_nationkey=n_nationkey, n_regionkey=r_regionkey)提取为CTE或派生表，避免重复计算。同时将p_size=6和p_type LIKE '%NICKEL'条件尽早应用于part表扫描以减少数据量"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将子查询中的MIN(ps_supplycost)聚合改为按p_partkey分组的预聚合，使用CTE或派生表存储结果(GROUP BY p_partkey)，然后与主查询JOIN。这样可以将子查询从相关子查询(每行执行一次)转换为独立子查询(只执行一次)"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 71 条规则（按优化组筛选: 子查询优化, 连接优化, 谓词简化, 聚合优化；记忆已关闭）
+{
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "groups": "谓词简化, 聚合优化, 子查询优化"
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 聚合优化, 子查询优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH europe_nations AS (\n  SELECT n_nationkey, n_name\n  FROM nation\n  JOIN region ON n_regionkey = r_regionkey\n  WHERE r_name = 'EUROPE'\n),\neurope_suppliers AS (\n  SELECT s_suppkey, s_acctbal, s_name, s_address, s_phone, s_comment, s_nationkey\n  FROM supplier\n  WHERE s_nationkey IN (SELECT n_nationkey FROM europe_nations)\n),\nfiltered_parts AS (\n  SELECT p_partkey, p_mfgr\n  FROM part\n  WHERE p_size = 6 AND p_type LIKE '%NICKEL'\n),\nmin_supplycost_per_part AS (\n  SELECT ps.ps_partkey, MIN(ps.ps_supplycost) AS min_cost\n  FROM partsupp ps\n  JOIN europe_suppliers es ON ps.ps_suppkey = es.s_suppkey\n  WHERE ps.ps_partkey IN (SELECT p_partkey FROM filtered_parts)\n  GROUP BY ps.ps_partkey\n)\nSELECT \n  s.s_acctbal,\n  s.s_name,\n  n.n_name,\n  p.p_partkey,\n  p.p_mfgr,\n  s.s_address,\n  s.s_phone,\n  s.s_comment\nFROM filtered_parts p\nJOIN partsupp ps ON p.p_partkey = ps.ps_partkey\nJOIN europe_suppliers s ON ps.ps_suppkey = s.s_suppkey\nJOIN europe_nations n ON s.s_nationkey = n.n_nationkey\nJOIN min_supplycost_per_part msc ON p.p_partkey = msc.ps_partkey AND ps.ps_supplycost = msc.min_cost\nORDER BY s.s_acctbal DESC, n.n_name, s.s_name, p.p_partkey\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **CTE提取公共过滤逻辑（STRATEGY_CTE_DECOMPOSITION + FILTER_INTO_JOIN）**：\n   - europe_nations: 提取原SQL主查询和子查询中共同的 region-nation JOIN + r_name='EUROPE' 过滤，返回EUROPE区域的所有国家键和名称。由于region.r_regionkey是主键，nation.n_regionkey是外键，且r_name='EUROPE'在两处完全相同，此CTE与原SQL中两次独立计算的结果集完全等价。\n   - europe_suppliers: 基于europe_nations提取EUROPE区域的所有供应商，等价于原SQL中 supplier JOIN nation JOIN region WHERE r_name='EUROPE' 的结果。使用IN子查询确保只选择EUROPE国家的供应商。\n   - filtered_parts: 提前应用 p_size=6 AND p_type LIKE '%NICKEL' 过滤，等价于原SQL WHERE子句中对part表的过滤条件，减少后续JOIN数据量但不改变结果集。\n\n2. **相关子查询去相关化（AGGREGATE_JOIN_TRANSPOSE_EXTENDED）**：\n   - 原SQL子查询 ps_supplycost = (SELECT MIN(ps_supplycost) FROM ... WHERE p_partkey = ps_partkey ...) 是相关子查询，对外层每个part-partsupp组合执行一次。\n   - min_supplycost_per_part CTE将其改写为独立聚合：按ps_partkey分组计算每个零件在EUROPE区域的最小供应成本，只执行一次。\n   - 通过 JOIN msc ON p.p_partkey = msc.ps_partkey AND ps.ps_supplycost = msc.min_cost 确保只保留供应成本等于该零件最小成本的记录，与原SQL相关子查询的等值过滤语义完全等价。\n\n3. **JOIN顺序调整与谓词下推（FILTER_INTO_JOIN）**：\n   - 主查询从filtered_parts开始JOIN，确保只处理符合p_size和p_type条件的零件。\n   - 通过预过滤的europe_suppliers和europe_nations进行JOIN，避免在大表上重复应用region过滤条件。\n   - 所有JOIN条件（p_partkey=ps_partkey, ps_suppkey=s_suppkey, s_nationkey=n_nationkey）与原SQL完全一致，保持相同的关联关系。\n\n4. **聚合与过滤的等价性保证**：\n   - min_supplycost_per_part中的GROUP BY ps_partkey确保每个零件只有一个最小成本值。\n   - 最终JOIN条件 ps.ps_supplycost = msc.min_cost 确保只选择成本等于最小值的partsupp记录，与原SQL的等值子查询过滤完全等价。\n   - 由于partsupp表的主键是(ps_partkey, ps_suppkey)，同一零件可能有多个供应商提供相同的最小成本，重写SQL与原SQL一样会返回所有这些记录。\n\n5. **SELECT列表与ORDER BY/LIMIT的等价性**：\n   - SELECT子句返回的8个列（s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment）与原SQL完全一致，来源表和列名未改变。\n   - ORDER BY s_acctbal DESC, n_name, s_name, p_partkey 和 LIMIT 100 保持不变，确保返回相同的排序和行数限制。\n\n6. **NULL值处理**：\n   - 所有JOIN使用INNER JOIN（隐式或显式），与原SQL的逗号分隔多表FROM子句（笛卡尔积+WHERE过滤）语义一致。\n   - CTE中的WHERE条件和主查询的JOIN条件不会引入NULL值匹配问题，因为所有关联列都是主键/外键关系且有NOT NULL约束（根据TPC-H标准Schema）。\n\n7. **结果集完整性验证**：\n   - 原SQL返回：所有满足part条件、在EUROPE区域、且供应成本等于该零件在EUROPE区域最小成本的(part, supplier, partsupp)组合。\n   - 重写SQL通过CTE预计算和JOIN组合，返回完全相同的记录集：filtered_parts限定零件范围，min_supplycost_per_part计算每个零件的最小成本，最终JOIN确保只保留成本等于最小值且供应商在EUROPE的记录。\n   - 由于所有过滤条件、JOIN条件、聚合逻辑均与原SQL等价，且未引入去重或额外过滤，结果集在行数、列值、排序上完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取公共过滤逻辑、将相关子查询改写为独立聚合JOIN，所有过滤条件、JOIN关系、聚合语义与原SQL完全一致，结果集相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 12951378.0 -> 455044.0 (重写侧约为原的 3.5135%) | 强信号: 行数估计求和大幅下降，重写侧约为原的 3.5135% (<= 10%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+✅ 行数估计求和大幅下降至原的 3.5135%，直接判定优化成功，终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+
+----------------------------------------
+

@@ -1,0 +1,101 @@
+Query ID: 10
+==================================================
+
+Original: select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1996-01-01' and o_orderdate < date '1996-01-01' + interval '3' month and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;
+Rewritten: SELECT o_orderpriority, COUNT(*) AS order_count
+FROM orders
+JOIN (
+    SELECT DISTINCT l_orderkey
+    FROM lineitem
+    WHERE l_commitdate < l_receiptdate
+      AND l_orderkey IS NOT NULL
+) AS sub_lineitem ON o_orderkey = sub_lineitem.l_orderkey
+WHERE o_orderdate >= DATE '1996-01-01'
+  AND o_orderdate < DATE '1996-04-01'
+GROUP BY o_orderpriority
+ORDER BY o_orderpriority
+Time Cost: 146.12s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将EXISTS相关子查询改写为SEMI JOIN。当前EXISTS子查询对每个符合日期条件的orders记录都触发lineitem全表扫描。改写为'INNER JOIN (SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate) l ON o_orderkey = l.l_orderkey'，可以先对lineitem进行一次过滤和去重，然后与orders进行哈希连接，避免重复扫描，显著降低I/O开销。"}, {'group': '谓词简化', 'produced_suggestion': "将日期范围条件'o_orderdate >= date '1996-01-01' and o_orderdate < date '1996-01-01' + interval '3' month'简化为'o_orderdate >= '1996-01-01' AND o_orderdate < '1996-04-01''，消除运行时的interval计算，便于优化器进行常量折叠和分区裁剪(如果有分区表)。"}, {'group': '投影优化', 'produced_suggestion': "EXISTS子查询中使用'SELECT *'会扫描lineitem所有列。改为'SELECT 1'或仅投影关联键'SELECT l_orderkey'，减少不必要的列读取开销，降低内存和I/O消耗。"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表全表扫描(Seq Scan)占总代价97.2%，扫描近6000万行数据。当前EXISTS子查询导致对lineitem表的重复扫描。虽然缺少针对l_commitdate和l_receiptdate的索引，但可以通过查询重写将EXISTS转换为半连接(SEMI JOIN)，利用PostgreSQL优化器选择更高效的执行策略，减少重复扫描开销。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS相关子查询改写为SEMI JOIN。当前EXISTS子查询对每个符合日期条件的orders记录都触发lineitem全表扫描。改写为'INNER JOIN (SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate) l ON o_orderkey = l.l_orderkey'，可以先对lineitem进行一次过滤和去重，然后与orders进行哈希连接，避免重复扫描，显著降低I/O开销。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将日期范围条件'o_orderdate >= date '1996-01-01' and o_orderdate < date '1996-01-01' + interval '3' month'简化为'o_orderdate >= '1996-01-01' AND o_orderdate < '1996-04-01''，消除运行时的interval计算，便于优化器进行常量折叠和分区裁剪(如果有分区表)。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "EXISTS子查询中使用'SELECT *'会扫描lineitem所有列。改为'SELECT 1'或仅投影关联键'SELECT l_orderkey'，减少不必要的列读取开销，降低内存和I/O消耗。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 29 条规则（按优化组筛选: 子查询优化, 谓词简化, 投影优化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "FILTER_REDUCE_EXPRESSIONS", "PROJECT_REMOVE"],
+  "groups": "子查询优化,谓词简化,投影优化",
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.95,
+    "FILTER_REDUCE_EXPRESSIONS": 0.9,
+    "PROJECT_REMOVE": 0.85
+  },
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.7,
+    "FILTER_REDUCE_EXPRESSIONS": 0.2,
+    "PROJECT_REMOVE": 0.1
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,谓词简化,投影优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "PROJECT_REMOVE"
+  ],
+  "rewritten_sql": "SELECT o_orderpriority, COUNT(*) AS order_count\nFROM orders\nJOIN (\n    SELECT DISTINCT l_orderkey\n    FROM lineitem\n    WHERE l_commitdate < l_receiptdate\n      AND l_orderkey IS NOT NULL\n) AS sub_lineitem ON o_orderkey = sub_lineitem.l_orderkey\nWHERE o_orderdate >= DATE '1996-01-01'\n  AND o_orderdate < DATE '1996-04-01'\nGROUP BY o_orderpriority\nORDER BY o_orderpriority",
+  "semantic_correctness_guarantee": "1. **子查询去相关化改写（FILTER_SUB_QUERY_TO_CORRELATE）**：将原始SQL中的EXISTS相关子查询改写为INNER JOIN + DISTINCT子查询。原EXISTS子查询'SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate'的语义是：对每个orders行，检查是否存在至少一个lineitem行满足关联条件(l_orderkey = o_orderkey)和过滤条件(l_commitdate < l_receiptdate)。改写后先对lineitem进行过滤(l_commitdate < l_receiptdate)和去重(DISTINCT l_orderkey)，然后与orders进行INNER JOIN。由于lineitem表的主键是(l_orderkey, l_linenumber)，DISTINCT l_orderkey确保每个l_orderkey只出现一次，JOIN后每个符合日期条件的orders行最多匹配一次，不会产生行数放大。添加'l_orderkey IS NOT NULL'是因为JOIN语义要求关联键非空，与EXISTS语义一致（EXISTS不会匹配NULL关联键）。\n\n2. **谓词常量折叠（FILTER_REDUCE_EXPRESSIONS）**：将原始SQL中的日期范围条件'o_orderdate < date '1996-01-01' + interval '3' month'简化为常量'o_orderdate < DATE '1996-04-01''。这是纯粹的常量计算：1996-01-01加3个月等于1996-04-01。简化后的谓词与原谓词在所有可能的o_orderdate值上产生完全相同的布尔结果，因此语义等价。\n\n3. **投影优化（PROJECT_REMOVE）**：原EXISTS子查询使用'SELECT *'，但EXISTS只关心是否存在匹配行，不关心返回哪些列。改写后的子查询仅投影关联键'SELECT DISTINCT l_orderkey'，减少不必要的列读取。由于EXISTS的语义仅依赖于是否存在匹配行，投影列的变化不影响最终结果集。\n\n4. **GROUP BY与聚合保持不变**：原SQL和重写SQL都对o_orderpriority进行GROUP BY，并计算COUNT(*)。由于JOIN不会改变符合条件的orders行集合（只是改变了筛选方式），每个o_orderpriority分组中的行数保持一致，因此聚合结果相同。\n\n5. **ORDER BY保持不变**：两个SQL都按o_orderpriority排序，结果集顺序一致。\n\n6. **NULL值处理**：原EXISTS子查询中，如果o_orderkey为NULL，则不会匹配任何lineitem行（因为NULL = NULL为UNKNOWN，不满足EXISTS）。改写后的JOIN中，添加了'l_orderkey IS NOT NULL'过滤条件，确保JOIN行为与EXISTS一致。由于orders表的o_orderkey是主键（NOT NULL约束），实际上o_orderkey不会为NULL，但此条件确保了理论上的语义等价性。\n\n7. **结果集等价性总结**：重写SQL返回的结果集与原始SQL完全相同，包括列名(o_orderpriority, order_count)、数据类型、每行的值和排序顺序。改写仅改变了执行路径（从相关子查询改为物化子查询+JOIN），但在TPC-H Schema和标准SQL语义下，两者产生的结果集在所有可能的数据状态下都完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 20291376.0 -> 8332498.0 (重写侧约为原的 41.0642%)
+```json
+{
+  "terminate": true,
+  "reason": "结构明确改进：1) 去相关化成功：原 EXISTS 相关子查询改写为 JOIN + 派生表，消除了对每个 orders 行重复执行 lineitem 扫描的相关子查询模式；2) 并行执行引入：重写后 lineitem 扫描启用 Parallel Seq Scan (Workers Planned: 2)，原计划为串行扫描；3) 行数估计求和大幅下降：从 20,291,376 降至 8,332,498 (降至原 41%)，表明数据流显著收缩；4) cost 下降 24%：从 1,928,131.72 降至 1,461,158.35，与结构改进一致；5) 派生表去重 (DISTINCT + Unique 节点) 提前过滤，避免重复关联。虽然两者均保留 Seq Scan + Index Scan 组合，但重写消除了相关子查询的重复执行瓶颈，引入并行扫描和预去重，结构性收益明显，符合高优先级正信号 (去相关 + 并行化 + 行数大幅下降)，无灾难性退化证据。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化"
+}
+```
+
+🎲 LinUCB Update: 3 rules, reward=+0.1284 (cost=+0.2422, rows=+0.5894, depth=-0.6000, oc=1928131.7200, rc=1461158.3500)
+✅ LinUCB Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: prior=0.653, reward=+0.067, count=13, avg=+0.013
+   → FILTER_REDUCE_EXPRESSIONS: prior=0.563, reward=+0.035, count=45, avg=+0.003
+   → PROJECT_REMOVE: prior=0.603, reward=+0.027, count=27, avg=+0.011
+
+----------------------------------------
+

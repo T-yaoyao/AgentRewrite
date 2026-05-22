@@ -1,0 +1,232 @@
+Query ID: 60
+==================================================
+
+Original: select s_name, count(*) as numwait from supplier, lineitem l1, orders, nation where s_suppkey = l1.l_suppkey and o_orderkey = l1.l_orderkey and o_orderstatus = 'F' and l1.l_receiptdate > l1.l_commitdate and exists ( select * from lineitem l2 where l2.l_orderkey = l1.l_orderkey and l2.l_suppkey <> l1.l_suppkey ) and not exists ( select * from lineitem l3 where l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey and l3.l_receiptdate > l3.l_commitdate ) and s_nationkey = n_nationkey and n_name = 'INDONESIA' group by s_name order by numwait desc, s_name limit 100;
+Rewritten: WITH filtered_lineitem AS (
+    SELECT l_orderkey, l_suppkey
+    FROM lineitem
+    WHERE l_receiptdate > l_commitdate
+),
+orders_f AS (
+    SELECT o_orderkey
+    FROM orders
+    WHERE o_orderstatus = 'F'
+)
+SELECT s_name, COUNT(*) AS numwait
+FROM supplier
+JOIN nation ON s_nationkey = n_nationkey AND n_name = 'INDONESIA'
+JOIN filtered_lineitem AS l1 ON s_suppkey = l1.l_suppkey
+JOIN orders_f ON orders_f.o_orderkey = l1.l_orderkey
+WHERE EXISTS (
+    SELECT 1
+    FROM lineitem l2
+    WHERE l2.l_orderkey = l1.l_orderkey
+      AND l2.l_suppkey <> l1.l_suppkey
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM lineitem l3
+    WHERE l3.l_orderkey = l1.l_orderkey
+      AND l3.l_suppkey <> l1.l_suppkey
+      AND l3.l_receiptdate > l3.l_commitdate
+)
+GROUP BY s_name
+ORDER BY numwait DESC, s_name
+LIMIT 100
+Time Cost: 227.01s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '使用CTE将lineitem的l_receiptdate>l_commitdate过滤结果物化为filtered_lineitem，供l1和l3复用，避免重复全表扫描（当前扫描2次，代价各1.4M）。将l2的DISTINCT子查询改为EXISTS半连接：EXISTS(SELECT 1 FROM lineitem l2 WHERE l2.l_orderkey=l1.l_orderkey AND l2.l_suppkey<>l1.l_suppkey)，消除Aggregate物化和DISTINCT去重开销'}, {'group': '连接优化', 'produced_suggestion': "将orders的o_orderstatus='F'过滤改为CTE预过滤（orders_f），然后用Hash Join连接l1和orders_f，避免当前Nested Loop逐行探测（代价6.0%）。调整JOIN顺序为：nation(小表) -> supplier -> filtered_lineitem(l1) -> orders_f -> EXISTS半连接(l2) -> Anti Join(l3)，确保小表驱动、过滤条件前置"}, {'group': '谓词简化', 'produced_suggestion': "将n_name='INDONESIA'和o_orderstatus='F'的过滤条件在CTE中预先应用，减少后续JOIN的数据量。保留l3的Anti Join结构（LEFT JOIN + IS NULL），但确保l3使用CTE filtered_lineitem而非重新扫描lineitem，避免第三次全表扫描（代价1.4M）"}, {'group': '投影优化', 'produced_suggestion': '在CTE filtered_lineitem中仅投影必需列(l_orderkey, l_suppkey, l_receiptdate, l_commitdate)，减少物化开销。在orders_f CTE中仅投影o_orderkey，减少Hash Join的内存占用'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个严重性能瓶颈：1) lineitem表被扫描3次(l1/l2/l3)，每次全表扫描代价超过137万，合计占比78.7%；2) 两个EXISTS子查询导致Semi Join和Anti Join，产生高代价Hash Join操作(占比12.8%)；3) orders表全表扫描过滤o_orderstatus，代价33.9万；4) 缺少针对l_orderkey、l_suppkey、l_receiptdate、l_commitdate等关键列的索引支持。SQL结构复杂，包含相关子查询、多表连接、聚合和排序，存在明显的查询重写优化空间。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS和NOT EXISTS子查询转换为LEFT JOIN + 聚合条件判断：用LEFT JOIN l2 ON l2.l_orderkey=l1.l_orderkey AND l2.l_suppkey<>l1.l_suppkey，在外层用HAVING COUNT(DISTINCT l2.l_suppkey)>0替代EXISTS；用LEFT JOIN l3 ON l3.l_orderkey=l1.l_orderkey AND l3.l_suppkey<>l1.l_suppkey AND l3.l_receiptdate>l3.l_commitdate，用HAVING COUNT(l3.l_suppkey)=0替代NOT EXISTS。这样可以将Semi Join和Anti Join转换为普通Hash Join，减少重复扫描lineitem表的次数。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将l1.l_receiptdate > l1.l_commitdate过滤条件尽早应用：在JOIN之前对l1进行过滤，减少参与JOIN的数据量。同时将o_orderstatus='F'和n_name='INDONESIA'等高选择性过滤条件前置，利用统计信息优先过滤小结果集，减少后续JOIN的数据量。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接高选择性的小表(nation过滤后 + supplier)，然后再与orders(过滤o_orderstatus='F')连接，最后才连接大表lineitem。这样可以利用小表驱动大表的策略，减少Hash Join的构建代价和探测代价。建议顺序：nation -> supplier -> orders -> lineitem。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "在子查询转换为JOIN后，将聚合条件(COUNT判断)与GROUP BY s_name合并到同一层，避免多次物化中间结果。利用HAVING子句同时完成EXISTS/NOT EXISTS的逻辑判断和最终的分组聚合，减少一次额外的聚合操作。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 71 条规则（按优化组筛选: 子查询优化, 谓词简化, 连接优化, 聚合优化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "JOIN_PUSH_TRANSITIVE_PREDICATES", "FILTER_INTO_JOIN"],
+  "groups": "子查询优化,连接优化,谓词简化",
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.8,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.7,
+    "FILTER_INTO_JOIN": 0.7
+  },
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.4,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.3,
+    "FILTER_INTO_JOIN": 0.3
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,连接优化,谓词简化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "FILTER_INTO_JOIN"
+  ],
+  "rewritten_sql": "SELECT s_name, COUNT(*) AS numwait\nFROM (\n    SELECT s_name, l1.l_orderkey, l1.l_suppkey\n    FROM supplier\n    JOIN nation ON s_nationkey = n_nationkey AND n_name = 'INDONESIA'\n    JOIN (\n        SELECT l_orderkey, l_suppkey\n        FROM lineitem\n        WHERE l_receiptdate > l_commitdate\n    ) AS l1 ON s_suppkey = l1.l_suppkey\n    JOIN (\n        SELECT o_orderkey\n        FROM orders\n        WHERE o_orderstatus = 'F'\n    ) AS orders_filtered ON orders_filtered.o_orderkey = l1.l_orderkey\n    JOIN (\n        SELECT DISTINCT l_orderkey, l_suppkey\n        FROM lineitem\n    ) AS l2 ON l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey\n    LEFT JOIN (\n        SELECT l_orderkey, l_suppkey\n        FROM lineitem\n        WHERE l_receiptdate > l_commitdate\n    ) AS l3 ON l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey <> l1.l_suppkey\n    WHERE l3.l_suppkey IS NULL\n) AS main_query\nGROUP BY s_name\nORDER BY numwait DESC, s_name\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **子查询去相关化改写**：原SQL中的EXISTS子查询(l2)被改写为INNER JOIN + DISTINCT去重；NOT EXISTS子查询(l3)被改写为LEFT JOIN + WHERE IS NULL过滤。EXISTS语义要求至少存在一行满足条件，INNER JOIN + DISTINCT确保l2.l_orderkey=l1.l_orderkey且l2.l_suppkey<>l1.l_suppkey的行存在；NOT EXISTS语义要求不存在满足条件的行，LEFT JOIN后WHERE l3.l_suppkey IS NULL确保不存在l3.l_orderkey=l1.l_orderkey且l3.l_suppkey<>l1.l_suppkey且l3.l_receiptdate>l3.l_commitdate的行。\n\n2. **谓词下推到子查询**：将l1.l_receiptdate > l1.l_commitdate下推到l1子查询内部，将o_orderstatus='F'下推到orders子查询内部，将n_name='INDONESIA'直接放在nation的JOIN ON条件中。这些谓词仅依赖单表列，下推后过滤时机提前但不改变最终结果集，因为WHERE子句与JOIN ON中单表条件在INNER JOIN语义下等价。\n\n3. **传递性谓词推导**：原SQL中s_suppkey=l1.l_suppkey且后续所有JOIN条件均为等值连接，传递性已隐含在JOIN链中。重写后保持了所有等值连接关系(s_suppkey=l1.l_suppkey, o_orderkey=l1.l_orderkey, l2.l_orderkey=l1.l_orderkey, l3.l_orderkey=l1.l_orderkey)，未引入额外传递谓词但也未丢失任何连接条件。\n\n4. **JOIN顺序调整与结果集等价性**：原SQL采用隐式逗号连接，重写后显式指定JOIN顺序(nation->supplier->l1->orders->l2->l3)。由于所有连接均为INNER JOIN(除l3为LEFT JOIN)，且连接条件完整保留，根据关系代数交换律和结合律，JOIN顺序改变不影响最终结果集。LEFT JOIN l3的位置在所有INNER JOIN之后，确保先筛选出满足EXISTS条件的行，再用LEFT JOIN + IS NULL实现NOT EXISTS语义。\n\n5. **DISTINCT去重的必要性与正确性**：l2子查询添加DISTINCT是因为原EXISTS只需判断存在性，不关心匹配行数；若不去重，同一l_orderkey下多个不同l_suppkey会导致笛卡尔积放大l1的行数，进而影响最终COUNT(*)结果。DISTINCT确保每个(l_orderkey, l_suppkey)组合只保留一行，JOIN后每个l1行最多匹配一次，保持与原EXISTS语义一致。\n\n6. **LEFT JOIN + IS NULL实现NOT EXISTS的等价性**：原NOT EXISTS要求不存在满足l3.l_orderkey=l1.l_orderkey且l3.l_suppkey<>l1.l_suppkey且l3.l_receiptdate>l3.l_commitdate的行。LEFT JOIN后，若存在匹配行则l3.l_suppkey非NULL，若不存在匹配行则l3.l_suppkey为NULL。WHERE l3.l_suppkey IS NULL精确过滤出不存在匹配行的情况，与NOT EXISTS语义完全等价。\n\n7. **GROUP BY与聚合函数的保持**：原SQL按s_name分组并计数，重写后外层查询保持相同的GROUP BY s_name和COUNT(*)聚合。由于内层子查询已完成所有过滤和连接，每个s_name对应的行数与原SQL一致，因此COUNT(*)结果相同。ORDER BY numwait DESC, s_name和LIMIT 100也完整保留，确保最终输出的行顺序和数量与原SQL一致。\n\n8. **NULL值处理的正确性**：LEFT JOIN l3后，WHERE l3.l_suppkey IS NULL利用了LEFT JOIN在无匹配时右表列为NULL的特性。由于l_suppkey在lineitem表中定义为NOT NULL，只有在LEFT JOIN无匹配时才会出现NULL，因此IS NULL判断准确识别出NOT EXISTS的语义，不会误判实际数据中的NULL值(因为l_suppkey本身不允许NULL)。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过JOIN + DISTINCT实现EXISTS、LEFT JOIN + IS NULL实现NOT EXISTS，谓词下推和JOIN顺序调整均保持结果集不变，与原SQL等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 6->5, index-like 0->1 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 81998451.0 -> 51208266.0 (重写侧约为原的 62.4503%)
+```json
+{
+  "terminate": false,
+  "reason": "重写引入了结构性退化：1) 新增了 Unique + Gather Merge + Sort + Aggregate(Hashed) 链路对 lineitem 进行 DISTINCT 去重（l2），这是一个高开销的物化操作，原计划中不存在；2) 新增了 Nested Loop + Index Scan 对 orders 进行逐行探测，虽然引入了索引扫描，但在大数据量场景下 Nested Loop 的累积代价可能高于原 Hash Join；3) 虽然 cost 下降约 8.4%，但结构上新增的 DISTINCT 物化和 Nested Loop 探测是明显的负信号，且行数估计求和下降 37.5% 不足以触发"大幅度降低"阈值（未降至原 10% 以下）；4) 原计划的 Semi Join 和 Anti Join 已经是针对 EXISTS/NOT EXISTS 的高效执行路径，重写后用 LEFT JOIN + IS NULL 替代 Anti Join 是合理的，但用 DISTINCT + Nested Loop 替代 Semi Join 引入了额外开销。综合判断：虽然 cost 略有下降，但结构上新增的 DISTINCT 物化和 Nested Loop 探测是明显的退化信号，不应终止优化。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 rewritten_sql 继续改进：1) 移除 l2 的 DISTINCT 去重操作，直接用 EXISTS 子查询或保留原 Semi Join 结构，避免对 lineitem 全表进行 DISTINCT 物化；2) 将 orders 的过滤条件 o_orderstatus='F' 改为派生表或 CTE 预过滤，但保持 Hash Join 而非 Nested Loop，避免逐行探测；3) 保留 l3 的 LEFT JOIN + IS NULL 结构（Anti Join 替代方案合理），但确保 l1 和 l3 的过滤条件 l_receiptdate > l_commitdate 在 JOIN 前应用；4) 调整 JOIN 顺序：nation -> supplier -> l1(预过滤) -> orders(预过滤) -> l2(Semi Join 或 EXISTS) -> l3(Anti Join 或 LEFT JOIN + IS NULL)，避免引入 DISTINCT 和 Nested Loop。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示三个关键性能瓶颈：1) lineitem表被扫描3次（l1/l2/l3），每次全表扫描代价约1.4M，合计占比86%；2) l2的DISTINCT操作引入了Aggregate物化（代价2.5%）和Nested Loop逐行探测orders（代价6.0%），这是上一轮重写引入的结构性退化；3) Anti Join使用Hash Join但Join Filter条件l_suppkey<>导致额外开销（代价3.6%）。根据上一轮反馈，需移除DISTINCT、避免Nested Loop、保持Hash Join结构，并通过CTE复用lineitem过滤结果减少重复扫描",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用CTE将lineitem的l_receiptdate>l_commitdate过滤结果物化为filtered_lineitem，供l1和l3复用，避免重复全表扫描（当前扫描2次，代价各1.4M）。将l2的DISTINCT子查询改为EXISTS半连接：EXISTS(SELECT 1 FROM lineitem l2 WHERE l2.l_orderkey=l1.l_orderkey AND l2.l_suppkey<>l1.l_suppkey)，消除Aggregate物化和DISTINCT去重开销"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将orders的o_orderstatus='F'过滤改为CTE预过滤（orders_f），然后用Hash Join连接l1和orders_f，避免当前Nested Loop逐行探测（代价6.0%）。调整JOIN顺序为：nation(小表) -> supplier -> filtered_lineitem(l1) -> orders_f -> EXISTS半连接(l2) -> Anti Join(l3)，确保小表驱动、过滤条件前置"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将n_name='INDONESIA'和o_orderstatus='F'的过滤条件在CTE中预先应用，减少后续JOIN的数据量。保留l3的Anti Join结构（LEFT JOIN + IS NULL），但确保l3使用CTE filtered_lineitem而非重新扫描lineitem，避免第三次全表扫描（代价1.4M）"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在CTE filtered_lineitem中仅投影必需列(l_orderkey, l_suppkey, l_receiptdate, l_commitdate)，减少物化开销。在orders_f CTE中仅投影o_orderkey，减少Hash Join的内存占用"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择...
+📚 加载规则库 55 条规则（按优化组筛选: 子查询优化, 连接优化, 谓词简化, 投影优化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_AGGREGATE_TRANSPOSE",
+    "SEMI_JOIN_JOIN_TRANSPOSE",
+    "FILTER_INTO_JOIN"
+  ],
+  "groups": "子查询优化, 谓词简化, 连接优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.7,
+    "SEMI_JOIN_JOIN_TRANSPOSE": 0.7,
+    "FILTER_INTO_JOIN": 0.6
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.4,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.2,
+    "SEMI_JOIN_JOIN_TRANSPOSE": 0.2,
+    "FILTER_INTO_JOIN": 0.2
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 谓词简化, 连接优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_AGGREGATE_TRANSPOSE",
+    "SEMI_JOIN_JOIN_TRANSPOSE",
+    "FILTER_INTO_JOIN"
+  ],
+  "rewritten_sql": "WITH filtered_lineitem AS (\n    SELECT l_orderkey, l_suppkey\n    FROM lineitem\n    WHERE l_receiptdate > l_commitdate\n),\norders_f AS (\n    SELECT o_orderkey\n    FROM orders\n    WHERE o_orderstatus = 'F'\n)\nSELECT s_name, COUNT(*) AS numwait\nFROM supplier\nJOIN nation ON s_nationkey = n_nationkey AND n_name = 'INDONESIA'\nJOIN filtered_lineitem AS l1 ON s_suppkey = l1.l_suppkey\nJOIN orders_f ON orders_f.o_orderkey = l1.l_orderkey\nWHERE EXISTS (\n    SELECT 1\n    FROM lineitem l2\n    WHERE l2.l_orderkey = l1.l_orderkey\n      AND l2.l_suppkey <> l1.l_suppkey\n)\nAND NOT EXISTS (\n    SELECT 1\n    FROM lineitem l3\n    WHERE l3.l_orderkey = l1.l_orderkey\n      AND l3.l_suppkey <> l1.l_suppkey\n      AND l3.l_receiptdate > l3.l_commitdate\n)\nGROUP BY s_name\nORDER BY numwait DESC, s_name\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **CTE物化改写（STRATEGY_CTE_DECOMPOSITION）**：将原SQL中两次出现的 `lineitem WHERE l_receiptdate > l_commitdate` 子查询提取为CTE `filtered_lineitem`，供l1复用；将 `orders WHERE o_orderstatus = 'F'` 提取为CTE `orders_f`。这两个CTE仅做过滤投影，不改变数据内容，与原子查询语义等价。\n\n2. **l2的DISTINCT子查询改为EXISTS半连接（SEMI_JOIN_JOIN_TRANSPOSE）**：原SQL中 `l2` 是 `SELECT DISTINCT l_orderkey, l_suppkey FROM lineitem`，通过 `JOIN l2 ON l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey` 实现"存在其他供应商"的语义。改写为 `EXISTS (SELECT 1 FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey)`，两者等价：原JOIN要求l2中存在满足条件的行，EXISTS同样检查存在性；DISTINCT在原SQL中用于去重后JOIN，但JOIN条件本身只关心存在性，EXISTS天然去重，结果集不变。\n\n3. **l3的LEFT JOIN + IS NULL改为NOT EXISTS反连接（SEMI_JOIN_JOIN_TRANSPOSE）**：原SQL用 `LEFT JOIN l3 ON ... WHERE l3.l_suppkey IS NULL` 实现反连接（排除存在延迟收货的其他供应商）。改写为 `NOT EXISTS (SELECT 1 FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey <> l1.l_suppkey AND l3.l_receiptdate > l3.l_commitdate)`，两者语义等价：LEFT JOIN + IS NULL 筛选出左表中在右表无匹配的行，NOT EXISTS 同样筛选出不存在满足条件的行，结果集一致。\n\n4. **过滤条件前置（FILTER_INTO_JOIN）**：`n_name = 'INDONESIA'` 和 `o_orderstatus = 'F'` 在原SQL中分别通过子查询或JOIN条件应用，改写后通过CTE和JOIN ON条件前置过滤，减少JOIN输入数据量，但不改变最终结果集：nation和orders的过滤条件在JOIN前后应用效果相同（内连接可交换过滤顺序）。\n\n5. **JOIN顺序调整**：原SQL的JOIN顺序为 supplier -> nation -> l1 -> orders_filtered -> l2 -> l3，改写后调整为 supplier -> nation -> l1(CTE) -> orders_f(CTE) -> EXISTS(l2) -> NOT EXISTS(l3)。由于所有JOIN均为内连接（除l3为反连接），且JOIN条件和WHERE条件未改变，JOIN顺序调整不影响结果集（关系代数的交换律和结合律）。\n\n6. **GROUP BY和聚合保持不变**：原SQL和重写SQL均对 `s_name` 分组并计数，聚合逻辑未改变，输出列 `s_name` 和 `numwait` 语义一致。\n\n7. **ORDER BY和LIMIT保持不变**：排序条件 `numwait DESC, s_name` 和 `LIMIT 100` 在改写前后完全一致，最终输出的100行结果集顺序和内容相同。\n\n8. **易误判点说明**：l2的DISTINCT改为EXISTS可能被误判为改变语义，但原SQL中l2的DISTINCT仅用于去重后JOIN，JOIN条件本身只关心存在性（至少一行满足 `l2.l_suppkey <> l1.l_suppkey`），EXISTS天然实现存在性检查且无需物化DISTINCT，结果集等价。l3的LEFT JOIN + IS NULL改为NOT EXISTS同理，两者均实现反连接语义，NULL检查与NOT EXISTS逻辑一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取公共过滤逻辑、将WHERE条件推入JOIN ON，并调整JOIN顺序，但保持了相同的过滤条件、连接关系和EXISTS/NOT EXISTS子查询语义，最终结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（cost、节点类型、扫描方式、JOIN顺序、并行度均无变化），说明优化器未采纳CTE重写。原因：PostgreSQL优化器将CTE视为优化屏障（optimization fence），filtered_lineitem和orders_f被强制物化后无法与主查询融合优化，导致：1) lineitem仍被扫描3次（l1/l2/l3各1次，未实现CTE复用）；2) orders的o_orderstatus='F'过滤未前置到CTE，仍在主查询中执行；3) 两个EXISTS子查询保持原样，未转换为半连接。结构上无改进，cost持平但未获得预期的扫描次数减少和过滤前置收益。需尝试不同重写策略。",
+  "no_further_optimization": false,
+  "next_step_advice": "放弃CTE方案，改用派生表（inline view）+ 显式JOIN重排：1) 将lineitem的l_receiptdate>l_commitdate过滤改为派生表(SELECT l_orderkey, l_suppkey FROM lineitem WHERE l_receiptdate>l_commitdate) AS l1，允许优化器融合；2) 将orders的o_orderstatus='F'过滤改为派生表(SELECT o_orderkey FROM orders WHERE o_orderstatus='F') AS orders_f；3) 将第一个EXISTS改为显式INNER JOIN：INNER JOIN (SELECT DISTINCT l_orderkey FROM lineitem) AS l2_distinct ON l1.l_orderkey=l2_distinct.l_orderkey AND EXISTS(SELECT 1 FROM lineitem l2_inner WHERE l2_inner.l_orderkey=l1.l_orderkey AND l2_inner.l_suppkey<>l1.l_suppkey)；4) 将NOT EXISTS改为LEFT JOIN + IS NULL：LEFT JOIN (SELECT l_orderkey, l_suppkey FROM lineitem WHERE l_receiptdate>l_commitdate) AS l3 ON l1.l_orderkey=l3.l_orderkey AND l1.l_suppkey<>l3.l_suppkey WHERE l3.l_orderkey IS NULL。调整JOIN顺序为nation -> supplier -> l1派生表 -> orders_f派生表 -> l2半连接 -> l3反连接，确保小表驱动、过滤前置、派生表可融合优化。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+
+🎲 LinUCB Update: 4 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=5399366.7400, rc=5399366.7400)
+✅ LinUCB Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: prior=0.449, reward=+0.000, count=131, avg=+0.018
+   → FILTER_AGGREGATE_TRANSPOSE: prior=0.595, reward=+0.000, count=25, avg=+0.015
+   → SEMI_JOIN_JOIN_TRANSPOSE: prior=0.884, reward=+0.000, count=2, avg=+0.000
+   → FILTER_INTO_JOIN: prior=0.434, reward=+0.000, count=140, avg=+0.005
+
+----------------------------------------
+

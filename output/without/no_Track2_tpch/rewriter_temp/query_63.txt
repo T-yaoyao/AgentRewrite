@@ -1,0 +1,212 @@
+Query ID: 63
+==================================================
+
+Original: select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal from ( select substring(c_phone from 1 for 2) as cntrycode, c_acctbal from customer where substring(c_phone from 1 for 2) in ('15', '18', '31', '33', '32', '28', '16') and c_acctbal > ( select avg(c_acctbal) from customer where c_acctbal > 0.00 and substring(c_phone from 1 for 2) in ('15', '18', '31', '33', '32', '28', '16') ) and not exists ( select * from orders where o_custkey = c_custkey ) ) as custsale group by cntrycode order by cntrycode;
+Rewritten: WITH avg_acctbal AS (
+  SELECT avg(c_acctbal) AS avg_bal
+  FROM customer
+  WHERE c_acctbal > 0.00
+    AND substring(c_phone from 1 for 2) IN ('15', '18', '31', '33', '32', '28', '16')
+),
+filtered_customer AS (
+  SELECT c_custkey,
+         substring(c_phone from 1 for 2) AS cntrycode,
+         c_acctbal
+  FROM customer
+  WHERE substring(c_phone from 1 for 2) IN ('15', '18', '31', '33', '32', '28', '16')
+    AND c_acctbal > (SELECT avg_bal FROM avg_acctbal)
+)
+SELECT fc.cntrycode,
+       count(*) AS numcust,
+       sum(fc.c_acctbal) AS totacctbal
+FROM filtered_customer fc
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM orders
+  WHERE o_custkey = fc.c_custkey
+)
+GROUP BY fc.cntrycode
+ORDER BY fc.cntrycode
+Time Cost: 599.57s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "移除no_orders_customers CTE，将NOT EXISTS子查询改为直接查询orders表：'NOT EXISTS (SELECT 1 FROM orders WHERE o_custkey = fc.c_custkey)'。这样优化器可选择Hash Anti Join(原方案cost 431222)而非当前的Merge Anti Join(cost 1107098)，避免orders表的物化(Aggregate cost 393081)、排序(Sort cost 95217)和Gather Merge(cost 231362)开销，预计总代价可降回50万左右。"}, {'group': '连接优化', 'produced_suggestion': '通过移除显式CTE物化，让Anti Join从Merge Join退回Hash Join模式。Hash Anti Join利用orders表的o_custkey构建哈希表后直接探测，无需预先去重和排序，可消除当前执行计划中33.8%的Aggregate开销和28.1%的排序开销(Gather Merge+Sort)。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个明显性能瓶颈：1) orders表全表扫描代价占比66.5%，涉及1500万行数据的Anti Join操作；2) customer表被扫描两次（主查询和子查询各一次），代价各占10.8%；3) 子查询计算avg(c_acctbal)需要全表扫描并过滤；4) NOT EXISTS转换为Right Anti Hash Join，虽然使用了Hash但仍需扫描orders全表。可通过子查询优化（提取常量子查询、优化NOT EXISTS）、连接优化（调整连接方式）、谓词简化（合并重复过滤条件）来提升性能。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将标量子查询 avg(c_acctbal) 提取为 CTE 或临时变量，避免在主查询执行时重复计算。该子查询需要扫描 customer 表并过滤 c_acctbal > 0 和国家代码条件，提取后可减少一次全表扫描。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "NOT EXISTS 子查询当前转换为 Right Anti Hash Join，需要扫描 orders 全表（1500万行，代价占比66.5%）。考虑改写为 LEFT JOIN + IS NULL 模式，或利用 o_custkey 索引（如果存在）来优化反连接操作。若 orders 表有 o_custkey 索引，可显著降低扫描代价。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "substring(c_phone from 1 for 2) in ('15','18','31','33','32','28','16') 条件在主查询和子查询中重复出现。将此条件统一处理，避免在两次 customer 表扫描中重复计算 substring 函数。可考虑在 CTE 中预先过滤符合国家代码的客户。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "当前 Anti Join 使用 Hash Join 方式，orders 表作为外表需要全表扫描。如果 orders 表在 o_custkey 列上有索引，可尝试改写为 Nested Loop Anti Join 或使用 NOT IN (SELECT o_custkey FROM orders WHERE ...) 配合索引查找，减少 orders 表的扫描代价。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "子查询 custsale 中只需要 cntrycode 和 c_acctbal 两列，确保在 customer 表扫描时只投影必要列。同时 NOT EXISTS 子查询中 'select *' 可改为 'select 1'，减少不必要的列传输。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 55 条规则（按优化组筛选: 子查询优化, 谓词简化, 连接优化, 投影优化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_PROJECT_TRANSPOSE", "FILTER_SUB_QUERY_TO_CORRELATE"],
+  "groups": "子查询优化,谓词简化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "FILTER_PROJECT_TRANSPOSE": 0.7,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.8
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.4,
+    "FILTER_PROJECT_TRANSPOSE": 0.3,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.3
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,谓词简化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_PROJECT_TRANSPOSE",
+    "FILTER_SUB_QUERY_TO_CORRELATE"
+  ],
+  "rewritten_sql": "WITH avg_acctbal AS (\n  SELECT avg(c_acctbal) AS avg_bal\n  FROM customer\n  WHERE c_acctbal > 0.00\n    AND substring(c_phone from 1 for 2) IN ('15', '18', '31', '33', '32', '28', '16')\n),\nfiltered_customer AS (\n  SELECT c_custkey,\n         substring(c_phone from 1 for 2) AS cntrycode,\n         c_acctbal\n  FROM customer\n  WHERE substring(c_phone from 1 for 2) IN ('15', '18', '31', '33', '32', '28', '16')\n    AND c_acctbal > (SELECT avg_bal FROM avg_acctbal)\n),\nno_orders_customers AS (\n  SELECT DISTINCT o_custkey\n  FROM orders\n  WHERE o_custkey IS NOT NULL\n)\nSELECT fc.cntrycode,\n       count(*) AS numcust,\n       sum(fc.c_acctbal) AS totacctbal\nFROM filtered_customer fc\nWHERE NOT EXISTS (\n  SELECT 1\n  FROM no_orders_customers noc\n  WHERE noc.o_custkey = fc.c_custkey\n)\nGROUP BY fc.cntrycode\nORDER BY fc.cntrycode",
+  "semantic_correctness_guarantee": "1. **STRATEGY_CTE_DECOMPOSITION应用**：将原始SQL中的标量子查询 avg(c_acctbal) 提取为CTE avg_acctbal，避免在主查询执行时重复计算。该子查询仅依赖customer表的静态过滤条件（c_acctbal > 0 和国家代码），与外层查询无相关性，提取后结果完全等价。\n\n2. **STRATEGY_CTE_DECOMPOSITION应用**：将主查询中对customer表的过滤逻辑（国家代码过滤 + c_acctbal > avg 过滤 + 投影cntrycode和c_acctbal）提取为CTE filtered_customer。该CTE包含原始内层子查询custsale的全部逻辑，仅是结构重组，未改变过滤条件或投影列，结果集与原custsale完全一致。\n\n3. **FILTER_PROJECT_TRANSPOSE应用**：在filtered_customer CTE中，将substring(c_phone from 1 for 2)的计算与过滤条件同时处理，并直接投影为cntrycode列。这避免了原始SQL中先投影再过滤的嵌套，但保持了相同的计算逻辑和过滤顺序，结果集不变。\n\n4. **NOT EXISTS子查询保留**：原始SQL中的NOT EXISTS子查询用于过滤掉在orders表中有订单的客户。重写后保持NOT EXISTS结构不变，仅将内部的SELECT * 改为SELECT 1（标准优化，不影响EXISTS语义），并引用no_orders_customers CTE以提高可读性。NOT EXISTS的反连接语义完全保留，过滤逻辑等价。\n\n5. **FILTER_SUB_QUERY_TO_CORRELATE未实际应用于NOT EXISTS**：虽然规则序列包含此规则,但经分析NOT EXISTS改写为LEFT JOIN + IS NULL在当前Schema下（orders表无o_custkey索引）不会带来性能提升，且可能引入NULL处理复杂性。因此保持NOT EXISTS原结构，确保语义严格等价。no_orders_customers CTE仅作为辅助结构，未改变反连接逻辑。\n\n6. **GROUP BY和聚合函数保持一致**：重写后的GROUP BY cntrycode、count(*)和sum(c_acctbal)与原始SQL完全一致，聚合作用域为经过NOT EXISTS过滤后的filtered_customer行集，与原custsale子查询过滤后的行集等价。\n\n7. **ORDER BY保持一致**：重写后ORDER BY cntrycode与原始SQL一致，排序列和顺序未改变。\n\n8. **易误判点说明**：substring函数在CTE中仅计算一次并复用，避免了原始SQL中在子查询和主查询中重复计算的冗余，但计算结果和过滤逻辑完全相同。avg_acctbal CTE的提取不影响其作为标量值在filtered_customer中的使用，WHERE c_acctbal > (SELECT avg_bal FROM avg_acctbal)与原始WHERE c_acctbal > (SELECT avg(...))语义完全等价。NOT EXISTS的相关列o_custkey = c_custkey在重写后保持不变，反连接条件未被修改。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取了标量子查询和过滤逻辑，NOT EXISTS反连接语义保持不变，最终结果集（按cntrycode分组的客户数和余额总和）完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：1) 重写引入3个CTE（avg_acctbal、filtered_customer、no_orders_customers），实现了avg子查询的一次性计算与复用，这是明确的正向信号；2) 但Anti Join从Hash Join（原cost 431222.91）退化为Merge Join（新cost 1107098.83），且新增了对orders表的Gather Merge + Sort + Aggregate(Hashed)物化操作（cost 810991.65→1048422.81），引入了高开销的排序与去重；3) 原方案利用Hash Join的Inner Unique特性直接完成反连接，新方案需先物化orders全表的distinct o_custkey（估计831576行），再排序后做Merge Anti Join；4) 虽然CTE复用是正向改进，但orders表处理路径从单次并行扫描+Hash探测，变为并行扫描+哈希聚合+排序+Gather Merge+再排序，增加了两次大规模排序与一次物化，这是明确的结构退化；5) cost从486955增至1161257（增幅138%），虽cost仅为辅助信号，但结合上述结构退化可作为佐证；6) 行数估计求和从630万增至1082万（增幅71%），未达到'大幅下降'标准，不能触发高优先级成功终止规则。综合判断：CTE复用带来的avg子查询优化收益，被Anti Join路径的结构退化抵消且有余，当前重写未达到整体改进。",
+  "no_further_optimization": false,
+  "next_step_advice": "保留avg_acctbal和filtered_customer两个CTE（已实现avg子查询复用和customer过滤复用），但移除no_orders_customers CTE。将Anti Join改回原方案的Hash Anti Join模式：直接用NOT EXISTS子查询，让优化器选择Hash Anti Join而非Merge Anti Join。具体改写：在filtered_customer基础上，WHERE子句直接写'NOT EXISTS (SELECT 1 FROM orders WHERE o_custkey = fc.c_custkey)'，避免显式物化orders的distinct集合。这样既保留CTE复用收益，又避免orders表的排序物化开销。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "根据上一轮反馈，当前SQL的核心问题是no_orders_customers CTE引入了orders表的物化、排序和Merge Anti Join，导致代价从486955增至1161257。执行计划显示：1) Aggregate(Hashed)对orders表分组去重消耗33.8%代价(393081)；2) orders全表扫描消耗27.9%(323772)；3) Gather Merge和Sort引入额外19.9%+8.2%的排序开销(326580)。这些开销均源于显式物化no_orders_customers。解决方案：移除no_orders_customers CTE，将NOT EXISTS子查询直接作用于orders表原始数据，让优化器选择Hash Anti Join而非Merge Anti Join，避免物化和排序。保留avg_acctbal和filtered_customer两个CTE以维持avg子查询复用收益。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "移除no_orders_customers CTE，将NOT EXISTS子查询改为直接查询orders表：'NOT EXISTS (SELECT 1 FROM orders WHERE o_custkey = fc.c_custkey)'。这样优化器可选择Hash Anti Join(原方案cost 431222)而非当前的Merge Anti Join(cost 1107098)，避免orders表的物化(Aggregate cost 393081)、排序(Sort cost 95217)和Gather Merge(cost 231362)开销，预计总代价可降回50万左右。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "通过移除显式CTE物化，让Anti Join从Merge Join退回Hash Join模式。Hash Anti Join利用orders表的o_custkey构建哈希表后直接探测，无需预先去重和排序，可消除当前执行计划中33.8%的Aggregate开销和28.1%的排序开销(Gather Merge+Sort)。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择...
+📚 加载规则库 33 条规则（按优化组筛选: 子查询优化, 连接优化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_SUB_QUERY_TO_CORRELATE"
+  ],
+  "groups": "子查询优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.9
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.6,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.4
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_SUB_QUERY_TO_CORRELATE"
+  ],
+  "rewritten_sql": "WITH avg_acctbal AS (\n  SELECT avg(c_acctbal) AS avg_bal\n  FROM customer\n  WHERE c_acctbal > 0.00\n    AND substring(c_phone from 1 for 2) IN ('15', '18', '31', '33', '32', '28', '16')\n),\nfiltered_customer AS (\n  SELECT c_custkey,\n         substring(c_phone from 1 for 2) AS cntrycode,\n         c_acctbal\n  FROM customer\n  WHERE substring(c_phone from 1 for 2) IN ('15', '18', '31', '33', '32', '28', '16')\n    AND c_acctbal > (SELECT avg_bal FROM avg_acctbal)\n)\nSELECT fc.cntrycode,\n       count(*) AS numcust,\n       sum(fc.c_acctbal) AS totacctbal\nFROM filtered_customer fc\nWHERE NOT EXISTS (\n  SELECT 1\n  FROM orders\n  WHERE o_custkey = fc.c_custkey\n)\nGROUP BY fc.cntrycode\nORDER BY fc.cntrycode",
+  "semantic_correctness_guarantee": "1. **CTE avg_acctbal 的提取与复用**：将原 SQL 中 filtered_customer 内的标量子查询 `(SELECT avg_bal FROM avg_acctbal)` 所依赖的平均值计算提取为独立 CTE。由于 avg(c_acctbal) 在给定过滤条件下返回唯一标量值，且 filtered_customer 仅引用一次该值，提取后语义完全等价，同时实现了计算复用。\n\n2. **CTE filtered_customer 的保留**：该 CTE 封装了对 customer 表的两层过滤（国家代码 IN 列表 + c_acctbal 大于平均值）以及投影（c_custkey、cntrycode、c_acctbal）。其结果集与原 SQL 中同名 CTE 完全一致，作为主查询的数据源，语义无变化。\n\n3. **移除 no_orders_customers CTE，改为直接相关子查询**：原 SQL 中 no_orders_customers 显式物化了 orders 表中所有非空 o_custkey 的去重集合，然后通过 NOT EXISTS 与 filtered_customer 做反连接。重写后直接在 WHERE 子句中使用 `NOT EXISTS (SELECT 1 FROM orders WHERE o_custkey = fc.c_custkey)`，让优化器直接对 orders 表执行相关子查询。由于 NOT EXISTS 的语义是"不存在满足条件的行"，无论 orders 中 o_custkey 是否重复，只要存在任意一行匹配 fc.c_custkey，该 customer 行即被过滤；因此去重操作（DISTINCT）对最终结果集无影响，移除 CTE 后语义完全等价。\n\n4. **Anti Join 语义的等价性**：原 SQL 通过 `NOT EXISTS (SELECT 1 FROM no_orders_customers noc WHERE noc.o_custkey = fc.c_custkey)` 实现反连接，本质是排除在 orders 表中存在订单的客户。重写后 `NOT EXISTS (SELECT 1 FROM orders WHERE o_custkey = fc.c_custkey)` 直接在 orders 表上执行相关子查询，由于 orders.o_custkey 是外键引用 customer.c_custkey（Schema 中定义），且 NOT EXISTS 仅关心存在性而非重复次数，两种写法在逻辑上完全等价：均返回"在 filtered_customer 中但在 orders 表中无对应 o_custkey 的客户"。\n\n5. **GROUP BY 与聚合函数的保持**：主查询的 `GROUP BY fc.cntrycode` 以及 `count(*)`、`sum(fc.c_acctbal)` 聚合逻辑未做任何改动，仅数据源从原 filtered_customer（经 NOT EXISTS 过滤后）变为重写后的 filtered_customer（经相同语义的 NOT EXISTS 过滤后），聚合输入行集完全一致，输出结果集等价。\n\n6. **ORDER BY 的保持**：`ORDER BY fc.cntrycode` 未改动，排序键与原 SQL 一致，最终结果集的行顺序完全相同。\n\n7. **NULL 值处理的等价性**：原 SQL 中 no_orders_customers 使用 `WHERE o_custkey IS NOT NULL` 过滤空值后再去重，但由于 orders.o_custkey 定义为 NOT NULL（Schema 中明确），该过滤条件实际无效（不会过滤任何行）。重写后直接在 orders 上执行相关子查询，NOT EXISTS 的语义天然排除 NULL 匹配（SQL 标准中 NULL = NULL 返回 UNKNOWN，NOT EXISTS 不会因 NULL 产生误判），因此 NULL 处理逻辑等价。\n\n8. **执行计划优化路径的改变不影响语义**：移除 no_orders_customers CTE 后，优化器可选择 Hash Anti Join 而非 Merge Anti Join，避免 orders 表的物化、排序和 Gather Merge 开销。这是执行策略的变化，不改变查询语义：Hash Anti Join 通过哈希表探测实现反连接，Merge Anti Join 通过排序后归并实现反连接，两者在逻辑上均实现"排除存在匹配的行"，结果集完全一致。重写后预期优化器选择成本更低的 Hash Anti Join 路径，但无论选择哪种物理算子，最终返回的行集与原 SQL 等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE提取了平均值计算和过滤逻辑，并将NOT EXISTS相关子查询直接内联到WHERE子句，这些变换均为结构性改写，未改变最终结果集的行集合与列语义。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（cost 486955.81，节点结构、扫描方式、连接算法、并行度均无变化），说明优化器未采纳 CTE 重写。虽然重写 SQL 引入了 avg_acctbal 和 filtered_customer 两个 CTE，意图通过物化公共中间结果实现复用，但实际执行计划显示优化器将 CTE 内联回原始形式，仍保持 InitPlan 1 计算平均值 + Hash Anti Join 的结构。结构上无改进也无恶化，但本轮重写未产生实际效果。结合 optimization_context 中的建议（移除 no_orders_customers CTE，改用直接 NOT EXISTS 以触发 Hash Anti Join），当前重写方向未命中优化器预期路径。应继续尝试下一轮改写。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 enhanced_sql，移除 filtered_customer CTE 的显式物化，将其改为内联派生表或直接在主查询中展开过滤条件，同时保留 avg_acctbal CTE（因其为标量子查询，优化器已正确处理为 InitPlan）。具体改写：将 'FROM filtered_customer fc WHERE NOT EXISTS ...' 改为 'FROM (SELECT c_custkey, substring(c_phone from 1 for 2) AS cntrycode, c_acctbal FROM customer WHERE substring(c_phone from 1 for 2) IN (...) AND c_acctbal > (SELECT avg_bal FROM avg_acctbal)) fc WHERE NOT EXISTS ...'，或直接展开为单层查询。目标是让优化器继续选择 Hash Anti Join，同时避免 CTE 物化屏障。若仍无效，则尝试完全移除 CTE，回归原始 SQL 的内联子查询形式，但调整 NOT EXISTS 子查询写法（如显式 SELECT 1 而非 SELECT *）以确认是否触发不同的连接策略。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+
+🎲 LinUCB Update: 2 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=486955.8100, rc=486955.8100)
+✅ LinUCB Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: prior=0.488, reward=+0.000, count=134, avg=+0.017
+   → FILTER_SUB_QUERY_TO_CORRELATE: prior=0.599, reward=+0.000, count=25, avg=+0.021
+
+----------------------------------------
+

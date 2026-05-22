@@ -1,0 +1,251 @@
+Query ID: 49
+==================================================
+
+Original: select c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity) from customer, orders, lineitem where o_orderkey in ( select l_orderkey from lineitem group by l_orderkey having sum(l_quantity) > 315 ) and c_custkey = o_custkey and o_orderkey = l_orderkey group by c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice order by o_totalprice desc, o_orderdate limit 100;
+Rewritten: WITH lineitem_filtered AS (
+    SELECT l_orderkey
+    FROM lineitem
+    GROUP BY l_orderkey
+    HAVING sum(l_quantity) > 315
+)
+SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity)
+FROM lineitem_filtered lf
+JOIN orders ON lf.l_orderkey = o_orderkey
+JOIN customer ON o_custkey = c_custkey
+JOIN lineitem l ON o_orderkey = l.l_orderkey
+GROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice
+ORDER BY o_totalprice DESC, o_orderdate
+LIMIT 100
+Time Cost: 595.33s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '回退至原SQL的子查询结构：将lineitem的聚合和having sum(l_quantity)>315过滤封装在独立子查询中，先将6000万行lineitem通过预聚合+having过滤缩减至约67行高选择性结果集，再与orders和customer进行连接。可改写为CTE或保持子查询形式，关键是确保having过滤在JOIN之前执行，避免大表笛卡尔积。'}, {'group': '连接优化', 'produced_suggestion': '在子查询预过滤后，利用orders_pkey索引进行嵌套循环连接：子查询结果(67行)通过o_orderkey与orders表进行索引探测，再通过customer_pkey索引与customer表连接。连接顺序应为：子查询结果→orders(索引探测)→customer(索引探测)，充分利用小结果集驱动大表的索引嵌套循环优势。'}, {'group': '聚合优化', 'produced_suggestion': '在子查询内完成lineitem的预聚合(GROUP BY l_orderkey, HAVING sum(l_quantity)>315)，外层查询复用子查询已计算的sum(l_quantity)结果，避免在外层重复聚合。外层GROUP BY仅需补充customer和orders的维度列(c_name, c_custkey, o_orderdate, o_totalprice)，无需重新计算sum。'}, {'group': '排序优化', 'produced_suggestion': '在子查询预过滤将数据量缩减至67行后，最终排序(ORDER BY o_totalprice DESC, o_orderdate LIMIT 100)的代价将大幅降低。若子查询结果可物化，考虑在物化结果上直接排序，避免当前执行计划中对大中间结果集的两次Sort阻塞(518万+81万cost)。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) lineitem表被扫描两次(50%+39.8%代价)，第一次全表扫描用于主查询，第二次全表扫描用于子查询聚合；2) 子查询中的聚合操作(3.6%代价)造成流水线阻塞；3) Hash Join代价占6.5%。当前SQL结构导致lineitem表重复扫描，可通过子查询优化(转JOIN或CTE)、谓词下推等方式消除重复扫描，显著降低总代价。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将IN子查询转换为JOIN：子查询 'select l_orderkey from lineitem group by l_orderkey having sum(l_quantity) > 315' 可改写为派生表JOIN，避免lineitem表的二次全表扫描。具体方案：将子查询结果作为派生表与orders表JOIN，利用o_orderkey的等值连接条件，消除IN语义带来的半连接开销。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "合并聚合操作：当前SQL在子查询中对lineitem按l_orderkey聚合一次(having sum(l_quantity)>315)，在外层查询中再次聚合相同分组键。可将两次聚合合并为一次：在派生表中完成sum(l_quantity)计算并过滤，外层直接复用该结果，减少聚合计算量和流水线阻塞。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "优化连接条件顺序：当前三表连接(customer, orders, lineitem)中，应优先执行orders与lineitem的JOIN(利用o_orderkey索引)，再与customer JOIN(利用c_custkey索引)。同时将子查询的having条件转换为派生表的WHERE条件，提前过滤数据量，减少后续JOIN的数据规模。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 45 条规则（按优化组筛选: 子查询优化, 聚合优化, 谓词简化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+    "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "AGGREGATE_MERGE", "JOIN_CONDITION_PUSH"],
+    "groups": "子查询优化,聚合优化,谓词简化",
+    "rule_effect_confidence": {
+        "FILTER_SUB_QUERY_TO_CORRELATE": 0.9,
+        "AGGREGATE_MERGE": 0.8,
+        "JOIN_CONDITION_PUSH": 0.7
+    },
+    "rule_effect_scores": {
+        "FILTER_SUB_QUERY_TO_CORRELATE": 0.4,
+        "AGGREGATE_MERGE": 0.4,
+        "JOIN_CONDITION_PUSH": 0.2
+    }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,聚合优化,谓词简化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "AGGREGATE_MERGE",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rewritten_sql": "SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity)\nFROM customer\nJOIN orders ON c_custkey = o_custkey\nJOIN lineitem ON o_orderkey = l_orderkey\nGROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice\nHAVING sum(l_quantity) > 315\nORDER BY o_totalprice DESC, o_orderdate\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **子查询去相关化（FILTER_SUB_QUERY_TO_CORRELATE）**：原SQL中的IN子查询 'select l_orderkey from lineitem group by l_orderkey having sum(l_quantity) > 315' 是一个半连接语义，用于过滤orders表中满足条件的订单。重写后将其转换为直接JOIN lineitem表，并在外层HAVING中应用相同的sum(l_quantity) > 315条件。由于原SQL外层已经有 'o_orderkey = l_orderkey' 的JOIN条件，且外层按 'c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice' 分组（包含o_orderkey主键），因此每个分组对应唯一的订单，其sum(l_quantity)与子查询中按l_orderkey分组的sum(l_quantity)完全一致，半连接语义得以保留。\n\n2. **聚合合并（AGGREGATE_MERGE）**：原SQL在子查询中对lineitem按l_orderkey聚合计算sum(l_quantity)并过滤>315的订单，外层再次对相同的lineitem表按包含o_orderkey的分组键聚合。重写后消除了子查询，将两次聚合合并为一次：直接在外层对customer、orders、lineitem三表JOIN后的结果按 'c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice' 分组并计算sum(l_quantity)，然后用HAVING过滤>315。由于分组键包含o_orderkey（orders表主键），每个分组对应唯一订单的所有lineitem行，聚合结果与原SQL两阶段聚合完全等价。\n\n3. **连接条件优化（JOIN_CONDITION_PUSH）**：原SQL使用隐式逗号连接三表，重写后改为显式INNER JOIN，并按照orders与lineitem的JOIN（利用o_orderkey索引）、再与customer的JOIN（利用c_custkey索引）的顺序组织。连接条件 'c_custkey = o_custkey' 和 'o_orderkey = l_orderkey' 保持不变，仅调整了JOIN顺序以优化执行计划，不改变结果集。\n\n4. **HAVING条件等价性**：原SQL子查询的HAVING条件 'sum(l_quantity) > 315' 作用于按l_orderkey分组的lineitem聚合结果，用于过滤订单。重写后将此条件移至外层HAVING，作用于按包含o_orderkey的分组键聚合的结果。由于外层分组键包含o_orderkey主键，每个分组的sum(l_quantity)与子查询中相同l_orderkey的聚合值一致，因此过滤效果完全等价。\n\n5. **结果集完整性**：原SQL最终返回满足条件的订单及其客户信息和总数量，按o_totalprice降序、o_orderdate升序排序后取前100行。重写后保持相同的SELECT列表、分组键、排序键和LIMIT子句，确保结果集的列、顺序和行数完全一致。\n\n6. **NULL值处理**：由于customer.c_custkey、orders.o_orderkey、lineitem.l_orderkey均为NOT NULL主键/外键，且l_quantity为NOT NULL，JOIN和聚合操作不会引入NULL值差异，重写前后对NULL的处理一致。\n\n7. **主键约束保证无重复放大**：orders.o_orderkey是主键，customer.c_custkey是主键，外键约束保证orders.o_custkey引用customer.c_custkey、lineitem.l_orderkey引用orders.o_orderkey。重写后的JOIN不会产生笛卡尔积放大，每个订单对应唯一客户，每个订单的多个lineitem行在分组聚合时正确累加，与原SQL语义完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过将IN子查询改写为JOIN并在外层HAVING中应用相同过滤条件，利用分组键包含o_orderkey主键的特性保证了每个分组的sum(l_quantity)与原子查询中按l_orderkey分组的聚合值完全一致，结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 2->0, Hash/Merge 1->2
+```json
+{
+  "terminate": false,
+  "reason": "结构明确恶化。原SQL通过子查询预聚合+过滤(having sum>315)将符合条件的订单缩减至67行，再通过索引嵌套循环高效关联orders和customer；重写SQL将having条件后移至外层聚合，导致lineitem全表(6000万行)与orders全表(1500万行)先做笛卡尔式hash join，产生6000万中间行后才过滤，引入灾难性数据膨胀。关键退化信号：1)子查询预过滤消失，原本67行的高选择性过滤点失效；2)嵌套循环被hash join替代，但无补偿性过滤前移；3)行数估计从8498万暴增至24894万(2.9倍)，且主干数据流从67行膨胀至6000万行；4)cost从345万增至1726万(5倍)，与结构退化一致。虽检测到NestedLoop减少，但这是负向变化(丢失索引探测优势)，不符合'去相关/复用'等高优先级正信号定义。",
+  "no_further_optimization": false,
+  "next_step_advice": "回退至原SQL结构，保留子查询的预聚合+having过滤机制(这是关键选择性过滤点)。下一轮优化方向：1)保持子查询独立执行并物化结果(或改写为CTE)，确保having sum>315的高选择性过滤先于JOIN执行；2)在子查询结果与orders JOIN时，利用o_orderkey索引；3)若子查询可并行化，考虑添加并行聚合hint；4)外层聚合可复用子查询已计算的sum(l_quantity)，避免重复计算。核心原则：绝不能将having条件后移导致大表先JOIN。"
+}
+```
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮将having条件后移导致灾难性退化(cost从345万增至1726万)。核心问题：丢失了子查询预聚合的高选择性过滤点(67行)，导致lineitem全表(6000万)与orders全表(1500万)先做笛卡尔式连接产生6000万中间行。当前执行计划显示：1)lineitem全表扫描(138万cost)；2)Hash Join产生大量中间行；3)Aggregate的having过滤在连接后执行，过滤时机过晚；4)两次Sort造成流水线阻塞(518万+81万cost)。必须回退至原SQL的子查询结构，保留预聚合+having的高选择性过滤机制，确保过滤发生在大表连接之前。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "回退至原SQL的子查询结构：将lineitem的聚合和having sum(l_quantity)>315过滤封装在独立子查询中，先将6000万行lineitem通过预聚合+having过滤缩减至约67行高选择性结果集，再与orders和customer进行连接。可改写为CTE或保持子查询形式，关键是确保having过滤在JOIN之前执行，避免大表笛卡尔积。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "在子查询预过滤后，利用orders_pkey索引进行嵌套循环连接：子查询结果(67行)通过o_orderkey与orders表进行索引探测，再通过customer_pkey索引与customer表连接。连接顺序应为：子查询结果→orders(索引探测)→customer(索引探测)，充分利用小结果集驱动大表的索引嵌套循环优势。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "在子查询内完成lineitem的预聚合(GROUP BY l_orderkey, HAVING sum(l_quantity)>315)，外层查询复用子查询已计算的sum(l_quantity)结果，避免在外层重复聚合。外层GROUP BY仅需补充customer和orders的维度列(c_name, c_custkey, o_orderdate, o_totalprice)，无需重新计算sum。"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "在子查询预过滤将数据量缩减至67行后，最终排序(ORDER BY o_totalprice DESC, o_orderdate LIMIT 100)的代价将大幅降低。若子查询结果可物化，考虑在物化结果上直接排序，避免当前执行计划中对大中间结果集的两次Sort阻塞(518万+81万cost)。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择...
+📚 加载规则库 58 条规则（按优化组筛选: 子查询优化, 连接优化, 聚合优化, 排序优化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_CORRELATE",
+    "AGGREGATE_FILTER_TRANSPOSE",
+    "SORT_REMOVE"
+  ],
+  "groups": "子查询优化, 聚合优化, 排序优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.9,
+    "FILTER_CORRELATE": 0.85,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.9,
+    "SORT_REMOVE": 0.7
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.4,
+    "FILTER_CORRELATE": 0.2,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.3,
+    "SORT_REMOVE": 0.1
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 聚合优化, 排序优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_CORRELATE",
+    "AGGREGATE_FILTER_TRANSPOSE",
+    "SORT_REMOVE"
+  ],
+  "rewritten_sql": "WITH lineitem_filtered AS (\n    SELECT l_orderkey, sum(l_quantity) AS total_quantity\n    FROM lineitem\n    GROUP BY l_orderkey\n    HAVING sum(l_quantity) > 315\n)\nSELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, lf.total_quantity\nFROM lineitem_filtered lf\nJOIN orders ON lf.l_orderkey = o_orderkey\nJOIN customer ON o_custkey = c_custkey\nORDER BY o_totalprice DESC, o_orderdate\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **CTE预聚合结构(STRATEGY_CTE_DECOMPOSITION)**：将lineitem的聚合逻辑(GROUP BY l_orderkey, HAVING sum(l_quantity)>315)提取为独立CTE lineitem_filtered，先将6000万行lineitem通过预聚合+having过滤缩减至约67行高选择性结果集。此改写保持原SQL子查询预过滤的语义，仅将隐式子查询显式化为CTE，结果集完全等价。\n\n2. **HAVING过滤前置(AGGREGATE_FILTER_TRANSPOSE)**：CTE内的HAVING sum(l_quantity)>315在聚合后立即执行，与原SQL的HAVING子句作用域一致(均在lineitem聚合后、JOIN前过滤)。由于lineitem表的主键为(l_orderkey, l_linenumber)，按l_orderkey分组聚合后每个l_orderkey对应唯一一行，HAVING过滤的67行订单键集合与原SQL完全相同。\n\n3. **JOIN顺序与索引利用(FILTER_CORRELATE应用于连接优化)**：重写后连接顺序为lineitem_filtered(67行)→orders(通过orders_pkey索引探测o_orderkey)→customer(通过customer_pkey索引探测c_custkey)。此顺序与原SQL的嵌套循环连接语义等价：小结果集驱动大表，利用主键索引进行点查，避免大表笛卡尔积。由于orders.o_orderkey和customer.c_custkey均为主键，JOIN结果的行数与过滤后的订单数(67行)一致。\n\n4. **聚合列复用**：外层查询直接引用CTE已计算的total_quantity(即sum(l_quantity))，无需重新聚合。原SQL的GROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice实际是为了保留这些维度列，由于orders.o_orderkey为主键，每个o_orderkey唯一对应一组(o_orderdate, o_totalprice)；customer.c_custkey为主键，唯一对应c_name。重写SQL通过JOIN自然保留这些列，无需显式GROUP BY，结果集的列值与原SQL完全一致。\n\n5. **排序语义保持(SORT_REMOVE未实际移除排序)**：保留ORDER BY o_totalprice DESC, o_orderdate和LIMIT 100，与原SQL排序逻辑完全一致。由于CTE预过滤将数据量缩减至67行，排序代价大幅降低，但排序结果与原SQL等价(均对最终67行结果按o_totalprice降序、o_orderdate升序排序后取前100行)。\n\n6. **NULL值与重复行处理**：lineitem表的l_orderkey为主键的一部分(NOT NULL约束)，CTE聚合不会产生NULL键；orders和customer的主键连接保证无重复行。原SQL的GROUP BY虽包含更多列，但由于主键约束，实际分组粒度与重写SQL的JOIN结果一致，不会产生额外去重或NULL行差异。\n\n7. **易误判点澄清**：原SQL的GROUP BY看似在外层聚合，但实际作用是保留维度列而非二次聚合(因l_orderkey已在子查询内聚合)。重写SQL通过主键JOIN直接保留这些列，避免冗余GROUP BY，语义完全等价。HAVING过滤在CTE内执行与原SQL在子查询内执行的时机和作用域完全一致，不存在过滤提前或延后导致的结果集差异。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL在外层对lineitem再次GROUP BY并SUM(l_quantity)，重写SQL直接复用CTE的total_quantity，当一个订单有多个lineitem行时聚合结果不同。",
+    "differences": [
+        {
+            "type": "aggregation_semantic",
+            "description": "原始SQL外层GROUP BY对每个订单的所有lineitem行重新聚合sum(l_quantity)，重写SQL直接取CTE中已按l_orderkey聚合的total_quantity，但原始SQL的外层GROUP BY包含customer和orders的列，实际是对customer-orders-lineitem三表JOIN后的结果集聚合",
+            "location": "SELECT子句的聚合列与GROUP BY子句"
+        },
+        {
+            "type": "join_then_aggregate_vs_aggregate_then_join",
+            "description": "原始SQL是先三表JOIN(customer-orders-lineitem)再GROUP BY聚合，重写SQL是先lineitem聚合再JOIN，当orders表通过外键关联到已过滤的lineitem时，原始SQL会对JOIN后的明细行聚合，重写SQL只取预聚合值",
+            "location": "整体查询结构"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL在外层对lineitem再次GROUP BY并SUM(l_quantity)，重写SQL直接复用CTE的total_quantity，当一个订单有多个lineitem行时聚合结果不同。
+```json
+{
+  "fixed_sql": "WITH lineitem_filtered AS (\n    SELECT l_orderkey\n    FROM lineitem\n    GROUP BY l_orderkey\n    HAVING sum(l_quantity) > 315\n)\nSELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity)\nFROM lineitem_filtered lf\nJOIN orders ON lf.l_orderkey = o_orderkey\nJOIN customer ON o_custkey = c_custkey\nJOIN lineitem ON o_orderkey = l_orderkey\nGROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice\nORDER BY o_totalprice DESC, o_orderdate\nLIMIT 100",
+  "note": "CTE仅保留过滤条件不预聚合total_quantity，外层重新JOIN lineitem表并GROUP BY聚合sum(l_quantity)以匹配原始SQL的先JOIN后聚合语义"
+}
+```
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: column reference "l_orderkey" is ambiguous
+LINE 11: JOIN lineitem ON o_orderkey = l_orderkey
+                                       ^
+
+{'flag': False, 'error': 'column reference "l_orderkey" is ambiguous\nLINE 11: JOIN lineitem ON o_orderkey = l_orderkey\n                                       ^\n'}
+DBMS_syntax_Tool ends...
+```json
+{
+  "rewritten_sql": "WITH lineitem_filtered AS (\n    SELECT l_orderkey\n    FROM lineitem\n    GROUP BY l_orderkey\n    HAVING sum(l_quantity) > 315\n)\nSELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity)\nFROM lineitem_filtered lf\nJOIN orders ON lf.l_orderkey = o_orderkey\nJOIN customer ON o_custkey = c_custkey\nJOIN lineitem l ON o_orderkey = l.l_orderkey\nGROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice\nORDER BY o_totalprice DESC, o_orderdate\nLIMIT 100",
+  "note": "为lineitem表添加别名l并在JOIN条件中使用l.l_orderkey消除列引用歧义"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正上轮问题：外层重新JOIN lineitem并GROUP BY聚合sum(l_quantity)，与原始SQL的聚合语义完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划对比显示：1) 结构完全相同：两个计划的节点类型、连接顺序、扫描方式、并行度均无差异，节点计数完全一致（Seq Scan=2, Index Scan=2, Nested Loop=2, Hash Join=1等）；2) 行数估计求和相同（84982562行），无数据量压缩；3) cost增加约6%（3452047→3652998），虽不构成灾难性退化，但结合结构无改进，说明CTE改写未被优化器实质利用；4) 关键问题：重写SQL虽引入CTE lineitem_filtered，但优化器未将其物化或提前过滤，仍在Hash Join阶段才执行having过滤（Aggregate节点位置未前移），导致lineitem全表扫描（59986052行）仍在JOIN前发生，未实现预期的'先过滤后连接'效果；5) 与optimization_context中'子查询预过滤缩减至67行再JOIN'的目标相悖，当前计划仍是'先JOIN再过滤'模式。结论：本轮CTE改写在执行计划层面无实质改进，cost略增且未达成预过滤目标，判定为未改进。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前enhanced_sql继续改写：1) 将CTE lineitem_filtered改为MATERIALIZED提示（WITH lineitem_filtered AS MATERIALIZED），强制优化器物化预聚合结果；2) 或回退至原SQL的IN子查询结构，PostgreSQL对IN子查询的半连接优化可能更有效；3) 关键是确保having sum(l_quantity)>315的过滤在与orders/customer JOIN之前完成，可尝试在CTE内增加OFFSET 0或ORDER BY等优化器屏障，阻止CTE被内联展开；4) 验证orders_pkey和customer_pkey索引是否被正确利用于嵌套循环连接（当前已利用，需保持）。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+
+🎲 LinUCB Update: 4 rules, reward=-0.0175 (cost=-0.0582, rows=+0.0000, depth=+0.0000, oc=3452047.7300, rc=3652998.3200)
+✅ LinUCB Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: prior=0.553, reward=-0.006, count=126, avg=+0.019
+   → FILTER_CORRELATE: prior=0.784, reward=-0.004, count=4, avg=+0.027
+   → AGGREGATE_FILTER_TRANSPOSE: prior=0.622, reward=-0.005, count=27, avg=+0.019
+   → SORT_REMOVE: prior=0.723, reward=-0.003, count=9, avg=+0.024
+
+----------------------------------------
+

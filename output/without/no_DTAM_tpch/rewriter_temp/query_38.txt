@@ -1,0 +1,181 @@
+Query ID: 38
+==================================================
+
+Original: select c_count, count(*) as custdist from ( select c_custkey, count(o_orderkey) from customer left outer join orders on c_custkey = o_custkey and o_comment not like '%unusual%deposits%' group by c_custkey ) as c_orders (c_custkey, c_count) group by c_count order by custdist desc, c_count desc;
+Rewritten: SELECT c_count, COUNT(*) AS custdist FROM (SELECT c.c_custkey, COUNT(o.o_orderkey) AS c_count FROM customer c LEFT OUTER JOIN orders o ON c.c_custkey = o.o_custkey AND o.o_comment NOT LIKE '%unusual%deposits%' GROUP BY c.c_custkey) AS c_orders GROUP BY c_count ORDER BY custdist DESC, c_count DESC;
+Time Cost: 314.10s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将orders侧改写为派生表预聚合：先在子查询中WHERE o_comment NOT LIKE '%unusual%deposits%' 过滤（利用Seq Scan早期过滤优势），再GROUP BY o_custkey聚合COUNT(o_orderkey)，最后与customer进行RIGHT JOIN。这样可将过滤从15000000行提前至JOIN前，减少Hash Join输入行数（预计从15000000降至约6123738行），降低JOIN和后续聚合代价。"}, {'group': '聚合优化', 'produced_suggestion': "消除CASE WHEN条件聚合：将COUNT(CASE WHEN o_comment NOT LIKE '%unusual%deposits%' THEN o_orderkey END)改写为orders派生表中的简单COUNT(o_orderkey)，过滤条件前置到派生表的WHERE子句。这样可避免在Aggregate阶段对每行执行LIKE判断，将过滤成本从聚合阶段（代价占比42.3%）转移到Seq Scan阶段（可利用Filter机制），减少三层Aggregate的数据处理量。"}, {'group': '连接优化', 'produced_suggestion': "调整JOIN结构为customer LEFT JOIN预聚合orders派生表：派生表结构为(SELECT o_custkey, COUNT(*) as order_count FROM orders WHERE o_comment NOT LIKE '%unusual%deposits%' GROUP BY o_custkey)。由于customer表较小（1500000行）且有主键索引，优化器可能选择Index Only Scan customer + Hash右表（预聚合后的orders，行数大幅减少），降低Hash Join代价（当前占比8.0%）。同时外层聚合可直接使用派生表的order_count，简化为COALESCE(order_count, 0)，减少一层Aggregate嵌套。"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个性能瓶颈：1) orders表全表扫描(Seq Scan)占比22.5%，过滤条件'o_comment not like'无法使用索引；2) 多层聚合操作(27.0%+2.2%+1.5%)造成流水线阻塞；3) LEFT OUTER JOIN后立即GROUP BY的模式可以优化；4) 子查询物化增加中间结果处理开销。统计信息显示orders表1500万行，customer表150万行，存在较大优化空间。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将派生表c_orders内联展开，消除子查询物化开销。将内层GROUP BY与外层GROUP BY合并为单次聚合，通过条件聚合函数COUNT(CASE WHEN o_comment NOT LIKE '%unusual%deposits%' THEN o_orderkey END)实现过滤逻辑，减少流水线阻塞点"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "LEFT OUTER JOIN的过滤条件'o_comment not like'放在ON子句中会导致全表扫描。考虑将过滤逻辑移入聚合函数内部(条件COUNT)，或改写为RIGHT JOIN customer让优化器选择更优连接顺序，利用customer表的索引扫描(已有Index Only Scan)"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "o_comment NOT LIKE '%unusual%deposits%'是双通配符模式无法使用索引。若业务允许，考虑改写为o_comment NOT LIKE '%unusual%deposits'(单侧通配)或使用全文索引。当前可将此条件整合到条件聚合中，避免JOIN阶段的大量行过滤"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "当前三层聚合(内层COUNT(o_orderkey) GROUP BY c_custkey，外层COUNT(*) GROUP BY c_count)可优化为两层：直接在customer上LEFT JOIN orders并用条件聚合COUNT(CASE...)得到c_count，然后单次GROUP BY c_count。减少中间物化表和Sort操作"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 71 条规则（按优化组筛选: 子查询优化, 连接优化, 谓词简化, 聚合优化；记忆已关闭）
+{
+  "applied_rules": ["AGGREGATE_MERGE", "FILTER_INTO_JOIN", "AGGREGATE_CASE_TO_FILTER"],
+  "groups": "聚合优化,谓词简化"
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化,谓词简化",
+  "applied_rules": [
+    "AGGREGATE_MERGE",
+    "FILTER_INTO_JOIN",
+    "AGGREGATE_CASE_TO_FILTER"
+  ],
+  "rewritten_sql": "SELECT c_count, COUNT(*) AS custdist\nFROM (\n    SELECT c_custkey,\n           COUNT(o_orderkey) FILTER (WHERE o_comment NOT LIKE '%unusual%deposits%') AS c_count\n    FROM customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    GROUP BY c_custkey\n) AS c_orders\nGROUP BY c_count\nORDER BY custdist DESC, c_count DESC;",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原始SQL中LEFT OUTER JOIN的ON子句过滤条件'o_comment not like '%unusual%deposits%'从JOIN条件中移除，改为在聚合函数COUNT中使用FILTER子句实现条件过滤，即COUNT(o_orderkey) FILTER (WHERE o_comment NOT LIKE '%unusual%deposits%')。\n\n2. **等价性保证 - LEFT JOIN语义保持**：原SQL在LEFT JOIN的ON子句中包含o_comment过滤，这意味着不满足该条件的orders行会被当作NULL处理（LEFT JOIN特性）。改写后将过滤移入FILTER子句，对于每个customer：若其关联的orders行不满足o_comment条件，COUNT的FILTER子句会排除该行，效果等同于原SQL中ON子句过滤后的NULL行在COUNT(o_orderkey)时被忽略。因此两种写法对每个c_custkey产生的c_count值完全相同。\n\n3. **等价性保证 - 聚合层次保持**：原SQL有两层聚合：内层按c_custkey分组计算每个客户的订单数c_count，外层按c_count分组统计客户分布custdist。改写后保持相同的两层聚合结构，仅将内层的COUNT(o_orderkey)改为条件聚合COUNT(o_orderkey) FILTER (...)，不改变分组键和聚合逻辑，外层GROUP BY c_count的输入数据集与原SQL完全一致。\n\n4. **等价性保证 - NULL与COUNT行为**：LEFT JOIN中未匹配或被ON条件过滤的orders行会产生NULL的o_orderkey。COUNT(o_orderkey)会忽略NULL值。改写后FILTER子句同样只统计满足条件的非NULL o_orderkey，对于没有匹配订单的customer，两种写法均产生c_count=0。\n\n5. **等价性保证 - 过滤条件位置变化的语义一致性**：在LEFT JOIN中，ON子句的非等值条件'o_comment not like ...'作用于右表orders，不满足时该行被视为不匹配（产生NULL）。改写后FILTER子句在聚合阶段应用相同条件，对已JOIN的行进行过滤。由于LEFT JOIN保证左表customer的所有行都保留，且COUNT只统计非NULL的o_orderkey，两种方式对每个c_custkey的计数结果完全相同。\n\n6. **易误判点说明 - FILTER与ON条件的等价性**：关键在于LEFT JOIN的ON子句中对右表的过滤条件，与聚合时使用FILTER子句过滤右表列，在LEFT JOIN语义下是等价的。原因：ON条件过滤导致不匹配行产生NULL，COUNT忽略NULL；FILTER条件在聚合时排除不满足条件的行，COUNT同样不计入。两者对最终c_count的计算结果无差异。\n\n7. **最终结果集等价性**：由于内层子查询c_orders对每个c_custkey产生的c_count值完全相同，外层按c_count分组并计算COUNT(*)的结果集（c_count, custdist）及ORDER BY排序后的最终输出与原SQL完全一致，包括列名、数据类型、行数和顺序。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": false,
+    "message": "LEFT JOIN的ON条件过滤与FILTER子句在语义上不等价：ON条件中的o_comment过滤会阻止不满足条件的orders行参与JOIN匹配，而FILTER子句仅在聚合时排除已匹配的行，对于满足o_comment条件的订单，两者产生的c_count相同，但最终结果集不同。",
+    "differences": [
+        {
+            "type": "JOIN语义差异",
+            "description": "原SQL在LEFT JOIN ON子句中过滤o_comment，导致不满足条件的orders行不参与JOIN；重写SQL将过滤移入FILTER子句，所有orders行先参与JOIN，再在COUNT时过滤，两者对每个customer的c_count计算结果相同，但这不是差异点",
+            "location": "LEFT JOIN ON条件 vs FILTER子句"
+        },
+        {
+            "type": "聚合计数对象差异",
+            "description": "原SQL的COUNT(o_orderkey)统计的是满足ON条件后JOIN成功的行数；重写SQL的COUNT(o_orderkey) FILTER统计的是所有JOIN行中满足FILTER条件的o_orderkey数量，由于LEFT JOIN特性和NULL处理，两者对每个c_custkey产生相同的c_count值",
+            "location": "内层子查询的COUNT聚合"
+        }
+    ]
+}
+```
+❌ 语义不等价: LEFT JOIN的ON条件过滤与FILTER子句在语义上不等价：ON条件中的o_comment过滤会阻止不满足条件的orders行参与JOIN匹配，而FILTER子句仅在聚合时排除已匹配的行，对于满足o_comment条件的订单，两者产生的c_count相同，但最终结果集不同。
+```json
+{"fixed_sql": "SELECT c_count, COUNT(*) AS custdist FROM ( SELECT c_custkey, COUNT(CASE WHEN o_comment NOT LIKE '%unusual%deposits%' THEN o_orderkey END) AS c_count FROM customer LEFT OUTER JOIN orders ON c_custkey = o_custkey GROUP BY c_custkey ) AS c_orders GROUP BY c_count ORDER BY custdist DESC, c_count DESC;", "note": "将FILTER子句改为CASE WHEN表达式，确保只统计满足条件的o_orderkey，与原SQL的JOIN ON过滤语义等价"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL将LEFT JOIN ON条件中的o_comment过滤改为COUNT聚合中的CASE WHEN条件过滤，两者在LEFT JOIN语义下对每个c_custkey产生相同的c_count值（满足条件的o_orderkey计数相同，不满足或NULL均不计入），外层聚合和排序逻辑完全一致，最终结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划结构基本一致，未见明显改进。两版本均为：Parallel Seq Scan orders → Hash Join → Partial Aggregate → Sort → Gather Merge → Finalize Aggregate → 外层 Aggregate → Sort。核心差异：1) 原版在 Seq Scan 阶段通过 Filter 过滤 o_comment，扫描行数 6123738；重写版取消 Filter，扫描全量 6250000 行，将过滤逻辑后移至 Aggregate 内的 CASE WHEN，导致 Hash Join 后数据量增加（6123738→6250000）。2) Planned Partitions 从 16 增至 32，表明聚合分区增加，但未带来补偿收益。3) cost 从 1508890.73 升至 2030992.92（+34.6%），行数估计求和从 21597876 升至 21850400（+1.2%）。结构信号：过滤后移导致 JOIN 阶段处理更多无效行，Seq Scan 阶段失去早期过滤优势，未见去相关/子计划减少/公共结果复用等高优先级正信号。虽未达到"灾难性退化"（并行度保持、连接算法未变），但明确无改进且 cost 显著上升，不符合终止条件。",
+  "no_further_optimization": false,
+  "next_step_advice": "回退至 original_sql 的过滤策略（在 JOIN ON 子句或 Seq Scan 阶段提前过滤 o_comment），保留早期过滤优势。尝试以下方向：1) 保持 ON 子句过滤不变，探索是否可通过 CTE 或派生表预聚合 orders（先 WHERE o_comment NOT LIKE '%unusual%deposits%' 再 GROUP BY o_custkey）减少 JOIN 输入行数；2) 若 customer 表较小，考虑改写为 RIGHT JOIN 让优化器优先扫描 customer 索引；3) 评估是否可在 orders 表 o_comment 列上建立部分索引（WHERE o_comment NOT LIKE '%unusual%deposits%'）以加速过滤。"
+}
+```
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮将过滤逻辑从Seq Scan阶段后移至Aggregate内的CASE WHEN导致性能恶化（cost增加34.6%）。当前执行计划显示：1) Seq Scan扫描orders全表15000000行（代价占比15.9%），无Filter过滤；2) Hash Join处理全量数据（代价占比8.0%）；3) 三层Aggregate嵌套（代价占比42.3%+1.6%+1.1%）成为最大瓶颈。核心问题：过滤条件o_comment NOT LIKE '%unusual%deposits%'在CASE WHEN中执行，导致JOIN和聚合阶段处理大量无效行。优化方向：回退过滤策略至JOIN前，通过派生表或CTE在orders侧预先过滤和预聚合，减少JOIN输入行数和后续聚合负担。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将orders侧改写为派生表预聚合：先在子查询中WHERE o_comment NOT LIKE '%unusual%deposits%' 过滤（利用Seq Scan早期过滤优势），再GROUP BY o_custkey聚合COUNT(o_orderkey)，最后与customer进行RIGHT JOIN。这样可将过滤从15000000行提前至JOIN前，减少Hash Join输入行数（预计从15000000降至约6123738行），降低JOIN和后续聚合代价。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除CASE WHEN条件聚合：将COUNT(CASE WHEN o_comment NOT LIKE '%unusual%deposits%' THEN o_orderkey END)改写为orders派生表中的简单COUNT(o_orderkey)，过滤条件前置到派生表的WHERE子句。这样可避免在Aggregate阶段对每行执行LIKE判断，将过滤成本从聚合阶段（代价占比42.3%）转移到Seq Scan阶段（可利用Filter机制），减少三层Aggregate的数据处理量。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN结构为customer LEFT JOIN预聚合orders派生表：派生表结构为(SELECT o_custkey, COUNT(*) as order_count FROM orders WHERE o_comment NOT LIKE '%unusual%deposits%' GROUP BY o_custkey)。由于customer表较小（1500000行）且有主键索引，优化器可能选择Index Only Scan customer + Hash右表（预聚合后的orders，行数大幅减少），降低Hash Join代价（当前占比8.0%）。同时外层聚合可直接使用派生表的order_count，简化为COALESCE(order_count, 0)，减少一层Aggregate嵌套。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择...
+📚 加载规则库 52 条规则（按优化组筛选: 子查询优化, 聚合优化, 连接优化；记忆已关闭）
+{
+    "applied_rules": [
+        "FILTER_AGGREGATE_TRANSPOSE",
+        "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+        "FILTER_INTO_JOIN"
+    ],
+    "groups": "聚合优化,连接优化"
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化,连接优化",
+  "applied_rules": [
+    "FILTER_AGGREGATE_TRANSPOSE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "FILTER_INTO_JOIN"
+  ],
+  "rewritten_sql": "SELECT c_count, COUNT(*) AS custdist\nFROM (\n    SELECT c.c_custkey, COALESCE(o_agg.order_count, 0) AS c_count\n    FROM customer c\n    LEFT OUTER JOIN (\n        SELECT o_custkey, COUNT(o_orderkey) AS order_count\n        FROM orders\n        WHERE o_comment NOT LIKE '%unusual%deposits%'\n        GROUP BY o_custkey\n    ) AS o_agg ON c.c_custkey = o_agg.o_custkey\n) AS c_orders\nGROUP BY c_count\nORDER BY custdist DESC, c_count DESC;",
+  "semantic_correctness_guarantee": "1. **FILTER_INTO_JOIN 应用**：将原 SQL 中 COUNT(CASE WHEN o_comment NOT LIKE '%unusual%deposits%' THEN o_orderkey END) 的过滤条件提取为派生表 o_agg 的 WHERE 子句（WHERE o_comment NOT LIKE '%unusual%deposits%'），过滤逻辑从聚合阶段前移至 orders 表扫描阶段。由于 CASE WHEN 条件为 FALSE 时返回 NULL（COUNT 不计入），等价于先过滤再 COUNT 全部行，结果集不变。\n\n2. **AGGREGATE_JOIN_TRANSPOSE_EXTENDED 应用**：将 orders 侧聚合（COUNT(o_orderkey) GROUP BY o_custkey）下推至 JOIN 前的派生表 o_agg 中执行。原 SQL 在 LEFT JOIN 后对每个 c_custkey 聚合其关联的 orders 行；重写后先在 orders 内按 o_custkey 预聚合得到 order_count，再与 customer 进行 LEFT JOIN。由于 orders.o_custkey 外键引用 customer.c_custkey，且 GROUP BY o_custkey 保证每个 custkey 仅一行聚合结果，JOIN 后每个 c_custkey 仍对应唯一的 order_count（或 NULL），外层 COALESCE(order_count, 0) 等价于原 SQL 的 COUNT(CASE...)（未匹配行计为 0）。\n\n3. **FILTER_AGGREGATE_TRANSPOSE 隐式应用**：过滤条件 o_comment NOT LIKE '%unusual%deposits%' 仅依赖 orders 表，与分组键 o_custkey 无关，从聚合后（HAVING 或 CASE WHEN）前移至聚合前（WHERE）不改变分组逻辑，仅减少输入行数，语义等价。\n\n4. **LEFT JOIN 语义保持**：原 SQL 使用 LEFT OUTER JOIN 确保所有 customer 行均保留（即使无匹配 orders）。重写后仍为 LEFT OUTER JOIN，派生表 o_agg 仅包含满足过滤条件的 orders 聚合结果，未匹配的 c_custkey 对应 o_agg.order_count 为 NULL，通过 COALESCE(order_count, 0) 转为 0，与原 SQL 的 COUNT(CASE...) 对未匹配行返回 0 完全一致。\n\n5. **外层聚合等价性**：原 SQL 外层对 c_count（每个客户的订单数）进行 GROUP BY 并 COUNT(*) 统计分布。重写后 c_count 定义为 COALESCE(o_agg.order_count, 0)，与原 SQL 的 COUNT(CASE...) 逻辑等价（见第 2 点），外层聚合输入的 c_count 值分布完全相同，因此 custdist 结果集不变。\n\n6. **主键与相关列保证**：customer.c_custkey 为主键，orders.o_custkey 为外键且非空（NOT NULL），派生表 o_agg 按 o_custkey 分组后每个 custkey 至多一行。LEFT JOIN ON c.c_custkey = o_agg.o_custkey 保证每个 customer 行至多匹配一行 o_agg，不产生笛卡尔积或重复行，与原 SQL 的 LEFT JOIN orders（后聚合）在行数和分组逻辑上等价。\n\n7. **NULL 处理与 ORDER BY**：原 SQL 中未匹配 orders 的 customer 行在 COUNT(CASE...) 后得到 0；重写后通过 COALESCE 显式处理 NULL 为 0，保证 c_count 值域一致。外层 ORDER BY custdist DESC, c_count DESC 作用于相同的 (c_count, custdist) 分布，排序结果不变。\n\n8. **易误判点说明**：原 SQL 的 CASE WHEN 在聚合内部执行，可能被误认为必须在 JOIN 后处理；实际上由于过滤条件仅依赖 orders 表且与分组键独立，可安全前移至派生表 WHERE 子句。LEFT JOIN 的 NULL 传播通过 COALESCE 显式处理，确保未匹配行的 c_count 为 0 而非 NULL，与原 SQL 的 COUNT 行为（COUNT 不计 NULL）等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+❌ 确定性等价验证不通过: NEQ
+```json
+{"fixed_sql": "SELECT c_count, COUNT(*) AS custdist FROM (SELECT c.c_custkey, COUNT(o.o_orderkey) AS c_count FROM customer c LEFT OUTER JOIN orders o ON c.c_custkey = o.o_custkey AND o.o_comment NOT LIKE '%unusual%deposits%' GROUP BY c.c_custkey) AS c_orders GROUP BY c_count ORDER BY custdist DESC, c_count DESC;", "note": "将过滤条件从子查询WHERE移回LEFT JOIN的ON子句，并对o_orderkey直接COUNT而非COALESCE聚合结果，确保NULL值按原始语义处理"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，costs相同(1508890.73)，结构无任何变化。本轮重写仅为表别名调整(customer→c, orders→o)，未产生实质性优化效果。但原SQL已采用高效执行策略：1)并行Hash Join(2 workers)处理customer与orders；2)过滤条件在Seq Scan阶段早期执行(Filter机制)；3)三层聚合(Partial→Finalize→Hashed)合理分工；4)Index Only Scan访问customer主键。当前执行计划已较优，进一步优化空间有限：orders表15M行的Seq Scan+Filter是合理选择(过滤率约40.8%)，派生表预聚合可能引入额外物化开销而无明显收益；外层双重聚合是业务逻辑必需(先按客户聚合订单数，再按订单数统计客户分布)。综合判断：当前方案已接近最优，继续迭代改进空间极小。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+
+----------------------------------------
+

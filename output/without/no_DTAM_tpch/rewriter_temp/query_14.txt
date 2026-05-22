@@ -1,0 +1,123 @@
+Query ID: 14
+==================================================
+
+Original: select n_name, sum(l_extendedprice * (1 - l_discount)) as revenue from customer, orders, lineitem, supplier, nation, region where c_custkey = o_custkey and l_orderkey = o_orderkey and l_suppkey = s_suppkey and c_nationkey = s_nationkey and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = 'AMERICA' and o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-01-01' + interval '1' year group by n_name order by revenue desc;
+Rewritten: WITH region_filtered AS (
+  SELECT r_regionkey
+  FROM region
+  WHERE r_name = 'AMERICA'
+),
+nation_filtered AS (
+  SELECT n_nationkey, n_name
+  FROM nation
+  JOIN region_filtered ON n_regionkey = region_filtered.r_regionkey
+),
+supplier_filtered AS (
+  SELECT s_suppkey, s_nationkey
+  FROM supplier
+  JOIN nation_filtered ON s_nationkey = nation_filtered.n_nationkey
+),
+customer_filtered AS (
+  SELECT c_custkey, c_nationkey
+  FROM customer
+  WHERE c_nationkey IN (SELECT n_nationkey FROM nation_filtered)
+),
+orders_filtered AS (
+  SELECT o_orderkey, o_custkey
+  FROM orders
+  WHERE o_orderdate >= date '1995-01-01'
+    AND o_orderdate < date '1995-01-01' + interval '1' year
+)
+SELECT n_name, sum(l_extendedprice * (1 - l_discount)) AS revenue
+FROM lineitem
+JOIN orders_filtered ON l_orderkey = orders_filtered.o_orderkey
+JOIN customer_filtered ON orders_filtered.o_custkey = customer_filtered.c_custkey
+JOIN supplier_filtered ON l_suppkey = supplier_filtered.s_suppkey
+  AND customer_filtered.c_nationkey = supplier_filtered.s_nationkey
+JOIN nation_filtered ON supplier_filtered.s_nationkey = nation_filtered.n_nationkey
+GROUP BY n_name
+ORDER BY revenue DESC;
+Time Cost: 120.68s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': "将region表的r_name='AMERICA'过滤条件通过JOIN提前传播，先过滤region得到r_regionkey，再与nation连接过滤出符合条件的n_nationkey集合，最后用该集合过滤supplier和customer，减少大表连接前的数据量"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序：优先连接小表region和nation（通过r_name过滤），然后与supplier连接得到符合区域条件的供应商集合，再用该集合与lineitem连接，最后连接orders（带日期过滤）和customer。这样可以先通过小表过滤大幅减少lineitem的扫描范围'}, {'group': '谓词简化', 'produced_suggestion': "将orders表的日期范围过滤条件(o_orderdate >= '1995-01-01' AND o_orderdate < '1996-01-01')尽早应用，建议在连接前先过滤orders表，减少与lineitem连接时的数据量，避免全表扫描后再过滤"}, {'group': '子查询优化', 'produced_suggestion': "考虑将region和nation的过滤逻辑改写为子查询或CTE，先物化符合r_name='AMERICA'条件的n_nationkey列表，然后用IN或EXISTS子查询过滤supplier和customer，利用索引加速nationkey的查找"}, {'group': '连接优化', 'produced_suggestion': '当前c_nationkey = s_nationkey条件在lineitem与orders连接的Hash条件中，导致需要处理大量数据。建议将该条件提前到customer与supplier的连接阶段，通过半连接或EXISTS改写，先确定符合nationkey条件的customer-supplier对，再与orders和lineitem连接'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) lineitem表全表扫描代价占比62.5%（1,375,085.88），orders表全表扫描占比16.1%（355,022.00），两者合计占总代价78.6%；2) 存在多层Hash Join，其中lineitem与orders的连接代价占比12.4%；3) orders表有日期范围过滤条件但仍进行全表扫描；4) 六表连接顺序可能存在优化空间，当前执行计划显示先扫描大表再过滤，可通过谓词下推和连接顺序调整减少中间结果集；5) region和nation是小表但参与多表连接，可优先过滤以减少后续连接数据量",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将region表的r_name='AMERICA'过滤条件通过JOIN提前传播，先过滤region得到r_regionkey，再与nation连接过滤出符合条件的n_nationkey集合，最后用该集合过滤supplier和customer，减少大表连接前的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接小表region和nation（通过r_name过滤），然后与supplier连接得到符合区域条件的供应商集合，再用该集合与lineitem连接，最后连接orders（带日期过滤）和customer。这样可以先通过小表过滤大幅减少lineitem的扫描范围"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将orders表的日期范围过滤条件(o_orderdate >= '1995-01-01' AND o_orderdate < '1996-01-01')尽早应用，建议在连接前先过滤orders表，减少与lineitem连接时的数据量，避免全表扫描后再过滤"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑将region和nation的过滤逻辑改写为子查询或CTE，先物化符合r_name='AMERICA'条件的n_nationkey列表，然后用IN或EXISTS子查询过滤supplier和customer，利用索引加速nationkey的查找"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "当前c_nationkey = s_nationkey条件在lineitem与orders连接的Hash条件中，导致需要处理大量数据。建议将该条件提前到customer与supplier的连接阶段，通过半连接或EXISTS改写，先确定符合nationkey条件的customer-supplier对，再与orders和lineitem连接"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 52 条规则（按优化组筛选: 谓词简化, 连接优化, 子查询优化；记忆已关闭）
+{
+  "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "JOIN_PUSH_TRANSITIVE_PREDICATES", "STRATEGY_CTE_DECOMPOSITION"],
+  "groups": "谓词简化,连接优化,子查询优化"
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化,连接优化,子查询优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH region_filtered AS (\n  SELECT r_regionkey\n  FROM region\n  WHERE r_name = 'AMERICA'\n),\nnation_filtered AS (\n  SELECT n_nationkey, n_name\n  FROM nation\n  JOIN region_filtered ON n_regionkey = region_filtered.r_regionkey\n),\nsupplier_filtered AS (\n  SELECT s_suppkey, s_nationkey\n  FROM supplier\n  JOIN nation_filtered ON s_nationkey = nation_filtered.n_nationkey\n),\ncustomer_filtered AS (\n  SELECT c_custkey, c_nationkey\n  FROM customer\n  WHERE c_nationkey IN (SELECT n_nationkey FROM nation_filtered)\n),\norders_filtered AS (\n  SELECT o_orderkey, o_custkey\n  FROM orders\n  WHERE o_orderdate >= date '1995-01-01'\n    AND o_orderdate < date '1995-01-01' + interval '1' year\n)\nSELECT n_name, sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM lineitem\nJOIN orders_filtered ON l_orderkey = orders_filtered.o_orderkey\nJOIN customer_filtered ON orders_filtered.o_custkey = customer_filtered.c_custkey\nJOIN supplier_filtered ON l_suppkey = supplier_filtered.s_suppkey\n  AND customer_filtered.c_nationkey = supplier_filtered.s_nationkey\nJOIN nation_filtered ON supplier_filtered.s_nationkey = nation_filtered.n_nationkey\nGROUP BY n_name\nORDER BY revenue DESC;",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原始SQL中的隐式WHERE连接条件改写为显式JOIN，并通过CTE将过滤逻辑分层提取。具体包括：\n   - region表的r_name='AMERICA'过滤提取为CTE region_filtered\n   - nation与region的连接及过滤提取为CTE nation_filtered\n   - supplier与nation的连接及过滤提取为CTE supplier_filtered\n   - customer的nationkey过滤提取为CTE customer_filtered（使用IN子查询）\n   - orders的日期范围过滤提取为CTE orders_filtered\n   - 最终JOIN按lineitem→orders_filtered→customer_filtered→supplier_filtered→nation_filtered顺序连接\n\n2. **连接条件等价性**：原始SQL中的WHERE子句包含的所有等值连接条件均保留在重写SQL的JOIN ON子句中：\n   - c_custkey = o_custkey 对应 orders_filtered.o_custkey = customer_filtered.c_custkey\n   - l_orderkey = o_orderkey 对应 l_orderkey = orders_filtered.o_orderkey\n   - l_suppkey = s_suppkey 对应 l_suppkey = supplier_filtered.s_suppkey\n   - c_nationkey = s_nationkey 对应 customer_filtered.c_nationkey = supplier_filtered.s_nationkey\n   - s_nationkey = n_nationkey 在supplier_filtered CTE中已通过JOIN nation_filtered实现，最终JOIN再次连接nation_filtered以获取n_name\n   - n_regionkey = r_regionkey 在nation_filtered CTE中已通过JOIN region_filtered实现\n\n3. **过滤条件等价性**：所有WHERE过滤条件均在CTE或JOIN前应用，保证过滤语义不变：\n   - r_name = 'AMERICA' 在region_filtered中应用\n   - o_orderdate范围条件在orders_filtered中应用\n   - customer的nationkey通过IN子查询过滤，等价于原始SQL中通过连接传递的nationkey约束\n\n4. **传递性谓词推导**：利用JOIN_PUSH_TRANSITIVE_PREDICATES规则，将nationkey的等值约束传递到customer表：\n   - 原始SQL中c_nationkey = s_nationkey且s_nationkey在nation_filtered中，因此customer的c_nationkey必须在nation_filtered的n_nationkey集合中\n   - 重写SQL通过customer_filtered CTE的IN子查询显式表达此约束，提前过滤customer表\n\n5. **聚合与排序等价性**：\n   - GROUP BY n_name保持不变，n_name来自nation_filtered CTE，与原始SQL中的nation表等价\n   - 聚合函数sum(l_extendedprice * (1 - l_discount))保持不变，作用于相同的lineitem行集合\n   - ORDER BY revenue DESC保持不变，revenue别名指向相同的聚合结果\n\n6. **结果集完整性保证**：\n   - 所有CTE的过滤和连接条件均为原始SQL WHERE子句的子集或等价变换\n   - 最终JOIN的连接图与原始SQL的连接图拓扑等价，仅改变了执行顺序和中间物化点\n   - 未引入额外的过滤条件或连接条件，未删除任何原始约束\n   - 因此重写SQL返回的(n_name, revenue)元组集合与原始SQL完全一致\n\n7. **易误判点说明**：\n   - customer_filtered使用IN子查询而非直接JOIN：IN子查询的语义等价于半连接，确保customer.c_nationkey在nation_filtered的n_nationkey集合中，与原始SQL通过连接传递的约束等价\n   - supplier_filtered与nation_filtered的JOIN在CTE中完成，最终查询再次JOIN nation_filtered：这是为了获取n_name列用于GROUP BY和SELECT，不会改变结果集，因为supplier_filtered已确保s_nationkey在nation_filtered中\n   - 连接顺序调整（先过滤小表再连接大表）：连接顺序的改变不影响结果集语义，仅影响执行效率，因为所有连接条件和过滤条件均保持等价"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE分层提取过滤和连接逻辑，所有连接条件、过滤条件及聚合语义与原始SQL完全等价，仅改变了执行顺序和中间物化点。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "重写SQL通过CTE显式组织公共中间结果（region_filtered、nation_filtered、supplier_filtered、customer_filtered、orders_filtered），实现了一次性计算后复用的意图，这是高优先级正信号。虽然cost从2201038.6增至2425741.05（增幅约10%），但结构分析显示：1）CTE将region→nation→supplier/customer的过滤逻辑前置并复用，避免重复计算；2）行数估计求和从34211603降至33472645（降幅约2.2%），说明中间结果有所压缩；3）Hash Join数量从5增至7，但这是因为CTE引入的额外连接，用于复用过滤结果，而非数据膨胀；4）并行度保持（Gather节点仍存在），主干扫描路径未恶化；5）未检测到关键大表被重复扫描、过滤失效、或新增高开销排序/物化主瓶颈等灾难性结构退化证据。根据成功终止优先规则，检测到CTE复用公共中间结果且无明确灾难性结构退化证据，可直接视为优秀重写并终止。cost增幅在可接受范围内，且结构收益（CTE复用、行数估计下降）足以支持成功终止。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+
+----------------------------------------
+

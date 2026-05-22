@@ -1,0 +1,296 @@
+Query ID: 59
+==================================================
+
+Original: select s_name, count(*) as numwait from supplier, lineitem l1, orders, nation where s_suppkey = l1.l_suppkey and o_orderkey = l1.l_orderkey and o_orderstatus = 'F' and l1.l_receiptdate > l1.l_commitdate and exists ( select * from lineitem l2 where l2.l_orderkey = l1.l_orderkey and l2.l_suppkey <> l1.l_suppkey ) and not exists ( select * from lineitem l3 where l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey and l3.l_receiptdate > l3.l_commitdate ) and s_nationkey = n_nationkey and n_name = 'SAUDI ARABIA' group by s_name order by numwait desc, s_name limit 100;
+Rewritten: WITH filtered_nation AS (
+    SELECT n_nationkey
+    FROM nation
+    WHERE n_name = 'SAUDI ARABIA'
+),
+filtered_supplier AS (
+    SELECT s_suppkey, s_name
+    FROM supplier
+    WHERE s_nationkey IN (SELECT n_nationkey FROM filtered_nation)
+),
+filtered_orders AS (
+    SELECT o_orderkey
+    FROM orders
+    WHERE o_orderstatus = 'F'
+),
+lineitem_base AS (
+    SELECT 
+        l_orderkey,
+        l_suppkey,
+        l_receiptdate > l_commitdate AS is_late
+    FROM lineitem
+),
+lineitem_with_metrics AS (
+    SELECT 
+        l_orderkey,
+        l_suppkey,
+        is_late,
+        COUNT(*) OVER (PARTITION BY l_orderkey) AS supplier_count,
+        SUM(CASE WHEN is_late THEN 1 ELSE 0 END) OVER (PARTITION BY l_orderkey) AS late_supplier_count
+    FROM lineitem_base
+)
+SELECT s_name, COUNT(*) AS numwait
+FROM filtered_supplier fs
+JOIN lineitem_with_metrics lwm ON fs.s_suppkey = lwm.l_suppkey
+JOIN filtered_orders fo ON lwm.l_orderkey = fo.o_orderkey
+WHERE lwm.is_late = TRUE
+  AND lwm.supplier_count > 1
+  AND lwm.late_supplier_count = 1
+GROUP BY s_name
+ORDER BY numwait DESC, s_name
+LIMIT 100
+Time Cost: 417.29s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '使用窗口函数完全替代EXISTS/NOT EXISTS相关子查询：在l_receiptdate>l_commitdate过滤后的lineitem上应用COUNT(*) OVER(PARTITION BY l_orderkey)计算每个订单的总供应商数，应用SUM(CASE WHEN l_receiptdate>l_commitdate THEN 1 END) OVER(PARTITION BY l_orderkey)计算延迟供应商数，然后在WHERE子句中过滤supplier_count>1 AND late_supplier_count=1（仅当前供应商延迟），消除l2_inner和l3的独立扫描，将3次Seq Scan合并为1次'}, {'group': '连接优化', 'produced_suggestion': "调整连接顺序为小表驱动策略：先连接nation(n_name='SAUDI ARABIA'，预估25行)和supplier(10万行)得到目标供应商集合(约4000行)，再连接orders(o_orderstatus='F'，预估750万行)，最后连接经过窗口函数处理的lineitem结果集，利用Hash Join的build-probe机制减少中间结果集大小，避免当前orders与lineitem直接连接产生的大量无效行"}, {'group': '子查询优化', 'produced_suggestion': '使用CTE物化窗口函数计算结果：将带窗口函数的lineitem查询定义为WITH filtered_lineitem AS (SELECT l_orderkey, l_suppkey, COUNT(*) OVER(...) as supplier_count, SUM(...) OVER(...) as late_count FROM lineitem WHERE l_receiptdate>l_commitdate)，PostgreSQL优化器可选择物化该CTE避免重复计算，同时在后续JOIN中复用过滤和窗口计算结果'}, {'group': '谓词简化', 'produced_suggestion': '将l_receiptdate>l_commitdate过滤条件前置到窗口函数计算之前，减少窗口函数处理的数据量；同时将supplier和orders的过滤条件(s_nationkey和o_orderstatus)尽早应用，在连接前而非连接后过滤，减少Hash表构建和探测的行数'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在多个严重性能瓶颈：1) lineitem表被扫描3次(l1/l2/l3)，每次全表扫描代价超过137万，合计占比78.7%；2) 两个EXISTS子查询导致Semi Join和Anti Join，代价分别占9.6%和3.2%；3) orders表全表扫描过滤o_orderstatus='F'，代价占6.3%。该SQL存在明显的子查询优化和谓词下推空间，可通过查询重写显著提升性能。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS子查询转换为LEFT JOIN + 聚合条件：第一个EXISTS检查是否存在其他供应商的订单行，第二个NOT EXISTS检查是否存在其他延迟供应商。可改写为：LEFT JOIN lineitem l2 ON l2.l_orderkey=l1.l_orderkey AND l2.l_suppkey<>l1.l_suppkey，然后用HAVING COUNT(DISTINCT l2.l_suppkey)>0 AND COUNT(DISTINCT CASE WHEN l2.l_receiptdate>l2.l_commitdate THEN l2.l_suppkey END)=0 来替代两个子查询，减少lineitem表的重复扫描"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将l1.l_receiptdate > l1.l_commitdate条件从Filter下推到JOIN之前：在l1的扫描阶段就应用此过滤条件，可以大幅减少参与JOIN的数据量。同时将o_orderstatus='F'和n_name='SAUDI ARABIA'等高选择性谓词尽早应用，减少中间结果集"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序，优先连接小表和高选择性过滤：建议顺序为 nation(过滤n_name) -> supplier -> orders(过滤o_orderstatus) -> lineitem(过滤l_receiptdate>l_commitdate)。nation表只有25行，supplier表10万行，先连接可以显著减少后续JOIN的基数，避免大表lineitem(6000万行)过早参与连接"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用窗口函数替代相关子查询：通过ROW_NUMBER() OVER(PARTITION BY l_orderkey ORDER BY l_suppkey) 和 SUM(CASE WHEN l_receiptdate>l_commitdate THEN 1 END) OVER(PARTITION BY l_orderkey) 在单次扫描中计算每个订单的供应商数量和延迟供应商数量，完全消除l2和l3的独立扫描"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将GROUP BY s_name的聚合与JOIN合并优化：考虑在JOIN完成后再进行聚合，并利用supplier表的s_suppkey主键特性，确保聚合前的数据已经过充分过滤。同时ORDER BY numwait DESC配合LIMIT 100，可以考虑使用Top-N堆优化，避免全量排序"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 71 条规则（按优化组筛选: 子查询优化, 谓词简化, 连接优化, 聚合优化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "FILTER_PROJECT_TRANSPOSE",
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_MERGE"
+  ],
+  "groups": "谓词简化,连接优化,子查询优化",
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.8,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "FILTER_PROJECT_TRANSPOSE": 0.75,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.85,
+    "FILTER_MERGE": 0.6
+  },
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.3,
+    "JOIN_CONDITION_PUSH": 0.2,
+    "FILTER_PROJECT_TRANSPOSE": 0.15,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.25,
+    "FILTER_MERGE": 0.1
+  }
+}
+✅ 选择了 5 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化,连接优化,子查询优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "FILTER_PROJECT_TRANSPOSE",
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_MERGE"
+  ],
+  "rewritten_sql": "SELECT s_name, COUNT(*) AS numwait\nFROM (\n    SELECT s.s_name, l1.l_orderkey\n    FROM (\n        SELECT n_nationkey\n        FROM nation\n        WHERE n_name = 'SAUDI ARABIA'\n    ) AS n_filtered\n    JOIN supplier s ON s.s_nationkey = n_filtered.n_nationkey\n    JOIN (\n        SELECT o_orderkey\n        FROM orders\n        WHERE o_orderstatus = 'F'\n    ) AS o_filtered ON TRUE\n    JOIN (\n        SELECT l_orderkey, l_suppkey\n        FROM lineitem\n        WHERE l_receiptdate > l_commitdate\n    ) AS l1_filtered ON o_filtered.o_orderkey = l1_filtered.l_orderkey AND s.s_suppkey = l1_filtered.l_suppkey\n    JOIN (\n        SELECT DISTINCT l_orderkey\n        FROM lineitem l2\n        WHERE l2.l_orderkey IS NOT NULL\n    ) AS l2_distinct ON l1_filtered.l_orderkey = l2_distinct.l_orderkey\n    WHERE EXISTS (\n        SELECT 1\n        FROM lineitem l2_inner\n        WHERE l2_inner.l_orderkey = l1_filtered.l_orderkey\n          AND l2_inner.l_suppkey <> l1_filtered.l_suppkey\n    )\n    AND NOT EXISTS (\n        SELECT 1\n        FROM lineitem l3\n        WHERE l3.l_orderkey = l1_filtered.l_orderkey\n          AND l3.l_suppkey <> l1_filtered.l_suppkey\n          AND l3.l_receiptdate > l3.l_commitdate\n    )\n) AS main_query\nGROUP BY s_name\nORDER BY numwait DESC, s_name\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **谓词下推（FILTER_INTO_JOIN + JOIN_CONDITION_PUSH）**：将 n_name='SAUDI ARABIA' 下推到 nation 表子查询，o_orderstatus='F' 下推到 orders 表子查询，l1.l_receiptdate > l1.l_commitdate 下推到 lineitem l1 表子查询。这些谓词仅依赖各自表的列，下推后在 JOIN 前过滤，减少参与 JOIN 的行数，但不改变最终结果集，因为原 SQL 的 WHERE 条件在 JOIN 后应用与在 JOIN 前应用对这些单表谓词等价。\n\n2. **JOIN 顺序调整（连接优化）**：按 nation（过滤后约1行）-> supplier（约4000行，假设均匀分布25国）-> orders（过滤后）-> lineitem（过滤后）的顺序连接。原 SQL 使用逗号连接（笛卡尔积 + WHERE 过滤），重写后显式 JOIN 并提前应用高选择性过滤，逻辑上等价于原 SQL 的隐式 JOIN + WHERE 组合，但执行效率更高。所有 JOIN 条件（s_suppkey = l1.l_suppkey, o_orderkey = l1.l_orderkey, s_nationkey = n_nationkey）保持不变。\n\n3. **EXISTS 子查询保留（FILTER_SUB_QUERY_TO_CORRELATE 部分应用）**：第一个 EXISTS 子查询检查是否存在 l2.l_orderkey = l1.l_orderkey 且 l2.l_suppkey <> l1.l_suppkey 的行，第二个 NOT EXISTS 检查是否不存在满足额外条件 l3.l_receiptdate > l3.l_commitdate 的此类行。这两个子查询在重写后保持为相关子查询形式，因为它们依赖外层的 l1_filtered.l_orderkey 和 l1_filtered.l_suppkey。添加的 l2_distinct JOIN 仅用于辅助优化器识别存在性检查，但实际过滤逻辑仍由 EXISTS/NOT EXISTS 保证，确保与原 SQL 语义完全一致。\n\n4. **聚合与排序保持不变**：GROUP BY s_name、COUNT(*) 聚合、ORDER BY numwait DESC, s_name 和 LIMIT 100 的逻辑完全保留。重写后的查询在外层对 s_name 分组计数，与原 SQL 在所有 JOIN 和过滤完成后分组计数的语义一致。\n\n5. **NULL 值处理**：原 SQL 的 JOIN 条件（等值连接）和 WHERE 条件（不等值比较、EXISTS）对 NULL 值的处理在重写后保持一致。l2_distinct 的 WHERE l2.l_orderkey IS NOT NULL 确保 JOIN 键非空，但由于 l_orderkey 是主键的一部分（NOT NULL 约束），此条件实际上是冗余的安全检查，不影响结果集。\n\n6. **相关子查询的相关列**：EXISTS 子查询中 l2_inner.l_orderkey = l1_filtered.l_orderkey 和 l2_inner.l_suppkey <> l1_filtered.l_suppkey 的相关条件在重写后保持不变，确保每个 l1 行的存在性检查仍针对同一 orderkey 下的其他 suppkey，与原 SQL 完全等价。NOT EXISTS 同理。\n\n7. **结果集完整性**：重写后的 SQL 通过子查询过滤和显式 JOIN 替代原 SQL 的隐式连接，但所有过滤条件、连接条件、聚合逻辑和排序逻辑均保持一致，因此返回的 s_name 和 numwait 列与原 SQL 完全相同，行数和顺序也一致（受 LIMIT 100 限制）。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: missing FROM-clause entry for table "l1"
+LINE 3:     SELECT s.s_name, l1.l_orderkey
+                             ^
+
+{'flag': False, 'error': 'missing FROM-clause entry for table "l1"\nLINE 3:     SELECT s.s_name, l1.l_orderkey\n                             ^\n'}
+DBMS_syntax_Tool ends...
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: missing FROM-clause entry for table "l1"
+LINE 3:     SELECT s.s_name, l1.l_orderkey
+                             ^
+
+{'flag': False, 'error': 'missing FROM-clause entry for table "l1"\nLINE 3:     SELECT s.s_name, l1.l_orderkey\n                             ^\n'}
+DBMS_syntax_Tool ends...
+```json
+{
+  "rewritten_sql": "SELECT s_name, COUNT(*) AS numwait\nFROM (\n    SELECT s.s_name, l1_filtered.l_orderkey, l1_filtered.l_suppkey\n    FROM (\n        SELECT n_nationkey\n        FROM nation\n        WHERE n_name = 'SAUDI ARABIA'\n    ) AS n_filtered\n    JOIN supplier s ON s.s_nationkey = n_filtered.n_nationkey\n    JOIN (\n        SELECT o_orderkey\n        FROM orders\n        WHERE o_orderstatus = 'F'\n    ) AS o_filtered ON TRUE\n    JOIN (\n        SELECT l_orderkey, l_suppkey\n        FROM lineitem\n        WHERE l_receiptdate > l_commitdate\n    ) AS l1_filtered ON o_filtered.o_orderkey = l1_filtered.l_orderkey AND s.s_suppkey = l1_filtered.l_suppkey\n    WHERE EXISTS (\n        SELECT 1\n        FROM lineitem l2_inner\n        WHERE l2_inner.l_orderkey = l1_filtered.l_orderkey\n          AND l2_inner.l_suppkey <> l1_filtered.l_suppkey\n    )\n    AND NOT EXISTS (\n        SELECT 1\n        FROM lineitem l3\n        WHERE l3.l_orderkey = l1_filtered.l_orderkey\n          AND l3.l_suppkey <> l1_filtered.l_suppkey\n          AND l3.l_receiptdate > l3.l_commitdate\n    )\n) AS main_query\nGROUP BY s_name\nORDER BY numwait DESC, s_name\nLIMIT 100",
+  "note": "修复了SELECT子句中l1引用错误，改为l1_filtered并添加l_suppkey到投影列以供EXISTS子查询使用，同时移除了冗余的l2_distinct JOIN"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过谓词下推、显式JOIN和子查询过滤替代原SQL的隐式连接，所有过滤条件、连接条件、EXISTS/NOT EXISTS逻辑、聚合和排序均保持一致，结果集完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（节点类型、扫描方式、连接顺序、并行度、cost均无变化），重写SQL仅改变了表别名和子查询嵌套形式，但未产生任何实质性优化效果。原SQL与重写SQL的EXPLAIN完全一致：均为6次Seq Scan（3次lineitem全表扫描：l1/l2/l3各一次，1次orders，1次supplier，1次nation），5次Hash Join（包括Semi Join和Anti Join），2个Workers并行执行。重写引入的派生表（n_filtered、o_filtered、l1_filtered）和外层子查询包装并未改变优化器的执行策略，过滤条件仍在各自Seq Scan节点应用，未实现谓词下推或连接顺序调整。两个EXISTS子查询仍以Semi/Anti Join形式存在，未消除l2/l3的独立扫描。结构信号显示无改进：节点类型计数完全相同，行数估计求和相同（81998451），无去相关、无子计划减少、无公共结果复用。虽然cost未恶化，但也未改善，且未触及optimization_advice中的核心建议（窗口函数替代相关子查询、JOIN顺序调整、聚合优化等）。需继续优化。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写，重点实施以下策略：1) 使用窗口函数消除l2/l3独立扫描：在l1过滤后的结果上应用ROW_NUMBER() OVER(PARTITION BY l_orderkey ORDER BY l_suppkey)和SUM(CASE WHEN l_receiptdate>l_commitdate THEN 1 END) OVER(PARTITION BY l_orderkey)，通过单次扫描计算每个订单的供应商数量和延迟供应商数量，然后在WHERE子句中过滤（供应商数>1且延迟供应商数=0），完全替代EXISTS/NOT EXISTS子查询；2) 调整JOIN顺序：先连接nation(n_name='SAUDI ARABIA')和supplier，再连接orders(o_orderstatus='F')，最后连接经过l_receiptdate>l_commitdate过滤的lineitem，利用小表驱动减少中间结果集；3) 考虑使用CTE或临时物化视图缓存l1过滤结果，避免在窗口函数计算和最终JOIN中重复扫描lineitem。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "基于上一轮反馈，当前SQL仍存在三个核心性能瓶颈：1) lineitem表被独立扫描3次（l1_filtered、l2_inner、l3各一次，总代价占比78.7%），EXISTS/NOT EXISTS子查询未被消除；2) 连接顺序未优化，大表orders(1500万行)与lineitem(6000万行)直接Hash Join产生巨大中间结果集；3) 过滤条件l_receiptdate>l_commitdate在每次扫描中重复应用。执行计划显示Semi Join和Anti Join的Join Filter（l_suppkey不等条件）导致高代价Hash操作。本轮优化将采用窗口函数彻底消除重复扫描，通过单次lineitem扫描计算每个订单的供应商计数和延迟供应商计数，同时调整连接顺序为小表驱动（nation→supplier→orders→lineitem），预期可减少60%以上的扫描代价并优化连接中间结果集大小。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用窗口函数完全替代EXISTS/NOT EXISTS相关子查询：在l_receiptdate>l_commitdate过滤后的lineitem上应用COUNT(*) OVER(PARTITION BY l_orderkey)计算每个订单的总供应商数，应用SUM(CASE WHEN l_receiptdate>l_commitdate THEN 1 END) OVER(PARTITION BY l_orderkey)计算延迟供应商数，然后在WHERE子句中过滤supplier_count>1 AND late_supplier_count=1（仅当前供应商延迟），消除l2_inner和l3的独立扫描，将3次Seq Scan合并为1次"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序为小表驱动策略：先连接nation(n_name='SAUDI ARABIA'，预估25行)和supplier(10万行)得到目标供应商集合(约4000行)，再连接orders(o_orderstatus='F'，预估750万行)，最后连接经过窗口函数处理的lineitem结果集，利用Hash Join的build-probe机制减少中间结果集大小，避免当前orders与lineitem直接连接产生的大量无效行"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用CTE物化窗口函数计算结果：将带窗口函数的lineitem查询定义为WITH filtered_lineitem AS (SELECT l_orderkey, l_suppkey, COUNT(*) OVER(...) as supplier_count, SUM(...) OVER(...) as late_count FROM lineitem WHERE l_receiptdate>l_commitdate)，PostgreSQL优化器可选择物化该CTE避免重复计算，同时在后续JOIN中复用过滤和窗口计算结果"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将l_receiptdate>l_commitdate过滤条件前置到窗口函数计算之前，减少窗口函数处理的数据量；同时将supplier和orders的过滤条件(s_nationkey和o_orderstatus)尽早应用，在连接前而非连接后过滤，减少Hash表构建和探测的行数"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择...
+📚 加载规则库 52 条规则（按优化组筛选: 子查询优化, 连接优化, 谓词简化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "AGGREGATE_FILTER_TRANSPOSE",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "groups": "子查询优化,谓词简化,连接优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.9,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.8,
+    "JOIN_CONDITION_PUSH": 0.7
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.3,
+    "JOIN_CONDITION_PUSH": 0.2
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,谓词简化,连接优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "AGGREGATE_FILTER_TRANSPOSE", "JOIN_CONDITION_PUSH"],
+  "rewritten_sql": "WITH filtered_nation AS (\n    SELECT n_nationkey\n    FROM nation\n    WHERE n_name = 'SAUDI ARABIA'\n),\nfiltered_supplier AS (\n    SELECT s_suppkey, s_name\n    FROM supplier\n    WHERE s_nationkey IN (SELECT n_nationkey FROM filtered_nation)\n),\nfiltered_orders AS (\n    SELECT o_orderkey\n    FROM orders\n    WHERE o_orderstatus = 'F'\n),\nlineitem_with_metrics AS (\n    SELECT \n        l_orderkey,\n        l_suppkey,\n        COUNT(*) OVER (PARTITION BY l_orderkey) AS supplier_count,\n        SUM(CASE WHEN l_receiptdate > l_commitdate THEN 1 ELSE 0 END) OVER (PARTITION BY l_orderkey) AS late_supplier_count\n    FROM lineitem\n    WHERE l_receiptdate > l_commitdate\n)\nSELECT s_name, COUNT(*) AS numwait\nFROM filtered_supplier fs\nJOIN lineitem_with_metrics lwm ON fs.s_suppkey = lwm.l_suppkey\nJOIN filtered_orders fo ON lwm.l_orderkey = fo.o_orderkey\nWHERE lwm.supplier_count > 1\n  AND lwm.late_supplier_count = 1\nGROUP BY s_name\nORDER BY numwait DESC, s_name\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **CTE分解与过滤下推（STRATEGY_CTE_DECOMPOSITION + JOIN_CONDITION_PUSH）**：将nation、supplier、orders的过滤条件分别提取为filtered_nation、filtered_supplier、filtered_orders三个CTE，确保n_name='SAUDI ARABIA'、s_nationkey匹配、o_orderstatus='F'的过滤在JOIN前完成，减少参与连接的数据量。这些过滤条件与原SQL中的内联子查询（n_filtered、o_filtered）及WHERE子句中的s_nationkey/o_orderstatus过滤语义完全一致，仅改变了执行时机（提前到CTE物化阶段），不改变结果集。\n\n2. **窗口函数替代相关子查询（子查询优化核心改写）**：原SQL中的两个相关子查询（EXISTS检查是否存在其他供应商、NOT EXISTS检查其他供应商是否延迟）被替换为窗口函数计算。在lineitem_with_metrics CTE中，对满足l_receiptdate>l_commitdate的lineitem行，使用COUNT(*) OVER(PARTITION BY l_orderkey)计算每个订单的总供应商数（supplier_count），使用SUM(CASE WHEN l_receiptdate>l_commitdate THEN 1 END) OVER(PARTITION BY l_orderkey)计算延迟供应商数（late_supplier_count）。由于窗口函数在已过滤的行（l_receiptdate>l_commitdate）上计算，late_supplier_count实际等于该订单中延迟供应商的总数。最终WHERE子句中supplier_count>1确保订单有多个供应商（对应原EXISTS子查询：存在l_suppkey不同的其他行），late_supplier_count=1确保只有当前供应商延迟（对应原NOT EXISTS子查询：不存在其他l_suppkey不同且l_receiptdate>l_commitdate的行）。这一转换在TPC-H Q21语义下等价：原SQL要求l1供应商延迟、存在其他供应商、其他供应商均不延迟；重写SQL通过窗口函数统计延迟供应商总数=1（即只有当前供应商延迟）且总供应商数>1（存在其他供应商）达到相同效果。\n\n3. **连接顺序调整与中间结果优化（JOIN_CONDITION_PUSH）**：原SQL的连接顺序为nation→supplier→orders→lineitem→EXISTS/NOT EXISTS子查询；重写SQL调整为先物化小表过滤结果（filtered_nation约25行、filtered_supplier约4000行、filtered_orders约750万行），再将filtered_supplier与lineitem_with_metrics连接（利用s_suppkey=l_suppkey），最后与filtered_orders连接（利用l_orderkey=o_orderkey）。由于lineitem_with_metrics已包含窗口函数计算结果且过滤了l_receiptdate>l_commitdate的行，连接时无需再访问l2/l3子查询，将原3次lineitem扫描（l1、l2_inner、l3）合并为1次扫描+窗口函数计算。连接条件（s_suppkey=l_suppkey、l_orderkey=o_orderkey）与原SQL完全一致，仅改变了连接顺序和驱动表选择，不影响最终匹配的行集合。\n\n4. **聚合与排序保持（AGGREGATE_FILTER_TRANSPOSE）**：原SQL在最外层对s_name进行GROUP BY并计算COUNT(*)，重写SQL保持相同的聚合逻辑（GROUP BY s_name, COUNT(*) AS numwait）和排序逻辑（ORDER BY numwait DESC, s_name）。由于前述改写仅改变了数据获取和过滤方式，未改变参与聚合的行集合（仍为满足所有条件的supplier-lineitem-order组合），聚合结果与原SQL等价。\n\n5. **NULL值与重复行处理**：原SQL中l_suppkey、l_orderkey、s_suppkey均为NOT NULL主键/外键列，窗口函数PARTITION BY l_orderkey不会因NULL产生错误分组。窗口函数计算的supplier_count和late_supplier_count基于相同的分区逻辑，确保每个l_orderkey的所有l_suppkey行共享相同的统计值。WHERE子句中supplier_count>1和late_supplier_count=1的过滤逻辑与原EXISTS/NOT EXISTS子查询的行级过滤等价：原SQL对每个l1行独立检查是否存在其他供应商及其他供应商是否延迟，重写SQL通过窗口函数全局统计后过滤，两者在l_orderkey+l_suppkey组合唯一性（主键约束）下结果一致。\n\n6. **LIMIT与最终结果集**：原SQL和重写SQL均在聚合和排序后应用LIMIT 100，返回延迟订单数最多的前100个供应商。由于聚合输入行集合等价（满足所有过滤和连接条件的supplier-lineitem-order组合），聚合结果（s_name及其对应的numwait）等价，排序后的前100行也等价。\n\n7. **易误判点说明**：窗口函数替代相关子查询的关键在于理解原NOT EXISTS子查询的语义——它要求不存在「其他供应商且该供应商也延迟」的行。由于窗口函数在l_receiptdate>l_commitdate过滤后的行上计算late_supplier_count，该值等于订单中所有延迟供应商的数量。当late_supplier_count=1时，意味着该订单只有一个延迟供应商（即当前l_suppkey对应的供应商），其他供应商（若存在）均未延迟，这与原NOT EXISTS子查询的语义完全一致。结合supplier_count>1（确保存在其他供应商，对应原EXISTS子查询），两个条件共同保证了与原SQL相同的行过滤逻辑。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL的窗口函数逻辑与原SQL的EXISTS/NOT EXISTS语义不等价：原SQL要求当前供应商l1延迟且存在其他供应商但其他供应商均不延迟；重写SQL的late_supplier_count=1仅统计延迟供应商总数为1，但无法确保当前连接的l_suppkey就是那个唯一延迟的供应商。",
+    "differences": [
+        {
+            "type": "子查询语义偏移",
+            "description": "原SQL的NOT EXISTS确保l1.l_suppkey是唯一延迟的供应商；重写SQL的late_supplier_count=1只保证订单有1个延迟供应商，但JOIN可能匹配到该订单的任意供应商（包括未延迟的），导致结果集包含不应计入的supplier",
+            "location": "lineitem_with_metrics窗口函数与WHERE late_supplier_count=1的组合逻辑"
+        },
+        {
+            "type": "过滤范围扩大",
+            "description": "lineitem_with_metrics仅过滤l_receiptdate>l_commitdate的行，但后续JOIN时supplier_count>1条件会匹配该订单的所有供应商（无论是否延迟），而原SQL的l1必须满足l_receiptdate>l_commitdate",
+            "location": "filtered_supplier与lineitem_with_metrics的JOIN条件缺少对当前行l_receiptdate>l_commitdate的约束"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL的窗口函数逻辑与原SQL的EXISTS/NOT EXISTS语义不等价：原SQL要求当前供应商l1延迟且存在其他供应商但其他供应商均不延迟；重写SQL的late_supplier_count=1仅统计延迟供应商总数为1，但无法确保当前连接的l_suppkey就是那个唯一延迟的供应商。
+```json
+{
+  "fixed_sql": "WITH filtered_nation AS (\n    SELECT n_nationkey\n    FROM nation\n    WHERE n_name = 'SAUDI ARABIA'\n),\nfiltered_supplier AS (\n    SELECT s_suppkey, s_name\n    FROM supplier\n    WHERE s_nationkey IN (SELECT n_nationkey FROM filtered_nation)\n),\nfiltered_orders AS (\n    SELECT o_orderkey\n    FROM orders\n    WHERE o_orderstatus = 'F'\n),\nlineitem_base AS (\n    SELECT \n        l_orderkey,\n        l_suppkey,\n        l_receiptdate > l_commitdate AS is_late\n    FROM lineitem\n),\nlineitem_with_metrics AS (\n    SELECT \n        l_orderkey,\n        l_suppkey,\n        is_late,\n        COUNT(*) OVER (PARTITION BY l_orderkey) AS supplier_count,\n        SUM(CASE WHEN is_late THEN 1 ELSE 0 END) OVER (PARTITION BY l_orderkey) AS late_supplier_count\n    FROM lineitem_base\n)\nSELECT s_name, COUNT(*) AS numwait\nFROM filtered_supplier fs\nJOIN lineitem_with_metrics lwm ON fs.s_suppkey = lwm.l_suppkey\nJOIN filtered_orders fo ON lwm.l_orderkey = fo.o_orderkey\nWHERE lwm.is_late = TRUE\n  AND lwm.supplier_count > 1\n  AND lwm.late_supplier_count = 1\nGROUP BY s_name\nORDER BY numwait DESC, s_name\nLIMIT 100",
+  "note": "在lineitem_base中保留所有行并标记is_late，在最终WHERE中添加lwm.is_late=TRUE确保JOIN仅匹配l1本身延迟的供应商，同时保留窗口函数计算全订单的supplier_count和late_supplier_count"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正上轮问题：lineitem_base保留所有行并标记is_late，窗口函数在全表计算supplier_count和late_supplier_count，WHERE条件lwm.is_late=TRUE确保当前行延迟，late_supplier_count=1确保订单仅有1个延迟供应商，与原SQL的EXISTS/NOT EXISTS语义等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 6->2, index-like 0->2 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写SQL引入5个CTE和窗口函数，成功消除了原SQL中的EXISTS/NOT EXISTS相关子查询（原2个SubPlan节点完全消失），将lineitem的3次独立扫描（l1/l2/l3各1次Seq Scan）合并为1次全表扫描+窗口函数计算，这是去相关和公共结果复用的典型正信号。执行计划变化：Seq Scan从6降至2，Hash Join从5降至0，新增3个Nested Loop和2个Index Scan用于小表连接。行数估计求和从8200万升至1.7亿（2.08倍），但这是窗口函数中间结果膨胀导致的统计失真，不能作为恶化依据。Cost从540万升至1490万（2.76倍增长），但结合去相关、子计划消除、扫描次数减少等高优先级正信号，cost增长只能作为辅助信息，不足以否定重写价值。然而，当前重写存在明显可优化空间：(1)窗口函数在全表lineitem上计算后才过滤supplier_count>1，应先用CTE过滤nation/supplier/orders再与lineitem连接，避免对6000万行全表做窗口计算；(2)Nested Loop连接顺序未充分利用小表驱动，应调整为先连接过滤后的小表集合再探测lineitem。虽然本轮已有去相关等正向收益，但结构上仍有显著改进空间且cost增幅较大，应继续优化而非直接终止。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：(1)将filtered_nation/filtered_supplier/filtered_orders的CTE保留，但将lineitem_base和lineitem_with_metrics合并为单个CTE，在其中先JOIN filtered_orders和filtered_supplier过滤出目标订单和供应商的lineitem子集，再在该子集上应用窗口函数，避免对全表6000万行计算窗口；(2)调整主查询连接顺序为先JOIN三个过滤CTE得到小表驱动集合，再与窗口函数CTE连接；(3)考虑将窗口函数的PARTITION BY l_orderkey改为在已过滤的订单范围内计算，进一步减少窗口计算开销。预期改进：窗口函数处理行数从6000万降至数十万级别，cost应显著下降，同时保留去相关和公共结果复用的结构优势。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+ℹ️  估计代价上升 176.0%（> 50.0%），计划结构分析建议保留当前重写，不回退。
+
+🎲 LinUCB Update: 3 rules, reward=-0.2769 (cost=-1.0000, rows=+0.0000, depth=+0.0769, oc=5399366.7400, rc=14901757.3400)
+✅ LinUCB Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: prior=0.390, reward=-0.117, count=130, avg=+0.018
+   → AGGREGATE_FILTER_TRANSPOSE: prior=0.536, reward=-0.087, count=31, avg=+0.015
+   → JOIN_CONDITION_PUSH: prior=0.397, reward=-0.072, count=128, avg=+0.003
+
+----------------------------------------
+

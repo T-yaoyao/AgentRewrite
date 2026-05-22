@@ -1,0 +1,205 @@
+Query ID: 54
+==================================================
+
+Original: select sum(l_extendedprice* (1 - l_discount)) as revenue from lineitem, part where ( p_partkey = l_partkey and p_brand = 'Brand#31' and p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') and l_quantity >= 10 and l_quantity <= 10 + 10 and p_size between 1 and 5 and l_shipmode in ('AIR', 'AIR REG') and l_shipinstruct = 'DELIVER IN PERSON' ) or ( p_partkey = l_partkey and p_brand = 'Brand#22' and p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') and l_quantity >= 19 and l_quantity <= 19 + 10 and p_size between 1 and 10 and l_shipmode in ('AIR', 'AIR REG') and l_shipinstruct = 'DELIVER IN PERSON' ) or ( p_partkey = l_partkey and p_brand = 'Brand#25' and p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') and l_quantity >= 27 and l_quantity <= 27 + 10 and p_size between 1 and 15 and l_shipmode in ('AIR', 'AIR REG') and l_shipinstruct = 'DELIVER IN PERSON' );
+Rewritten: WITH filtered_lineitem AS (
+  SELECT 
+    l_partkey,
+    l_quantity,
+    l_extendedprice,
+    l_discount
+  FROM lineitem
+  WHERE l_shipmode IN ('AIR', 'AIR REG')
+    AND l_shipinstruct = 'DELIVER IN PERSON'
+    AND l_quantity BETWEEN 10 AND 37
+)
+SELECT SUM(
+  CASE 
+    WHEN l_quantity BETWEEN 10 AND 20 
+         AND p_brand = 'Brand#31'
+         AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
+         AND p_size BETWEEN 1 AND 5
+    THEN l_extendedprice * (1 - l_discount)
+    WHEN l_quantity BETWEEN 19 AND 29
+         AND p_brand = 'Brand#22'
+         AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
+         AND p_size BETWEEN 1 AND 10
+    THEN l_extendedprice * (1 - l_discount)
+    WHEN l_quantity BETWEEN 27 AND 37
+         AND p_brand = 'Brand#25'
+         AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
+         AND p_size BETWEEN 1 AND 15
+    THEN l_extendedprice * (1 - l_discount)
+    ELSE 0
+  END
+) AS revenue
+FROM filtered_lineitem
+INNER JOIN part ON p_partkey = l_partkey;
+Time Cost: 424.17s
+Suggestion: [{'group': '集合优化', 'produced_suggestion': "将UNION ALL的三个分支合并为单次lineitem扫描：使用CTE预过滤lineitem（l_shipmode IN ('AIR','AIR REG') AND l_shipinstruct='DELIVER IN PERSON' AND l_quantity BETWEEN 10 AND 37），然后在外层通过CASE WHEN表达式根据l_quantity范围（10-20/19-29/27-37）匹配对应的part条件（brand/container/size组合），避免lineitem大表的三次重复扫描"}, {'group': '谓词简化', 'produced_suggestion': '在CTE中对lineitem应用公共过滤条件（l_shipmode/l_shipinstruct）和合并后的quantity范围（BETWEEN 10 AND 37），将三个分支特有的quantity精确范围判断（10-20/19-29/27-37）与part条件的匹配逻辑移至外层CASE WHEN中，实现过滤条件的分层下推和合并'}, {'group': '连接优化', 'produced_suggestion': "将三次独立的lineitem JOIN part改为：CTE预过滤lineitem后，外层单次JOIN part，在JOIN条件或WHERE子句中通过CASE WHEN逻辑同时检查三组条件（(l_quantity BETWEEN 10 AND 20 AND p_brand='Brand#31' AND p_container IN (...) AND p_size BETWEEN 1 AND 5) OR (l_quantity BETWEEN 19 AND 29 AND ...) OR (...)），减少part索引探测次数从3次到1次"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表全表扫描(Seq Scan)占总代价99.9%，扫描近6000万行数据。当前SQL使用隐式CROSS JOIN后通过复杂OR条件过滤，导致优化器无法有效利用索引。可通过将OR条件拆分为UNION ALL子查询，配合显式INNER JOIN改写，使每个分支条件更清晰，便于优化器针对性优化并可能利用part表的主键索引进行连接。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将隐式CROSS JOIN改写为显式INNER JOIN，明确连接条件p_partkey = l_partkey，避免笛卡尔积后再过滤的低效模式"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将复杂OR条件拆分为三个独立的查询分支，每个分支包含一组完整的过滤条件(brand、container、quantity、size、shipmode、shipinstruct)，消除OR导致的索引失效问题"
+    },
+    {
+      "group": "集合优化",
+      "produced_suggestion": "使用UNION ALL合并三个拆分后的查询分支(因计算sum聚合，重复行也需保留)，每个分支针对特定brand和container组合进行过滤，提升过滤选择性"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "在每个UNION ALL分支中，将l_quantity范围条件简化为具体数值(如l_quantity BETWEEN 10 AND 20)，将p_size条件与对应分支的具体范围关联，提高谓词下推效率"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 54 条规则（按优化组筛选: 连接优化, 谓词简化, 集合优化；LinUCB参数化记忆开启）
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCB=1.100
+   → AGGREGATE_JOIN_REMOVE: UCB=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCB=1.100
+{
+  "applied_rules": [],
+  "groups": "",
+  "rule_effect_confidence": {},
+  "rule_effect_scores": {}
+}
+✅ 选择了 0 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "",
+  "applied_rules": [],
+  "rewritten_sql": "SELECT SUM(revenue) AS revenue\nFROM (\n  SELECT l_extendedprice * (1 - l_discount) AS revenue\n  FROM lineitem\n  INNER JOIN part ON p_partkey = l_partkey\n  WHERE p_brand = 'Brand#31'\n    AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')\n    AND l_quantity BETWEEN 10 AND 20\n    AND p_size BETWEEN 1 AND 5\n    AND l_shipmode IN ('AIR', 'AIR REG')\n    AND l_shipinstruct = 'DELIVER IN PERSON'\n  \n  UNION ALL\n  \n  SELECT l_extendedprice * (1 - l_discount) AS revenue\n  FROM lineitem\n  INNER JOIN part ON p_partkey = l_partkey\n  WHERE p_brand = 'Brand#22'\n    AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')\n    AND l_quantity BETWEEN 19 AND 29\n    AND p_size BETWEEN 1 AND 10\n    AND l_shipmode IN ('AIR', 'AIR REG')\n    AND l_shipinstruct = 'DELIVER IN PERSON'\n  \n  UNION ALL\n  \n  SELECT l_extendedprice * (1 - l_discount) AS revenue\n  FROM lineitem\n  INNER JOIN part ON p_partkey = l_partkey\n  WHERE p_brand = 'Brand#25'\n    AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')\n    AND l_quantity BETWEEN 27 AND 37\n    AND p_size BETWEEN 1 AND 15\n    AND l_shipmode IN ('AIR', 'AIR REG')\n    AND l_shipinstruct = 'DELIVER IN PERSON'\n) AS combined_revenue;",
+  "semantic_correctness_guarantee": "1. **连接改写**：将原始SQL中的隐式交叉连接(FROM lineitem, part)改写为显式INNER JOIN，连接条件为p_partkey = l_partkey。由于原SQL的WHERE子句中每个OR分支都包含p_partkey = l_partkey条件，因此提取为JOIN ON条件后语义完全等价，不会改变结果集。\n\n2. **OR条件拆分为UNION ALL**：原SQL包含三个由OR连接的复合条件分支，每个分支的过滤条件互斥(brand和container组合不同)。将其拆分为三个独立的SELECT查询，通过UNION ALL合并。由于：(a)三个分支条件互斥，不存在同一行同时满足多个分支的情况；(b)使用UNION ALL保留所有行(包括可能的重复)；(c)最外层对所有分支结果统一求SUM，因此与原SQL的单次SUM(所有满足OR条件的行)语义完全等价。\n\n3. **quantity范围条件简化**：原SQL中l_quantity条件为'l_quantity >= X AND l_quantity <= X + 10'形式，改写为标准BETWEEN语法。具体为：第一分支BETWEEN 10 AND 20(对应>=10且<=20)，第二分支BETWEEN 19 AND 29(对应>=19且<=29)，第三分支BETWEEN 27 AND 37(对应>=27且<=37)。BETWEEN在SQL标准中为闭区间[a, b]，与原条件完全等价。\n\n4. **size范围条件保持**：每个分支的p_size条件保持原SQL的BETWEEN语法和范围值不变(1-5, 1-10, 1-15)，确保过滤逻辑一致。\n\n5. **聚合计算等价性**：原SQL直接对所有满足WHERE条件的行计算SUM(l_extendedprice*(1-l_discount))。重写SQL在每个UNION ALL分支中先计算revenue列(l_extendedprice*(1-l_discount))，然后在最外层对所有分支的revenue列求SUM。由于SUM的结合律，SUM(A ∪ B ∪ C) = SUM(A) + SUM(B) + SUM(C)，两种计算方式结果完全相同。\n\n6. **过滤条件完整性**：每个UNION ALL分支保留了原SQL对应OR分支的所有过滤条件(brand、container的IN列表、quantity范围、size范围、shipmode的IN列表、shipinstruct等值条件)，未遗漏或修改任何谓词，确保每个分支的行选择与原SQL对应分支完全一致。\n\n7. **NULL值处理**：由于lineitem和part表的相关列(l_partkey、p_partkey、l_quantity、l_extendedprice、l_discount等)在Schema中定义为NOT NULL，不存在NULL值导致的JOIN或过滤行为差异。所有等值、范围和IN条件的语义在原SQL和重写SQL中保持一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "原始SQL的三个OR分支被拆分为UNION ALL的三个独立查询，每个分支的过滤条件、JOIN条件和聚合表达式均保持一致，最外层SUM对所有分支结果求和，与原SQL直接对所有满足OR条件的行求和语义完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写将单次 OR 复杂过滤改为 UNION ALL 三分支，每分支独立扫描 lineitem + Index Scan part，逻辑清晰且过滤下推更精准。但执行计划显示 lineitem 被扫描 3 次（每分支一次 Parallel Seq Scan，总 Plan Rows 从 19→18，几乎持平），part 索引探测次数从 1 次增至 3 次。Cost 从 1.88M 升至 4.88M（增幅 160%），主要源于三次独立扫描 lineitem 大表的开销累加。虽然每分支过滤更精准（单分支 Plan Rows=6 vs 原 19），但三次扫描的总开销超过原单次扫描 + 复杂 OR 过滤的成本。结构上未出现去相关、子计划消除或公共结果复用等高优先级正信号；反而引入了 lineitem 大表的重复扫描（3 次 vs 1 次），这是明确的结构退化信号。Cost 大幅上升与结构退化方向一致，可作为辅助佐证。综合判断：本轮重写在逻辑清晰度上有提升，但执行效率上明确恶化（大表重复扫描 + cost 显著增加），不应终止。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 UNION ALL 结构，引入 CTE 或派生表对 lineitem 进行一次性预过滤（合并三个分支的 quantity/shipmode/shipinstruct 条件为单次扫描），然后在外层通过 CASE WHEN 或多次 JOIN part 的方式分别匹配三组 brand/container/size 条件，消除 lineitem 的重复扫描；或考虑回退到原 SQL 的单次扫描 + OR 过滤模式，但优化 part 表的过滤条件顺序或索引利用。"
+}
+```
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮UNION ALL重写导致lineitem大表被扫描3次（每分支独立Seq Scan，总cost从1.88M升至4.88M，增幅160%），这是明确的性能退化。当前SQL的核心问题是：三个分支的lineitem过滤条件（shipmode/shipinstruct相同，仅quantity范围不同）和part过滤条件（brand/container/size不同）被分散到三次独立扫描中。优化方向：通过CTE对lineitem进行一次性预过滤（合并三个quantity范围为OR条件或BETWEEN宽范围），然后在外层通过单次JOIN part + CASE WHEN分支逻辑匹配三组brand/container/size条件，消除lineitem的重复扫描。这样可将lineitem扫描次数从3次降为1次，同时保留过滤下推的优势。",
+  "advice": [
+    {
+      "group": "集合优化",
+      "produced_suggestion": "将UNION ALL的三个分支合并为单次lineitem扫描：使用CTE预过滤lineitem（l_shipmode IN ('AIR','AIR REG') AND l_shipinstruct='DELIVER IN PERSON' AND l_quantity BETWEEN 10 AND 37），然后在外层通过CASE WHEN表达式根据l_quantity范围（10-20/19-29/27-37）匹配对应的part条件（brand/container/size组合），避免lineitem大表的三次重复扫描"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "在CTE中对lineitem应用公共过滤条件（l_shipmode/l_shipinstruct）和合并后的quantity范围（BETWEEN 10 AND 37），将三个分支特有的quantity精确范围判断（10-20/19-29/27-37）与part条件的匹配逻辑移至外层CASE WHEN中，实现过滤条件的分层下推和合并"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将三次独立的lineitem JOIN part改为：CTE预过滤lineitem后，外层单次JOIN part，在JOIN条件或WHERE子句中通过CASE WHEN逻辑同时检查三组条件（(l_quantity BETWEEN 10 AND 20 AND p_brand='Brand#31' AND p_container IN (...) AND p_size BETWEEN 1 AND 5) OR (l_quantity BETWEEN 19 AND 29 AND ...) OR (...)），减少part索引探测次数从3次到1次"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择...
+📚 加载规则库 54 条规则（按优化组筛选: 集合优化, 谓词简化, 连接优化；LinUCB参数化记忆开启）
+   → AGGREGATE_UNION_AGGREGATE_FIRST: UCB=1.100
+   → AGGREGATE_UNION_AGGREGATE_SECOND: UCB=1.100
+   → JOIN_RIGHT_UNION_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": [
+    "FILTER_SET_OP_TRANSPOSE",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "groups": "谓词简化,连接优化",
+  "rule_effect_confidence": {
+    "FILTER_SET_OP_TRANSPOSE": 0.8,
+    "JOIN_CONDITION_PUSH": 0.8
+  },
+  "rule_effect_scores": {
+    "FILTER_SET_OP_TRANSPOSE": 0.5,
+    "JOIN_CONDITION_PUSH": 0.5
+  }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化,连接优化",
+  "applied_rules": [
+    "FILTER_SET_OP_TRANSPOSE",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rewritten_sql": "WITH filtered_lineitem AS (\n  SELECT \n    l_partkey,\n    l_quantity,\n    l_extendedprice,\n    l_discount\n  FROM lineitem\n  WHERE l_shipmode IN ('AIR', 'AIR REG')\n    AND l_shipinstruct = 'DELIVER IN PERSON'\n    AND l_quantity BETWEEN 10 AND 37\n)\nSELECT SUM(\n  CASE \n    WHEN l_quantity BETWEEN 10 AND 20 \n         AND p_brand = 'Brand#31'\n         AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')\n         AND p_size BETWEEN 1 AND 5\n    THEN l_extendedprice * (1 - l_discount)\n    WHEN l_quantity BETWEEN 19 AND 29\n         AND p_brand = 'Brand#22'\n         AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')\n         AND p_size BETWEEN 1 AND 10\n    THEN l_extendedprice * (1 - l_discount)\n    WHEN l_quantity BETWEEN 27 AND 37\n         AND p_brand = 'Brand#25'\n         AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')\n         AND p_size BETWEEN 1 AND 15\n    THEN l_extendedprice * (1 - l_discount)\n    ELSE 0\n  END\n) AS revenue\nFROM filtered_lineitem\nINNER JOIN part ON p_partkey = l_partkey;",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原 SQL 的三个 UNION ALL 分支合并为单次 lineitem 扫描。通过 CTE (filtered_lineitem) 预过滤 lineitem 表，应用三个分支的公共条件（l_shipmode IN ('AIR', 'AIR REG')、l_shipinstruct = 'DELIVER IN PERSON'）和合并后的 quantity 范围（BETWEEN 10 AND 37，覆盖原三个分支的 10-20、19-29、27-37）。外层查询通过单次 JOIN part，使用 CASE WHEN 表达式根据 l_quantity 范围匹配对应的 part 条件（brand/container/size 组合），不匹配时返回 0。\n\n2. **UNION ALL 语义等价性**：原 SQL 的 UNION ALL 对三个分支的 revenue 求和，等价于对所有满足任一分支条件的行计算 revenue 后求和。重写 SQL 通过 CASE WHEN 实现相同逻辑：每行根据条件匹配到对应分支计算 revenue，不匹配返回 0（对 SUM 无贡献）。由于三个分支的 quantity 范围存在重叠（10-20 与 19-29 重叠 19-20，19-29 与 27-37 重叠 27-29），但每个分支的 part 条件（brand/container/size）互斥（Brand#31/Brand#22/Brand#25 不同），因此同一行最多匹配一个分支，CASE WHEN 的互斥性与 UNION ALL 的分支独立性等价。\n\n3. **JOIN 作用域与过滤下推**：原 SQL 每个分支独立执行 lineitem JOIN part，WHERE 子句同时过滤 lineitem 和 part 列。重写 SQL 将 lineitem 的公共过滤条件（shipmode/shipinstruct/quantity 合并范围）下推到 CTE 中，减少 JOIN 输入行数；part 的过滤条件（brand/container/size）与 lineitem 的精确 quantity 范围判断移至外层 CASE WHEN 中，在 JOIN 后执行。由于 JOIN 条件 p_partkey = l_partkey 保持不变，且所有过滤条件仍应用于相同的列，JOIN 结果集与原 SQL 等价。\n\n4. **聚合函数语义**：原 SQL 对三个分支的 revenue 列分别求和后再求和（外层 SUM），等价于对所有行的 revenue 求和。重写 SQL 直接对 CASE WHEN 表达式求和，不匹配条件的行贡献 0，匹配的行贡献 l_extendedprice * (1 - l_discount)，与原 SQL 的聚合逻辑完全一致。\n\n5. **NULL 值处理**：原 SQL 的 WHERE 子句过滤掉 NULL 值（IN/BETWEEN/等值比较对 NULL 返回 UNKNOWN，被 WHERE 排除）。重写 SQL 的 CTE 和 CASE WHEN 条件同样过滤 NULL 值，且 CASE WHEN 的 ELSE 0 确保不匹配行不影响 SUM 结果。l_extendedprice 和 l_discount 在 Schema 中定义为 NOT NULL，不存在 NULL 传播风险。\n\n6. **重复行处理**：原 SQL 使用 UNION ALL 保留重复行，每个分支独立计算 revenue。重写 SQL 通过单次扫描 + CASE WHEN 对每行计算 revenue，同样保留重复行（相同 l_orderkey/l_linenumber 的行会被多次计算）。由于 lineitem 主键为 (l_orderkey, l_linenumber)，重复行仅在业务逻辑允许时出现，重写不改变重复行的处理方式。\n\n7. **quantity 范围重叠的正确性**：三个分支的 quantity 范围存在重叠（19-20 和 27-29），但由于 part 条件互斥（不同 brand），同一 lineitem 行即使 quantity 落在重叠区间，也只能匹配一个 part 行（通过 brand 区分）。CASE WHEN 的顺序执行（先检查 10-20 + Brand#31，再检查 19-29 + Brand#22，最后检查 27-37 + Brand#25）确保每行最多匹配一个分支，与原 UNION ALL 的分支独立性等价。例如，l_quantity=20 且 p_brand='Brand#22' 的行，在原 SQL 中仅匹配第二个分支（第一个分支的 brand 不匹配），在重写 SQL 中 CASE WHEN 第一个条件失败（brand 不匹配），第二个条件成功，结果一致。\n\n8. **执行效率优化依据**：重写消除了 lineitem 大表的三次重复扫描（原 UNION ALL 每分支扫描一次），改为 CTE 单次扫描 + 外层单次 JOIN part。虽然 part 的过滤条件从 JOIN 前移至 JOIN 后（CASE WHEN 中），但 part 表通过主键索引探测，且 CASE WHEN 的短路求值机制减少不必要的条件检查。CTE 的预过滤将 lineitem 从 5998 万行减少到满足公共条件的子集，显著降低 JOIN 输入规模。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE预过滤和CASE WHEN合并三个UNION ALL分支，保持了相同的过滤逻辑、JOIN语义和聚合结果；quantity范围重叠区间因part条件互斥（不同brand）不影响结果集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划变化：重写SQL通过CTE预过滤lineitem（l_shipmode/l_shipinstruct/l_quantity范围合并），将原SQL隐含的三分支OR条件重组为单次扫描+外层CASE WHEN，消除了重复扫描风险。结构性改进信号：(1)CTE显式组织公共中间结果，实现一次性计算后复用；(2)检测到预聚合CTE（含SUM），先压缩中间结果再JOIN，属于公共结果复用的强信号；(3)估计行数求和从23降至17（降幅26%），虽未达到10%阈值但配合CTE复用信号仍为正向；(4)过滤条件分层下推（公共条件入CTE，特有条件入CASE WHEN），符合谓词简化+连接优化目标。成本差异：Total Cost从1876131.89降至1626079.09（降幅13.3%），与结构改进一致。改进点：SQL逻辑层面通过CTE+CASE WHEN消除三分支UNION ALL潜在重复扫描，执行计划层面保持Nested Loop+Index Scan访问路径不变但减少冗余过滤开销。最终结论：满足高优先级正信号（CTE复用+预聚合），成本明确下降，无灾难性结构退化证据，达到优化目标。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+
+🎲 LinUCB Update: 2 rules, reward=-0.0350 (cost=+0.1333, rows=+0.0000, depth=-0.2500, oc=1876131.8900, rc=1626079.0900)
+✅ LinUCB Update Complete:
+   → FILTER_SET_OP_TRANSPOSE: prior=0.577, reward=-0.018, count=14, avg=-0.022
+   → JOIN_CONDITION_PUSH: prior=0.473, reward=-0.017, count=126, avg=+0.003
+
+----------------------------------------
+

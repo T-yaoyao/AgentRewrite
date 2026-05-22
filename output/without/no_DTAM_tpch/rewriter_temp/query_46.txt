@@ -1,0 +1,93 @@
+Query ID: 46
+==================================================
+
+Original: select sum(l_extendedprice) / 7.0 as avg_yearly from lineitem, part where p_partkey = l_partkey and p_brand = 'Brand#35' and p_container = 'LG PKG' and l_quantity < ( select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey );
+Rewritten: WITH part_filtered AS (
+  SELECT p_partkey
+  FROM part
+  WHERE p_brand = 'Brand#35'
+    AND p_container = 'LG PKG'
+),
+avg_quantity_per_part AS (
+  SELECT l_partkey, AVG(l_quantity) * 0.2 AS threshold_quantity
+  FROM lineitem
+  WHERE l_partkey IN (SELECT p_partkey FROM part_filtered)
+  GROUP BY l_partkey
+)
+SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly
+FROM lineitem
+JOIN part_filtered ON lineitem.l_partkey = part_filtered.p_partkey
+JOIN avg_quantity_per_part ON lineitem.l_partkey = avg_quantity_per_part.l_partkey
+WHERE lineitem.l_quantity < avg_quantity_per_part.threshold_quantity
+Time Cost: 142.99s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将相关子查询转换为JOIN或窗口函数。当前子查询'select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey'对每个匹配行都执行一次，建议先计算每个p_partkey的平均值并物化为临时结果集，然后通过JOIN关联，消除相关性，避免重复扫描lineitem表"}, {'group': '连接优化', 'produced_suggestion': "优化连接顺序和条件。建议先对part表应用过滤条件(p_brand='Brand#35' and p_container='LG PKG')减少数据量，然后与预计算的平均值结果集JOIN，最后再与lineitem JOIN并应用l_quantity过滤条件，利用索引part_pkey和lineitem_pkey提升连接效率"}, {'group': '谓词简化', 'produced_suggestion': '将过滤条件尽早下推。part表的过滤条件(p_brand和p_container)应在JOIN前应用，减少参与JOIN的数据量；l_quantity的过滤条件可在与平均值结果集JOIN后立即应用，避免在Hash Join的Filter阶段处理'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) Hash Join占比82.3%，其中Join Filter使用了相关子查询(SubPlan 1)导致每行都需要执行子查询；2) 相关子查询导致lineitem表被扫描多次(lineitem_1的Seq Scan占比9.1%)；3) 主查询中lineitem表的全表扫描占比8.3%。该SQL可通过子查询去相关化和连接优化显著提升性能。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将相关子查询转换为JOIN或窗口函数。当前子查询'select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey'对每个匹配行都执行一次，建议先计算每个p_partkey的平均值并物化为临时结果集，然后通过JOIN关联，消除相关性，避免重复扫描lineitem表"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "优化连接顺序和条件。建议先对part表应用过滤条件(p_brand='Brand#35' and p_container='LG PKG')减少数据量，然后与预计算的平均值结果集JOIN，最后再与lineitem JOIN并应用l_quantity过滤条件，利用索引part_pkey和lineitem_pkey提升连接效率"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将过滤条件尽早下推。part表的过滤条件(p_brand和p_container)应在JOIN前应用，减少参与JOIN的数据量；l_quantity的过滤条件可在与平均值结果集JOIN后立即应用，避免在Hash Join的Filter阶段处理"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 52 条规则（按优化组筛选: 子查询优化, 连接优化, 谓词简化；记忆已关闭）
+{
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_INTO_JOIN",
+    "FILTER_CORRELATE"
+  ],
+  "groups": "子查询优化,谓词简化"
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,谓词简化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_INTO_JOIN",
+    "FILTER_CORRELATE"
+  ],
+  "rewritten_sql": "WITH part_filtered AS (\n  SELECT p_partkey\n  FROM part\n  WHERE p_brand = 'Brand#35'\n    AND p_container = 'LG PKG'\n),\navg_quantity_per_part AS (\n  SELECT l_partkey, AVG(l_quantity) * 0.2 AS threshold_quantity\n  FROM lineitem\n  WHERE l_partkey IN (SELECT p_partkey FROM part_filtered)\n  GROUP BY l_partkey\n)\nSELECT SUM(l_extendedprice) / 7.0 AS avg_yearly\nFROM lineitem\nJOIN part_filtered ON lineitem.l_partkey = part_filtered.p_partkey\nJOIN avg_quantity_per_part ON lineitem.l_partkey = avg_quantity_per_part.l_partkey\nWHERE lineitem.l_quantity < avg_quantity_per_part.threshold_quantity",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原始SQL中的相关子查询 `(SELECT 0.2 * AVG(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)` 去相关化，提取为独立CTE `avg_quantity_per_part`，按 l_partkey 分组预计算每个零件的平均数量阈值；同时将 part 表的过滤条件提取为CTE `part_filtered`。\n\n2. **谓词下推与提前过滤**：原 SQL 中 `p_brand = 'Brand#35' AND p_container = 'LG PKG'` 仅依赖 part 表，现下推到 CTE `part_filtered` 中，减少后续 JOIN 的数据量；`avg_quantity_per_part` 的 WHERE 子句 `l_partkey IN (SELECT p_partkey FROM part_filtered)` 确保只计算符合条件的零件的平均值，避免对全表 lineitem 做无效聚合。\n\n3. **JOIN 等价性保证**：原 SQL 的隐式 JOIN `FROM lineitem, part WHERE p_partkey = l_partkey` 等价于重写后的 `lineitem JOIN part_filtered ON l_partkey = p_partkey`；相关子查询的过滤条件 `l_quantity < 0.2 * AVG(...)` 转换为与 `avg_quantity_per_part` 的 JOIN 并在 WHERE 中比较 `l_quantity < threshold_quantity`，保持相同的过滤语义。\n\n4. **聚合键与相关列正确性**：`avg_quantity_per_part` 按 l_partkey 分组，与原相关子查询的相关列 `WHERE l_partkey = p_partkey` 一致；每个 lineitem 行通过 l_partkey JOIN 到对应零件的预计算阈值，与原 SQL 中每行动态执行子查询获取的阈值完全相同。\n\n5. **结果集等价性**：原 SQL 筛选出满足 `p_brand/p_container` 且 `l_quantity < 该零件平均数量的20%` 的 lineitem 行，对其 l_extendedprice 求和后除以7.0；重写后通过两次 JOIN 和 WHERE 过滤实现相同筛选逻辑，最终 SUM 和除法操作的输入行集完全一致，输出结果等价。\n\n6. **NULL 与边界情况**：若某 p_partkey 在 lineitem 中无记录，AVG 返回 NULL，原 SQL 的比较 `l_quantity < NULL` 为 FALSE（不匹配任何行）；重写后该 p_partkey 不会出现在 `avg_quantity_per_part` 中，JOIN 时自然无匹配行，行为一致。\n\n7. **无重复行风险**：lineitem 与 part_filtered 通过 l_partkey = p_partkey JOIN，part_filtered 中 p_partkey 唯一（part 表主键）；与 avg_quantity_per_part JOIN 时 l_partkey 也唯一（GROUP BY 键），不会产生笛卡尔积或重复行，保持原 SQL 的行数逻辑。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE去相关化子查询并下推过滤条件，保持了与原SQL完全相同的结果集：筛选相同零件、应用相同阈值比较、聚合相同行集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+✅ 估计代价降幅 78.3% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+
+----------------------------------------
+

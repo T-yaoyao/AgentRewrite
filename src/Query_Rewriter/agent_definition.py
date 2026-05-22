@@ -178,7 +178,7 @@ class ReasoningAgent(Agent):
         """Select appropriate rule sequence based on DecisionAgent's advice and rule descriptions."""
         advice_text = json.dumps(decision_advice, ensure_ascii=False, indent=2)
 
-        # Build rule library text without parameterized memory scores.
+        # Build rule library text without memory-derived scores.
         rule_text = ""
         all_groups = []
         all_rules = []

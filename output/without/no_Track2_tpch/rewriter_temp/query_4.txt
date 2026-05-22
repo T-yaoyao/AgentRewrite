@@ -1,0 +1,120 @@
+Query ID: 4
+==================================================
+
+Original: select s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment from part, supplier, partsupp, nation, region where p_partkey = ps_partkey and s_suppkey = ps_suppkey and p_size = 6 and p_type like '%NICKEL' and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = 'EUROPE' and ps_supplycost = ( select min(ps_supplycost) from partsupp, supplier, nation, region where p_partkey = ps_partkey and s_suppkey = ps_suppkey and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = 'EUROPE' ) order by s_acctbal desc, n_name, s_name, p_partkey limit 100;
+Rewritten: WITH europe_suppliers AS (
+  SELECT s_suppkey, s_acctbal, s_name, s_address, s_phone, s_comment, n_name, n_nationkey
+  FROM supplier
+  JOIN nation ON s_nationkey = n_nationkey
+  JOIN region ON n_regionkey = r_regionkey
+  WHERE r_name = 'EUROPE'
+),
+min_supplycost_per_part AS (
+  SELECT ps.ps_partkey, MIN(ps.ps_supplycost) AS min_cost
+  FROM partsupp ps
+  JOIN europe_suppliers es ON ps.ps_suppkey = es.s_suppkey
+  GROUP BY ps.ps_partkey
+)
+SELECT es.s_acctbal, es.s_name, es.n_name, p.p_partkey, p.p_mfgr, es.s_address, es.s_phone, es.s_comment
+FROM part p
+JOIN partsupp ps ON p.p_partkey = ps.ps_partkey
+JOIN europe_suppliers es ON ps.ps_suppkey = es.s_suppkey
+JOIN min_supplycost_per_part msc ON p.p_partkey = msc.ps_partkey AND ps.ps_supplycost = msc.min_cost
+WHERE p.p_size = 6 AND p.p_type LIKE '%NICKEL'
+ORDER BY es.s_acctbal DESC, es.n_name, es.s_name, p.p_partkey
+LIMIT 100;
+Time Cost: 137.68s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将相关子查询 ps_supplycost = (SELECT MIN(ps_supplycost) ...) 转换为窗口函数或CTE。当前子查询在Merge Join的每一行都会执行，导致大量重复计算。建议使用ROW_NUMBER() OVER(PARTITION BY p_partkey ORDER BY ps_supplycost) = 1 来替代，或先用CTE计算每个part的最小supplycost再JOIN，可消除55%代价中的子查询重复执行开销。'}, {'group': '连接优化', 'produced_suggestion': "优化连接顺序，先过滤小表再关联大表。当前执行计划先处理part(200万行)和partsupp(800万行)的Merge Join，建议先执行region='EUROPE'过滤(region表很小)，然后关联nation、supplier，最后再关联part和partsupp，可显著减少参与Merge Join的数据量。"}, {'group': '谓词简化', 'produced_suggestion': "将主查询和子查询中的公共过滤条件(r_name='EUROPE', s_nationkey=n_nationkey等)提前应用。当前子查询重复执行相同的region和nation过滤，可通过CTE或临时结果集预先过滤出EUROPE区域的supplier，减少后续JOIN的数据量。"}, {'group': '排序优化', 'produced_suggestion': '消除或延迟Sort操作。当前Sort占比26.1%且为流水线阻塞算子，对partsupp的ps_partkey排序是为了Merge Join准备。如果通过子查询优化改用Hash Join或窗口函数，可能避免此排序；或者利用partsupp_pkey索引(ps_partkey, ps_suppkey)的有序性减少排序代价。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) Merge Join占比55.1%，其中包含相关子查询作为Join Filter，导致子查询重复执行；2) Sort操作占比26.1%且为流水线阻塞算子；3) partsupp大表全表扫描占比12.1%。主查询与子查询结构高度相似，存在显著的子查询优化空间，可通过窗口函数或CTE消除相关子查询的重复计算。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将相关子查询 ps_supplycost = (SELECT MIN(ps_supplycost) ...) 转换为窗口函数或CTE。当前子查询在Merge Join的每一行都会执行，导致大量重复计算。建议使用ROW_NUMBER() OVER(PARTITION BY p_partkey ORDER BY ps_supplycost) = 1 来替代，或先用CTE计算每个part的最小supplycost再JOIN，可消除55%代价中的子查询重复执行开销。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "优化连接顺序，先过滤小表再关联大表。当前执行计划先处理part(200万行)和partsupp(800万行)的Merge Join，建议先执行region='EUROPE'过滤(region表很小)，然后关联nation、supplier，最后再关联part和partsupp，可显著减少参与Merge Join的数据量。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将主查询和子查询中的公共过滤条件(r_name='EUROPE', s_nationkey=n_nationkey等)提前应用。当前子查询重复执行相同的region和nation过滤，可通过CTE或临时结果集预先过滤出EUROPE区域的supplier，减少后续JOIN的数据量。"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "消除或延迟Sort操作。当前Sort占比26.1%且为流水线阻塞算子，对partsupp的ps_partkey排序是为了Merge Join准备。如果通过子查询优化改用Hash Join或窗口函数，可能避免此排序；或者利用partsupp_pkey索引(ps_partkey, ps_suppkey)的有序性减少排序代价。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 58 条规则（按优化组筛选: 子查询优化, 连接优化, 谓词简化, 排序优化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "JOIN_CONDITION_PUSH",
+    "SORT_REMOVE_CONSTANT_KEYS"
+  ],
+  "groups": "子查询优化,连接优化,排序优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "JOIN_CONDITION_PUSH": 0.75,
+    "SORT_REMOVE_CONSTANT_KEYS": 0.7
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "JOIN_CONDITION_PUSH": 0.3,
+    "SORT_REMOVE_CONSTANT_KEYS": 0.2
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,连接优化,排序优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "JOIN_CONDITION_PUSH",
+    "SORT_REMOVE_CONSTANT_KEYS"
+  ],
+  "rewritten_sql": "WITH europe_suppliers AS (\n  SELECT s_suppkey, s_acctbal, s_name, s_address, s_phone, s_comment, n_name, n_nationkey\n  FROM supplier\n  JOIN nation ON s_nationkey = n_nationkey\n  JOIN region ON n_regionkey = r_regionkey\n  WHERE r_name = 'EUROPE'\n),\nmin_supplycost_per_part AS (\n  SELECT ps.ps_partkey, MIN(ps.ps_supplycost) AS min_cost\n  FROM partsupp ps\n  JOIN europe_suppliers es ON ps.ps_suppkey = es.s_suppkey\n  GROUP BY ps.ps_partkey\n)\nSELECT es.s_acctbal, es.s_name, es.n_name, p.p_partkey, p.p_mfgr, es.s_address, es.s_phone, es.s_comment\nFROM part p\nJOIN partsupp ps ON p.p_partkey = ps.ps_partkey\nJOIN europe_suppliers es ON ps.ps_suppkey = es.s_suppkey\nJOIN min_supplycost_per_part msc ON p.p_partkey = msc.ps_partkey AND ps.ps_supplycost = msc.min_cost\nWHERE p.p_size = 6 AND p.p_type LIKE '%NICKEL'\nORDER BY es.s_acctbal DESC, es.n_name, es.s_name, p.p_partkey\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **STRATEGY_CTE_DECOMPOSITION应用**：将原始SQL中重复出现的region='EUROPE'过滤及supplier/nation/region三表连接提取为CTE europe_suppliers，预先过滤出欧洲区域的供应商及其国家信息；将相关子查询(SELECT MIN(ps_supplycost) ...)转换为独立CTE min_supplycost_per_part，按ps_partkey分组计算每个零件的最小供应成本。这两个CTE的结果集与原SQL中对应的子查询/表连接在Schema约束下完全等价：europe_suppliers通过外键s_nationkey=n_nationkey和n_regionkey=r_regionkey保证连接正确性，min_supplycost_per_part的GROUP BY ps_partkey与原子查询中WHERE p_partkey=ps_partkey的相关条件语义一致（原子查询对每个外层p_partkey计算MIN，CTE预先计算所有part的MIN后通过JOIN关联）。\n\n2. **JOIN_CONDITION_PUSH应用**：将原SQL中WHERE子句的连接条件全部推入JOIN ON子句，包括p_partkey=ps_partkey、ps_suppkey=s_suppkey（通过CTE间接实现）、以及关键的ps_supplycost=msc.min_cost条件。原SQL通过相关子查询在WHERE中过滤ps_supplycost等于最小值的行，重写后通过JOIN min_supplycost_per_part ON p.p_partkey=msc.ps_partkey AND ps.ps_supplycost=msc.min_cost实现相同语义：只保留每个零件中供应成本等于该零件最小成本的partsupp记录。由于partsupp主键为(ps_partkey, ps_suppkey)且ps_supplycost为非键列，多个supplier可能对同一part提供相同的最小成本，JOIN保留所有满足条件的行，与原SQL WHERE子查询过滤结果完全一致。\n\n3. **相关子查询去相关化的等价性保证**：原SQL的相关子查询通过WHERE p_partkey=ps_partkey将外层part表的p_partkey传入子查询，对每个p_partkey独立计算MIN(ps_supplycost)。重写后的min_supplycost_per_part CTE通过GROUP BY ps_partkey预先计算所有零件的最小成本，然后在主查询中通过JOIN ON p.p_partkey=msc.ps_partkey AND ps.ps_supplycost=msc.min_cost关联。这两种方式在TPC-H Schema下等价：(1)原子查询的相关条件p_partkey=ps_partkey保证子查询只计算当前零件的MIN，重写后GROUP BY ps_partkey达到相同分组效果；(2)原WHERE ps_supplycost=(子查询)过滤出等于MIN的行，重写后JOIN条件ps.ps_supplycost=msc.min_cost实现相同过滤；(3)由于子查询和CTE都对europe_suppliers范围内的partsupp计算MIN，且通过JOIN europe_suppliers保证supplier范围一致，结果集完全相同。\n\n4. **过滤条件提前与作用域保持**：原SQL在主查询和子查询中都有r_name='EUROPE'及相关连接条件，重写后通过europe_suppliers CTE统一处理，避免重复过滤。主查询的WHERE p.p_size=6 AND p.p_type LIKE '%NICKEL'保持不变，作用于part表过滤。由于part表通过p_partkey与partsupp连接，且partsupp通过ps_suppkey与europe_suppliers连接，过滤顺序的改变（先过滤region再连接part vs 先连接part再过滤region）不影响最终结果集：JOIN的交换律和结合律在等值连接下保证语义等价，只要所有连接条件和过滤条件都被正确应用。\n\n5. **聚合与分组的正确性**：min_supplycost_per_part CTE的GROUP BY ps_partkey与原相关子查询的语义对应：原子查询隐式地对每个p_partkey分组（通过相关条件），CTE显式分组。由于partsupp表的ps_partkey列参与主键且有外键约束到part(p_partkey)，GROUP BY ps_partkey不会产生NULL分组或重复分组问题。MIN(ps_supplycost)聚合函数在两种写法下计算范围一致（都限定在europe_suppliers的supplier范围内），结果相同。\n\n6. **SELECT列与ORDER BY的等价性**：重写后SELECT子句通过CTE别名es引用s_acctbal、s_name、n_name等列，与原SQL直接引用supplier/nation表的列语义相同（CTE只是提前过滤，不改变列内容）。ORDER BY子句保持s_acctbal DESC、n_name、s_name、p_partkey的顺序不变，由于这些列在重写前后都来自相同的表且连接条件未变，排序结果一致。LIMIT 100保证只返回前100行，与原SQL相同。\n\n7. **NULL值与重复行处理**：原SQL和重写SQL在处理NULL值时行为一致：(1)外键约束保证s_nationkey、n_regionkey、ps_partkey、ps_suppkey不为NULL；(2)r_name='EUROPE'过滤排除NULL（若存在）；(3)MIN聚合函数忽略NULL（但ps_supplycost为NOT NULL列）；(4)JOIN ON条件的等值比较对NULL的处理符合SQL标准（NULL不等于任何值包括NULL自身），重写前后一致。关于重复行：由于主查询SELECT的列组合(s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment)不构成唯一键，若多个supplier对同一part提供相同的最小成本，原SQL和重写SQL都会返回多行，这是正确的业务语义（TPC-H Q2要求列出所有满足条件的supplier-part组合）。\n\n8. **SORT_REMOVE_CONSTANT_KEYS未实际应用的说明**：检查ORDER BY子句中的s_acctbal、n_name、s_name、p_partkey四个排序键，均为变量列（来自不同表的非常量列），不存在常量排序键需要移除。因此该规则在当前SQL中不产生实际改写，ORDER BY子句保持原样，保证排序语义不变。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE预计算欧洲供应商和每个零件的最小成本，再通过JOIN关联实现与原SQL相关子查询完全相同的过滤逻辑，结果集、排序、LIMIT均等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 3->2, Hash/Merge 4->4 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 12951378.0 -> 10290334.0 (重写侧约为原的 79.4536%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+✅ 估计代价降幅 76.7% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+
+🎲 LinUCB Update: 3 rules, reward=+0.3872 (cost=+0.7666, rows=+0.2055, depth=+0.2500, oc=2111096.4000, rc=492644.5200)
+✅ LinUCB Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: prior=0.489, reward=+0.162, count=100, avg=+0.016
+   → JOIN_CONDITION_PUSH: prior=0.499, reward=+0.123, count=106, avg=-0.000
+   → SORT_REMOVE_CONSTANT_KEYS: prior=0.881, reward=+0.102, count=3, avg=+0.042
+
+----------------------------------------
+

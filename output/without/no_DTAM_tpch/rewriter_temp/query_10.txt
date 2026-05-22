@@ -1,0 +1,83 @@
+Query ID: 10
+==================================================
+
+Original: select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1996-01-01' and o_orderdate < date '1996-01-01' + interval '3' month and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;
+Rewritten: SELECT o_orderpriority, COUNT(*) AS order_count
+FROM orders
+JOIN (
+    SELECT DISTINCT l_orderkey
+    FROM lineitem
+    WHERE l_commitdate < l_receiptdate
+      AND l_orderkey IS NOT NULL
+) AS sub_lineitem ON orders.o_orderkey = sub_lineitem.l_orderkey
+WHERE o_orderdate >= DATE '1996-01-01'
+  AND o_orderdate < DATE '1996-04-01'
+GROUP BY o_orderpriority
+ORDER BY o_orderpriority;
+Time Cost: 203.76s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将EXISTS相关子查询转换为SEMI JOIN或IN子查询。使用'WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate)'或显式INNER JOIN + DISTINCT，利用orders_pkey和lineitem_pkey索引加速关联，减少lineitem全表扫描次数"}, {'group': '连接优化', 'produced_suggestion': "改写为JOIN后，调整连接顺序：先对lineitem表应用过滤条件'l_commitdate < l_receiptdate'并去重l_orderkey，再与已按日期过滤的orders表关联。小结果集驱动大表，降低Nested Loop代价"}, {'group': '谓词简化', 'produced_suggestion': "将orders表的日期范围条件'o_orderdate >= date '1996-01-01' AND o_orderdate < date '1996-04-01''作为第一层过滤，减少参与JOIN的orders记录数。确保日期过滤在JOIN之前执行"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示lineitem表的全表扫描(Seq Scan)占总代价的97.2%，扫描近6000万行数据。EXISTS子查询导致对lineitem表的相关子查询执行，每个orders记录都需要探测lineitem表。可以通过将EXISTS子查询转换为半连接(SEMI JOIN)来优化，利用orders和lineitem的主键索引进行高效关联，避免重复扫描大表。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS相关子查询转换为SEMI JOIN或IN子查询。使用'WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate)'或显式INNER JOIN + DISTINCT，利用orders_pkey和lineitem_pkey索引加速关联，减少lineitem全表扫描次数"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "改写为JOIN后，调整连接顺序：先对lineitem表应用过滤条件'l_commitdate < l_receiptdate'并去重l_orderkey，再与已按日期过滤的orders表关联。小结果集驱动大表，降低Nested Loop代价"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将orders表的日期范围条件'o_orderdate >= date '1996-01-01' AND o_orderdate < date '1996-04-01''作为第一层过滤，减少参与JOIN的orders记录数。确保日期过滤在JOIN之前执行"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 52 条规则（按优化组筛选: 子查询优化, 连接优化, 谓词简化；记忆已关闭）
+{
+    "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "FILTER_INTO_JOIN", "FILTER_MERGE", "FILTER_REDUCE_EXPRESSIONS"],
+    "groups": "子查询优化,谓词简化"
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,谓词简化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_INTO_JOIN",
+    "FILTER_MERGE",
+    "FILTER_REDUCE_EXPRESSIONS"
+  ],
+  "rewritten_sql": "SELECT o_orderpriority, COUNT(*) AS order_count\nFROM orders\nJOIN (\n    SELECT DISTINCT l_orderkey\n    FROM lineitem\n    WHERE l_commitdate < l_receiptdate\n      AND l_orderkey IS NOT NULL\n) AS sub_lineitem ON orders.o_orderkey = sub_lineitem.l_orderkey\nWHERE o_orderdate >= DATE '1996-01-01'\n  AND o_orderdate < DATE '1996-04-01'\nGROUP BY o_orderpriority\nORDER BY o_orderpriority;",
+  "semantic_correctness_guarantee": "1. **子查询去相关化（FILTER_SUB_QUERY_TO_CORRELATE）**：原始SQL中的EXISTS相关子查询'EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate)'被改写为SEMI JOIN语义的'JOIN (SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate AND l_orderkey IS NOT NULL)'。由于lineitem表的主键为(l_orderkey, l_linenumber)，同一l_orderkey可能对应多行，DISTINCT去重确保每个满足条件的l_orderkey只保留一次，避免JOIN时放大orders表的行数。添加'l_orderkey IS NOT NULL'过滤NULL值，因为原始EXISTS语义中NULL关联键不会匹配成功。\n\n2. **谓词下推到子查询（FILTER_INTO_JOIN）**：lineitem表的过滤条件'l_commitdate < l_receiptdate'在子查询内部先执行，减少参与DISTINCT和JOIN的数据量。这与原始SQL中子查询内的WHERE条件位置一致，仅是结构调整，不改变过滤逻辑的作用范围。\n\n3. **外层过滤条件保持（FILTER_MERGE）**：orders表的日期范围条件'o_orderdate >= DATE '1996-01-01' AND o_orderdate < DATE '1996-04-01''（原始SQL中为'+ interval '3' month'，等价于'1996-04-01'）保留在JOIN之后的WHERE子句中。由于JOIN是INNER JOIN语义，WHERE条件在JOIN前后执行结果等价（orders表的过滤不依赖lineitem表列），且在JOIN前过滤可减少JOIN输入规模。\n\n4. **常量表达式简化（FILTER_REDUCE_EXPRESSIONS）**：将'DATE '1996-01-01' + INTERVAL '3' MONTH'预计算为'DATE '1996-04-01''，消除运行时计算开销，语义完全等价。\n\n5. **结果集等价性保证**：原始SQL通过EXISTS筛选出至少存在一条lineitem记录满足'l_commitdate < l_receiptdate'的orders行，重写SQL通过JOIN + DISTINCT实现相同语义。由于DISTINCT确保每个l_orderkey唯一，JOIN后每个符合条件的o_orderkey最多匹配一次，不会产生重复行。GROUP BY o_orderpriority和COUNT(*)聚合逻辑保持不变，最终返回的o_orderpriority及其对应的订单计数与原始SQL完全一致。\n\n6. **主键与外键约束保证**：orders表主键为o_orderkey，lineitem表主键为(l_orderkey, l_linenumber)，且l_orderkey是外键引用orders.o_orderkey。子查询中DISTINCT l_orderkey后，每个l_orderkey对应orders表中唯一的o_orderkey，JOIN条件'orders.o_orderkey = sub_lineitem.l_orderkey'基于主键-外键关系，确保关联正确且无歧义。\n\n7. **NULL值处理**：原始EXISTS子查询中，若l_orderkey为NULL则不会与任何o_orderkey匹配（SQL标准中NULL不等于任何值包括NULL本身）。重写SQL中显式添加'l_orderkey IS NOT NULL'过滤，确保子查询结果集不包含NULL键，JOIN行为与原始EXISTS语义一致。\n\n8. **排序与输出列一致性**：ORDER BY o_orderpriority和SELECT列表(o_orderpriority, COUNT(*) AS order_count)与原始SQL完全相同，输出结果的列名、数据类型、排序顺序均保持一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 20291376.0 -> 8332498.0 (重写侧约为原的 41.0642%)
+```json
+{
+  "terminate": true,
+  "reason": "结构性改进明显：1) 去相关化成功：原 EXISTS 相关子查询改为 JOIN + DISTINCT 预聚合，消除了 Nested Loop 内层对每个 orders 行重复执行子查询的开销；2) 并行化增强：引入 Gather Merge + Parallel Seq Scan，利用 2 个 worker 并行处理 lineitem 过滤与去重；3) 行数估计求和大幅下降：从 20,291,376 降至 8,332,498（降至原 41%），反映中间结果集显著收缩；4) cost 下降 24%（1,928,131.72 → 1,461,158.35），与结构改进一致；5) 虽然重写侧增加了 Unique、Gather Merge、Sort 等节点，但这些是为实现去相关与并行化的必要代价，且通过预聚合 + 并行扫描有效补偿。无明确灾难性退化证据（关键表未重复扫描、过滤未失效、并行度提升）。综合判断：去相关 + 并行化 + 行数大幅下降 + cost 下降，优化成功。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+
+----------------------------------------
+

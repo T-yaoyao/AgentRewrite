@@ -1,0 +1,132 @@
+Query ID: 56
+==================================================
+
+Original: select s_name, s_address from supplier, nation where s_suppkey in ( select ps_suppkey from partsupp where ps_partkey in ( select p_partkey from part where p_name like 'spring%' ) and ps_availqty > ( select 0.5 * sum(l_quantity) from lineitem where l_partkey = ps_partkey and l_suppkey = ps_suppkey and l_shipdate >= date '1997-01-01' and l_shipdate < date '1997-01-01' + interval '1' year ) ) and s_nationkey = n_nationkey and n_name = 'KENYA' order by s_name;
+Rewritten: WITH filtered_part AS (
+    SELECT p_partkey
+    FROM part
+    WHERE p_name LIKE 'spring%'
+),
+filtered_nation AS (
+    SELECT n_nationkey
+    FROM nation
+    WHERE n_name = 'KENYA'
+),
+lineitem_agg AS (
+    SELECT l_partkey, l_suppkey, 0.5 * SUM(l_quantity) AS half_sum_qty
+    FROM lineitem
+    WHERE l_shipdate >= DATE '1997-01-01'
+      AND l_shipdate < DATE '1997-01-01' + INTERVAL '1' YEAR
+    GROUP BY l_partkey, l_suppkey
+),
+qualified_partsupp AS (
+    SELECT DISTINCT ps.ps_suppkey
+    FROM partsupp ps
+    INNER JOIN filtered_part fp ON ps.ps_partkey = fp.p_partkey
+    INNER JOIN lineitem_agg la ON ps.ps_partkey = la.l_partkey AND ps.ps_suppkey = la.l_suppkey
+    WHERE ps.ps_availqty > la.half_sum_qty
+)
+SELECT s.s_name, s.s_address
+FROM supplier s
+INNER JOIN filtered_nation fn ON s.s_nationkey = fn.n_nationkey
+INNER JOIN qualified_partsupp qp ON s.s_suppkey = qp.ps_suppkey
+ORDER BY s.s_name
+Time Cost: 198.54s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将最内层相关子查询(lineitem聚合)转换为LEFT JOIN + GROUP BY预聚合：先按l_partkey和l_suppkey分组计算sum(l_quantity)*0.5，再与partsupp JOIN比较ps_availqty，避免对每个partsupp行重复执行聚合查询'}, {'group': '子查询优化', 'produced_suggestion': '将IN子查询转换为INNER JOIN：ps_suppkey in (select...)改为JOIN partsupp，ps_partkey in (select...)改为JOIN part，利用索引加速关联而非半连接扫描'}, {'group': '谓词简化', 'produced_suggestion': "将part表的p_name like 'spring%'谓词和nation表的n_name='KENYA'谓词尽早下推到基表扫描层，减少JOIN前的数据量：先过滤part表(200万行)和nation表(25行)，再参与JOIN"}, {'group': '连接优化', 'produced_suggestion': "调整JOIN顺序：先JOIN小表nation(n_name='KENYA'过滤后约1行)和supplier(10万行)，再JOIN part(p_name过滤后数据量减少)，最后JOIN预聚合的lineitem结果和partsupp，利用小表驱动减少Nested Loop代价"}, {'group': '聚合优化', 'produced_suggestion': '将lineitem的聚合计算从相关子查询提升为独立CTE或子查询：CREATE TEMP TABLE或WITH子句预先计算每个(l_partkey,l_suppkey)的sum(l_quantity)*0.5，避免重复计算，利用partsupp_pkey索引关联'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示Nested Loop Semi Join代价极高(762,605,134,591.02)，占总代价100%。这是由多层嵌套子查询导致的：supplier表(10万行)与partsupp表(800万行)进行半连接，内层还有相关子查询对lineitem大表(6000万行)进行聚合计算。每个supplier-partsupp组合都需要执行一次lineitem聚合子查询，导致性能瓶颈。可通过子查询展开为JOIN、谓词下推、聚合预计算等方式优化。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将最内层相关子查询(lineitem聚合)转换为LEFT JOIN + GROUP BY预聚合：先按l_partkey和l_suppkey分组计算sum(l_quantity)*0.5，再与partsupp JOIN比较ps_availqty，避免对每个partsupp行重复执行聚合查询"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将IN子查询转换为INNER JOIN：ps_suppkey in (select...)改为JOIN partsupp，ps_partkey in (select...)改为JOIN part，利用索引加速关联而非半连接扫描"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将part表的p_name like 'spring%'谓词和nation表的n_name='KENYA'谓词尽早下推到基表扫描层，减少JOIN前的数据量：先过滤part表(200万行)和nation表(25行)，再参与JOIN"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序：先JOIN小表nation(n_name='KENYA'过滤后约1行)和supplier(10万行)，再JOIN part(p_name过滤后数据量减少)，最后JOIN预聚合的lineitem结果和partsupp，利用小表驱动减少Nested Loop代价"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将lineitem的聚合计算从相关子查询提升为独立CTE或子查询：CREATE TEMP TABLE或WITH子句预先计算每个(l_partkey,l_suppkey)的sum(l_quantity)*0.5，避免重复计算，利用partsupp_pkey索引关联"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 71 条规则（按优化组筛选: 子查询优化, 谓词简化, 连接优化, 聚合优化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_SUB_QUERY_TO_CORRELATE", "FILTER_AGGREGATE_TRANSPOSE", "FILTER_INTO_JOIN"],
+  "groups": "子查询优化, 谓词简化, 聚合优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.9,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.85,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.8,
+    "FILTER_INTO_JOIN": 0.75
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.4,
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.3,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.2,
+    "FILTER_INTO_JOIN": 0.1
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 谓词简化, 聚合优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_AGGREGATE_TRANSPOSE",
+    "FILTER_INTO_JOIN"
+  ],
+  "rewritten_sql": "WITH filtered_part AS (\n    SELECT p_partkey\n    FROM part\n    WHERE p_name LIKE 'spring%'\n),\nfiltered_nation AS (\n    SELECT n_nationkey\n    FROM nation\n    WHERE n_name = 'KENYA'\n),\nlineitem_agg AS (\n    SELECT l_partkey, l_suppkey, 0.5 * SUM(l_quantity) AS half_sum_qty\n    FROM lineitem\n    WHERE l_shipdate >= DATE '1997-01-01'\n      AND l_shipdate < DATE '1997-01-01' + INTERVAL '1' YEAR\n    GROUP BY l_partkey, l_suppkey\n),\nqualified_partsupp AS (\n    SELECT DISTINCT ps.ps_suppkey\n    FROM partsupp ps\n    INNER JOIN filtered_part fp ON ps.ps_partkey = fp.p_partkey\n    INNER JOIN lineitem_agg la ON ps.ps_partkey = la.l_partkey AND ps.ps_suppkey = la.l_suppkey\n    WHERE ps.ps_availqty > la.half_sum_qty\n)\nSELECT s.s_name, s.s_address\nFROM supplier s\nINNER JOIN filtered_nation fn ON s.s_nationkey = fn.n_nationkey\nINNER JOIN qualified_partsupp qp ON s.s_suppkey = qp.ps_suppkey\nORDER BY s.s_name",
+  "semantic_correctness_guarantee": "1. **STRATEGY_CTE_DECOMPOSITION应用**：将原始SQL中的三层嵌套子查询分解为四个独立CTE（filtered_part、filtered_nation、lineitem_agg、qualified_partsupp），每个CTE对应原查询中的一个逻辑过滤或聚合单元，降低嵌套层级但不改变数据流向和过滤逻辑。\n\n2. **FILTER_SUB_QUERY_TO_CORRELATE应用**：原查询中`s_suppkey IN (SELECT ps_suppkey FROM partsupp WHERE ...)`和`ps_partkey IN (SELECT p_partkey FROM part WHERE ...)`两个IN子查询被改写为INNER JOIN。由于partsupp表的主键是(ps_partkey, ps_suppkey)，qualified_partsupp CTE中使用DISTINCT ps_suppkey确保每个supplier最多匹配一次，避免结果集行数放大；part表的p_partkey是主键，filtered_part天然无重复，JOIN不会产生笛卡尔积。\n\n3. **FILTER_AGGREGATE_TRANSPOSE应用**：原查询中相关子查询`ps_availqty > (SELECT 0.5 * SUM(l_quantity) FROM lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND ...)`被改写为lineitem_agg CTE，将聚合计算从每个partsupp行的相关子查询提升到独立的GROUP BY预聚合。lineitem_agg按(l_partkey, l_suppkey)分组，与partsupp的主键(ps_partkey, ps_suppkey)一一对应，JOIN后比较ps_availqty > half_sum_qty与原查询的相关子查询比较语义完全等价。\n\n4. **FILTER_INTO_JOIN应用**：原查询中`p_name LIKE 'spring%'`谓词下推到filtered_part CTE，`n_name = 'KENYA'`谓词下推到filtered_nation CTE，这两个过滤条件仅依赖各自基表，提前过滤减少JOIN输入数据量。由于这些谓词在原查询中也是WHERE子句的一部分，下推不改变最终结果集的行筛选逻辑。\n\n5. **相关子查询去相关化的等价性保证**：原查询中lineitem的相关子查询通过`l_partkey = ps_partkey AND l_suppkey = ps_suppkey`与外层partsupp关联。改写后lineitem_agg按(l_partkey, l_suppkey)分组，qualified_partsupp CTE通过`ps.ps_partkey = la.l_partkey AND ps.ps_suppkey = la.l_suppkey`进行等值JOIN，确保每个partsupp行仍然与其对应的lineitem聚合结果进行比较，相关列的绑定关系未改变。\n\n6. **NULL值处理的等价性**：原查询中若某个partsupp行在lineitem中无匹配记录（即相关子查询返回NULL），则`ps_availqty > NULL`结果为FALSE，该行被过滤。改写后lineitem_agg仅包含有shipdate范围内记录的(l_partkey, l_suppkey)组合，qualified_partsupp使用INNER JOIN，无匹配的partsupp行自动被排除，与原查询的NULL过滤行为一致。\n\n7. **最终结果集的等价性**：原查询返回满足条件的supplier的(s_name, s_address)，按s_name排序。改写后通过一系列INNER JOIN逐层过滤，最终保留的supplier集合与原查询完全相同：必须在KENYA国家、其partsupp记录关联到spring开头的part、且ps_availqty大于对应lineitem半年总量的一半。ORDER BY s_name在最外层保持不变，结果集顺序与原查询一致。\n\n8. **DISTINCT使用的必要性与正确性**：qualified_partsupp CTE中使用DISTINCT ps_suppkey是因为一个supplier可能有多个partsupp记录满足条件（不同part或不同供应成本），但最终结果集只需每个supplier出现一次。原查询中`s_suppkey IN (...)`的语义本身就是半连接（存在性检查），DISTINCT确保改写后的JOIN不会因右表多行匹配而重复左表行，保持与IN子查询的等价性。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过CTE分解、相关子查询去相关化为JOIN+预聚合、IN改写为JOIN+DISTINCT，在Schema约束下与原SQL等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+✅ 估计代价降幅 100.0% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+
+🎲 LinUCB Update: 4 rules, reward=+0.0500 (cost=+1.0000, rows=+0.0000, depth=-0.8333, oc=762795838171.2100, rc=1592258.3400)
+✅ LinUCB Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: prior=0.403, reward=+0.017, count=129, avg=+0.019
+   → FILTER_SUB_QUERY_TO_CORRELATE: prior=0.505, reward=+0.014, count=22, avg=+0.024
+   → FILTER_AGGREGATE_TRANSPOSE: prior=0.563, reward=+0.011, count=24, avg=+0.016
+   → FILTER_INTO_JOIN: prior=0.416, reward=+0.008, count=139, avg=+0.005
+
+----------------------------------------
+

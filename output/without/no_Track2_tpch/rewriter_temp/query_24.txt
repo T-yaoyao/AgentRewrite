@@ -1,0 +1,225 @@
+Query ID: 24
+==================================================
+
+Original: select o_year, sum(case when nation = 'ALGERIA' then volume else 0 end) / sum(volume) as mkt_share from ( select extract(year from o_orderdate) as o_year, l_extendedprice * (1 - l_discount) as volume, n2.n_name as nation from part, supplier, lineitem, orders, customer, nation n1, nation n2, region where p_partkey = l_partkey and s_suppkey = l_suppkey and l_orderkey = o_orderkey and o_custkey = c_custkey and c_nationkey = n1.n_nationkey and n1.n_regionkey = r_regionkey and r_name = 'AFRICA' and s_nationkey = n2.n_nationkey and o_orderdate between date '1995-01-01' and date '1996-12-31' and p_type = 'LARGE BURNISHED TIN' ) as all_nations group by o_year order by o_year;
+Rewritten: WITH filtered_region AS MATERIALIZED (
+  SELECT r_regionkey
+  FROM region
+  WHERE r_name = 'AFRICA'
+),
+filtered_part AS MATERIALIZED (
+  SELECT p_partkey
+  FROM part
+  WHERE p_type = 'LARGE BURNISHED TIN'
+),
+filtered_orders AS MATERIALIZED (
+  SELECT o_orderkey, o_custkey, EXTRACT(YEAR FROM o_orderdate) AS o_year
+  FROM orders
+  WHERE o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'
+),
+filtered_nation_n1 AS MATERIALIZED (
+  SELECT n1.n_nationkey
+  FROM nation n1
+  JOIN filtered_region ON n1.n_regionkey = filtered_region.r_regionkey
+)
+SELECT 
+  o_year,
+  SUM(CASE WHEN n2.n_name = 'ALGERIA' THEN l_extendedprice * (1 - l_discount) ELSE 0 END) / SUM(l_extendedprice * (1 - l_discount)) AS mkt_share
+FROM filtered_part
+JOIN lineitem ON filtered_part.p_partkey = lineitem.l_partkey
+JOIN supplier ON lineitem.l_suppkey = supplier.s_suppkey
+JOIN nation n2 ON supplier.s_nationkey = n2.n_nationkey
+JOIN filtered_orders ON lineitem.l_orderkey = filtered_orders.o_orderkey
+JOIN customer ON filtered_orders.o_custkey = customer.c_custkey
+JOIN filtered_nation_n1 ON customer.c_nationkey = filtered_nation_n1.n_nationkey
+GROUP BY o_year
+ORDER BY o_year
+Time Cost: 395.11s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "将filtered_part CTE改为MATERIALIZED强制物化：WITH filtered_part AS MATERIALIZED (SELECT p_partkey FROM part WHERE p_type = 'LARGE BURNISHED TIN')。这将确保part过滤结果(5555行)被缓存并作为Hash表，优化器更可能选择filtered_part作为驱动表，通过lineitem.l_partkey索引访问而非全表扫描。同时对filtered_orders也使用MATERIALIZED，固化日期过滤结果(约300万行)，避免被内联到lineitem连接后才过滤。"}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，将高选择性过滤表前置为驱动表：先连接filtered_region(1行)→filtered_nation_n1(5行)→customer(过滤后约6万行)→filtered_orders(约300万行)，形成小结果集后再连接filtered_part(5555行)→lineitem(通过l_partkey索引访问)→supplier→n2。这样可将lineitem的访问从全表扫描5998万行降至索引扫描数万行。具体实现：在FROM子句中按filtered_region、filtered_nation_n1、customer、filtered_orders、filtered_part、lineitem的顺序排列，并在filtered_part与lineitem的JOIN前添加注释/*+ LEADING(filtered_part lineitem) */提示优化器。'}, {'group': '谓词简化', 'produced_suggestion': "将orders的日期过滤条件从CTE内移至主查询的WHERE子句，改为：FROM orders JOIN (SELECT o_orderkey FROM orders WHERE o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31') filtered_oids USING(o_orderkey)。这种半连接模式可能触发优化器使用orders表上的索引(如存在o_orderdate索引)或至少确保日期过滤在连接前完成。同时在主查询WHERE子句添加冗余条件：WHERE lineitem.l_partkey IN (SELECT p_partkey FROM filtered_part)，强化优化器对过滤选择性的感知。"}, {'group': '连接优化', 'produced_suggestion': '将filtered_part与lineitem的连接改为EXISTS半连接，减少数据传输：SELECT o_year, SUM(...) FROM lineitem WHERE EXISTS (SELECT 1 FROM filtered_part WHERE p_partkey = lineitem.l_partkey) AND EXISTS (SELECT 1 FROM filtered_orders WHERE o_orderkey = lineitem.l_orderkey) AND ... 。这种写法可能触发优化器使用Nested Loop + Index Scan模式，先通过filtered_part的5555个p_partkey值逐个在lineitem上进行索引查找(需在l_partkey上建索引)，避免lineitem全表扫描。但需注意：若优化器仍选择Hash Semi Join则无改进，此时需结合索引创建。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) lineitem表全表扫描占71.6%代价(1375085.88)，扫描近6000万行；2) orders表全表扫描占18.5%代价(355022.00)，扫描1500万行但仅过滤日期范围；3) part表全表扫描占2.7%代价，扫描200万行仅过滤p_type；4) 8表连接顺序未优化，存在大量中间结果集。可通过谓词下推、连接顺序调整、子查询优化等重写技术显著降低扫描行数和中间结果集规模。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将子查询中的过滤条件(r_name='AFRICA', o_orderdate范围, p_type='LARGE BURNISHED TIN')尽早应用，通过WHERE子句重组使高选择性谓词优先执行。特别是p_type和r_name过滤可大幅减少part和region的参与行数，建议将这些条件前置以触发更优的连接顺序。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整8表连接顺序：优先连接小表和高选择性过滤表。建议顺序：1)region(r_name='AFRICA')→n1(通过r_regionkey)；2)part(p_type过滤后)→lineitem(通过p_partkey)；3)orders(日期过滤后)→lineitem(通过l_orderkey)；4)再连接customer、supplier、n2。这样可将lineitem的扫描范围从6000万行降低到满足part和orders条件的子集。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将子查询all_nations改写为CTE或直接内联，消除子查询物化开销。同时考虑将多表连接拆分为两阶段：第一阶段通过part、orders的过滤条件缩小lineitem范围；第二阶段再进行维度表(nation、region、customer、supplier)的连接，减少Hash Join的构建代价。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在子查询中仅投影必需列：o_orderdate的年份提取、l_extendedprice、l_discount、n2.n_name，避免携带其他冗余列通过多层连接。特别是lineitem表有16列，仅需3列参与计算，早期列裁剪可减少Hash Join的内存占用和数据传输量。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择...
+📚 加载规则库 55 条规则（按优化组筛选: 谓词简化, 连接优化, 子查询优化, 投影优化；LinUCB参数化记忆开启）
+   → FILTER_EXPAND_IS_NOT_DISTINCT_FROM: UCB=1.100
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: UCB=1.100
+   → FILTER_VALUES_MERGE: UCB=1.100
+{
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "STRATEGY_CTE_DECOMPOSITION",
+    "PROJECT_REMOVE"
+  ],
+  "groups": "谓词简化,连接优化,子查询优化,投影优化",
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.8,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "STRATEGY_CTE_DECOMPOSITION": 0.6,
+    "PROJECT_REMOVE": 0.5
+  },
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.3,
+    "JOIN_CONDITION_PUSH": 0.3,
+    "STRATEGY_CTE_DECOMPOSITION": 0.3,
+    "PROJECT_REMOVE": 0.1
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化,连接优化,子查询优化,投影优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "STRATEGY_CTE_DECOMPOSITION",
+    "PROJECT_REMOVE"
+  ],
+  "rewritten_sql": "WITH filtered_region AS (\n  SELECT r_regionkey\n  FROM region\n  WHERE r_name = 'AFRICA'\n),\nfiltered_part AS (\n  SELECT p_partkey\n  FROM part\n  WHERE p_type = 'LARGE BURNISHED TIN'\n),\nfiltered_orders AS (\n  SELECT o_orderkey, o_custkey, EXTRACT(YEAR FROM o_orderdate) AS o_year\n  FROM orders\n  WHERE o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'\n),\nfiltered_nation_n1 AS (\n  SELECT n1.n_nationkey\n  FROM nation n1\n  JOIN filtered_region ON n1.n_regionkey = filtered_region.r_regionkey\n)\nSELECT \n  o_year,\n  SUM(CASE WHEN n2.n_name = 'ALGERIA' THEN l_extendedprice * (1 - l_discount) ELSE 0 END) / SUM(l_extendedprice * (1 - l_discount)) AS mkt_share\nFROM filtered_part\nJOIN lineitem ON filtered_part.p_partkey = lineitem.l_partkey\nJOIN supplier ON lineitem.l_suppkey = supplier.s_suppkey\nJOIN nation n2 ON supplier.s_nationkey = n2.n_nationkey\nJOIN filtered_orders ON lineitem.l_orderkey = filtered_orders.o_orderkey\nJOIN customer ON filtered_orders.o_custkey = customer.c_custkey\nJOIN filtered_nation_n1 ON customer.c_nationkey = filtered_nation_n1.n_nationkey\nGROUP BY o_year\nORDER BY o_year",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原始SQL的子查询all_nations消除，通过CTE将高选择性过滤条件（r_name='AFRICA'、p_type='LARGE BURNISHED TIN'、o_orderdate范围）提前应用到各自的基表（region、part、orders），并将n1与region的连接也提取为CTE filtered_nation_n1。主查询直接从这些CTE和剩余表进行连接。\n\n2. **谓词下推的等价性**：原SQL在FROM子句中通过WHERE统一过滤8表笛卡尔积；重写后将r_name、p_type、o_orderdate三个谓词分别下推到对应CTE中。由于这些谓词仅依赖单表列（region.r_name、part.p_type、orders.o_orderdate），根据关系代数的选择下推规则，先过滤再连接与先连接再过滤的结果集完全等价（σ(R⋈S) = σ(R)⋈S，当σ仅涉及R的列时）。\n\n3. **连接条件的等价性**：原SQL的8个等值连接条件（p_partkey=l_partkey、s_suppkey=l_suppkey、l_orderkey=o_orderkey、o_custkey=c_custkey、c_nationkey=n1.n_nationkey、n1.n_regionkey=r_regionkey、s_nationkey=n2.n_nationkey）在重写后完全保留，仅调整了连接顺序和表别名引用。由于等值连接满足交换律和结合律，连接顺序的改变不影响最终结果集的行集合。\n\n4. **投影列的等价性**：原SQL子查询投影o_year（从o_orderdate提取年份）、volume（l_extendedprice*(1-l_discount)）、nation（n2.n_name）；重写后在filtered_orders CTE中提前计算o_year，在主查询的聚合表达式中直接使用l_extendedprice和l_discount计算volume，n2.n_name在CASE表达式中引用。最终外层SELECT的o_year和mkt_share计算逻辑与原SQL完全一致。\n\n5. **聚合语义的等价性**：原SQL对子查询结果按o_year分组，计算SUM(CASE WHEN nation='ALGERIA' THEN volume ELSE 0 END)/SUM(volume)；重写后直接在主查询中按o_year分组，CASE表达式判断n2.n_name='ALGERIA'并计算相同的volume表达式。由于连接结果集与原SQL等价，分组键和聚合表达式完全相同，聚合结果必然等价。\n\n6. **CTE物化的透明性**：PostgreSQL的CTE默认为优化屏障（物化），但本重写中各CTE仅用于提前过滤和简化连接顺序，不改变数据流的逻辑依赖关系。即使CTE被物化，其输出行集与原SQL中对应的过滤后表子集完全相同，后续连接的输入数据一致，因此最终结果等价。\n\n7. **NULL值处理的等价性**：原SQL的连接条件和过滤谓词均为等值比较或范围比较，NULL值在这些条件下会被自然过滤（NULL不等于任何值，包括NULL本身）。重写后的CTE过滤和连接条件保持相同的NULL处理语义，不会引入或丢失NULL相关的行。聚合函数SUM和CASE表达式对NULL的处理也与原SQL一致（NULL在算术运算中传播，CASE的ELSE 0确保非匹配行贡献0而非NULL）。\n\n8. **排序的等价性**：原SQL和重写SQL均以o_year升序排序，且o_year在两者中的计算方式完全相同（EXTRACT(YEAR FROM o_orderdate)），因此排序结果等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写通过CTE将高选择性过滤条件下推到各基表，并调整连接顺序，但所有连接条件、过滤谓词、聚合逻辑和投影列完全保留，结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（cost、节点类型、扫描方式、连接顺序、并行度均无变化），说明优化器未采纳CTE重写。虽然重写SQL引入4个CTE意图通过预过滤减少连接数据量，但实际执行计划显示：1)所有表仍采用相同扫描方式（8个Seq Scan）；2)连接顺序未改变（仍是lineitem→part→orders→customer→supplier→n2）；3)过滤条件未前移（part、orders、region的Filter仍在各自Seq Scan节点内）；4)未出现CTE物化节点，说明优化器将CTE内联后生成了与原SQL相同的计划。结构上无改进也无恶化，但未达到预期的'过滤前置→减少连接数据量'效果。需尝试更激进的重写策略。",
+  "no_further_optimization": false,
+  "next_step_advice": "当前CTE被优化器完全内联，未产生执行计划差异。下一轮应尝试：1)使用MATERIALIZED提示强制CTE物化（WITH filtered_part AS MATERIALIZED (...)），确保过滤结果被缓存后再参与连接；2)或改用派生表+LATERAL连接，将part和orders的过滤结果作为驱动表；3)或引入临时聚合（如先对lineitem按l_partkey预聚合volume，再连接其他表），强制改变连接顺序。重点是打破当前'lineitem全表扫描→逐层Hash Join'的模式，使高选择性过滤（part 5555行、region 1行）能真正驱动执行计划。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮CTE被优化器完全内联，未产生执行计划差异。当前执行计划仍存在严重性能瓶颈：1)lineitem全表扫描占71.6%代价(1375085.88)，扫描5998万行后才通过Hash Join过滤；2)orders全表扫描占18.5%代价(355022.00)，扫描1500万行后通过日期过滤；3)part全表扫描占2.7%代价(51408.67)，扫描200万行后通过p_type过滤仅保留5555行。核心问题是高选择性过滤条件(part 5555行、region 1行、orders日期范围约2年)未能驱动执行计划，导致大表lineitem作为驱动表进行全表扫描。需采用更激进的重写策略：使用MATERIALIZED提示强制CTE物化，或改用派生表+索引提示，打破当前'lineitem→part→orders'的连接顺序，使小结果集(filtered_part 5555行)成为驱动表，通过索引访问lineitem(l_partkey)和orders(o_orderkey)，预期可将lineitem扫描行数从5998万降至数万行级别。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将filtered_part CTE改为MATERIALIZED强制物化：WITH filtered_part AS MATERIALIZED (SELECT p_partkey FROM part WHERE p_type = 'LARGE BURNISHED TIN')。这将确保part过滤结果(5555行)被缓存并作为Hash表，优化器更可能选择filtered_part作为驱动表，通过lineitem.l_partkey索引访问而非全表扫描。同时对filtered_orders也使用MATERIALIZED，固化日期过滤结果(约300万行)，避免被内联到lineitem连接后才过滤。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，将高选择性过滤表前置为驱动表：先连接filtered_region(1行)→filtered_nation_n1(5行)→customer(过滤后约6万行)→filtered_orders(约300万行)，形成小结果集后再连接filtered_part(5555行)→lineitem(通过l_partkey索引访问)→supplier→n2。这样可将lineitem的访问从全表扫描5998万行降至索引扫描数万行。具体实现：在FROM子句中按filtered_region、filtered_nation_n1、customer、filtered_orders、filtered_part、lineitem的顺序排列，并在filtered_part与lineitem的JOIN前添加注释/*+ LEADING(filtered_part lineitem) */提示优化器。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将orders的日期过滤条件从CTE内移至主查询的WHERE子句，改为：FROM orders JOIN (SELECT o_orderkey FROM orders WHERE o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31') filtered_oids USING(o_orderkey)。这种半连接模式可能触发优化器使用orders表上的索引(如存在o_orderdate索引)或至少确保日期过滤在连接前完成。同时在主查询WHERE子句添加冗余条件：WHERE lineitem.l_partkey IN (SELECT p_partkey FROM filtered_part)，强化优化器对过滤选择性的感知。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将filtered_part与lineitem的连接改为EXISTS半连接，减少数据传输：SELECT o_year, SUM(...) FROM lineitem WHERE EXISTS (SELECT 1 FROM filtered_part WHERE p_partkey = lineitem.l_partkey) AND EXISTS (SELECT 1 FROM filtered_orders WHERE o_orderkey = lineitem.l_orderkey) AND ... 。这种写法可能触发优化器使用Nested Loop + Index Scan模式，先通过filtered_part的5555个p_partkey值逐个在lineitem上进行索引查找(需在l_partkey上建索引)，避免lineitem全表扫描。但需注意：若优化器仍选择Hash Semi Join则无改进，此时需结合索引创建。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择...
+📚 加载规则库 52 条规则（按优化组筛选: 子查询优化, 连接优化, 谓词简化；LinUCB参数化记忆开启）
+   → JOIN_TO_CORRELATE: UCB=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCB=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCB=1.100
+{
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "groups": "子查询优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 1.0
+  }
+}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化",
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION"],
+  "rewritten_sql": "WITH filtered_region AS MATERIALIZED (\n  SELECT r_regionkey\n  FROM region\n  WHERE r_name = 'AFRICA'\n),\nfiltered_part AS MATERIALIZED (\n  SELECT p_partkey\n  FROM part\n  WHERE p_type = 'LARGE BURNISHED TIN'\n),\nfiltered_orders AS MATERIALIZED (\n  SELECT o_orderkey, o_custkey, EXTRACT(YEAR FROM o_orderdate) AS o_year\n  FROM orders\n  WHERE o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'\n),\nfiltered_nation_n1 AS MATERIALIZED (\n  SELECT n1.n_nationkey\n  FROM nation n1\n  JOIN filtered_region ON n1.n_regionkey = filtered_region.r_regionkey\n)\nSELECT \n  o_year,\n  SUM(CASE WHEN n2.n_name = 'ALGERIA' THEN l_extendedprice * (1 - l_discount) ELSE 0 END) / SUM(l_extendedprice * (1 - l_discount)) AS mkt_share\nFROM filtered_part\nJOIN lineitem ON filtered_part.p_partkey = lineitem.l_partkey\nJOIN supplier ON lineitem.l_suppkey = supplier.s_suppkey\nJOIN nation n2 ON supplier.s_nationkey = n2.n_nationkey\nJOIN filtered_orders ON lineitem.l_orderkey = filtered_orders.o_orderkey\nJOIN customer ON filtered_orders.o_custkey = customer.c_custkey\nJOIN filtered_nation_n1 ON customer.c_nationkey = filtered_nation_n1.n_nationkey\nGROUP BY o_year\nORDER BY o_year",
+  "semantic_correctness_guarantee": "1. 结构性改写：在原CTE定义基础上，为所有4个CTE（filtered_region、filtered_part、filtered_orders、filtered_nation_n1）添加MATERIALIZED提示，强制优化器物化这些中间结果集而非内联展开。主查询的FROM子句、JOIN条件、WHERE过滤、GROUP BY和ORDER BY逻辑完全保持不变。\n\n2. 等价性保证——CTE物化不改变语义：MATERIALIZED提示仅改变执行策略（将CTE结果缓存为临时表），不改变CTE定义的查询逻辑。每个CTE的SELECT语句与原SQL完全一致：filtered_region仍返回r_name='AFRICA'的r_regionkey；filtered_part仍返回p_type='LARGE BURNISHED TIN'的p_partkey；filtered_orders仍返回1995-1996年订单的o_orderkey、o_custkey和o_year；filtered_nation_n1仍返回AFRICA地区的n_nationkey。物化后这些结果集的行集合与内联执行时完全相同。\n\n3. 等价性保证——主查询连接逻辑不变：主查询仍通过filtered_part.p_partkey = lineitem.l_partkey连接过滤后的part表与lineitem表，通过filtered_orders.o_orderkey = lineitem.l_orderkey连接过滤后的orders表，通过filtered_nation_n1.n_nationkey = customer.c_nationkey连接过滤后的nation表。所有JOIN条件、连接类型（INNER JOIN）、连接顺序的语义约束（通过ON子句的外键关系）均与原SQL一致。\n\n4. 等价性保证——聚合与分组逻辑不变：SELECT子句中的CASE表达式（当n2.n_name='ALGERIA'时计算volume，否则为0）、SUM聚合函数、除法运算逻辑与原SQL完全一致。GROUP BY o_year确保按年份分组，ORDER BY o_year确保结果按年份升序排列，与原SQL语义相同。\n\n5. 等价性保证——过滤条件覆盖范围不变：原SQL通过CTE在连接前过滤region（1行）、part（约5555行）、orders（约300万行）、nation（约5行），重写SQL的MATERIALIZED CTE仍在相同位置应用相同过滤条件，不存在过滤条件遗漏或额外添加的情况。主查询中未引入新的WHERE子句或HAVING子句。\n\n6. 易误判点——MATERIALIZED不影响NULL处理：CTE中的JOIN（如filtered_nation_n1中的nation与filtered_region的JOIN）和主查询中的JOIN均为INNER JOIN，NULL值的处理逻辑（不匹配则排除）在物化前后保持一致。MATERIALIZED不改变JOIN的语义类型或NULL过滤行为。\n\n7. 易误判点——物化不影响重复行处理：原SQL和重写SQL均未使用DISTINCT，lineitem表中可能存在的重复行（同一订单的多个行项）在聚合前的连接结果中保持相同的重复模式。MATERIALIZED仅缓存CTE结果，不对结果去重或改变行的多重性，因此SUM聚合的输入行集合与原SQL完全一致。\n\n8. 审计验证点：可通过对比原SQL与重写SQL在相同数据集上的执行结果（o_year和mkt_share列）验证等价性。若优化器在原SQL中已内联CTE，则重写SQL通过MATERIALIZED强制物化后，执行计划会出现CTE Scan节点，但最终结果集的行数、列值、排序顺序必须与原SQL完全一致。若结果不一致，说明优化器对MATERIALIZED的处理存在bug，而非重写逻辑错误。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL在原CTE基础上添加MATERIALIZED提示，仅改变执行策略（物化中间结果）而不改变查询语义；所有CTE定义、JOIN条件、过滤逻辑、聚合表达式和分组排序均与原SQL完全一致，结果集必然相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL引入了4个CTE（filtered_region/filtered_part/filtered_orders/filtered_nation_n1）实现公共结果复用，这是高优先级正信号。但执行计划显示：1) lineitem仍为全表扫描（5998万行→5998万行），未能通过索引访问减少扫描量；2) filtered_orders的CTE扫描估计行数从192万行膨胀至461万行（实际可能因统计信息偏差），导致后续Hash Join处理的数据量从原10249行激增至239万行；3) 并行度从原2个worker降至部分节点串行执行；4) cost从192万升至385万（翻倍）。虽然CTE复用是正向结构改进，但当前实现未能触发索引访问路径，且中间结果膨胀抵消了复用收益。结构上未达到'明确改进'标准，也不存在'明确灾难性退化'（lineitem扫描次数未增加、无新增高开销排序），但优化空间明显：需通过MATERIALIZED强制物化、调整连接顺序、或改用半连接触发索引访问，将lineitem从全表扫描降至索引扫描。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：1) 保留4个CTE的复用结构，但对filtered_part和filtered_orders显式添加MATERIALIZED关键字（WITH filtered_part AS MATERIALIZED (...)），强制物化避免被内联；2) 调整主查询连接顺序，将高选择性表前置：FROM filtered_region JOIN filtered_nation_n1 ... JOIN filtered_part JOIN lineitem（按此顺序），利用filtered_part的5555行小结果集作为驱动表，通过lineitem.l_partkey索引访问（若索引存在）减少扫描量；3) 若优化器仍选择全表扫描，尝试将filtered_part与lineitem的连接改写为半连接：WHERE EXISTS (SELECT 1 FROM filtered_part WHERE p_partkey = lineitem.l_partkey)，配合索引提示或实际创建l_partkey索引；4) 验证filtered_orders的行数估计偏差，若统计信息过时需ANALYZE orders表后重新评估。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+ℹ️  估计代价上升 100.6%（> 50.0%），计划结构分析建议保留当前重写，不回退。
+
+🎲 LinUCB Update: 1 rules, reward=-0.2400 (cost=-1.0000, rows=+0.0000, depth=+0.2000, oc=1921221.1000, rc=3854108.1500)
+✅ LinUCB Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: prior=0.427, reward=-0.240, count=112, avg=+0.019
+
+----------------------------------------
+
