@@ -27,8 +27,16 @@ STRICT_JSON_SCHEMAS = {
             "properties": {
                 "groups": {"type": "string"},
                 "applied_rules": {"type": "array", "items": {"type": "string"}},
+                "rule_effect_scores": {
+                    "type": "object",
+                    "additionalProperties": {"type": "number"},
+                },
+                "rule_effect_confidence": {
+                    "type": "object",
+                    "additionalProperties": {"type": "number"},
+                },
             },
-            "required": ["groups", "applied_rules"],
+            "required": ["groups", "applied_rules", "rule_effect_scores", "rule_effect_confidence"],
             "additionalProperties": False,
         },
     },
@@ -147,6 +155,18 @@ STRICT_JSON_SCHEMAS = {
 }
 
 
+def _build_single_agent_gpt() -> GPT:
+    """Single LLM client for architecture ablation (single-agent branch)."""
+    return GPT(
+        api_key=os.getenv("SINGLE_AGENT_MODEL_API_KEY") or os.getenv("REASONING_MODEL_API_KEY"),
+        model=os.getenv("SINGLE_AGENT_MODEL") or os.getenv("REASONING_MODEL"),
+        base_url=os.getenv("SINGLE_AGENT_MODEL_URL") or os.getenv("REASONING_MODEL_URL"),
+        thinking_type=os.getenv("SINGLE_AGENT_MODEL_THINKING") or os.getenv("REASONING_MODEL_THINKING"),
+        reasoning_effort=os.getenv("SINGLE_AGENT_MODEL_REASONING_EFFORT")
+        or os.getenv("REASONING_MODEL_REASONING_EFFORT"),
+    )
+
+
 def _merge_rewrite_semantic_fields(parsed: dict) -> None:
     """
     统一 semantic_correctness_guarantee 与旧字段 semantic_check；
@@ -174,23 +194,101 @@ class ReasoningAgent(Agent):
         base_url=os.getenv("REASONING_MODEL_URL")
         ))
 
+    @staticmethod
+    def _sanitize_rule_effect_scores(applied_rules, raw_scores) -> Dict[str, float]:
+        """Keep only positive numeric scores for selected rules and normalize to sum=1."""
+        if not isinstance(applied_rules, list) or not applied_rules:
+            return {}
+        if not isinstance(raw_scores, dict):
+            return {}
+
+        cleaned: Dict[str, float] = {}
+        for rid in applied_rules:
+            v = raw_scores.get(rid)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                fv = float(v)
+                if fv > 0:
+                    cleaned[rid] = fv
+            elif isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    continue
+                try:
+                    fv = float(s)
+                except ValueError:
+                    continue
+                if fv > 0:
+                    cleaned[rid] = fv
+
+        total = sum(cleaned.values())
+        if total <= 0:
+            return {}
+        return {rid: cleaned[rid] / total for rid in cleaned}
+
+    @staticmethod
+    def _sanitize_rule_effect_confidence(applied_rules, raw_confidence) -> Dict[str, float]:
+        """Keep confidence values in [0, 1] for selected rules only."""
+        if not isinstance(applied_rules, list) or not applied_rules:
+            return {}
+        if not isinstance(raw_confidence, dict):
+            return {}
+
+        cleaned: Dict[str, float] = {}
+        for rid in applied_rules:
+            v = raw_confidence.get(rid)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                cleaned[rid] = float(max(0.0, min(1.0, float(v))))
+            elif isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    continue
+                try:
+                    fv = float(s)
+                except ValueError:
+                    continue
+                cleaned[rid] = float(max(0.0, min(1.0, fv)))
+        return cleaned
+
     async def select_rule_sequence(self, sql: str, decision_advice: list, rule_library: dict, data_statistics: str, explain_info: str, iteration_round: int = 1, previous_feedback: dict = None, few_shot_examples: list = None, index_info: str = "") -> dict:
-        """Select appropriate rule sequence based on DecisionAgent's advice and rule descriptions."""
+        """Select appropriate rule sequence based on DecisionAgent's advice with UCT scores."""
         advice_text = json.dumps(decision_advice, ensure_ascii=False, indent=2)
 
-        # Build rule library text without memory-derived scores.
         rule_text = ""
         all_groups = []
         all_rules = []
+
+        has_uct_scores = False
+        for group, rules in rule_library.items():
+            if rules:
+                first_val = next(iter(rules.values()))
+                if isinstance(first_val, tuple):
+                    has_uct_scores = True
+                break
 
         for group, rules in rule_library.items():
             all_groups.append(group)
             rule_text += f"### {group}\n"
 
+            sorted_rules = []
             for rule_id, rule_data in rules.items():
-                desc = rule_data[0] if isinstance(rule_data, tuple) else rule_data
+                if has_uct_scores and isinstance(rule_data, tuple):
+                    desc, score = rule_data
+                    sorted_rules.append((rule_id, desc, score))
+                else:
+                    sorted_rules.append((rule_id, rule_data, 1.0))
+
+            sorted_rules.sort(key=lambda x: x[2], reverse=True)
+
+            for rule_id, desc, score in sorted_rules:
                 all_rules.append(rule_id)
-                rule_text += f"- {rule_id}: {desc}\n"
+                if has_uct_scores:
+                    rule_text += f"- {rule_id} [UCT分数: {score:.3f}]: {desc}\n"
+                else:
+                    rule_text += f"- {rule_id}: {desc}\n"
 
         groups_text = ", ".join(all_groups)
 
@@ -217,6 +315,15 @@ class ReasoningAgent(Agent):
                 few_shot_context += f"- 命中次数: {example.get('frequency', 0)}\n\n"
             few_shot_context += "</相似历史案例>\n"
 
+        uct_guidance = """
+        【UCT分数说明】
+        规则后面的 [UCT分数: x.xxx] 表示该规则在历史上的表现评分：
+        - 高分规则（>0.7）：历史成功率较高，通常更可靠
+        - 中分规则（0.4-0.7）：有一定成功案例，需结合SQL结构判断
+        - 低分规则（<0.4）：历史表现一般或为较少尝试的新规则
+        可以优先选择 UCT 分数高的规则，但需要结合当前SQL的具体结构做最终判断，不要盲目选择。
+        """ if has_uct_scores else ""
+
         prompt = textwrap.dedent(f"""
         <Mission>
         你是一名经验丰富的 DBA，你的任务是基于 SQL / 执行计划 / 统计信息，从全量规则库中直接挑选合适的优化规则序列。你只负责选择规则，不进行任何重写操作。
@@ -233,6 +340,8 @@ class ReasoningAgent(Agent):
            {few_shot_context}
 
         {previous_feedback_text}
+
+        {uct_guidance}
 
         <sql语句（当前轮次基底 SQL；若为第2轮及以后，则是上一轮 rewritten_sql）>
         {sql}
@@ -255,8 +364,10 @@ class ReasoningAgent(Agent):
         3. 输出要求：**只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）。字段：
         - groups: 字符串，填写你判断本次所选规则涉及的类别；可为单个类别或多个类别的逗号分隔字符串，不要求与 decision_advice 中的 group 保持一致
         - applied_rules: 字符串数组，按应用顺序列出规则 ID；必须来自 <rule_library>，禁止编造；若无适用规则则为 []
+        - rule_effect_scores: 对象，键为 applied_rules 中的 rule_id，值为该规则预估贡献分（正数）。建议总和约为 1；若无规则则 {{}}
+        - rule_effect_confidence: 对象，键为 applied_rules 中的 rule_id，值为该规则效果估计的置信度（0到1之间）
 
-        示例：{{"groups": "连接优化, 谓词简化", "applied_rules": ["RULE_ID_1"]}}
+        示例：{{"groups": "连接优化, 谓词简化", "applied_rules": ["RULE_ID_1"], "rule_effect_scores": {{"RULE_ID_1": 1.0}}, "rule_effect_confidence": {{"RULE_ID_1": 0.8}}}}
         """)
 
         thought_chain = await self.llm.get_LLM_response_async(
@@ -268,14 +379,35 @@ class ReasoningAgent(Agent):
         default = {
             "groups": groups_text,
             "applied_rules": [],
+            "chosen_rule_prior": [],
+            "rule_effect_scores": {},
+            "rule_effect_confidence": {},
         }
         parsed, _ = parse_llm_json(thought_chain, default)
         if parsed and isinstance(parsed.get("applied_rules"), list):
+            parsed["chosen_rule_prior"] = []
+            parsed["rule_effect_scores"] = ReasoningAgent._sanitize_rule_effect_scores(
+                parsed.get("applied_rules", []),
+                parsed.get("rule_effect_scores", {}),
+            )
+            parsed["rule_effect_confidence"] = ReasoningAgent._sanitize_rule_effect_confidence(
+                parsed.get("applied_rules", []),
+                parsed.get("rule_effect_confidence", {}),
+            )
             return parsed
         sequence_match = re.search(r"<rule_sequence>(.*?)</rule_sequence>", thought_chain, re.DOTALL)
         inner = sequence_match.group(1).strip() if sequence_match else thought_chain
         parsed2, _ = parse_llm_json(inner, default)
         if parsed2 and isinstance(parsed2.get("applied_rules"), list):
+            parsed2["chosen_rule_prior"] = []
+            parsed2["rule_effect_scores"] = ReasoningAgent._sanitize_rule_effect_scores(
+                parsed2.get("applied_rules", []),
+                parsed2.get("rule_effect_scores", {}),
+            )
+            parsed2["rule_effect_confidence"] = ReasoningAgent._sanitize_rule_effect_confidence(
+                parsed2.get("applied_rules", []),
+                parsed2.get("rule_effect_confidence", {}),
+            )
             return parsed2
         return default
 
@@ -1316,4 +1448,33 @@ class SemanticCheckAgent(Agent):
             json_schema=STRICT_JSON_SCHEMAS["semantic_equivalence"],
         )
         return self._parse_equivalence_response(response)
+
+
+class SingleAgent(Agent):
+    """
+    Architecture ablation: one agent + one LLM replaces Decision / Reasoning /
+    Rewrite / SemanticCheck agents. Method bodies are reused via class binding.
+    """
+
+    def __init__(self, mq: MessageQueue):
+        super().__init__("SingleAgent", mq, gpt=_build_single_agent_gpt())
+
+    # Decision
+    initial_optimization_check = DecisionAgent.initial_optimization_check
+    evaluate_with_costs = DecisionAgent.evaluate_with_costs
+
+    # Reasoning
+    select_rule_sequence = ReasoningAgent.select_rule_sequence
+
+    # Rewrite
+    rewrite_with_rule_sequence = RewriteAgent.rewrite_with_rule_sequence
+    semantic_fix = RewriteAgent.semantic_fix
+    iterative_rewrite = RewriteAgent.iterative_rewrite
+    correct_sql = RewriteAgent.correct_sql
+    extract_corrected_sql_content = RewriteAgent.extract_corrected_sql_content
+    _extract_sql_from_response_robust = RewriteAgent._extract_sql_from_response_robust
+
+    # Semantic check
+    check_equivalence = SemanticCheckAgent.check_equivalence
+    _parse_equivalence_response = SemanticCheckAgent._parse_equivalence_response
 
