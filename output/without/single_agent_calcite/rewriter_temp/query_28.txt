@@ -1,0 +1,222 @@
+Query ID: 28
+==================================================
+
+Original: SELECT ENAME, SAL, DEPTNO FROM (SELECT ENAME, SAL, DEPTNO FROM EMP GROUP BY ENAME, SAL, DEPTNO HAVING SAL > 5000) AS t4 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)
+Rewritten: SELECT ENAME, SAL, DEPTNO FROM (SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ENAME, SAL, DEPTNO) AS t4 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)
+Time Cost: 188.82s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': "消除内层冗余GROUP BY和派生表：将SQL重写为单层结构 'SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)'。理由：内层子查询对(ENAME,SAL,DEPTNO)做GROUP BY后，外层再对相同列集做ROLLUP聚合，内层GROUP BY无实际去重或聚合意义（ROLLUP本身会处理所有分组组合）。消除派生表后，执行计划应从'Seq Scan → Group(内层) → Group(外层ROLLUP)'简化为'Seq Scan → Group(ROLLUP)'，减少一个Group/Aggregate节点，降低内存和CPU消耗。"}, {'group': '投影优化', 'produced_suggestion': '展开派生表消除冗余投影：当前SQL中派生表t4的SELECT列表(ENAME,SAL,DEPTNO)与外层查询完全一致，派生表引入了额外的投影层。简化为单层查询后，投影操作仅需执行一次，减少列传递开销。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) Seq Scan on emp表占总代价99.8%，扫描4500万行数据；2) SQL存在冗余的GROUP BY操作，内层子查询已经按ENAME,SAL,DEPTNO分组并过滤SAL>5000，外层又对相同列进行ROLLUP分组，这导致不必要的重复聚合计算；3) 参考历史案例显示相似SQL通过AGGREGATE_MERGE和AGGREGATE_FILTER_TRANSPOSE规则优化后性能提升，本SQL同样适用聚合合并优化；4) 虽然Seq Scan高代价主要需要索引优化，但查询重写可以通过消除冗余聚合、简化查询结构来减少数据处理量，为后续索引优化创造条件",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除内层冗余GROUP BY：内层子查询的GROUP BY ENAME,SAL,DEPTNO在HAVING过滤后，外层直接对过滤结果执行GROUP BY ROLLUP即可，无需嵌套两层聚合。建议将SQL重写为：SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)，这样可以减少一次聚合操作的开销"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将HAVING条件下推为WHERE条件：HAVING SAL > 5000作用于非聚合列，应改为WHERE SAL > 5000在扫描阶段提前过滤，减少进入GROUP BY的数据量。这与历史案例中的AGGREGATE_FILTER_TRANSPOSE规则一致，可显著降低聚合计算代价"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除不必要的派生表：当前SQL使用子查询AS t4包装内层结果，但外层直接引用其所有列且无额外过滤，该派生表可直接展开。结合聚合合并后，整个查询可简化为单层结构，减少查询执行的层次复杂度"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.245
+   → AGGREGATE_VALUES: UCT=1.245
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "聚合优化, 谓词简化",
+  "applied_rules": ["AGGREGATE_MERGE", "AGGREGATE_FILTER_TRANSPOSE"],
+  "rule_effect_scores": {
+    "AGGREGATE_MERGE": 0.6,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.4
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_MERGE": 0.9,
+    "AGGREGATE_FILTER_TRANSPOSE": 0.95
+  }
+}
+```
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 谓词简化",
+  "applied_rules": [
+    "AGGREGATE_MERGE",
+    "AGGREGATE_FILTER_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT ENAME, SAL, DEPTNO\nFROM EMP\nWHERE SAL > 5000\nGROUP BY ROLLUP(ENAME, SAL, DEPTNO)",
+  "semantic_correctness_guarantee": "1. 结构性改写说明：消除了内层子查询 t4 的 GROUP BY ENAME, SAL, DEPTNO，将两层聚合合并为单层 GROUP BY ROLLUP；同时将内层的 HAVING SAL > 5000 下推为外层的 WHERE SAL > 5000。\n\n2. AGGREGATE_MERGE 等价性保证：原 SQL 内层 GROUP BY ENAME, SAL, DEPTNO 作用于 EMP 表的三个非聚合列，由于 Schema 中 empno 是主键但查询未涉及聚合函数（仅投影 ENAME, SAL, DEPTNO），内层 GROUP BY 实际上是对 (ENAME, SAL, DEPTNO) 组合去重。外层 GROUP BY ROLLUP(ENAME, SAL, DEPTNO) 会生成多个分组集（包括全集、各维度组合及空集），其输入是内层去重后的结果。合并后直接在 EMP 表上执行 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)，由于 ROLLUP 的语义是对输入行按分组集聚合，而 WHERE SAL > 5000 过滤后的行集与原 SQL 内层 HAVING 过滤后的行集完全一致，因此 ROLLUP 的输入行集相同，输出的汇总行（包括小计和总计行）也完全相同。\n\n3. AGGREGATE_FILTER_TRANSPOSE 等价性保证：原 SQL 的 HAVING SAL > 5000 作用于非聚合列 SAL（内层 GROUP BY 未对 SAL 做聚合函数计算，仅作为分组键），根据 SQL 语义，HAVING 在此场景等价于对分组后的每组检查 SAL 值。由于 SAL 是分组键且来自基表 EMP，将其改写为 WHERE SAL > 5000 在扫描阶段提前过滤，过滤后的行集与 HAVING 过滤后的行集完全一致（因为 SAL 值在分组前后不变），因此不改变最终结果集。\n\n4. ROLLUP 语义保持：原 SQL 外层 GROUP BY ROLLUP(ENAME, SAL, DEPTNO) 生成的分组集包括 (ENAME, SAL, DEPTNO)、(ENAME, SAL)、(ENAME)、()，重写后的 ROLLUP 作用于相同的三列且顺序一致，生成的分组集结构完全相同。由于输入行集（经 WHERE SAL > 5000 过滤后的 EMP 表行）与原 SQL 内层子查询输出一致，ROLLUP 的汇总逻辑（包括 NULL 填充的小计行和总计行）完全相同。\n\n5. 投影列一致性：原 SQL 和重写 SQL 均投影 ENAME, SAL, DEPTNO 三列，且 ROLLUP 生成的汇总行中，非分组维度列会填充 NULL（标准 SQL ROLLUP 语义），两者投影列的数据类型、NULL 语义和顺序完全一致。\n\n6. 易误判点说明：内层 GROUP BY 看似必要，但因其分组键 (ENAME, SAL, DEPTNO) 未涉及聚合函数且 HAVING 仅过滤非聚合列，实际作用仅为去重+过滤。外层 ROLLUP 会重新分组并生成汇总行，内层去重对最终结果无影响（ROLLUP 的分组逻辑已包含去重）。因此消除内层 GROUP BY 并将 HAVING 下推为 WHERE 后，查询语义与原 SQL 完全等价，且减少了一次不必要的聚合操作。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原SQL内层GROUP BY对(ENAME,SAL,DEPTNO)去重后再ROLLUP，重写SQL直接对原表ROLLUP；当存在重复(ENAME,SAL,DEPTNO)组合时，ROLLUP汇总行的计数会不同。",
+    "differences": [
+        {
+            "type": "aggregation_semantics",
+            "description": "原SQL内层去重使ROLLUP基于唯一组合计数，重写SQL基于原表所有行计数，汇总行数值不同",
+            "location": "GROUP BY子句与ROLLUP输入行集"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原SQL内层GROUP BY对(ENAME,SAL,DEPTNO)去重后再ROLLUP，重写SQL直接对原表ROLLUP；当存在重复(ENAME,SAL,DEPTNO)组合时，ROLLUP汇总行的计数会不同。
+```json
+{"fixed_sql": "SELECT ENAME, SAL, DEPTNO FROM (SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ENAME, SAL, DEPTNO) AS t4 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)", "note": "在内层子查询保留去重逻辑(GROUP BY)后再应用ROLLUP,确保汇总基于唯一组合而非原表所有行"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已在内层保留GROUP BY去重，外层ROLLUP输入行集与原SQL一致，消除了上轮差异。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "两个执行计划完全相同：节点类型、扫描方式、并行度、cost、Plan Rows均一致，说明优化器已将HAVING SAL>5000自动下推为WHERE过滤（原始SQL中Seq Scan节点的Filter已经是'(sal > 5000)'），重写SQL的HAVING→WHERE转换在执行计划层面无额外收益。结构上无改进也无退化，属于等价重写。SQL逻辑层面的改进（谓词显式下推）虽然语义上更清晰，但优化器已自动完成该转换，实际执行路径无差异。cost完全相同（704418.16），行数估计求和相同（10668），无任何结构性变化。本轮重写未带来执行计划层面的实质改进，但也未恶化。考虑到optimization_advice中还提出了更激进的优化方向（消除内层冗余GROUP BY、展开派生表，将SQL简化为单层'SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)'），该方向有可能消除一层聚合节点，具有实质结构改进潜力，仍存在可执行的下一步优化空间，因此不应终止。",
+  "no_further_optimization": false,
+  "next_step_advice": "在当前rewritten_sql基础上，进一步消除内层冗余子查询和GROUP BY：将SQL重写为单层结构 'SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)'。理由：内层子查询对(ENAME, SAL, DEPTNO)做GROUP BY后，外层再对相同列集做GROUP BY ROLLUP，内层GROUP BY是冗余的（在SAL>5000过滤下，EMP中若(ENAME,SAL,DEPTNO)已是唯一或接近唯一，则内层GROUP BY无去重意义，且即使有重复行，外层ROLLUP聚合也会处理）。消除派生表和内层GROUP BY后，执行计划应减少一个Group/Aggregate节点，降低执行层次复杂度，有望带来实质性结构改进。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮HAVING→WHERE转换未带来执行计划改进，因为优化器已自动完成谓词下推。当前SQL存在冗余结构：内层子查询对(ENAME,SAL,DEPTNO)做GROUP BY后，外层再对相同列集做GROUP BY ROLLUP，内层GROUP BY是多余的聚合操作。执行计划显示存在两层Group/Aggregate节点（内层普通GROUP BY + 外层ROLLUP），消耗额外计算资源。通过消除派生表和内层冗余GROUP BY，可将SQL简化为单层结构，减少一个聚合节点，降低执行层次复杂度。此外，当前执行计划中Seq Scan占比99.8%（代价702,880），虽然SAL列无索引导致全表扫描不可避免，但简化聚合结构后可减少后续聚合阶段的开销。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除内层冗余GROUP BY和派生表：将SQL重写为单层结构 'SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)'。理由：内层子查询对(ENAME,SAL,DEPTNO)做GROUP BY后，外层再对相同列集做ROLLUP聚合，内层GROUP BY无实际去重或聚合意义（ROLLUP本身会处理所有分组组合）。消除派生表后，执行计划应从'Seq Scan → Group(内层) → Group(外层ROLLUP)'简化为'Seq Scan → Group(ROLLUP)'，减少一个Group/Aggregate节点，降低内存和CPU消耗。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "展开派生表消除冗余投影：当前SQL中派生表t4的SELECT列表(ENAME,SAL,DEPTNO)与外层查询完全一致，派生表引入了额外的投影层。简化为单层查询后，投影操作仅需执行一次，减少列传递开销。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.244
+   → AGGREGATE_VALUES: UCT=1.244
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "聚合优化, 投影优化",
+  "applied_rules": ["AGGREGATE_REMOVE", "PROJECT_REMOVE"],
+  "rule_effect_scores": {
+    "AGGREGATE_REMOVE": 0.7,
+    "PROJECT_REMOVE": 0.3
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_REMOVE": 0.85,
+    "PROJECT_REMOVE": 0.75
+  }
+}
+```
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 投影优化",
+  "applied_rules": [
+    "AGGREGATE_REMOVE",
+    "PROJECT_REMOVE"
+  ],
+  "rewritten_sql": "SELECT ENAME, SAL, DEPTNO\nFROM EMP\nWHERE SAL > 5000\nGROUP BY ROLLUP(ENAME, SAL, DEPTNO)",
+  "semantic_correctness_guarantee": "1. 结构性改写：消除了派生表t4和内层GROUP BY(ENAME, SAL, DEPTNO)，将两层聚合结构简化为单层ROLLUP聚合。原SQL执行路径为：EMP表扫描 → WHERE过滤 → 内层GROUP BY → 派生表 → 外层ROLLUP；重写后为：EMP表扫描 → WHERE过滤 → ROLLUP聚合。\n2. 内层GROUP BY冗余性证明：原SQL内层对(ENAME, SAL, DEPTNO)做GROUP BY，但该分组列集与外层ROLLUP的分组列集完全相同。ROLLUP(ENAME, SAL, DEPTNO)会生成4个分组集：(ENAME,SAL,DEPTNO)、(ENAME,SAL)、(ENAME)、()。内层GROUP BY仅产生(ENAME,SAL,DEPTNO)级别的分组结果，外层ROLLUP会在此基础上继续聚合生成更粗粒度的分组。由于内层GROUP BY不包含任何聚合函数（仅SELECT分组列本身），其作用仅为去重，而外层ROLLUP的(ENAME,SAL,DEPTNO)分组集会对相同的列集再次分组，内层去重操作被外层聚合完全覆盖，因此内层GROUP BY在语义上是冗余的。\n3. 结果集等价性：原SQL和重写SQL在WHERE SAL>5000过滤后的数据集上，均对(ENAME,SAL,DEPTNO)执行ROLLUP聚合。ROLLUP生成的4个分组集及其对应的汇总行完全一致。由于SELECT子句仅包含分组列（无聚合函数），每个分组集的输出行为该分组集对应的唯一组合值（对于汇总行，未参与分组的列为NULL）。无论是否经过内层GROUP BY，最终ROLLUP的输入数据集在(ENAME,SAL,DEPTNO)组合上是相同的（内层GROUP BY若有去重效果，外层ROLLUP的(ENAME,SAL,DEPTNO)分组集也会产生相同去重效果），因此ROLLUP生成的所有分组集结果完全一致。\n4. 派生表消除的等价性：原SQL中派生表t4的SELECT列表(ENAME,SAL,DEPTNO)与外层查询的SELECT列表完全一致，且外层仅对这些列做ROLLUP聚合，不涉及列重命名或表达式计算。消除派生表后，直接在EMP表上执行WHERE过滤和ROLLUP聚合，投影列集不变，语义完全等价。\n5. NULL值和重复行处理：EMP表Schema显示ENAME、SAL、DEPTNO均为NOT NULL，因此不存在NULL值导致的分组差异。即使存在重复行，内层GROUP BY的去重效果会被外层ROLLUP的(ENAME,SAL,DEPTNO)分组集完全覆盖（该分组集本身就是对这三列的完整分组，等价于DISTINCT），其他汇总分组集（如(ENAME,SAL)、(ENAME)、()）的聚合逻辑在原SQL和重写SQL中完全一致。\n6. ROLLUP语义保持：ROLLUP(ENAME, SAL, DEPTNO)在原SQL和重写SQL中的分组层次、汇总行生成规则、NULL填充逻辑完全一致，未做任何改变。重写仅消除了冗余的中间聚合层和派生表包装，不影响最终ROLLUP的执行语义。\n7. 执行计划简化预期：消除内层GROUP BY和派生表后，执行计划应从'Seq Scan → Group(内层) → Group(外层ROLLUP)'简化为'Seq Scan → Group(ROLLUP)'，减少一个聚合节点和派生表物化开销，在保持结果集完全等价的前提下降低执行复杂度。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL的内层GROUP BY在HAVING过滤后产生去重效果，外层ROLLUP基于去重后的行集生成汇总；重写SQL直接在WHERE过滤后的原始行集上执行ROLLUP，若存在重复的(ENAME,SAL,DEPTNO)组合，ROLLUP的汇总行(如空分组集)会产生不同的聚合基数。",
+    "differences": [
+        {
+            "type": "aggregation_semantics",
+            "description": "原SQL内层GROUP BY对(ENAME,SAL,DEPTNO)去重后再ROLLUP，重写SQL直接对未去重数据ROLLUP，当存在重复行时ROLLUP的汇总分组集(如())的行为不同",
+            "location": "内层GROUP BY vs 直接ROLLUP"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL的内层GROUP BY在HAVING过滤后产生去重效果，外层ROLLUP基于去重后的行集生成汇总；重写SQL直接在WHERE过滤后的原始行集上执行ROLLUP，若存在重复的(ENAME,SAL,DEPTNO)组合，ROLLUP的汇总行(如空分组集)会产生不同的聚合基数。
+```json
+{"fixed_sql": "SELECT ENAME, SAL, DEPTNO FROM (SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ENAME, SAL, DEPTNO) AS t4 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)", "note": "在内层子查询保留GROUP BY去重逻辑，WHERE条件下推到内层，外层继续ROLLUP"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已将HAVING过滤改为WHERE过滤，内层GROUP BY在过滤后对(ENAME,SAL,DEPTNO)去重，外层ROLLUP基于去重后的行集生成汇总，与原始SQL语义完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（costs均为704418.16，节点结构、行数估计、并行度完全相同），说明优化器已将内层HAVING自动改写为WHERE并下推过滤，本轮重写（HAVING→WHERE）未产生额外收益。但原SQL存在明显冗余：内层GROUP BY (ENAME,SAL,DEPTNO)后外层再对相同列集做ROLLUP，内层分组无实际意义（ROLLUP本身会生成所有分组组合）。当前重写仅完成过滤下推（已被优化器自动处理），未消除派生表和冗余GROUP BY。尽管本轮未改进，但结构上未恶化（计划完全相同），且已识别出下一步优化方向（消除派生表+内层GROUP BY，简化为单层ROLLUP）。考虑到：1）本轮无恶化；2）已有明确可执行的下一步优化路径；3）当前重写至少保持了原有性能。根据'若本轮并非明确恶化，而是已有明显正向结构收益或保持不变但仍可继续微调，可直接terminate=true'的原则，本轮可终止，但建议执行下一步优化以消除冗余结构。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前enhanced_sql继续改写：消除派生表t4和内层GROUP BY，将SQL简化为单层结构 'SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)'。预期收益：减少一个Group节点，降低内存和CPU消耗，执行计划从'Seq Scan → Group(内层) → Group(外层ROLLUP)'简化为'Seq Scan → Group(ROLLUP)'。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 142
+   - 规则序列: ['AGGREGATE_REMOVE', 'PROJECT_REMOVE']
+   - 优化组别: 聚合优化, 投影优化
+   - 估计代价: 原始=704418.16, 重写=704418.16，相对变化: 0.00%
+✅ 成功存储，记录ID: 600d6c3f-ba51-4cac-a4c0-e6a8af77ec86
+
+🎲 UCT Math Update: 2 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=704418.1600, rc=704418.1600)
+   结构分细节: rows 10668.0->10668.0 (score=+0.000), depth 5.0->5.0 (score=+0.000)
+✅ UCT Update Complete:
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=0.700, conf=0.85, lambda=0.42, reward=+0.000, count=12, avg=+0.094
+   → PROJECT_REMOVE: P(s,a)=N/A, effect=0.300, conf=0.75, lambda=0.38, reward=+0.000, count=34, avg=+0.013
+
+----------------------------------------
+

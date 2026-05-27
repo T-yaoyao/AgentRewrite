@@ -1,0 +1,199 @@
+Query ID: 4
+==================================================
+
+Original: SELECT NAME FROM (SELECT DEPTNO, NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT 2 * DEPTNO AS f0 FROM DEPT GROUP BY 2 * DEPTNO) AS t5 WHERE DEPTNO = t5.f0)) AS t2
+Rewritten: SELECT d.name FROM dept d WHERE d.deptno = 0
+Time Cost: 132.82s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将EXISTS子查询中的连接条件 `d.deptno = t5.f0`（其中t5.f0 = 2*DEPTNO）简化为 `d.deptno = 2*d.deptno`，该等式仅在d.deptno=0时成立，直接改写为 `WHERE d.deptno = 0`，消除整个EXISTS子查询及其内部的聚合操作'}, {'group': '子查询优化', 'produced_suggestion': '基于谓词简化结果，完全移除EXISTS子查询结构，将SQL改写为 `SELECT d.name FROM dept d WHERE d.deptno = 0`，利用dept_pkey索引实现常量等值查找，避免450000行的全表扫描和Hash Join'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) EXISTS子查询中包含不必要的聚合操作(GROUP BY 2*DEPTNO)，导致52.8%代价消耗在Aggregate算子上；2) 子查询与外层表进行Hash Join，代价占比23.3%；3) 两次全表扫描dept表(合计23.8%代价)。EXISTS条件'DEPTNO = 2*DEPTNO'实际等价于'DEPTNO = 0'，可通过谓词简化和子查询优化大幅提升性能。历史案例显示相似SQL通过AGGREGATE_REMOVE和PROJECT_SUB_QUERY_TO_CORRELATE规则优化成功。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "分析EXISTS子查询中的连接条件'DEPTNO = t5.f0'，其中t5.f0定义为'2*DEPTNO'，因此条件等价于'DEPTNO = 2*DEPTNO'，即'DEPTNO = 0'。将此谓词简化后可直接过滤外层查询，避免子查询执行。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "EXISTS子查询中的聚合操作(GROUP BY 2*DEPTNO)和派生表t5是冗余的，因为EXISTS只需判断存在性。移除聚合层，将子查询简化为半连接或直接转换为WHERE条件，消除52.8%的Aggregate代价和23.3%的Hash Join代价。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "外层派生表t2仅投影NAME列但包含DEPTNO列用于连接，在谓词简化后可直接从DEPT表投影NAME，消除冗余的子查询层级和重复的表扫描(节省11.0%代价)。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "应用AGGREGATE_REMOVE规则(参考历史案例)，移除EXISTS子查询中无实际过滤作用的GROUP BY操作，该聚合仅对2*DEPTNO分组但结果未被有效利用，移除后可避免流水线阻塞。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.245
+   → AGGREGATE_VALUES: UCT=1.245
+   → JOIN_TO_CORRELATE: UCT=1.100
+```json
+{
+  "groups": "聚合优化, 子查询优化, 谓词简化",
+  "applied_rules": ["AGGREGATE_REMOVE", "PROJECT_SUB_QUERY_TO_CORRELATE"],
+  "rule_effect_scores": {
+    "AGGREGATE_REMOVE": 0.6,
+    "PROJECT_SUB_QUERY_TO_CORRELATE": 0.4
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_REMOVE": 0.85,
+    "PROJECT_SUB_QUERY_TO_CORRELATE": 0.75
+  }
+}
+```
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 子查询优化, 谓词简化",
+  "applied_rules": [
+    "AGGREGATE_REMOVE",
+    "PROJECT_SUB_QUERY_TO_CORRELATE"
+  ],
+  "rewritten_sql": "SELECT d.name\nFROM dept d\nWHERE EXISTS (\n  SELECT 1\n  FROM dept d2\n  WHERE d.deptno = 2 * d2.deptno\n)",
+  "semantic_correctness_guarantee": "1. **结构性改写**：移除了内层子查询t5中的GROUP BY聚合操作（AGGREGATE_REMOVE规则），将原本的三层嵌套（外层t2派生表 → EXISTS子查询 → 内层t5聚合派生表）简化为两层（外层dept表 → EXISTS子查询直接访问dept表）。\n\n2. **聚合移除的等价性保证**：原查询中的`SELECT 2 * DEPTNO AS f0 FROM DEPT GROUP BY 2 * DEPTNO`对每个不同的`2*DEPTNO`值产生一行。移除GROUP BY后，`SELECT 1 FROM dept d2`对每个满足条件的dept行产生一行。由于EXISTS只判断存在性（至少有一行满足条件即返回TRUE），聚合与否不影响EXISTS的布尔结果，因此移除聚合在语义上等价。\n\n3. **连接条件的保持**：原查询的连接条件`DEPTNO = t5.f0`（即`DEPTNO = 2*DEPTNO`）在重写后保持为`d.deptno = 2 * d2.deptno`，谓词逻辑完全一致。外层表别名从隐式改为显式d，内层表别名从隐式改为d2，但引用关系未变。\n\n4. **投影列的等价性**：原查询最外层投影NAME列，来自派生表t2，t2又从DEPT表选择DEPTNO和NAME。重写后直接从dept表（别名d）投影name列，由于外层派生表t2没有对NAME做任何转换或过滤（仅作为透传），直接投影与通过派生表投影结果集完全相同。\n\n5. **EXISTS语义的保持**：原查询通过EXISTS判断是否存在满足`DEPTNO = 2*DEPTNO`的分组行，重写后通过EXISTS判断是否存在满足`d.deptno = 2*d2.deptno`的dept行。两者在dept表的主键约束（deptno为主键）和数据分布下，对于每个外层deptno值，内层查询的存在性判断结果完全一致。\n\n6. **易误判点说明**：虽然移除了GROUP BY，但由于EXISTS的短路特性（找到第一行即停止），即使内层查询可能返回多行（当移除GROUP BY后，相同2*deptno值的多行dept记录都会被扫描），EXISTS的布尔结果仍然等价。原查询中GROUP BY保证每个2*deptno值只产生一行，但这一行的存在性与多行的存在性在EXISTS语义下无区别。\n\n7. **NULL值处理**：dept表的deptno列定义为NOT NULL，因此`2*deptno`不会产生NULL值，连接条件`d.deptno = 2*d2.deptno`不会因NULL值导致语义差异。name列虽为NOT NULL，但仅作为投影列，不参与过滤或连接逻辑。\n\n8. **结果集完整性**：重写后的查询返回所有满足EXISTS条件的dept记录的name列，与原查询通过派生表t2过滤后返回的name列完全一致。由于没有引入额外的过滤条件、没有改变连接逻辑的语义、没有改变投影列的来源，结果集在行数、列值、顺序（无ORDER BY时顺序不保证但等价性不受影响）上完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "EXISTS 子查询的连接条件语义不同：原始 SQL 要求 deptno = 2*deptno（仅 deptno=0 满足），重写 SQL 要求 d.deptno = 2*d2.deptno（任意 deptno 只要存在其一半值的记录即满足），会返回不同的行集合。",
+    "differences": [
+        {
+            "type": "predicate_semantics",
+            "description": "原始 SQL 的 EXISTS 条件实际是 DEPTNO = 2*DEPTNO（同一行自比较，仅 deptno=0 时成立），重写 SQL 是 d.deptno = 2*d2.deptno（跨行比较，deptno=4 且存在 deptno=2 时成立）",
+            "location": "EXISTS 子查询的 WHERE 条件"
+        }
+    ]
+}
+```
+❌ 语义不等价: EXISTS 子查询的连接条件语义不同：原始 SQL 要求 deptno = 2*deptno（仅 deptno=0 满足），重写 SQL 要求 d.deptno = 2*d2.deptno（任意 deptno 只要存在其一半值的记录即满足），会返回不同的行集合。
+```json
+{"fixed_sql": "SELECT d.name FROM dept d WHERE EXISTS (SELECT 1 FROM (SELECT 2 * DEPTNO AS f0 FROM DEPT GROUP BY 2 * DEPTNO) AS t5 WHERE d.deptno = t5.f0)", "note": "恢复原始 EXISTS 子查询结构，保留 GROUP BY 聚合，确保 d.deptno 与聚合后的 2*DEPTNO 跨行比较"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写 SQL 已修正为在 EXISTS 子查询中保留 GROUP BY，连接条件 d.deptno = t5.f0（即 d.deptno = 2*DEPTNO）与原始 SQL 的 DEPTNO = t5.f0 语义一致，仅移除了外层冗余派生表 t2，结果集完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（cost 63099.39，结构相同：Hash Join + Aggregate + 2个Seq Scan），说明优化器将两个 SQL 视为等价并生成了相同的物理计划。重写仅消除了外层冗余派生表 t2，将 `FROM (SELECT DEPTNO, NAME FROM DEPT ...) AS t2` 简化为 `FROM dept d`，这是纯逻辑层面的清理，未触发执行计划变化。由于 EXISTS 子查询的连接条件 `DEPTNO = 2*DEPTNO` 本质上等价于 `DEPTNO = 0`（该谓词简化未在本轮应用），优化器已自动识别并保持了相同的半连接策略。虽然本轮重写未产生结构性改进，但已消除了 SQL 层面的冗余嵌套，且 optimization_context 显示后续轮次可继续应用谓词简化（将 EXISTS 转为 `WHERE DEPTNO = 0`）和移除冗余聚合。考虑到当前重写已完成逻辑清理且无恶化，可终止本轮；若需进一步优化应在下一轮基于当前 enhanced_sql 继续改写。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 enhanced_sql，应用谓词简化：将 EXISTS 子查询中的连接条件 `d.deptno = t5.f0`（其中 t5.f0 = 2*DEPTNO）简化为 `d.deptno = 2*d.deptno`，即 `d.deptno = 0`，直接改写为 `SELECT d.name FROM dept d WHERE d.deptno = 0`，消除子查询和聚合操作，预期可大幅降低 cost 并简化执行计划为单表过滤扫描。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮重写虽消除了外层冗余派生表，但未触及核心性能瓶颈：EXISTS子查询中的连接条件 `d.deptno = 2*DEPTNO` 本质上等价于 `d.deptno = 0`（因为等式两边都引用同一列，仅当DEPTNO=0时成立）。当前执行计划显示：1) Aggregate算子消耗52.8%代价（33,328.12）用于GROUP BY 2*DEPTNO；2) Hash Join消耗23.3%代价（14,718.27）执行半连接；3) 两次Seq Scan分别扫描450000行。通过谓词简化将连接条件改写为 `d.deptno = 0`，可直接消除子查询、聚合和连接操作，将执行计划简化为单表索引扫描（dept_pkey索引可精确定位DEPTNO=0的行），预期cost从63,099降至个位数级别。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将EXISTS子查询中的连接条件 `d.deptno = t5.f0`（其中t5.f0 = 2*DEPTNO）简化为 `d.deptno = 2*d.deptno`，该等式仅在d.deptno=0时成立，直接改写为 `WHERE d.deptno = 0`，消除整个EXISTS子查询及其内部的聚合操作"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "基于谓词简化结果，完全移除EXISTS子查询结构，将SQL改写为 `SELECT d.name FROM dept d WHERE d.deptno = 0`，利用dept_pkey索引实现常量等值查找，避免450000行的全表扫描和Hash Join"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.245
+   → AGGREGATE_VALUES: UCT=1.245
+   → JOIN_TO_CORRELATE: UCT=1.100
+```json
+{
+  "groups": "谓词简化, 子查询优化",
+  "applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_REMOVE"],
+  "rule_effect_scores": {
+    "FILTER_REDUCE_EXPRESSIONS": 0.7,
+    "AGGREGATE_REMOVE": 0.3
+  },
+  "rule_effect_confidence": {
+    "FILTER_REDUCE_EXPRESSIONS": 0.9,
+    "AGGREGATE_REMOVE": 0.85
+  }
+}
+```
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 子查询优化",
+  "applied_rules": [
+    "FILTER_REDUCE_EXPRESSIONS",
+    "AGGREGATE_REMOVE"
+  ],
+  "rewritten_sql": "SELECT d.name FROM dept d WHERE d.deptno = 0",
+  "semantic_correctness_guarantee": "1. **结构性改写**：完全消除了 EXISTS 子查询及其内部的派生表 t5 和 GROUP BY 聚合操作,将连接条件 `d.deptno = t5.f0` (其中 t5.f0 = 2*DEPTNO) 简化为直接谓词 `d.deptno = 0`。\n\n2. **等价性推导**：原 EXISTS 子查询要求存在满足 `d.deptno = 2*DEPTNO` 的 DEPTNO 值。该等式可变形为 `d.deptno = 2*d.deptno`,移项得 `d.deptno - 2*d.deptno = 0`,即 `-d.deptno = 0`,因此 `d.deptno = 0`。这是纯代数等价变换,在整数域下该等式仅在 deptno=0 时成立,与原 EXISTS 语义完全一致。\n\n3. **聚合操作移除的合理性**：原 GROUP BY 2*DEPTNO 对 2*DEPTNO 去重,但由于连接条件已简化为常量等值判断 (deptno=0),子查询是否存在聚合不影响 EXISTS 的布尔结果 (只要 dept 表中存在 deptno=0 的行,EXISTS 即为真)。根据 AGGREGATE_REMOVE 规则,当聚合不改变半连接语义时可安全移除。\n\n4. **主键约束保证**：dept 表的主键为 deptno (dept_pkey),保证 deptno 唯一且非空。WHERE d.deptno = 0 最多返回一行,与原 SQL 在 deptno=0 存在时返回该行的 name、不存在时返回空集的语义完全一致。\n\n5. **结果集等价性**：原 SQL 返回所有满足"存在某个 DEPTNO 使得 d.deptno = 2*DEPTNO"的 dept 行的 name 列。重写后直接返回 deptno=0 的 dept 行的 name 列。由于步骤 2 的代数推导,两者选择的行集合完全相同,且投影列 (name) 未变,因此结果集在行数、列值、列名、数据类型上完全等价。\n\n6. **NULL 处理一致性**：deptno 为主键列,根据 Schema 定义为 NOT NULL,不存在 NULL 值干扰等式判断的情况。name 列虽为 VARCHAR NOT NULL,但仅作为投影列,不影响过滤逻辑的等价性。\n\n7. **无排序/聚合/LIMIT 干扰**：原 SQL 和重写 SQL 均无 ORDER BY、HAVING 或 LIMIT 子句,不存在因改写顺序或分组逻辑变化导致结果集差异的风险。重写纯粹是将复杂的半连接+聚合结构简化为单表常量过滤,在关系代数层面严格等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL通过EXISTS子查询过滤出满足deptno = 2*deptno的行（即deptno=0的行），但重写SQL直接硬编码WHERE deptno=0，这在代数上等价；然而原始SQL的EXISTS子查询依赖外层DEPT表的deptno与内层GROUP BY派生的2*DEPTNO比较，当dept表为空或不存在deptno=0的行时两者均返回空集，当存在deptno=0时均返回该行name——经核验，重写SQL的WHERE d.deptno=0与原始SQL的EXISTS (... WHERE DEPTNO = 2*DEPTNO) 在所有数据状态下结果集一致，代数变形deptno = 2*deptno → deptno=0正确，且主键约束保证唯一性，判定等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 2->0, index-like 0->1 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 2250000.0 -> 1.0 (重写侧约为原的 0.0000%) | 强信号: 行数估计求和大幅下降，重写侧约为原的 0.0000% (<= 10%)
+✅ 行数估计求和大幅下降至原的 0.0000%，直接判定优化成功，终止并保留重写 SQL
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 159
+   - 规则序列: ['FILTER_REDUCE_EXPRESSIONS', 'AGGREGATE_REMOVE']
+   - 优化组别: 谓词简化, 子查询优化
+   - 估计代价: 原始=63099.39, 重写=8.44，相对变化: 99.99%
+✅ 成功存储，记录ID: 2e3d7986-6091-4528-a51c-f2382ffb783d
+
+🎲 UCT Math Update: 2 rules, reward=+0.9000 (cost=+0.9999, rows=+1.0000, depth=+0.6667, oc=63099.3900, rc=8.4400)
+   结构分细节: rows 2250000.0->1.0 (score=+1.000), depth 3.0->1.0 (score=+0.667)
+✅ UCT Update Complete:
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.700, conf=0.90, lambda=0.45, reward=+0.542, count=51, avg=+0.015
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=0.300, conf=0.85, lambda=0.42, reward=+0.358, count=6, avg=+0.070
+
+----------------------------------------
+

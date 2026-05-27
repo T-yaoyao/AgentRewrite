@@ -1,0 +1,239 @@
+Query ID: 50
+==================================================
+
+Original: select e.mgr, d.mgr from emp as e full outer join emp as d on e.mgr = d.mgr group by d.mgr, e.mgr
+Rewritten: SELECT e.mgr, d.mgr
+FROM emp AS e
+FULL OUTER JOIN emp AS d ON e.mgr = d.mgr
+GROUP BY e.mgr, d.mgr
+Time Cost: 151.77s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '回退到原始 SQL 的 GROUP BY 结构：SELECT E.MGR, D.MGR FROM EMP AS E FULL OUTER JOIN EMP AS D ON E.MGR=D.MGR GROUP BY D.MGR, E.MGR。避免使用 UNION ALL 构造 CTE，直接在基表上执行 FULL OUTER JOIN + GROUP BY，利用 mgr 列的过滤和分组特性减少中间结果'}, {'group': '连接优化', 'produced_suggestion': '移除当前 SQL 中的 UNION ALL 子查询和恒假 JOIN 条件（NULL=NULL）。原始 SQL 的 E.MGR=D.MGR 连接条件可以利用索引或 Hash Join 高效执行，而当前改写后的 NULL 常量连接导致笛卡尔积（45M × 45M），必须回退'}, {'group': '子查询优化', 'produced_suggestion': '消除 e_agg 和 d_agg 两个 CTE 子查询。这些子查询通过 UNION ALL 添加 NULL 行，但在 FULL OUTER JOIN 场景下无实际优化价值，反而增加扫描成本。直接使用原表 emp 进行 FULL OUTER JOIN 更高效'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示Aggregate算子代价占比91.5%，成为主要性能瓶颈。分析发现该SQL存在FULL OUTER JOIN后立即进行GROUP BY的模式，而GROUP BY的键恰好是JOIN条件的列(e.mgr, d.mgr)。根据相似历史案例(相似度1.0，规则AGGREGATE_JOIN_TRANSPOSE_EXTENDED)，可以通过聚合下推优化：将GROUP BY操作下推到JOIN之前，先对各表分别聚合去重，再进行JOIN，从而大幅减少JOIN和后续聚合的数据量。emp表有4500万行数据，聚合下推可显著降低中间结果集规模。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "应用AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则：将GROUP BY操作下推到FULL OUTER JOIN之前。具体策略：(1)对emp表e先执行SELECT DISTINCT mgr得到去重后的mgr集合；(2)对emp表d同样执行SELECT DISTINCT mgr；(3)再对两个去重结果进行FULL OUTER JOIN。这样可以将4500万行的大表JOIN转换为小得多的去重集合JOIN，消除Aggregate算子的流水线阻塞瓶颈。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "在聚合下推后，评估是否可以将FULL OUTER JOIN转换为更高效的连接类型。由于JOIN条件是e.mgr=d.mgr且两侧都是同一张表emp的mgr列，去重后的结果集应该完全相同，FULL OUTER JOIN可能退化为INNER JOIN，进一步降低Hash Join的代价(当前占比8.2%)。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.245
+   → AGGREGATE_VALUES: UCT=1.245
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "聚合优化, 连接优化",
+  "applied_rules": ["AGGREGATE_JOIN_TRANSPOSE_EXTENDED"],
+  "rule_effect_scores": {
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 1.0
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.95
+  }
+}
+```
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 连接优化",
+  "applied_rules": [
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"
+  ],
+  "rewritten_sql": "SELECT e_agg.mgr, d_agg.mgr\nFROM (\n  SELECT DISTINCT mgr\n  FROM emp\n) AS e_agg\nFULL OUTER JOIN (\n  SELECT DISTINCT mgr\n  FROM emp\n) AS d_agg\nON e_agg.mgr = d_agg.mgr",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原 SQL 中的 GROUP BY 操作下推到 FULL OUTER JOIN 之前，对 emp 表的两个别名 e 和 d 分别执行 SELECT DISTINCT mgr，然后对两个去重结果集进行 FULL OUTER JOIN。\n\n2. 等价性保证 - GROUP BY 与 DISTINCT 的等价：原 SQL 的 GROUP BY d.mgr, e.mgr 在没有聚合函数的情况下，其语义等同于对 (e.mgr, d.mgr) 组合去重。由于 FULL OUTER JOIN 的结果是 e.mgr 和 d.mgr 的笛卡尔积（受 ON 条件约束），先对各自的 mgr 列去重再 JOIN，与先 JOIN 再对结果去重在数学上等价。\n\n3. FULL OUTER JOIN 语义保持：原 SQL 和重写 SQL 都使用 FULL OUTER JOIN，且 ON 条件均为 e.mgr = d.mgr（重写后为 e_agg.mgr = d_agg.mgr）。FULL OUTER JOIN 保证左右两侧所有不匹配的行都会保留（以 NULL 填充对侧），因此结果集的完整性不变。\n\n4. NULL 值处理：mgr 列允许 NULL（Schema 中未标记 NOT NULL）。DISTINCT 操作会保留一个 NULL 值（如果存在），FULL OUTER JOIN 的 ON 条件对 NULL 的处理遵循 SQL 标准（NULL = NULL 为 UNKNOWN，不匹配），因此 NULL 值会出现在结果集的不匹配行中，与原 SQL 行为一致。\n\n5. 自连接特性：由于 e 和 d 都是 emp 表的别名，且连接条件是同一列 mgr，去重后的 e_agg 和 d_agg 实际上是相同的集合。但 FULL OUTER JOIN 的语义要求保留两侧的所有值，因此重写后的结果集与原 SQL 完全一致：每个 mgr 值会与自身匹配一次。\n\n6. 行数与列值验证：原 SQL 返回所有 (e.mgr, d.mgr) 的唯一组合，其中 e.mgr = d.mgr 或其中一侧为 NULL。重写 SQL 通过先去重再 JOIN，生成的结果集行数和列值与原 SQL 完全相同，因为 DISTINCT 消除了重复行，而 FULL OUTER JOIN 确保了所有 mgr 值（包括 NULL）都被保留。\n\n7. 性能优化不改变语义：将 GROUP BY 下推为 DISTINCT 并在 JOIN 前执行，减少了 JOIN 的输入行数（从 4500 万行降至 mgr 的唯一值数量），但不改变最终结果集的内容、顺序或语义。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+I need to carefully analyze whether these two SQLs are equivalent.
+
+**Original SQL:**
+```sql
+select e.mgr, d.mgr 
+from emp as e 
+full outer join emp as d on e.mgr = d.mgr 
+group by d.mgr, e.mgr
+```
+
+**Rewritten SQL:**
+```sql
+SELECT e_agg.mgr, d_agg.mgr
+FROM (SELECT DISTINCT mgr FROM emp) AS e_agg
+FULL OUTER JOIN (SELECT DISTINCT mgr FROM emp) AS d_agg
+ON e_agg.mgr = d_agg.mgr
+```
+
+**Key Analysis:**
+
+The original SQL does a FULL OUTER JOIN of emp with itself (both large tables, potentially many rows), then GROUP BY (e.mgr, d.mgr). Since there are no aggregate functions, GROUP BY acts as DISTINCT on the pair (e.mgr, d.mgr).
+
+The rewritten SQL first deduplicates mgr values from emp (DISTINCT), then does FULL OUTER JOIN on those distinct values.
+
+**Critical question:** Are the result sets the same?
+
+Let me think about what unique (e.mgr, d.mgr) pairs appear in the original:
+
+- When e.mgr = d.mgr (matched rows): pairs are (v, v) for each v that appears in emp.mgr (including NULL? No — NULL=NULL is UNKNOWN, so NULL rows go to unmatched side)
+- Unmatched from left (e): rows where e.mgr has no match in d.mgr — but since both sides are the same table emp, every mgr value on the left exists on the right. So unmatched only happens for NULL (since NULL≠NULL). Left unmatched: (NULL, NULL_right) → (NULL, NULL)... wait.
+
+Actually with FULL OUTER JOIN on the same table: for non-NULL mgr values, every value on the left matches something on the right, producing (v, v). For NULL values on either side, they don't match, producing (NULL, NULL) from both unmatched left and right... but after GROUP BY these collapse to one row (NULL, NULL).
+
+In the rewritten SQL: e_agg and d_agg both have DISTINCT mgr values. Since they're the same table, e_agg and d_agg have identical sets. FULL OUTER JOIN on e_agg.mgr = d_agg.mgr: non-NULL values match producing (v, v); NULL values on both sides don't match, producing (NULL, NULL) from left unmatched and (NULL, NULL) from right unmatched — two rows of (NULL, NULL).
+
+But in the original after GROUP BY, (NULL, NULL) appears as ONE row.
+
+So if emp contains any NULL mgr values, the rewritten SQL produces TWO rows of (NULL, NULL) while original produces ONE. This is a real difference.
+
+Wait — but DISTINCT in e_agg and d_agg keeps only ONE NULL each. Then FULL OUTER JOIN: one NULL row on left, one NULL row on right — they don't match (NULL=NULL is UNKNOWN). So left NULL produces (NULL, NULL) and right NULL produces (NULL, NULL). That's 2 rows in rewritten vs 1 row in original.
+
+This is a genuine difference when NULL exists in mgr.
+
+```json
+{
+    "equivalent": false,
+    "message": "当 emp.mgr 存在 NULL 值时，重写 SQL 的 FULL OUTER JOIN 会产生两行 (NULL, NULL)（左侧 NULL 不匹配右侧 NULL，各自补 NULL 输出），而原始 SQL 经 GROUP BY 去重后只输出一行 (NULL, NULL)，导致结果集行数不同。",
+    "differences": [
+        {
+            "type": "NULL语义差异",
+            "description": "e_agg 和 d_agg 各保留一个 NULL，FULL OUTER JOIN 时 NULL=NULL 为 UNKNOWN 不匹配，左右各产生一行 (NULL, NULL)，共两行；而原始 SQL 对同一大表做 FULL OUTER JOIN 后 GROUP BY 对 (NULL, NULL) 去重只剩一行，结果集行数不一致。",
+            "location": "FULL OUTER JOIN ON e_agg.mgr = d_agg.mgr 对 NULL 值的处理 vs 原始 GROUP BY 去重"
+        }
+    ]
+}
+```
+❌ 语义不等价: 当 emp.mgr 存在 NULL 值时，重写 SQL 的 FULL OUTER JOIN 会产生两行 (NULL, NULL)（左侧 NULL 不匹配右侧 NULL，各自补 NULL 输出），而原始 SQL 经 GROUP BY 去重后只输出一行 (NULL, NULL)，导致结果集行数不同。
+```json
+{"fixed_sql": "SELECT e_agg.mgr, d_agg.mgr FROM (SELECT mgr FROM emp WHERE mgr IS NOT NULL UNION ALL SELECT NULL AS mgr) AS e_agg FULL OUTER JOIN (SELECT mgr FROM emp WHERE mgr IS NOT NULL UNION ALL SELECT NULL AS mgr) AS d_agg ON e_agg.mgr = d_agg.mgr GROUP BY e_agg.mgr, d_agg.mgr", "note": "在子查询中分离 NULL 值处理，最后用 GROUP BY 去重以匹配原始 SQL 对 (NULL, NULL) 的去重行为"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写 SQL 通过 UNION ALL SELECT NULL 显式保留了 NULL 值，消除了上轮 DISTINCT 导致的 NULL 匹配问题；两 SQL 在 FULL OUTER JOIN 后 GROUP BY 的结果集完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL将 UNION ALL 置于派生表/JOIN 路径中，常对应分支过滤下推与公共结果复用。
+⚠️ 检测到成本爆炸：重写 cost 增幅 12327.6% (> 1000%)，判定当前重写性能更差，进入下一轮优化。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮应用 AGGREGATE_JOIN_TRANSPOSE_EXTENDED 规则后，cost 暴增 12327%，原因是将简单的 GROUP BY 改写为复杂的 UNION ALL + FULL OUTER JOIN 结构，导致笛卡尔积爆炸（45M × 45M 行）。当前执行计划显示 Hash Join 代价占比 74.5%，Join Condition 为 NULL=NULL 恒假条件，产生巨大中间结果集。需要回退到原始 SQL 结构，避免引入 CTE 和 FULL OUTER JOIN，直接在原表上执行 GROUP BY 聚合。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "回退到原始 SQL 的 GROUP BY 结构：SELECT E.MGR, D.MGR FROM EMP AS E FULL OUTER JOIN EMP AS D ON E.MGR=D.MGR GROUP BY D.MGR, E.MGR。避免使用 UNION ALL 构造 CTE，直接在基表上执行 FULL OUTER JOIN + GROUP BY，利用 mgr 列的过滤和分组特性减少中间结果"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "移除当前 SQL 中的 UNION ALL 子查询和恒假 JOIN 条件（NULL=NULL）。原始 SQL 的 E.MGR=D.MGR 连接条件可以利用索引或 Hash Join 高效执行，而当前改写后的 NULL 常量连接导致笛卡尔积（45M × 45M），必须回退"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除 e_agg 和 d_agg 两个 CTE 子查询。这些子查询通过 UNION ALL 添加 NULL 行，但在 FULL OUTER JOIN 场景下无实际优化价值，反而增加扫描成本。直接使用原表 emp 进行 FULL OUTER JOIN 更高效"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.245
+   → AGGREGATE_VALUES: UCT=1.245
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "聚合优化, 连接优化, 子查询优化",
+  "applied_rules": [],
+  "rule_effect_scores": {},
+  "rule_effect_confidence": {}
+}
+```
+
+**分析说明**：
+
+当前 SQL 已经过 `AGGREGATE_JOIN_TRANSPOSE_EXTENDED` 改写，导致 cost 暴增 12327%。执行计划显示核心问题：
+
+1. **恒假连接条件**：`NULL::integer = NULL::integer` 永远为假，导致 FULL OUTER JOIN 退化为笛卡尔积（45M × 45M）
+2. **无效 CTE 结构**：`UNION ALL SELECT NULL` 引入的空值行在 FULL OUTER JOIN 场景下无优化价值
+3. **Pipeline Blocker**：Aggregate 在 50B+ 行的笛卡尔积结果上执行，代价占比 25.5%
+
+**为何不选择任何规则**：
+
+- **回退到原始 SQL 是最优解**：原始 `SELECT E.MGR, D.MGR FROM EMP AS E FULL OUTER JOIN EMP AS D ON E.MGR=D.MGR GROUP BY D.MGR, E.MGR` 结构简单，连接条件 `E.MGR=D.MGR` 可利用索引/Hash Join 高效执行
+- **规则库无直接回退规则**：现有规则都是"前向改写"，无法撤销已应用的 `AGGREGATE_JOIN_TRANSPOSE_EXTENDED`
+- **任何增量修补都无效**：当前 SQL 的根本缺陷（恒假连接 + CTE 冗余）需要结构性重构，而非局部优化
+
+**建议**：系统应支持"回退到原始 SQL"操作，或提供专门的"CTE 消除"/"恒假条件检测"规则来处理此类改写失败场景。
+✅ 选择了 0 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 连接优化, 子查询优化",
+  "applied_rules": [],
+  "rewritten_sql": "SELECT e.mgr, d.mgr\nFROM emp AS e\nFULL OUTER JOIN emp AS d ON e.mgr = d.mgr\nGROUP BY e.mgr, d.mgr",
+  "semantic_correctness_guarantee": "1. **结构性改写**：移除了 base_sql 中的两个 CTE 子查询（e_agg 和 d_agg），这两个子查询通过 UNION ALL 将 mgr IS NOT NULL 的行与一个 NULL 常量行合并。改写后直接在 emp 表上执行 FULL OUTER JOIN，连接条件为 e.mgr = d.mgr，最后按 e.mgr, d.mgr 分组。\n\n2. **UNION ALL + NULL 行的等价性分析**：原 base_sql 中每个 CTE 都包含 (SELECT mgr FROM emp WHERE mgr IS NOT NULL UNION ALL SELECT NULL AS mgr)。在 FULL OUTER JOIN 语义下，UNION ALL 添加的 NULL 行会与对侧的 NULL 行进行连接（NULL = NULL 在 JOIN ON 条件中为 UNKNOWN，不匹配），但由于 FULL OUTER JOIN 会保留两侧所有不匹配行，最终 GROUP BY 会将所有 (NULL, NULL) 组合聚合为一行。改写后的 SQL 直接在 emp 表上 FULL OUTER JOIN，mgr 列中的 NULL 值同样会在 JOIN 时不匹配，由 FULL OUTER JOIN 保留为 (NULL, NULL) 组合，GROUP BY 后结果一致。\n\n3. **FULL OUTER JOIN 与 GROUP BY 的语义保证**：原 SQL 和改写 SQL 都执行 FULL OUTER JOIN + GROUP BY。对于 mgr IS NOT NULL 的行，两侧通过 e.mgr = d.mgr 连接，匹配的行产生 (mgr_value, mgr_value) 组合；不匹配的行由 FULL OUTER JOIN 保留为 (mgr_value, NULL) 或 (NULL, mgr_value)。对于 mgr IS NULL 的行，原 SQL 通过 UNION ALL 显式添加 NULL 行，改写 SQL 中 emp 表本身的 NULL 行在 JOIN 时不匹配任何行（包括对侧的 NULL），由 FULL OUTER JOIN 保留。最终 GROUP BY 将相同的 (e.mgr, d.mgr) 组合聚合，结果集完全等价。\n\n4. **NULL 值处理的等价性**：在 SQL 标准中，JOIN ON 条件中的 NULL = NULL 结果为 UNKNOWN（不匹配）。原 base_sql 通过 UNION ALL 添加的 NULL 行与对侧的 NULL 行在 JOIN 时不会匹配，而是由 FULL OUTER JOIN 分别保留为 (NULL, NULL) 的笛卡尔积（若两侧都有 NULL 行）。改写 SQL 中 emp 表的 NULL 行同样在 JOIN 时不匹配，由 FULL OUTER JOIN 保留。由于 emp 表自连接，左右两侧的 NULL 行数量相同，最终 GROUP BY 后 (NULL, NULL) 组合的行数一致。\n\n5. **过滤条件的等价性**：原 base_sql 中 CTE 子查询包含 WHERE mgr IS NOT NULL，但随后通过 UNION ALL 又添加了 NULL 行，实际上等价于扫描整个 emp 表的 mgr 列（包括 NULL 值）。改写 SQL 直接扫描 emp 表，无额外过滤，结果集覆盖范围一致。\n\n6. **GROUP BY 去重的等价性**：两个 SQL 都通过 GROUP BY e.mgr, d.mgr 对结果去重。由于 FULL OUTER JOIN 产生的 (e.mgr, d.mgr) 组合在两个 SQL 中完全相同（包括 NULL 值的处理），GROUP BY 后的结果集行数和内容完全一致。\n\n7. **性能优化的合理性**：原 base_sql 通过 UNION ALL 构造 CTE，导致每个 CTE 扫描 emp 表并添加 NULL 行，然后在 FULL OUTER JOIN 时产生大量中间结果（尤其是 NULL 行的笛卡尔积）。改写 SQL 直接在 emp 表上执行 FULL OUTER JOIN，避免了 UNION ALL 的额外扫描和中间结果膨胀，利用 mgr 列的索引（若存在）或 Hash Join 高效执行连接，符合优化方向的建议。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "两 SQL 完全等价：GROUP BY 子句中 (d.mgr, e.mgr) 与 (e.mgr, d.mgr) 在集合语义下等价，仅列顺序不同，不影响分组结果集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致：两个 SQL 的 EXPLAIN 结构、节点类型、扫描方式、连接算法、cost、行数估计完全相同（Total Cost 均为 540297517.6，Plan Rows 均为 3712453048）。唯一差异是 GROUP BY 子句中列的顺序（原始为 d.mgr, e.mgr；重写为 e.mgr, d.mgr），但这不影响执行计划和结果集。结构统计显示 rows_ratio=1.0，structural_improvement=false，无任何结构性改进或退化信号。本轮重写实际上已回退到原始 SQL 的等价形式，优化建议已被正确执行（移除了上一轮的 CTE/UNION ALL/恒假连接等问题结构）。当前 SQL 已是该查询在现有表结构和统计信息下的合理执行路径（两次全表扫描 + Hash Full Outer Join + Hash Aggregate），无明显可优化空间。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 93
+   - 规则序列: []
+   - 优化组别: 聚合优化, 连接优化, 子查询优化
+   - 估计代价: 原始=540297517.6, 重写=540297517.6，相对变化: 0.00%
+✅ 成功存储，记录ID: 7cbd6d69-b54c-405d-9cd0-46b8be8a6dfe
+
+----------------------------------------
+

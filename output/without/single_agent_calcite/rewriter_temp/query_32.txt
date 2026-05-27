@@ -1,0 +1,242 @@
+Query ID: 32
+==================================================
+
+Original: SELECT COALESCE(SUM(t1.EXPR0 * t2.EXPR0), 0) FROM (SELECT JOB, COUNT(*) AS EXPR0 FROM EMP GROUP BY JOB) AS t1 INNER JOIN (SELECT NAME, COUNT(*) AS EXPR0 FROM DEPT GROUP BY NAME) AS t2 ON t1.JOB = t2.NAME
+Rewritten: SELECT COALESCE(SUM(t1.cnt * t2.cnt), 0) FROM (SELECT job, COUNT(*) AS cnt FROM emp GROUP BY job) AS t1 INNER JOIN (SELECT name, COUNT(*) AS cnt FROM dept GROUP BY name) AS t2 ON t1.job = t2.name
+Time Cost: 171.00s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '消除两个派生表子查询，将连接前置到聚合之前：直接 FROM emp INNER JOIN dept ON emp.job = dept.name，利用dept小表(45万行)通过JOIN条件过滤emp大表(4500万行)，避免emp全量GROUP BY所有job值。连接后的结果集规模将远小于当前emp全表聚合的中间结果，降低后续聚合代价。'}, {'group': '聚合优化', 'produced_suggestion': "改为'先连接后聚合'策略：在emp JOIN dept之后执行 GROUP BY emp.job, dept.name 进行COUNT统计，最后外层SUM聚合。目标结构：SELECT COALESCE(SUM(cnt), 0) FROM (SELECT COUNT(*) as cnt FROM emp INNER JOIN dept ON emp.job = dept.name GROUP BY emp.job, dept.name) AS t。这样聚合仅处理JOIN后的匹配行，而非当前两个子查询各自全量聚合再JOIN的模式，可消除emp表84.1%代价占比的全表扫描+全量分组瓶颈。"}, {'group': '子查询优化', 'produced_suggestion': '展开两个派生表子查询为单层查询，消除子查询物化开销。当前t1和t2各自独立聚合后JOIN，导致优化器无法跨子查询边界优化连接顺序和谓词下推。展开后可让优化器统一考虑emp和dept的连接策略，可能选择Hash Join或Nested Loop(若dept.name有索引)，并将连接条件emp.job = dept.name作为过滤条件提前应用，减少参与聚合的数据量。'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示emp表全表扫描代价占比84.1%（656,004.90），且存在两个流水线阻塞算子（Aggregate和Gather Merge）。当前SQL使用两个子查询分别对emp和dept表进行GROUP BY聚合后再JOIN，这种结构导致必须先完成emp表的全量聚合（4500万行）。可以通过优化连接和聚合顺序，利用统计信息中dept表仅45万行的特点，先过滤再聚合，减少数据处理量。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将当前的'先聚合后连接'模式改为'先连接后聚合'：直接JOIN emp和dept表（ON emp.JOB = dept.NAME），利用dept表的小数据量（45万行）作为驱动表，通过连接条件过滤emp表数据后再进行聚合统计，避免对emp全表（4500万行）进行无条件GROUP BY"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "调整聚合时机：当前两个子查询独立聚合后再乘积求和，改为先通过JOIN关联过滤数据，然后在关联结果上执行COUNT分组统计，最终聚合。这样可以减少中间聚合结果集大小，降低Aggregate算子的流水线阻塞影响"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除子查询嵌套：将两个派生表子查询展开为单层查询结构，改写为 SELECT COALESCE(SUM(cnt), 0) FROM (SELECT COUNT(*) as cnt FROM emp JOIN dept ON emp.JOB = dept.NAME GROUP BY emp.JOB, dept.NAME)，减少查询层次和中间物化开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.245
+   → AGGREGATE_VALUES: UCT=1.245
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "子查询优化, 连接优化, 聚合优化",
+  "applied_rules": [
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "PROJECT_SUB_QUERY_TO_CORRELATE"
+  ],
+  "rule_effect_scores": {
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.6,
+    "PROJECT_SUB_QUERY_TO_CORRELATE": 0.4
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.75,
+    "PROJECT_SUB_QUERY_TO_CORRELATE": 0.65
+  }
+}
+```
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 连接优化, 聚合优化",
+  "applied_rules": ["AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "PROJECT_SUB_QUERY_TO_CORRELATE"],
+  "rewritten_sql": "SELECT COALESCE(SUM(cnt), 0)\nFROM (\n  SELECT COUNT(*) AS cnt\n  FROM emp\n  INNER JOIN dept ON emp.job = dept.name\n  GROUP BY emp.job, dept.name\n) AS t",
+  "semantic_correctness_guarantee": "1. 【结构性改写：消除派生表子查询，下推JOIN后聚合】原始SQL由两个独立派生表子查询（t1对EMP按JOB分组COUNT，t2对DEPT按NAME分组COUNT）通过INNER JOIN ON t1.JOB = t2.NAME连接，再对乘积 t1.EXPR0 * t2.EXPR0 求SUM。重写SQL将两个派生表展开，直接对EMP INNER JOIN DEPT ON emp.job = dept.name，并在连接结果上按 (emp.job, dept.name) 分组做COUNT，最终对各分组COUNT值求SUM。\n\n2. 【等价性核心论证：SUM(count_A * count_B) = SUM(COUNT(*) after join group by)】原始SQL中，t1.EXPR0 是 EMP 中 JOB=v 的行数，t2.EXPR0 是 DEPT 中 NAME=v 的行数。两者INNER JOIN后，对每个匹配的 (JOB=v, NAME=v) 组合，乘积即 count_emp(v) * count_dept(v)。重写SQL中，EMP INNER JOIN DEPT ON emp.job=dept.name，再按 (emp.job, dept.name) 分组，COUNT(*) 恰好等于 emp 中 job=v 的行数乘以 dept 中 name=v 的行数（笛卡尔展开后计数），即 count_emp(v) * count_dept(v)。因此 SUM(cnt) = SUM(count_emp(v) * count_dept(v))，与原始 SUM(t1.EXPR0 * t2.EXPR0) 完全等价。\n\n3. 【JOIN类型与过滤语义保持】原始SQL使用INNER JOIN，重写同样使用INNER JOIN。INNER JOIN要求两侧均有匹配才产生结果行，因此只有在 EMP.JOB 与 DEPT.NAME 均存在的值才参与计算，与原始子查询中两张表分别聚合后INNER JOIN的过滤语义一致。\n\n4. 【COALESCE处理NULL语义保持】原始SQL外层有 COALESCE(SUM(...), 0)，当INNER JOIN结果为空时SUM返回NULL，COALESCE将其转换为0。重写SQL同样保留了外层 COALESCE(SUM(cnt), 0)，当JOIN无匹配行时内层查询返回空集，SUM(cnt)为NULL，COALESCE同样返回0，语义完全一致。\n\n5. 【GROUP BY键的正确性】重写SQL按 (emp.job, dept.name) 分组，而由于JOIN条件是 emp.job = dept.name，这两列值相同，分组与原始子查询中分别按JOB、NAME分组后JOIN匹配的粒度完全一致，不会产生额外的分组合并或拆分。\n\n6. 【无重复行引入风险】原始SQL的派生表t1和t2各自先聚合，GROUP BY保证每个JOB/NAME值唯一，JOIN后每对匹配值只产生一行。重写SQL中按 (emp.job, dept.name) 分组同样保证每对值唯一一行，SUM的输入行集合等价，不存在重复行被多计的风险。\n\n7. 【列名与输出格式】最终输出列均为单列匿名聚合值（即 COALESCE(SUM(...), 0)），与原始SQL输出结构完全一致，无列名、数据类型或顺序差异。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL对两个独立聚合结果做笛卡尔积后求和，重写SQL对JOIN后的明细行按(job,name)分组计数后求和，当job或name在各自表中有重复行时结果不同。",
+    "differences": [
+        {
+            "type": "aggregation_semantics",
+            "description": "原始SQL计算SUM(count_job * count_name)，重写SQL计算SUM(count_joined_rows)；当EMP中同一job有多行或DEPT中同一name有多行时，JOIN产生的笛卡尔积行数与两个独立计数的乘积相等，但若job或name在各自表内无重复则等价",
+            "location": "聚合逻辑"
+        },
+        {
+            "type": "grouping_granularity",
+            "description": "原始SQL先各自按job和name独立分组计数再JOIN，重写SQL按(job,name)对JOIN后结果分组；由于JOIN条件emp.job=dept.name使两列值相同，分组键实质等价，但计数对象从独立表行变为JOIN结果行",
+            "location": "GROUP BY子句"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL对两个独立聚合结果做笛卡尔积后求和，重写SQL对JOIN后的明细行按(job,name)分组计数后求和，当job或name在各自表中有重复行时结果不同。
+{"fixed_sql": "SELECT COALESCE(SUM(t1.EXPR0 * t2.EXPR0), 0) FROM (SELECT emp.job, COUNT(*) AS EXPR0 FROM emp GROUP BY emp.job) AS t1 INNER JOIN (SELECT dept.name, COUNT(*) AS EXPR0 FROM dept GROUP BY dept.name) AS t2 ON t1.job = t2.name", "note": "恢复原始SQL的分组计数逻辑：先对EMP按job独立计数、对DEPT按name独立计数，再JOIN后计算两个计数的乘积之和，而非对JOIN结果行直接计数，以修复聚合语义差异。"}
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正为与原始SQL结构一致：两个独立派生表分别对EMP按job和DEPT按name分组计数，再通过INNER JOIN连接并计算乘积和，语义完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，costs相同（779712.54），结构无任何变化：两版本均为2个Seq Scan（emp并行扫描+dept单线程扫描）→各自Hash Aggregate→Hash Join→最终Aggregate。节点类型计数、行数估计求和（19612759.0）、并行度（Workers Planned=2）、连接算法（Hash Join）均完全相同。重写仅为表名大小写规范化（JOB→job, NAME→name），未触发任何执行计划改变。虽然optimization_context建议'先连接后聚合'等改写方向，但本轮实际应用的规则（AGGREGATE_JOIN_TRANSPOSE_EXTENDED, PROJECT_SUB_QUERY_TO_CORRELATE）未产生实质性SQL逻辑变化，优化器生成了相同计划。由于当前重写未改进也未恶化，且optimization_advice已明确指出可执行的下一步方向（调整聚合时机、消除子查询嵌套、改为先JOIN后聚合），应继续优化而非终止。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql，执行以下改写：1) 消除两个派生表子查询，将其展开为单层查询；2) 改为'先连接后聚合'模式：直接 FROM emp JOIN dept ON emp.job = dept.name，然后 GROUP BY emp.job, dept.name 进行COUNT统计，最后外层SUM聚合。参考目标结构：SELECT COALESCE(SUM(cnt), 0) FROM (SELECT COUNT(*) as cnt FROM emp JOIN dept ON emp.job = dept.name GROUP BY emp.job, dept.name) AS t。这样可利用dept小表驱动、减少emp全表无条件聚合、降低中间结果集规模。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "当前SQL存在严重性能问题：1) emp表(4500万行)全表扫描代价占比84.1%，且在连接前先做GROUP BY聚合，无法利用dept小表(45万行)过滤；2) 两个独立子查询各自聚合后再JOIN，导致emp必须全量分组统计所有job值，而实际只有dept.name中存在的job才有意义；3) 执行计划显示emp并行扫描+Gather Merge+Aggregate链路为主要瓶颈(Pipeline Blocker)。优化方向：改为'先连接后聚合'模式，让dept小表通过JOIN条件过滤emp大表，仅对匹配行进行聚合统计，可大幅减少emp扫描和聚合的数据量，若dept.name上有索引或选择性高，还可能触发索引扫描替代全表扫描。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "消除两个派生表子查询，将连接前置到聚合之前：直接 FROM emp INNER JOIN dept ON emp.job = dept.name，利用dept小表(45万行)通过JOIN条件过滤emp大表(4500万行)，避免emp全量GROUP BY所有job值。连接后的结果集规模将远小于当前emp全表聚合的中间结果，降低后续聚合代价。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "改为'先连接后聚合'策略：在emp JOIN dept之后执行 GROUP BY emp.job, dept.name 进行COUNT统计，最后外层SUM聚合。目标结构：SELECT COALESCE(SUM(cnt), 0) FROM (SELECT COUNT(*) as cnt FROM emp INNER JOIN dept ON emp.job = dept.name GROUP BY emp.job, dept.name) AS t。这样聚合仅处理JOIN后的匹配行，而非当前两个子查询各自全量聚合再JOIN的模式，可消除emp表84.1%代价占比的全表扫描+全量分组瓶颈。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "展开两个派生表子查询为单层查询，消除子查询物化开销。当前t1和t2各自独立聚合后JOIN，导致优化器无法跨子查询边界优化连接顺序和谓词下推。展开后可让优化器统一考虑emp和dept的连接策略，可能选择Hash Join或Nested Loop(若dept.name有索引)，并将连接条件emp.job = dept.name作为过滤条件提前应用，减少参与聚合的数据量。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.244
+   → AGGREGATE_VALUES: UCT=1.244
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "子查询优化, 连接优化, 聚合优化",
+  "applied_rules": [
+    "PROJECT_SUB_QUERY_TO_CORRELATE",
+    "AGGREGATE_JOIN_REMOVE",
+    "FILTER_AGGREGATE_TRANSPOSE"
+  ],
+  "rule_effect_scores": {
+    "PROJECT_SUB_QUERY_TO_CORRELATE": 0.5,
+    "AGGREGATE_JOIN_REMOVE": 0.3,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.2
+  },
+  "rule_effect_confidence": {
+    "PROJECT_SUB_QUERY_TO_CORRELATE": 0.85,
+    "AGGREGATE_JOIN_REMOVE": 0.75,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.65
+  }
+}
+```
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 连接优化, 聚合优化",
+  "applied_rules": [
+    "PROJECT_SUB_QUERY_TO_CORRELATE",
+    "AGGREGATE_JOIN_REMOVE",
+    "FILTER_AGGREGATE_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT COALESCE(SUM(cnt), 0)\nFROM (\n  SELECT COUNT(*) AS cnt\n  FROM emp\n  INNER JOIN dept ON emp.job = dept.name\n  GROUP BY emp.job, dept.name\n) AS t",
+  "semantic_correctness_guarantee": "1. 结构性改写：消除了原SQL中的两个派生表子查询t1和t2，将其展开为单层查询结构。原SQL是'各自聚合后JOIN'模式（emp按job分组→t1.EXPR0，dept按name分组→t2.EXPR0，然后t1 JOIN t2 ON job=name），改写为'先JOIN后聚合'模式（emp JOIN dept ON job=name，然后按job和name分组统计）。\n\n2. 等价性保证——连接条件与分组键：原SQL的JOIN条件是t1.job = t2.name，即emp.job = dept.name。改写后直接在基表上应用相同连接条件emp.job = dept.name。原SQL中t1按emp.job分组、t2按dept.name分组，JOIN后每对匹配的(job, name)产生一行，其乘积为t1.EXPR0 * t2.EXPR0。改写后按emp.job和dept.name分组，对于每个匹配的(job, name)组合，COUNT(*)统计的是该组合在JOIN结果中的行数，这正好等于原SQL中该job在emp中的出现次数（t1.EXPR0）乘以该name在dept中的出现次数（t2.EXPR0），因为笛卡尔积的行数=左侧行数×右侧行数。\n\n3. 聚合语义等价性：原SQL外层计算SUM(t1.EXPR0 * t2.EXPR0)，即对所有匹配的(job, name)对，求各自计数乘积之和。改写后外层计算SUM(cnt)，其中cnt是每个(job, name)组合在JOIN后的行数。由于INNER JOIN的语义，emp中每个job=X的行会与dept中每个name=X的行配对，产生COUNT(emp.job=X) × COUNT(dept.name=X)行。按(job, name)分组后COUNT(*)得到的正是这个乘积值。因此SUM(cnt)与SUM(t1.EXPR0 * t2.EXPR0)在数值上完全等价。\n\n4. INNER JOIN过滤等价性：原SQL和改写SQL均使用INNER JOIN，只保留emp.job在dept.name中存在的行。原SQL通过子查询聚合后JOIN实现过滤，改写通过基表直接JOIN实现相同过滤效果。不存在NULL值影响（job和name列均为NOT NULL），不存在重复行语义差异（两种方式最终都通过分组消除了重复）。\n\n5. COALESCE处理：两版本均对最终SUM结果应用COALESCE(..., 0)，处理空结果集情况（当emp和dept无匹配行时返回0而非NULL）。改写保持了这一边界情况处理逻辑。\n\n6. 易误判点说明：关键在于理解'先聚合后JOIN的乘积'与'先JOIN后按组合键聚合的计数'在INNER JOIN场景下的等价性。原SQL中t1.EXPR0是emp中某job的计数，t2.EXPR0是dept中某name的计数，它们的乘积表示这两个值的组合在笛卡尔积中会产生多少行。改写中直接执行JOIN并按(job, name)分组计数，得到的正是这个笛卡尔积行数。由于分组键包含了连接键的两侧（emp.job和dept.name），且连接条件保证job=name，因此每个分组对应原SQL中一个唯一的匹配对，计数值等于原SQL中的乘积值。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原SQL对每个匹配的(job,name)对计算两表各自计数的乘积后求和；重写SQL对JOIN后的行按(job,name)分组计数后求和，当某job或name在各自表中出现多次时，两者结果不同。",
+    "differences": [
+        {
+            "type": "aggregation_semantics",
+            "description": "原SQL计算SUM(COUNT(job) * COUNT(name))，重写计算SUM(COUNT(join_rows))，在job或name非唯一时结果集数值不同",
+            "location": "聚合表达式与分组逻辑"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原SQL对每个匹配的(job,name)对计算两表各自计数的乘积后求和；重写SQL对JOIN后的行按(job,name)分组计数后求和，当某job或name在各自表中出现多次时，两者结果不同。
+```json
+{
+  "fixed_sql": "SELECT COALESCE(SUM(t1.cnt * t2.cnt), 0) FROM (SELECT job, COUNT(*) AS cnt FROM emp GROUP BY job) AS t1 INNER JOIN (SELECT name, COUNT(*) AS cnt FROM dept GROUP BY name) AS t2 ON t1.job = t2.name",
+  "note": "恢复两个独立分组子查询并保留乘积聚合逻辑，使结果与原SQL等价"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已恢复为与原始SQL结构一致的'各自聚合后JOIN'模式，仅列名大小写差异（EXPR0→cnt，JOB→job，NAME→name），语义完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，cost相同(779712.54)，结构无任何变化。重写仅做了列名规范化(EXPR0→cnt, JOB→job, NAME→name)，未触及查询逻辑。本轮应用的规则(PROJECT_SUB_QUERY_TO_CORRELATE等)未生效，优化建议(先连接后聚合、消除派生表)未被采纳。当前结构已是'两个独立聚合子查询+Hash Join'模式，emp表Parallel Seq Scan(1875万行)占主导成本，但这是原始SQL固有结构，非本轮引入。由于连续两轮无实质改进(第1轮未提供对比，第2轮计划相同)，且优化建议未被执行器采纳，判断当前重写路径已无进展空间，终止优化流程。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 194
+   - 规则序列: ['PROJECT_SUB_QUERY_TO_CORRELATE', 'AGGREGATE_JOIN_REMOVE', 'FILTER_AGGREGATE_TRANSPOSE']
+   - 优化组别: 子查询优化, 连接优化, 聚合优化
+   - 估计代价: 原始=779712.54, 重写=779712.54，相对变化: 0.00%
+✅ 成功存储，记录ID: acca3034-4b4d-4b84-8ac0-0c139e91a733
+
+🎲 UCT Math Update: 3 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=779712.5400, rc=779712.5400)
+   结构分细节: rows 19612759.0->19612759.0 (score=+0.000), depth 7.0->7.0 (score=+0.000)
+✅ UCT Update Complete:
+   → PROJECT_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.500, conf=0.85, lambda=0.42, reward=+0.000, count=2, avg=+0.060
+   → AGGREGATE_JOIN_REMOVE: P(s,a)=N/A, effect=0.300, conf=0.75, lambda=0.38, reward=+0.000, count=2, avg=+0.194
+   → FILTER_AGGREGATE_TRANSPOSE: P(s,a)=N/A, effect=0.200, conf=0.65, lambda=0.33, reward=+0.000, count=28, avg=+0.017
+
+----------------------------------------
+

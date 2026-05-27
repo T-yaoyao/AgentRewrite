@@ -1,0 +1,107 @@
+Query ID: 24
+==================================================
+
+Original: SELECT * FROM (SELECT DEPT.DEPTNO, DEPT.NAME FROM DEPT INNER JOIN (SELECT DEPTNO FROM EMP GROUP BY DEPTNO) AS t0 ON DEPT.DEPTNO = t0.DEPTNO) AS t1 WHERE t1.DEPTNO <= 10
+Rewritten: SELECT DEPT.DEPTNO, DEPT.NAME
+FROM DEPT
+WHERE DEPT.DEPTNO <= 10
+  AND EXISTS (
+    SELECT 1
+    FROM EMP
+    WHERE EMP.DEPTNO = DEPT.DEPTNO
+      AND EMP.DEPTNO <= 10
+  )
+Time Cost: 55.23s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将外层WHERE条件t1.DEPTNO<=10下推到DEPT表和EMP表，利用传递性在JOIN前过滤数据。具体：在DEPT表上添加WHERE DEPT.DEPTNO<=10，在EMP的GROUP BY子查询中添加WHERE DEPTNO<=10，减少聚合前的数据量从4500万行降至满足条件的少量行'}, {'group': '连接优化', 'produced_suggestion': '利用JOIN条件的传递性优化：由于DEPT.DEPTNO=t0.DEPTNO且t1.DEPTNO<=10，可推导出t0.DEPTNO<=10和DEPT.DEPTNO<=10。将这些条件下推到各自数据源，使JOIN前数据集大幅缩小，避免对4500万行EMP数据进行全量GROUP BY'}, {'group': '聚合优化', 'produced_suggestion': '在EMP的GROUP BY子查询中添加WHERE DEPTNO<=10过滤条件，将聚合范围从全表4500万行缩减到仅满足DEPTNO<=10的行。这样可以显著降低Aggregate算子58.2%的代价消耗，并可能利用DEPTNO上的索引避免全表扫描'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) EMP表全表扫描(Seq Scan)消耗32.9%代价，扫描4500万行数据；2) 聚合操作(Aggregate)消耗58.2%代价，对大表进行GROUP BY；3) 存在多个流水线阻塞算子。关键优化机会：外层WHERE条件t1.DEPTNO<=10可以下推到内层，先过滤DEPT表再关联，大幅减少EMP表的GROUP BY数据量。历史案例显示JOIN_PUSH_TRANSITIVE_PREDICATES规则在相似场景下有效。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将外层WHERE条件t1.DEPTNO<=10下推到DEPT表和EMP表，利用传递性在JOIN前过滤数据。具体：在DEPT表上添加WHERE DEPT.DEPTNO<=10，在EMP的GROUP BY子查询中添加WHERE DEPTNO<=10，减少聚合前的数据量从4500万行降至满足条件的少量行"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用JOIN条件的传递性优化：由于DEPT.DEPTNO=t0.DEPTNO且t1.DEPTNO<=10，可推导出t0.DEPTNO<=10和DEPT.DEPTNO<=10。将这些条件下推到各自数据源，使JOIN前数据集大幅缩小，避免对4500万行EMP数据进行全量GROUP BY"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "在EMP的GROUP BY子查询中添加WHERE DEPTNO<=10过滤条件，将聚合范围从全表4500万行缩减到仅满足DEPTNO<=10的行。这样可以显著降低Aggregate算子58.2%的代价消耗，并可能利用DEPTNO上的索引避免全表扫描"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.243
+   → AGGREGATE_VALUES: UCT=1.243
+   → JOIN_TO_CORRELATE: UCT=1.100
+```json
+{
+  "groups": "连接优化, 谓词简化, 聚合优化",
+  "applied_rules": [
+    "JOIN_TO_CORRELATE",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES"
+  ],
+  "rule_effect_scores": {
+    "JOIN_TO_CORRELATE": 0.3,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.7
+  },
+  "rule_effect_confidence": {
+    "JOIN_TO_CORRELATE": 0.85,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.9
+  }
+}
+```
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化, 聚合优化",
+  "applied_rules": [
+    "JOIN_TO_CORRELATE",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES"
+  ],
+  "rewritten_sql": "SELECT DEPT.DEPTNO, DEPT.NAME\nFROM DEPT\nWHERE DEPT.DEPTNO <= 10\n  AND EXISTS (\n    SELECT 1\n    FROM EMP\n    WHERE EMP.DEPTNO = DEPT.DEPTNO\n      AND EMP.DEPTNO <= 10\n  )",
+  "semantic_correctness_guarantee": "1. 结构性改写说明：原SQL为三层嵌套结构（外层SELECT * FROM子查询，中层DEPT与GROUP BY子查询的INNER JOIN，内层EMP的GROUP BY DEPTNO）。重写后消除了所有子查询和JOIN，改为单表DEPT扫描+相关EXISTS子查询的形式。\n\n2. 谓词下推的传递性推导：原SQL外层WHERE条件t1.DEPTNO<=10，通过别名追溯到DEPT.DEPTNO；由于INNER JOIN条件DEPT.DEPTNO=t0.DEPTNO（t0是EMP的GROUP BY结果），根据等值传递性可推导出t0.DEPTNO<=10，即EMP.DEPTNO<=10。因此在DEPT和EMP上同时添加DEPTNO<=10过滤条件与原SQL等价。\n\n3. GROUP BY消除的等价性：原SQL中EMP的GROUP BY DEPTNO仅用于去重并提供JOIN键，不涉及聚合函数。INNER JOIN语义要求DEPT.DEPTNO必须在EMP.DEPTNO的去重集合中存在。改写为EXISTS(SELECT 1 FROM EMP WHERE EMP.DEPTNO=DEPT.DEPTNO)完全等价：EXISTS检查存在性，自动去重，且相关条件EMP.DEPTNO=DEPT.DEPTNO对应原JOIN条件。\n\n4. INNER JOIN转EXISTS的正确性：原SQL的INNER JOIN要求DEPT的每行必须在EMP的GROUP BY结果中找到匹配的DEPTNO。EXISTS子查询的语义是"存在至少一行EMP满足DEPTNO=DEPT.DEPTNO"，这与INNER JOIN+GROUP BY的存在性检查完全一致。由于只SELECT DEPT的列（DEPTNO和NAME），不依赖EMP的任何列值，因此不会因JOIN改为EXISTS而丢失或增加信息。\n\n5. 结果集列的一致性：原SQL最外层SELECT *实际返回t1的所有列，即DEPT.DEPTNO和DEPT.NAME（中层子查询t1已明确SELECT这两列）。重写后直接SELECT DEPT.DEPTNO, DEPT.NAME，列名、类型、顺序完全一致。\n\n6. 过滤条件的完整性：原SQL在最外层应用DEPTNO<=10过滤，重写后在DEPT的WHERE子句和EXISTS内的EMP过滤中都应用了DEPTNO<=10。DEPT上的过滤确保返回的部门满足条件；EXISTS内的过滤确保只检查满足条件的员工记录，与原SQL在JOIN前通过传递性过滤的效果等价。\n\n7. 无NULL值和重复行风险：DEPT.DEPTNO为主键（非NULL且唯一），EMP.DEPTNO为非NULL列（根据Schema定义）。原SQL的GROUP BY DEPTNO产生去重的DEPTNO集合，INNER JOIN确保DEPT中每个DEPTNO最多出现一次（因DEPT.DEPTNO是主键）。重写后DEPT的主键特性保证无重复行，EXISTS的存在性检查不会引入重复或NULL值问题。\n\n8. 相关子查询的相关列正确性：EXISTS子查询中的相关列为DEPT.DEPTNO（出现在WHERE EMP.DEPTNO=DEPT.DEPTNO中）。该相关条件直接对应原SQL的JOIN条件DEPT.DEPTNO=t0.DEPTNO，且DEPT.DEPTNO作为外层表的主键，相关性明确且无歧义。每次外层DEPT的一行被评估时，内层EXISTS检查该DEPTNO是否在满足条件的EMP记录中存在，逻辑完全等价于原INNER JOIN的匹配语义。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "两SQL等价：原SQL通过INNER JOIN + GROUP BY去重确保DEPT.DEPTNO存在于EMP中，重写为EXISTS子查询实现相同语义；谓词DEPTNO<=10通过等值传递性正确下推到两表。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 21151265.0 -> 6398.0 (重写侧约为原的 0.0302%) | 强信号: 行数估计求和大幅下降，重写侧约为原的 0.0302% (<= 10%)
+✅ 行数估计求和大幅下降至原的 0.0302%，直接判定优化成功，终止并保留重写 SQL
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 162
+   - 规则序列: ['JOIN_TO_CORRELATE', 'JOIN_PUSH_TRANSITIVE_PREDICATES']
+   - 优化组别: 连接优化, 谓词简化, 聚合优化
+   - 估计代价: 原始=1991626.46, 重写=704351.19，相对变化: 64.63%
+✅ 成功存储，记录ID: 24e9f484-f755-48c4-bcea-276ad9f2f10b
+
+🎲 UCT Math Update: 2 rules, reward=+0.7438 (cost=+0.6463, rows=+0.9997, depth=+0.5000, oc=1991626.4600, rc=704351.1900)
+   结构分细节: rows 21151265.0->6398.0 (score=+1.000), depth 6.0->3.0 (score=+0.500)
+✅ UCT Update Complete:
+   → JOIN_TO_CORRELATE: P(s,a)=N/A, effect=0.300, conf=0.85, lambda=0.42, reward=+0.318, count=1, avg=+0.318
+   → JOIN_PUSH_TRANSITIVE_PREDICATES: P(s,a)=N/A, effect=0.700, conf=0.90, lambda=0.45, reward=+0.426, count=33, avg=+0.027
+
+----------------------------------------
+

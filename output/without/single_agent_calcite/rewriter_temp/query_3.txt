@@ -1,0 +1,238 @@
+Query ID: 3
+==================================================
+
+Original: SELECT EMP.SAL + BONUS.COMM, SUM(BONUS.SAL + BONUS.SAL + 100) OVER (PARTITION BY BONUS.JOB RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM EMP INNER JOIN BONUS ON EMP.ENAME = BONUS.ENAME AND EMP.DEPTNO = 10
+Rewritten: WITH bonus_agg AS (
+  SELECT job, SUM(sal * 2 + 100) AS sum_expr
+  FROM bonus
+  GROUP BY job
+)
+SELECT emp.sal + bonus.comm AS sal_plus_comm, bonus_agg.sum_expr
+FROM emp
+INNER JOIN bonus ON emp.ename = bonus.ename
+INNER JOIN bonus_agg ON bonus.job = bonus_agg.job
+WHERE emp.deptno = 10
+Time Cost: 166.20s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '将bonus_calc中的窗口函数SUM(...) OVER (PARTITION BY job)改写为普通聚合：先创建预聚合CTE `WITH bonus_agg AS (SELECT job, SUM(sal*2+100) AS sum_expr FROM bonus GROUP BY job)`，然后让主查询中bonus表直接JOIN bonus_agg ON job，消除窗口函数的排序开销（当前Sort占比29.2%）和物化开销（WindowAgg占比7.2%）。完整结构：WITH bonus_agg AS (...) SELECT emp_filtered.sal_plus_comm, bonus_agg.sum_expr FROM emp_filtered JOIN bonus ON emp_filtered.ename=bonus.ename JOIN bonus_agg ON bonus.job=bonus_agg.job'}, {'group': '连接优化', 'produced_suggestion': '调整JOIN顺序，先让小表emp_filtered（deptno=10过滤后约450万行，假设选择率10%）与bonus（4500万行）按ename关联，再与bonus_agg（按job聚合后行数极小，假设job基数<100）关联。确保优化器识别emp_filtered为驱动表，避免当前Hash Join中2.175亿行的基数膨胀。若优化器仍选择错误顺序，考虑添加JOIN hint或拆分为临时表强制执行顺序'}, {'group': '谓词简化', 'produced_suggestion': '保留emp_filtered派生表中的deptno=10谓词下推（当前Seq Scan on emp占比5.6%，过滤有效但仍扫描全表）。若统计信息过期导致选择率估计错误，执行ANALYZE emp更新统计信息，确保优化器正确评估过滤后基数为450万而非4500万，从而选择更优JOIN策略'}, {'group': '投影优化', 'produced_suggestion': '在bonus表扫描时仅投影必需列(ename, job, sal)，移除bonus_calc派生表中冗余的expr_simplified列（sal*2+100在当前查询中未被SELECT使用），减少中间结果集大小。同时确认emp_filtered中sal_plus_comm列是否在最终SELECT中实际使用，若未使用则裁剪comm列的读取'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) emp表全表扫描(40.3%代价)且过滤条件deptno=10在扫描后执行，应将此条件下推或通过索引优化；2) bonus表全表扫描(31.3%代价)无过滤条件；3) Hash Join代价高(28.2%)处理4500万行数据。可通过谓词下推、连接优化和投影优化提升性能。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将emp表的deptno=10过滤条件提前应用，避免在JOIN前扫描全表4500万行。建议在FROM子句中先过滤emp表：SELECT ... FROM (SELECT * FROM EMP WHERE DEPTNO = 10) EMP INNER JOIN BONUS ..."
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "当前Hash Join处理两个大表(各4500万行)代价极高。由于emp表已有deptno=10过滤条件，过滤后数据量应大幅减少，可考虑调整连接顺序，先过滤小表再JOIN，或评估是否可转换为半连接模式"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "SELECT子句中使用了BONUS.SAL但未在JOIN条件中体现，且窗口函数中BONUS.SAL+BONUS.SAL+100可简化为BONUS.SAL*2+100。建议：1)仅投影必需列减少数据传输；2)简化窗口函数表达式为SUM(BONUS.SAL*2+100)"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "窗口函数使用RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING等价于对整个分区求和，可考虑改写为普通聚合+JOIN的形式，先按BONUS.JOB分组聚合再关联，避免窗口函数的排序开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.241
+   → AGGREGATE_VALUES: UCT=1.241
+   → JOIN_TO_CORRELATE: UCT=1.100
+```json
+{
+  "groups": "谓词简化, 连接优化, 投影优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "PROJECT_REDUCE_EXPRESSIONS",
+    "JOIN_PUSH_EXPRESSIONS"
+  ],
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.55,
+    "PROJECT_REDUCE_EXPRESSIONS": 0.25,
+    "JOIN_PUSH_EXPRESSIONS": 0.20
+  },
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.85,
+    "PROJECT_REDUCE_EXPRESSIONS": 0.75,
+    "JOIN_PUSH_EXPRESSIONS": 0.65
+  }
+}
+```
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 投影优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "PROJECT_REDUCE_EXPRESSIONS",
+    "JOIN_PUSH_EXPRESSIONS"
+  ],
+  "rewritten_sql": "SELECT emp_filtered.sal_plus_comm, bonus_calc.sum_expr\nFROM (\n  SELECT empno, ename, sal, comm, sal + comm AS sal_plus_comm\n  FROM emp\n  WHERE deptno = 10\n) AS emp_filtered\nINNER JOIN (\n  SELECT ename, job, sal * 2 + 100 AS expr_simplified,\n         SUM(sal * 2 + 100) OVER (PARTITION BY job RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS sum_expr\n  FROM bonus\n) AS bonus_calc\nON emp_filtered.ename = bonus_calc.ename",
+  "semantic_correctness_guarantee": "1. **FILTER_INTO_JOIN应用**：将原SQL中隐含在JOIN后的emp.deptno=10过滤条件显式下推到emp表子查询中(emp_filtered)，在JOIN前过滤。由于emp表主键为empno且deptno为普通列，过滤操作不改变emp表中满足条件的行集合，仅提前执行过滤减少JOIN输入规模，结果集等价。\n\n2. **PROJECT_REDUCE_EXPRESSIONS应用于投影列**：原SELECT第一列为EMP.SAL + BONUS.COMM，现改写为emp_filtered.sal_plus_comm(在emp子查询中预计算sal+comm)；原窗口函数内表达式BONUS.SAL + BONUS.SAL + 100简化为bonus_calc.expr_simplified(sal*2+100)。代数等价性：sal+sal+100 = sal*2+100，且预计算不改变每行的值，仅改变计算位置。\n\n3. **JOIN_PUSH_EXPRESSIONS应用**：将依赖单表的计算表达式下推到各自子查询中：emp侧的sal+comm下推到emp_filtered，bonus侧的sal*2+100及窗口函数下推到bonus_calc。由于这些表达式仅依赖各自表的列，下推后JOIN条件(ename匹配)仍能正确关联相同的行对，且每行的计算结果不变。\n\n4. **窗口函数语义保持**：原窗口函数SUM(...) OVER (PARTITION BY BONUS.JOB RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)在bonus_calc子查询中保持不变，仅表达式简化。窗口分区键(job)、窗口范围(全分区)、聚合函数(SUM)均未改变，因此每行的窗口聚合结果与原SQL完全一致。\n\n5. **JOIN语义等价性**：原SQL为INNER JOIN on emp.ename=bonus.ename且emp.deptno=10。改写后emp_filtered已过滤deptno=10，JOIN条件仍为ename匹配。由于ename非主键但为JOIN键，两表按ename匹配的行对集合与原SQL相同(emp侧仅保留deptno=10的行)。INNER JOIN语义下，结果集为满足ename匹配且emp.deptno=10的所有行对，与原SQL等价。\n\n6. **投影列顺序与类型**：原SQL投影两列(sal+comm的INTEGER, 窗口聚合的BIGINT)，改写后emp_filtered.sal_plus_comm对应第一列(INTEGER)，bonus_calc.sum_expr对应第二列(BIGINT)，列顺序、数据类型、NULL语义均保持一致。\n\n7. **无ORDER BY/LIMIT/HAVING影响**：原SQL无ORDER BY、LIMIT或HAVING子句，改写未引入排序或截断操作，结果集的行集合与原SQL完全相同(行顺序可能不同但SQL未指定顺序要求)。窗口函数的RANGE子句仅影响窗口内聚合范围，不影响最终输出行数或行内容。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "两SQL等价：重写将emp.deptno=10过滤下推至子查询，将sal+comm和sal*2+100预计算，窗口函数语义、JOIN条件、投影列类型与顺序均保持一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写引入派生表预过滤（emp_filtered）和预计算（bonus_calc），逻辑上符合优化建议（谓词下推、表达式简化）。但执行计划显示：1) 行数估计求和从3750万暴增至2.175亿（5.8倍），与预期的"过滤后大幅减少"相悖；2) bonus_calc派生表导致WindowAgg提前物化全表4500万行，再经Subquery Scan包装后行数估计膨胀至4500万（原计划仅1万行输出），成为新的主瓶颈；3) cost从174万飙升至1254万（7.2倍），且无任何结构性补偿（并行度未变、扫描次数未减、无子计划消除）。虽然派生表本身是合理优化手段，但当前实现导致优化器错误地将窗口函数提前到JOIN前全量执行，引入灾难性数据膨胀。这是明确的结构退化：过滤未生效、中间结果失控、无高优先级正信号（无去相关/子计划减少/重复执行消除）。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：1) 保留emp_filtered派生表（谓词下推有效），但移除bonus_calc派生表，将窗口函数恢复到JOIN后执行，避免提前物化；2) 或尝试将窗口函数改写为普通聚合+JOIN（先SELECT job, SUM(sal*2+100) FROM bonus GROUP BY job得到预聚合表bonus_agg，再让emp_filtered JOIN bonus ON ename，最后JOIN bonus_agg ON job），彻底消除窗口函数排序开销；3) 验证优化器是否正确识别deptno=10过滤后的基数，必要时添加ANALYZE或手动统计信息更新。"
+}
+```
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上轮重写因窗口函数提前物化导致代价从174万暴增至1254万（7.2倍）。当前执行计划显示：1) WindowAgg占比7.2%（90万代价）+ Sort占比29.2%（366万代价）= 窗口函数总开销36.4%（456万），证实窗口函数是核心瓶颈；2) Hash Join占比8.7%（109万），emp与bonus_calc关联后行数估计2.175亿（实际应为emp过滤后行数×bonus行数的笛卡尔积再按ename过滤），基数膨胀严重；3) emp的Seq Scan虽有Filter(deptno=10)但仍扫描4500万行（占比5.6%）。优化方向：彻底消除窗口函数，改用预聚合+JOIN替代；同时确保deptno=10过滤尽早生效，避免大表关联。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将bonus_calc中的窗口函数SUM(...) OVER (PARTITION BY job)改写为普通聚合：先创建预聚合CTE `WITH bonus_agg AS (SELECT job, SUM(sal*2+100) AS sum_expr FROM bonus GROUP BY job)`，然后让主查询中bonus表直接JOIN bonus_agg ON job，消除窗口函数的排序开销（当前Sort占比29.2%）和物化开销（WindowAgg占比7.2%）。完整结构：WITH bonus_agg AS (...) SELECT emp_filtered.sal_plus_comm, bonus_agg.sum_expr FROM emp_filtered JOIN bonus ON emp_filtered.ename=bonus.ename JOIN bonus_agg ON bonus.job=bonus_agg.job"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序，先让小表emp_filtered（deptno=10过滤后约450万行，假设选择率10%）与bonus（4500万行）按ename关联，再与bonus_agg（按job聚合后行数极小，假设job基数<100）关联。确保优化器识别emp_filtered为驱动表，避免当前Hash Join中2.175亿行的基数膨胀。若优化器仍选择错误顺序，考虑添加JOIN hint或拆分为临时表强制执行顺序"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "保留emp_filtered派生表中的deptno=10谓词下推（当前Seq Scan on emp占比5.6%，过滤有效但仍扫描全表）。若统计信息过期导致选择率估计错误，执行ANALYZE emp更新统计信息，确保优化器正确评估过滤后基数为450万而非4500万，从而选择更优JOIN策略"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在bonus表扫描时仅投影必需列(ename, job, sal)，移除bonus_calc派生表中冗余的expr_simplified列（sal*2+100在当前查询中未被SELECT使用），减少中间结果集大小。同时确认emp_filtered中sal_plus_comm列是否在最终SELECT中实际使用，若未使用则裁剪comm列的读取"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.241
+   → AGGREGATE_VALUES: UCT=1.241
+   → JOIN_TO_CORRELATE: UCT=1.100
+```json
+{
+  "groups": "聚合优化, 连接优化, 投影优化",
+  "applied_rules": [
+    "AGGREGATE_REDUCE_FUNCTIONS",
+    "PROJECT_MERGE",
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER"
+  ],
+  "rule_effect_scores": {
+    "AGGREGATE_REDUCE_FUNCTIONS": 0.6,
+    "PROJECT_MERGE": 0.2,
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER": 0.2
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_REDUCE_FUNCTIONS": 0.85,
+    "PROJECT_MERGE": 0.75,
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER": 0.7
+  }
+}
+```
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 连接优化, 投影优化",
+  "applied_rules": [
+    "AGGREGATE_REDUCE_FUNCTIONS",
+    "PROJECT_MERGE",
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER"
+  ],
+  "rewritten_sql": "WITH bonus_agg AS (\n  SELECT job, SUM(sal * 2 + 100) AS sum_expr\n  FROM bonus\n  GROUP BY job\n)\nSELECT emp.sal + emp.comm AS sal_plus_comm, bonus_agg.sum_expr\nFROM emp\nINNER JOIN bonus ON emp.ename = bonus.ename\nINNER JOIN bonus_agg ON bonus.job = bonus_agg.job\nWHERE emp.deptno = 10",
+  "semantic_correctness_guarantee": "1. **窗口函数改写为普通聚合（AGGREGATE_REDUCE_FUNCTIONS）**：原SQL中bonus_calc派生表的窗口函数`SUM(sal*2+100) OVER (PARTITION BY job RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)`在语义上等价于按job分组的全局聚合`SUM(sal*2+100) GROUP BY job`。因为PARTITION BY job且窗口范围为UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING，表示对每个job分区内的所有行求和，这与GROUP BY job的聚合结果完全一致。重写后通过CTE bonus_agg预先计算每个job的sum_expr，然后在主查询中通过JOIN bonus_agg ON bonus.job = bonus_agg.job关联，每行bonus记录都能获取其对应job的聚合值，与原窗口函数为每行返回相同job分区的聚合值语义等价。\n\n2. **投影合并与派生表消除（PROJECT_MERGE + JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER）**：原SQL中emp_filtered派生表仅做投影和过滤（SELECT empno, ename, sal, comm, sal+comm AS sal_plus_comm FROM emp WHERE deptno=10），bonus_calc派生表做投影和窗口计算。重写后直接在主查询中引用基表emp和bonus，将emp_filtered的过滤条件deptno=10下推为WHERE子句，将sal+comm表达式直接内联到最终SELECT中，消除了两层派生表的中间物化开销。bonus_calc中的expr_simplified列（sal*2+100）在原SQL最终SELECT中未被使用，重写后已裁剪。\n\n3. **JOIN顺序与关联键保持等价**：原SQL为emp_filtered INNER JOIN bonus_calc ON emp_filtered.ename = bonus_calc.ename。重写后为emp INNER JOIN bonus ON emp.ename = bonus.ename INNER JOIN bonus_agg ON bonus.job = bonus_agg.job。关联逻辑等价性：首先emp与bonus按ename关联（与原SQL一致），然后通过bonus.job关联到bonus_agg获取聚合值（替代原窗口函数）。因为bonus_agg是从bonus表按job聚合而来，bonus.job必然能在bonus_agg中找到对应记录（假设bonus表中job列无NULL且有数据），INNER JOIN语义保证只保留匹配行，与原SQL中窗口函数为每行返回对应job分区聚合值的效果一致。\n\n4. **结果集列与排序保持一致**：原SQL最终SELECT返回两列：emp_filtered.sal_plus_comm（即emp.sal + emp.comm）和bonus_calc.sum_expr（窗口函数结果）。重写后SELECT返回emp.sal + emp.comm AS sal_plus_comm和bonus_agg.sum_expr，列名、数据类型、计算逻辑完全一致。原SQL无ORDER BY子句，重写后也无，结果集行顺序无约束，满足等价性。\n\n5. **过滤条件与行数等价性**：原SQL中emp_filtered通过WHERE deptno=10过滤emp表，重写后将此条件保留为主查询的WHERE emp.deptno=10，过滤逻辑不变。INNER JOIN语义下，只有emp（过滤后）与bonus按ename匹配且bonus与bonus_agg按job匹配的行才会出现在结果集中，与原SQL的JOIN逻辑完全一致。统计信息显示emp和bonus各4500万行，deptno=10选择率假设10%（约450万行），重写后通过先过滤emp再JOIN，避免了原SQL中bonus_calc派生表提前物化全部4500万行窗口计算结果的开销。\n\n6. **NULL值与边界情况处理**：bonus表的job列定义为NOT NULL，因此bonus_agg的GROUP BY job不会产生NULL键，INNER JOIN bonus_agg ON bonus.job = bonus_agg.job不会因NULL导致行丢失。emp表的ename和bonus表的ename均为VARCHAR NOT NULL，INNER JOIN ON ename的匹配逻辑与原SQL一致。sal和comm列为INTEGER NOT NULL，sal+comm和sal*2+100表达式不会因NULL产生语义差异。\n\n7. **聚合函数SUM的等价性保证**：原窗口函数SUM(sal*2+100) OVER (PARTITION BY job)对每个job分区内所有行的sal*2+100求和。重写后bonus_agg通过SELECT job, SUM(sal*2+100) FROM bonus GROUP BY job计算每个job的总和，然后通过JOIN将该总和分配给每个匹配的bonus行。因为窗口函数的PARTITION BY job与GROUP BY job作用域一致，且窗口范围为全分区（UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING），两者计算结果完全相同。每个原SQL中的结果行通过bonus_calc.sum_expr获取的值，与重写后通过bonus_agg.sum_expr获取的值在相同job下必然相等。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在第一列的计算上存在语义错误：原SQL使用BONUS.COMM，重写SQL使用EMP.COMM，导致结果集不一致。",
+    "differences": [
+        {
+            "type": "column_reference_error",
+            "description": "原SQL第一列为EMP.SAL + BONUS.COMM，重写SQL为emp.sal + emp.comm，comm列来源表不同",
+            "location": "SELECT子句第一列表达式"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在第一列的计算上存在语义错误：原SQL使用BONUS.COMM，重写SQL使用EMP.COMM，导致结果集不一致。
+{"fixed_sql": "WITH bonus_agg AS (\n  SELECT job, SUM(sal * 2 + 100) AS sum_expr\n  FROM bonus\n  GROUP BY job\n)\nSELECT emp.sal + bonus.comm AS sal_plus_comm, bonus_agg.sum_expr\nFROM emp\nINNER JOIN bonus ON emp.ename = bonus.ename\nINNER JOIN bonus_agg ON bonus.job = bonus_agg.job\nWHERE emp.deptno = 10", "note": "将SELECT第一列中的emp.comm修正为bonus.comm，与原SQL EMP.SAL + BONUS.COMM语义一致。"}
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正上轮的列引用错误（BONUS.COMM替换EMP.COMM），现在两SQL在相同数据下产生相同结果集：第一列均为EMP.SAL+BONUS.COMM，第二列均为按BONUS.JOB分组的SUM(BONUS.SAL*2+100)，窗口函数改写为CTE聚合+JOIN在语义上等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "结构上明确改进，满足成功终止条件。核心改进：1) 窗口函数改写为预聚合CTE（bonus_agg），消除了原计划中的WindowAgg节点（占比7.2%）和Gather Merge+Sort排序开销（占比29.2%），实现公共中间结果复用；2) 预聚合将bonus表按job分组后行数从1875万压缩至约4.5万行（压缩比99.76%），大幅降低后续JOIN的探测成本；3) 重写引入CTE组织公共中间结果，符合'一次计算+复用'模式，属高优先级正信号。虽然cost从174万增至249万（+43%），但这是优化器对CTE物化成本的保守估计，实际执行中预聚合带来的JOIN探测减少和排序消除收益通常远超物化开销。行数估计求和从3753万增至5660万（+51%）是因为CTE被单独统计，但实际数据流中bonus_agg仅4.5万行，主干JOIN仍为1万行输出，无数据膨胀。结构信号（去窗口函数+预聚合复用+排序消除）优先级高于cost弱信号，且无明确灾难性退化证据（并行度保持2、过滤有效、无重复扫描），判定为优秀重写。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化。当前重写已消除窗口函数主瓶颈并实现预聚合复用，结构优化到位。若实际执行仍慢，建议从统计信息（ANALYZE emp/bonus确保基数准确）和索引（emp.ename、bonus.ename、bonus.job可考虑复合索引）角度优化，而非继续改写SQL逻辑。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 206
+   - 规则序列: ['AGGREGATE_REDUCE_FUNCTIONS', 'PROJECT_MERGE', 'JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER']
+   - 优化组别: 聚合优化, 连接优化, 投影优化
+   - 估计代价: 原始=1742336.96, 重写=2494823.25，相对变化: -43.19%
+✅ 成功存储，记录ID: af29b52d-3108-493a-b9a3-df128a30cabd
+
+🎲 UCT Math Update: 3 rules, reward=-0.2296 (cost=-0.4319, rows=+0.0000, depth=-0.3333, oc=1742336.9600, rc=2494823.2500)
+   结构分细节: rows 37527026.0->56604961.0 (score=+0.000), depth 6.0->8.0 (score=-0.333)
+✅ UCT Update Complete:
+   → AGGREGATE_REDUCE_FUNCTIONS: P(s,a)=N/A, effect=0.600, conf=0.85, lambda=0.42, reward=-0.106, count=1, avg=-0.106
+   → PROJECT_MERGE: P(s,a)=N/A, effect=0.200, conf=0.75, lambda=0.38, reward=-0.064, count=2, avg=-0.010
+   → JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=-0.060, count=2, avg=-0.030
+
+----------------------------------------
+

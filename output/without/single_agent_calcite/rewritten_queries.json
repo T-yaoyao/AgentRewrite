@@ -1,0 +1,1708 @@
+[
+    {
+        "id": 1,
+        "original_query": "SELECT t.EXPR0, 2 + 3 AS f1, MAX(t.FIVE) FROM EMP, (VALUES (4, 5)) AS t (EXPR0, FIVE) GROUP BY t.EXPR0, 2 + 3",
+        "rewritten_query": "SELECT 4 AS EXPR0, 5 AS f1, MAX(5) AS \"MAX(t.FIVE)\"\nFROM EMP",
+        "original_costs": 703880.35,
+        "rewrite_costs": 0.03,
+        "costs_reduction_rate": 100.0,
+        "rewrite_rules": [
+            "PROJECT_REDUCE_EXPRESSIONS",
+            "SORT_REMOVE_CONSTANT_KEYS"
+        ],
+        "time_cost": 46.43222689628601,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "常量折叠",
+                "produced_suggestion": "将常量表达式'2+3'预计算为5，消除运行时重复计算开销，并简化GROUP BY子句中的常量表达式"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "GROUP BY中包含常量't.EXPR0'和'2+3'，可移除常量分组键，因为常量不影响分组结果，简化为仅按实际变化的列分组"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "VALUES子句生成的常量数据(4,5)与EMP表做笛卡尔积后，t.EXPR0和t.FIVE均为常量，可在聚合前消除冗余投影，直接使用常量值"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "EMP表与单行VALUES常量表的笛卡尔积可优化：由于VALUES仅产生1行，笛卡尔积等价于EMP表扫描后附加常量列，可消除JOIN操作转为投影"
+            }
+        ]
+    },
+    {
+        "id": 2,
+        "original_query": "SELECT NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT 2 * DEPTNO AS f0 FROM DEPT GROUP BY 2 * DEPTNO) AS t0 WHERE DEPT.DEPTNO = t0.f0)",
+        "rewritten_query": "SELECT NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM DEPT d2 WHERE DEPT.DEPTNO = 2 * d2.DEPTNO)",
+        "original_costs": 63099.39,
+        "rewrite_costs": 31458.75,
+        "costs_reduction_rate": 50.14,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE",
+            "PROJECT_SUB_QUERY_TO_CORRELATE"
+        ],
+        "time_cost": 110.93774509429932,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "去除EXISTS子查询内层冗余的GROUP BY子句。EXISTS只判断行是否存在，GROUP BY不影响结果但引入了代价占比52.8%的Aggregate算子（自身消耗33328.12），应直接删除。"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "展平派生表t0，将'SELECT 2*DEPTNO AS f0 FROM DEPT GROUP BY 2*DEPTNO'改写为直接相关子查询：SELECT NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM DEPT d2 WHERE DEPT.DEPTNO = 2 * d2.DEPTNO)。消除派生表和Aggregate算子，使优化器可对d2.DEPTNO利用dept_pkey索引做Index Scan，将Hash Join+全表扫描替换为相关索引查找。"
+            }
+        ]
+    },
+    {
+        "id": 3,
+        "original_query": "SELECT EMP.SAL + BONUS.COMM, SUM(BONUS.SAL + BONUS.SAL + 100) OVER (PARTITION BY BONUS.JOB RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM EMP INNER JOIN BONUS ON EMP.ENAME = BONUS.ENAME AND EMP.DEPTNO = 10",
+        "rewritten_query": "WITH bonus_agg AS (\n  SELECT job, SUM(sal * 2 + 100) AS sum_expr\n  FROM bonus\n  GROUP BY job\n)\nSELECT emp.sal + bonus.comm AS sal_plus_comm, bonus_agg.sum_expr\nFROM emp\nINNER JOIN bonus ON emp.ename = bonus.ename\nINNER JOIN bonus_agg ON bonus.job = bonus_agg.job\nWHERE emp.deptno = 10",
+        "original_costs": 1742336.96,
+        "rewrite_costs": 2494823.25,
+        "costs_reduction_rate": -43.19,
+        "rewrite_rules": [
+            "AGGREGATE_REDUCE_FUNCTIONS",
+            "PROJECT_MERGE",
+            "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER"
+        ],
+        "time_cost": 166.20418310165405,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "将bonus_calc中的窗口函数SUM(...) OVER (PARTITION BY job)改写为普通聚合：先创建预聚合CTE `WITH bonus_agg AS (SELECT job, SUM(sal*2+100) AS sum_expr FROM bonus GROUP BY job)`，然后让主查询中bonus表直接JOIN bonus_agg ON job，消除窗口函数的排序开销（当前Sort占比29.2%）和物化开销（WindowAgg占比7.2%）。完整结构：WITH bonus_agg AS (...) SELECT emp_filtered.sal_plus_comm, bonus_agg.sum_expr FROM emp_filtered JOIN bonus ON emp_filtered.ename=bonus.ename JOIN bonus_agg ON bonus.job=bonus_agg.job"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "调整JOIN顺序，先让小表emp_filtered（deptno=10过滤后约450万行，假设选择率10%）与bonus（4500万行）按ename关联，再与bonus_agg（按job聚合后行数极小，假设job基数<100）关联。确保优化器识别emp_filtered为驱动表，避免当前Hash Join中2.175亿行的基数膨胀。若优化器仍选择错误顺序，考虑添加JOIN hint或拆分为临时表强制执行顺序"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "保留emp_filtered派生表中的deptno=10谓词下推（当前Seq Scan on emp占比5.6%，过滤有效但仍扫描全表）。若统计信息过期导致选择率估计错误，执行ANALYZE emp更新统计信息，确保优化器正确评估过滤后基数为450万而非4500万，从而选择更优JOIN策略"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "在bonus表扫描时仅投影必需列(ename, job, sal)，移除bonus_calc派生表中冗余的expr_simplified列（sal*2+100在当前查询中未被SELECT使用），减少中间结果集大小。同时确认emp_filtered中sal_plus_comm列是否在最终SELECT中实际使用，若未使用则裁剪comm列的读取"
+            }
+        ]
+    },
+    {
+        "id": 4,
+        "original_query": "SELECT NAME FROM (SELECT DEPTNO, NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT 2 * DEPTNO AS f0 FROM DEPT GROUP BY 2 * DEPTNO) AS t5 WHERE DEPTNO = t5.f0)) AS t2",
+        "rewritten_query": "SELECT d.name FROM dept d WHERE d.deptno = 0",
+        "original_costs": 63099.39,
+        "rewrite_costs": 8.44,
+        "costs_reduction_rate": 99.99,
+        "rewrite_rules": [
+            "FILTER_REDUCE_EXPRESSIONS",
+            "AGGREGATE_REMOVE"
+        ],
+        "time_cost": 132.81951308250427,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将EXISTS子查询中的连接条件 `d.deptno = t5.f0`（其中t5.f0 = 2*DEPTNO）简化为 `d.deptno = 2*d.deptno`，该等式仅在d.deptno=0时成立，直接改写为 `WHERE d.deptno = 0`，消除整个EXISTS子查询及其内部的聚合操作"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "基于谓词简化结果，完全移除EXISTS子查询结构，将SQL改写为 `SELECT d.name FROM dept d WHERE d.deptno = 0`，利用dept_pkey索引实现常量等值查找，避免450000行的全表扫描和Hash Join"
+            }
+        ]
+    },
+    {
+        "id": 5,
+        "original_query": "SELECT * FROM (SELECT UPPER(SUBSTRING(X FROM 1 FOR 2) || SUBSTRING(X FROM 3)) AS U, SUBSTRING(X FROM 1 FOR 1) AS S FROM (SELECT * FROM (SELECT 'table' AS X FROM (VALUES (TRUE)) AS t (EXPR0) UNION SELECT 'view' AS EXPR0 FROM (VALUES (TRUE)) AS t (EXPR0)) AS t UNION SELECT 'foreign table' AS EXPR0 FROM (VALUES (TRUE)) AS t (EXPR0)) AS t6) AS t7 WHERE U = 'TABLE'",
+        "rewritten_query": "SELECT 'TABLE' AS U, 't' AS S",
+        "original_costs": 0.15,
+        "rewrite_costs": 0.01,
+        "costs_reduction_rate": 93.33,
+        "rewrite_rules": [
+            "PROJECT_FILTER_VALUES_MERGE",
+            "PROJECT_REDUCE_EXPRESSIONS",
+            "PROJECT_REMOVE"
+        ],
+        "time_cost": 32.477161169052124,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "常量折叠",
+                "produced_suggestion": "将UNION生成的常量值集合('table','view','foreign table')在编译时展开，对每个常量字符串预计算UPPER(SUBSTRING(X FROM 1 FOR 2) || SUBSTRING(X FROM 3))的结果：'table'->'TABLE'、'view'->'VIEW'、'foreign table'->'FOREIGN TABLE'，然后应用WHERE U='TABLE'过滤，最终只保留满足条件的常量行"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除多层嵌套的VALUES子查询和UNION结构，由于所有输入都是常量且WHERE条件明确(U='TABLE')，可以直接将整个查询简化为返回常量结果集：SELECT 'TABLE' AS U, 't' AS S"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "消除最外层的SELECT *，直接投影需要的列U和S，避免不必要的列传递"
+            }
+        ]
+    },
+    {
+        "id": 6,
+        "original_query": "SELECT t6.ENAME FROM (SELECT JOB FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t5 LEFT JOIN (SELECT ENAME, JOB FROM EMP GROUP BY ENAME, JOB) AS t6 ON t5.JOB = t6.JOB GROUP BY t6.ENAME",
+        "rewritten_query": "SELECT DISTINCT e2.ENAME\nFROM EMP e1\nJOIN EMP e2 ON e1.JOB = e2.JOB\nWHERE e1.ENAME = 'A'",
+        "original_costs": 4984629.98,
+        "rewrite_costs": 1829039.55,
+        "costs_reduction_rate": 63.31,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE",
+            "PROJECT_JOIN_REMOVE"
+        ],
+        "time_cost": 170.61429619789124,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除t5子查询中的冗余GROUP BY JOB：由于WHERE ENAME='A'后JOB列已确定性去重(同一ENAME对应的JOB集合有限)，将'SELECT JOB FROM EMP WHERE ENAME='A' GROUP BY JOB'改写为'SELECT DISTINCT JOB FROM EMP WHERE ENAME='A''，减少一次聚合算子开销"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除t6子查询中的完全冗余GROUP BY：'SELECT ENAME, JOB FROM EMP GROUP BY ENAME, JOB'在外层已有'GROUP BY t6.ENAME'的情况下属于双重聚合，直接改为'SELECT ENAME, JOB FROM EMP'，由外层GROUP BY统一处理去重，避免提前物化4500万行的聚合结果"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "将两层派生表LEFT JOIN结构展开为单层JOIN：改写为'SELECT DISTINCT e2.ENAME FROM EMP e1 JOIN EMP e2 ON e1.JOB = e2.JOB WHERE e1.ENAME = 'A''，消除派生表物化开销，使优化器能选择更优连接顺序(先过滤e1.ENAME='A'的小结果集再JOIN e2)，并可能利用JOB列上的潜在索引或哈希连接替代当前的嵌套循环"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将WHERE ENAME='A'的过滤条件尽早应用：在展开后的JOIN结构中，确保e1.ENAME='A'的过滤在JOIN前执行(作为驱动表条件)，减少参与JOIN的行数，避免当前执行计划中Seq Scan on emp_1扫描全表后再过滤的低效模式"
+            }
+        ]
+    },
+    {
+        "id": 7,
+        "original_query": "SELECT t2.EMPNO, t2.ENAME, t2.JOB, t2.MGR, t2.HIREDATE, t2.SAL, t2.COMM, t2.DEPTNO, t2.SLACKER, t3.DEPTNO AS DEPTNO0, t3.NAME FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER FROM EMP ORDER BY SAL) AS t2 INNER JOIN (SELECT * FROM DEPT) AS t3 ON t2.DEPTNO = t3.DEPTNO ORDER BY t2.SAL FETCH NEXT 10 ROWS ONLY",
+        "rewritten_query": "SELECT emp.EMPNO, emp.ENAME, emp.JOB, emp.MGR, emp.HIREDATE, emp.SAL, emp.COMM, emp.DEPTNO, emp.SLACKER, dept.DEPTNO AS DEPTNO0, dept.NAME\nFROM emp\nINNER JOIN dept ON emp.DEPTNO = dept.DEPTNO\nORDER BY emp.SAL\nFETCH NEXT 10 ROWS ONLY",
+        "original_costs": 4652416.32,
+        "rewrite_costs": 1452006.13,
+        "costs_reduction_rate": 68.79,
+        "rewrite_rules": [
+            "SORT_REMOVE",
+            "PROJECT_JOIN_TRANSPOSE"
+        ],
+        "time_cost": 44.698636531829834,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "排序优化",
+                "produced_suggestion": "消除子查询t2中的冗余ORDER BY SAL，因为外层已有ORDER BY t2.SAL且使用FETCH NEXT 10限制结果集，内层排序无实际作用，移除后可减少Sort算子(14.5%代价)和Gather Merge算子(18.7%代价)的开销"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "消除不必要的子查询包装，将t2子查询(SELECT * FROM EMP ORDER BY SAL)直接改写为EMP表引用，将t3子查询(SELECT * FROM DEPT)直接改写为DEPT表引用，减少投影层级和中间结果集处理开销"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "考虑调整连接顺序，先对EMP表按SAL排序并LIMIT 10获取最小的10条记录，再与DEPT表进行Hash Join，可将Nested Loop的处理行数从4500万降低到10行，大幅降低连接代价(当前64.4%)"
+            }
+        ]
+    },
+    {
+        "id": 8,
+        "original_query": "SELECT * FROM (SELECT * FROM EMP WHERE DEPTNO = EMPNO) AS t1 INNER JOIN DEPT AS DEPT0 ON t1.DEPTNO = DEPT0.DEPTNO",
+        "rewritten_query": "SELECT EMP.empno, EMP.deptno, EMP.ename, EMP.job, EMP.mgr, EMP.hiredate, EMP.sal, EMP.comm, EMP.slacker, DEPT0.deptno, DEPT0.name\nFROM EMP\nINNER JOIN DEPT AS DEPT0 ON EMP.DEPTNO = DEPT0.DEPTNO\nWHERE EMP.DEPTNO = EMP.EMPNO AND DEPT0.DEPTNO = EMP.EMPNO",
+        "original_costs": 739280.2,
+        "rewrite_costs": 739280.2,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "FILTER_REDUCE_EXPRESSIONS",
+            "PROJECT_REMOVE",
+            "JOIN_PUSH_TRANSITIVE_PREDICATES"
+        ],
+        "time_cost": 69.28058767318726,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将子查询中的过滤条件'DEPTNO = EMPNO'识别为自引用等值条件,可利用emp表主键索引emp_pkey(empno)加速。建议改写为Index Scan方式:先通过empno索引定位,再验证deptno=empno条件,避免4500万行全表扫描"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "消除冗余投影:子查询t1和外层查询都使用SELECT *,导致emp表所有列在多层传递。根据最终JOIN条件(t1.DEPTNO = DEPT0.DEPTNO),应在子查询中仅投影必要列(至少包含DEPTNO和JOIN后需要的列),减少Hash Join的内存消耗和数据传输开销"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "优化JOIN顺序和方式:当前先过滤emp(4500万行)再与dept(45万行)做Hash Join。由于过滤条件'DEPTNO=EMPNO'选择性极高,且dept表较小,可考虑先让dept表与emp做Nested Loop Index Join(利用emp_pkey),或将过滤条件改写为EXISTS子查询形式,让优化器选择更优执行路径"
+            }
+        ]
+    },
+    {
+        "id": 9,
+        "original_query": "SELECT t2.EMPNO, t2.ENAME, t2.JOB, t2.MGR, t2.HIREDATE, t2.SAL, t2.COMM, t2.DEPTNO, t2.SLACKER, t3.DEPTNO AS DEPTNO0, t3.NAME FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS t2 LEFT JOIN (SELECT * FROM DEPT) AS t3 ON t2.DEPTNO = t3.DEPTNO ORDER BY t2.SAL FETCH NEXT 10 ROWS ONLY",
+        "rewritten_query": "SELECT emp.EMPNO, emp.ENAME, emp.JOB, emp.MGR, emp.HIREDATE, emp.SAL, emp.COMM, emp.DEPTNO, emp.SLACKER, dept.DEPTNO AS DEPTNO0, dept.NAME\nFROM EMP\nLEFT JOIN DEPT ON emp.DEPTNO = dept.DEPTNO\nORDER BY emp.SAL\nFETCH NEXT 10 ROWS ONLY",
+        "original_costs": 1062273.19,
+        "rewrite_costs": 1452006.13,
+        "costs_reduction_rate": -36.69,
+        "rewrite_rules": [
+            "PROJECT_MERGE",
+            "SORT_REMOVE",
+            "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER"
+        ],
+        "time_cost": 165.74122023582458,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除内层派生表t2的独立排序和FETCH子句。当前'(SELECT ... FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS t2'强制优化器在子查询内完成排序，导致全表扫描+Sort。应展平为直接引用EMP表，将排序和LIMIT统一到外层：'SELECT emp.EMPNO, emp.ENAME, ... FROM EMP LEFT JOIN DEPT ... ORDER BY emp.SAL FETCH NEXT 10 ROWS ONLY'。这使优化器能延迟排序至JOIN后，或利用索引扫描(若sal有索引)直接获取TOP 10行，避免对4500万行全排序。"
+            },
+            {
+                "group": "排序优化",
+                "produced_suggestion": "消除双重排序冗余。当前内层't2: ORDER BY SAL FETCH 10'和外层'ORDER BY t2.SAL FETCH 10'语义重复，但优化器因子查询边界无法合并，导致执行两次排序逻辑(实际计划中体现为单次全表Sort但代价未优化)。展平子查询后，单一外层'ORDER BY emp.SAL FETCH 10'可触发优化器的Top-N Heap Sort或Index Scan+Limit策略，将Sort代价从452057.93降至接近0(若有sal索引)或显著降低(Top-N堆排序仅需O(N log 10)而非O(N log N))。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "调整JOIN执行时机，先对EMP表应用LIMIT再JOIN DEPT。当前计划隐含'全表扫描emp -> 排序 -> 取10行 -> JOIN dept'，但dept表45万行的JOIN发生在排序后。展平子查询后，优化器可选择'Index Scan on emp ORDER BY sal LIMIT 10 -> Nested Loop Join dept ON deptno'，使JOIN仅处理10行而非全表，dept表的dept_pkey索引可用于高效查找，JOIN代价从O(4500万)降至O(10)。若无sal索引，至少确保Sort后立即LIMIT再JOIN，避免不必要的大表关联。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "保持当前投影裁剪(t3仅SELECT DEPTNO, NAME)，但需确认展平后列引用正确。去除派生表t2和t3后，直接引用'emp.EMPNO, emp.ENAME, ..., dept.DEPTNO AS DEPTNO0, dept.NAME'，避免额外投影层。当前t3的列裁剪已优化(dept表仅3列且仅用2列)，重写后需保持此优化，确保dept表扫描或索引查找仅涉及必要列，减少I/O开销。"
+            }
+        ]
+    },
+    {
+        "id": 10,
+        "original_query": "SELECT SUM(100) OVER (PARTITION BY DEPTNO, SAL ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL1, SUM(100) OVER (PARTITION BY SAL ORDER BY DEPTNO RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL2, SUM(SAL) OVER (PARTITION BY DEPTNO ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL3 FROM EMP WHERE SAL = 5000",
+        "rewritten_query": "SELECT\n  100 * COUNT(*) OVER (PARTITION BY DEPTNO, SAL ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL1,\n  100 * COUNT(*) OVER (PARTITION BY SAL ORDER BY DEPTNO RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL2,\n  SUM(SAL) OVER (PARTITION BY DEPTNO ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS COL3\nFROM EMP\nWHERE SAL = 5000",
+        "original_costs": 712964.51,
+        "rewrite_costs": 713196.11,
+        "costs_reduction_rate": -0.03,
+        "rewrite_rules": [
+            "WINDOW_REDUCE_EXPRESSIONS"
+        ],
+        "time_cost": 58.304320335388184,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "常量折叠",
+                "produced_suggestion": "窗口函数SUM(100) OVER (...)中的常量100可以预计算优化。由于SUM(100)在窗口内累加常量，结果等于100*COUNT(*)。建议将COL1改写为100 * COUNT(*) OVER (PARTITION BY DEPTNO, SAL ORDER BY SAL RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)，将COL2改写为100 * COUNT(*) OVER (PARTITION BY SAL ORDER BY DEPTNO RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)，减少聚合函数计算开销。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "WHERE SAL=5000是高选择性过滤条件，但因缺少SAL索引导致全表扫描。在查询重写层面，确保该谓词尽早应用。同时检查是否可以利用分区裁剪或其他优化手段。若SAL列存在NULL值，可显式添加SAL IS NOT NULL以辅助优化器生成更优执行计划。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "查询仅需要DEPTNO、SAL两列用于窗口分区和排序，以及SAL用于聚合计算。确保SELECT子句中不包含多余列，避免不必要的数据传输。当前查询已较为精简，但需确认窗口函数计算中是否可以进一步减少中间结果集大小。"
+            },
+            {
+                "group": "排序优化",
+                "produced_suggestion": "三个窗口函数使用了不同的PARTITION BY和ORDER BY组合，可能导致多次排序操作。分析窗口函数执行顺序：COL1和COL3使用相同分区(DEPTNO, SAL)和排序(SAL)，可以共享排序结果；COL2使用不同分区(SAL)和排序(DEPTNO)。建议调整窗口函数顺序，将相同分区排序的窗口函数相邻放置，帮助优化器识别排序复用机会，减少排序开销。"
+            }
+        ]
+    },
+    {
+        "id": 11,
+        "original_query": "SELECT t0.JOB FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A') AS t0 FULL JOIN (SELECT DEPTNO, NAME, DEPTNO + 5 AS f2 FROM DEPT) AS t1 ON t0.JOB = t1.NAME AND t0.f9 = t1.f2 GROUP BY t0.JOB",
+        "rewritten_query": "SELECT t0_agg.JOB FROM (SELECT JOB, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A' GROUP BY JOB, DEPTNO + EMPNO) AS t0_agg FULL JOIN (SELECT DEPTNO + 5 AS f2, NAME FROM DEPT) AS t1 ON t0_agg.JOB = t1.NAME AND t0_agg.f9 = t1.f2 GROUP BY t0_agg.JOB",
+        "original_costs": 716062.21,
+        "rewrite_costs": 714403.85,
+        "costs_reduction_rate": 0.23,
+        "rewrite_rules": [
+            "PROJECT_JOIN_TRANSPOSE",
+            "JOIN_PROJECT_LEFT_TRANSPOSE_INCLUDE_OUTER",
+            "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"
+        ],
+        "time_cost": 169.4942328929901,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "连接优化",
+                "produced_suggestion": "将 FULL JOIN 改写为 LEFT JOIN：由于 t0 子查询有强过滤条件 ENAME='A'（选择性极高），右表 t1 的 NULL 扩展行对最终 GROUP BY t0.JOB 无贡献（t0.JOB 为 NULL 时会被分组但无实际意义）。改为 LEFT JOIN 可减少优化器复杂度并为后续优化铺路"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "对 t0 子查询进行列裁剪：当前 t0 保留了 emp 表的所有列（EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER），但实际只需要 JOB（用于 GROUP BY 和投影）、DEPTNO 和 EMPNO（用于计算 f9=DEPTNO+EMPNO）。裁剪后可减少数据传输和内存占用"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "将 GROUP BY t0.JOB 前置到连接之前：在 t0 子查询内部先对 JOB 去重（SELECT DISTINCT JOB, DEPTNO+EMPNO AS f9 FROM EMP WHERE ENAME='A'），可大幅减少参与连接的数据量。由于 ENAME='A' 过滤后数据量已很小，且 JOB 重复度可能较高，提前去重可显著降低连接代价"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "简化连接条件中的计算列表达式：当前连接条件 t0.f9 = t1.f2（即 DEPTNO+EMPNO = DEPTNO+5）可简化为 EMPNO=5（当 t0.DEPTNO = t1.DEPTNO 时）。若统计信息显示 EMPNO=5 的选择性极高，可考虑将此条件下推到 t0 子查询的 WHERE 子句中，进一步减少数据量"
+            }
+        ]
+    },
+    {
+        "id": 12,
+        "original_query": "SELECT t6.NAME FROM (SELECT JOB FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t5 LEFT JOIN (SELECT NAME FROM DEPT GROUP BY NAME) AS t6 ON t5.JOB = t6.NAME GROUP BY t6.NAME",
+        "rewritten_query": "SELECT t6.NAME FROM (SELECT DISTINCT e.JOB FROM EMP e WHERE e.ENAME = 'A') AS t5 LEFT JOIN (SELECT DISTINCT d.NAME FROM DEPT d) AS t6 ON t5.JOB = t6.NAME GROUP BY t6.NAME",
+        "original_costs": 712518.36,
+        "rewrite_costs": 712518.3,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE",
+            "PROJECT_JOIN_REMOVE"
+        ],
+        "time_cost": 87.74093341827393,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除冗余的GROUP BY操作：子查询t5中'SELECT JOB FROM EMP WHERE ENAME='A' GROUP BY JOB'可以改写为'SELECT DISTINCT JOB FROM EMP WHERE ENAME='A''或直接去除GROUP BY(如果JOB本身具有唯一性约束)；子查询t6中'SELECT NAME FROM DEPT GROUP BY NAME'同样可以使用DISTINCT替代或去除(如果NAME是唯一列)；外层的GROUP BY t6.NAME在LEFT JOIN后可能是冗余的，需要根据业务语义判断是否可以消除"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "简化投影和连接结构：当前SQL通过LEFT JOIN连接两个聚合子查询后再次GROUP BY，可以考虑将子查询展开，直接在主查询中进行去重操作，减少中间物化开销。例如改写为'SELECT DISTINCT d.NAME FROM EMP e LEFT JOIN DEPT d ON e.JOB = d.NAME WHERE e.ENAME='A''，消除不必要的子查询嵌套"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "针对EMP表的全表扫描问题，虽然当前没有ENAME列的索引，但可以通过谓词下推确保过滤条件尽早生效。如果ENAME列选择性高(过滤后行数少)，建议在物理优化阶段考虑为ENAME列创建索引。在查询重写层面，确保WHERE条件不被子查询或聚合操作阻碍其下推"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "评估LEFT JOIN的必要性：如果业务逻辑允许，可以将LEFT JOIN改为INNER JOIN(当t6.NAME不为NULL时)，这样可以减少连接开销并可能启用更高效的连接算法。同时，由于t5子查询只选择JOB列用于连接，而t6子查询选择NAME列，连接条件't5.JOB = t6.NAME'暗示JOB和NAME之间存在关联关系，可以考虑直接关联原表而非聚合后的子查询"
+            }
+        ]
+    },
+    {
+        "id": 13,
+        "original_query": "SELECT t8.NAME FROM (SELECT JOB, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A' GROUP BY JOB, DEPTNO + EMPNO) AS t6 LEFT JOIN (SELECT NAME, DEPTNO + 5 AS f2 FROM DEPT GROUP BY NAME, DEPTNO + 5) AS t8 ON t6.JOB = t8.NAME AND t6.f9 = t8.f2 GROUP BY t8.NAME",
+        "rewritten_query": "SELECT t8.NAME\nFROM (\n  SELECT JOB, DEPTNO + EMPNO AS f9\n  FROM EMP\n  WHERE ENAME = 'A'\n) AS t6\nLEFT JOIN (\n  SELECT NAME, DEPTNO + 5 AS f2\n  FROM DEPT\n) AS t8\nON t6.JOB = t8.NAME AND t6.f9 = t8.f2\nGROUP BY t8.NAME",
+        "original_costs": 753256.34,
+        "rewrite_costs": 715573.74,
+        "costs_reduction_rate": 5.0,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE"
+        ],
+        "time_cost": 59.700748682022095,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除子查询t6中的冗余GROUP BY：由于EMP表按EMPNO主键唯一，表达式DEPTNO+EMPNO天然唯一，与JOB组合的GROUP BY不会产生聚合效果，可直接改写为SELECT JOB, DEPTNO+EMPNO AS f9 FROM EMP WHERE ENAME='A'，消除Aggregate算子减少5.2%代价"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除子查询t8中的冗余GROUP BY：DEPT表若DEPTNO为主键则DEPTNO+5唯一，与NAME组合的GROUP BY同样冗余，可改写为SELECT NAME, DEPTNO+5 AS f2 FROM DEPT，进一步减少聚合开销"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除最外层冗余GROUP BY：LEFT JOIN后对右表单列t8.NAME进行GROUP BY无聚合语义(无聚合函数)，等价于DISTINCT效果但代价更高，可改写为SELECT DISTINCT t8.NAME或直接去除GROUP BY依赖JOIN结果集特性"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "针对emp表全表扫描瓶颈(93.3%代价)：虽然ENAME='A'过滤条件已下推，但缺少索引支持导致Seq Scan，建议在查询重写层面确认过滤条件最优位置，为后续物理优化(如创建ENAME索引)提供基础"
+            }
+        ]
+    },
+    {
+        "id": 14,
+        "original_query": "SELECT t6.JOB, t8.NAME FROM (SELECT JOB, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A' GROUP BY JOB, DEPTNO + EMPNO) AS t6 LEFT JOIN (SELECT NAME, DEPTNO + 5 AS f2 FROM DEPT GROUP BY NAME, DEPTNO + 5) AS t8 ON t6.JOB = t8.NAME AND t6.f9 = t8.f2 GROUP BY t6.JOB, t8.NAME",
+        "rewritten_query": "SELECT t6.JOB, t8.NAME\nFROM (\n  SELECT JOB, DEPTNO + EMPNO AS f9\n  FROM EMP\n  WHERE ENAME = 'A'\n) AS t6\nLEFT JOIN (\n  SELECT NAME, DEPTNO + 5 AS f2\n  FROM DEPT\n) AS t8\nON t6.JOB = t8.NAME AND t6.f9 = t8.f2\nGROUP BY t6.JOB, t8.NAME",
+        "original_costs": 753259.13,
+        "rewrite_costs": 715574.0,
+        "costs_reduction_rate": 5.0,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE"
+        ],
+        "time_cost": 73.20356369018555,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除冗余聚合层：子查询t6和t8的GROUP BY与外层GROUP BY存在冗余。由于外层已对t6.JOB和t8.NAME分组，可将子查询的GROUP BY移除或合并到外层，减少两次Aggregate操作的Pipeline Blocker开销(当前占比5.2%)"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "优化过滤条件以利用索引：ENAME='A'导致EMP表全表扫描(93.3%代价)。若ENAME列存在索引，确保过滤条件能命中；若无索引但EMPNO有索引(emp_pkey)，考虑是否可通过其他条件先缩小范围"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "列裁剪优化：子查询t6和t8中计算列f9(DEPTNO+EMPNO)和f2(DEPTNO+5)仅用于JOIN条件，可在JOIN时直接计算而非在子查询中预先GROUP BY，减少聚合键数量"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "简化LEFT JOIN逻辑：由于外层GROUP BY包含t8.NAME，若t8为空时NAME为NULL会被分组保留，可评估是否能转为INNER JOIN(若业务允许)以减少JOIN开销；同时JOIN条件中的计算列(t6.f9=t8.f2)应尽量提前过滤"
+            }
+        ]
+    },
+    {
+        "id": 15,
+        "original_query": "SELECT COUNT(C) FILTER (WHERE g_0_f_1), COUNT(D) FILTER (WHERE g_0_f_0) FROM (SELECT SAL > 1000 AS C, SAL < 500 AS D, GROUPING(SAL > 1000, SAL < 500) = 0 AND SAL > 1000 AS g_0_f_0, GROUPING(SAL > 1000, SAL < 500) = 0 AND SAL < 500 AS g_0_f_1 FROM EMP GROUP BY SAL > 1000, SAL < 500) AS t3",
+        "rewritten_query": "SELECT COUNT(*) FILTER (WHERE SAL > 1000), COUNT(*) FILTER (WHERE SAL < 500) FROM EMP",
+        "original_costs": 844507.34,
+        "rewrite_costs": 844506.03,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE",
+            "FILTER_REDUCE_EXPRESSIONS",
+            "PROJECT_MERGE"
+        ],
+        "time_cost": 86.85795593261719,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "消除冗余的布尔表达式计算。子查询中C和D分别计算SAL>1000和SAL<500，而g_0_f_0和g_0_f_1又重复使用这些条件。可以直接在WHERE子句中使用SAL条件，避免在每行上重复计算布尔表达式。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "简化GROUPING函数和FILTER子句的使用。当前SQL使用GROUPING函数判断分组集，但实际上GROUP BY SAL>1000, SAL<500会产生所有组合。可以直接使用条件聚合SUM(CASE WHEN...)替代FILTER子句，并消除GROUPING函数的开销。"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除不必要的子查询嵌套。当前外层查询仅对子查询结果进行简单聚合，可以将两层聚合合并为一层。直接在EMP表上使用条件聚合COUNT(CASE WHEN SAL>1000 THEN 1 END)和COUNT(CASE WHEN SAL<500 THEN 1 END)，避免子查询的物化开销和额外的Aggregate算子。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "优化GROUP BY表达式。当前GROUP BY使用布尔表达式(SAL>1000, SAL<500)会导致每行都需要计算表达式。由于最终只需要统计满足条件的行数，可以完全消除GROUP BY，直接在全表上进行条件计数，将Aggregate的Group Key开销降为零。"
+            }
+        ]
+    },
+    {
+        "id": 16,
+        "original_query": "SELECT * FROM (SELECT DEPTNO, NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT DEPTNO FROM EMP) AS t4 WHERE DEPTNO = t4.DEPTNO) ORDER BY DEPTNO) AS t3 ORDER BY DEPTNO OFFSET 2 ROWS FETCH NEXT 10 ROWS ONLY",
+        "rewritten_query": "SELECT * FROM (SELECT DEPTNO, NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT DEPTNO FROM EMP) AS t4 WHERE DEPTNO = t4.DEPTNO) ORDER BY DEPTNO) AS t3 ORDER BY DEPTNO OFFSET 2 ROWS FETCH NEXT 10 ROWS ONLY",
+        "original_costs": 0.82,
+        "rewrite_costs": 0.82,
+        "costs_reduction_rate": 0,
+        "rewrite_rules": null,
+        "time_cost": 106.3703715801239,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "回退 DISTINCT 子查询改写，恢复原始 EXISTS 半连接模式：WHERE EXISTS (SELECT 1 FROM EMP WHERE EMP.DEPTNO = DEPT.DEPTNO)。半连接在找到第一个匹配行后即停止，避免 DISTINCT 对 45M 行的全表聚合 (Aggregate 占比 57.6%)，大幅降低中间结果处理代价。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "EXISTS 子查询中的 DEPTNO IS NOT NULL 条件可省略，因为连接条件 EMP.DEPTNO = DEPT.DEPTNO 隐含非空约束（NULL 不参与等值匹配），减少显式过滤开销。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "若 emp 表在 deptno 列上有索引（当前索引信息仅显示 empno 主键），优化器可对 EXISTS 子查询使用 Index Scan 替代 Seq Scan (当前 32.6% 代价)；若无索引，半连接仍优于当前 DISTINCT + JOIN 的物化路径。"
+            },
+            {
+                "group": "排序优化",
+                "produced_suggestion": "保留 ORDER BY DEPT.DEPTNO，但利用 dept_pkey (btree on deptno) 的有序性，优化器可选择 Index Scan 提供预排序结果，消除顶层 Sort 算子 (2.4% 代价) 和 Gather Merge (6.2% 代价) 的排序开销。"
+            },
+            {
+                "group": "保护机制",
+                "produced_suggestion": "写入防护触发：重写 cost 增幅 39325706.1% 超过 1000%，输出已回退到原始 SQL。"
+            }
+        ]
+    },
+    {
+        "id": 17,
+        "original_query": "SELECT t0.SAL + t1.COMM, SUM(t1.EXPR0) OVER (PARTITION BY t1.JOB RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM (SELECT ENAME, SAL, DEPTNO = 10 AS EXPR0 FROM EMP) AS t0 INNER JOIN (SELECT ENAME, JOB, COMM, SAL + SAL + 100 AS EXPR0 FROM BONUS) AS t1 ON t0.ENAME = t1.ENAME AND t0.EXPR0",
+        "rewritten_query": "SELECT emp.SAL + bonus.COMM, SUM(bonus.SAL * 2 + 100) OVER (PARTITION BY bonus.JOB RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)\nFROM emp\nINNER JOIN bonus ON emp.ENAME = bonus.ENAME\nWHERE emp.DEPTNO = 10",
+        "original_costs": 1742336.96,
+        "rewrite_costs": 1742336.96,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "FILTER_INTO_JOIN",
+            "PROJECT_MERGE",
+            "PROJECT_REDUCE_EXPRESSIONS",
+            "JOIN_REDUCE_EXPRESSIONS"
+        ],
+        "time_cost": 72.47806525230408,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将子查询t0中的布尔表达式'DEPTNO = 10 AS EXPR0'改为WHERE条件过滤，避免在JOIN条件中使用布尔列。修正后：WHERE DEPTNO = 10，这样可以在emp表扫描时直接过滤，减少参与JOIN的数据量，并可能利用deptno索引。"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除不必要的派生表t0和t1，将过滤条件和计算表达式直接整合到主查询中。特别是t0子查询仅做简单投影和过滤，t1子查询的计算可以在SELECT列表中完成，避免子查询物化开销。"
+            },
+            {
+                "group": "常量折叠",
+                "produced_suggestion": "简化t1子查询中的冗余表达式'SAL + SAL + 100'为'2 * SAL + 100'或'SAL * 2 + 100'，减少重复计算开销。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "修正JOIN条件'ON t0.ENAME = t1.ENAME AND t0.EXPR0'，t0.EXPR0是布尔值且缺少比较运算符，应改为'AND t0.EXPR0 = TRUE'或直接移除该条件改用WHERE过滤。同时考虑在ENAME列上创建索引以优化Hash Join为Index Join。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "窗口函数'SUM(t1.EXPR0) OVER (PARTITION BY t1.JOB RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)'使用RANGE语义，可简化为'ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING'或直接省略ROWS子句（默认全窗口），减少排序和范围计算开销。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "检查SELECT列表中是否所有列都必需。t0.SAL和t1.COMM用于计算，t1.EXPR0用于窗口函数，t1.JOB用于分区，但可以通过列裁剪减少子查询中不必要的列投影（如t0中的ENAME仅用于JOIN）。"
+            }
+        ]
+    },
+    {
+        "id": 18,
+        "original_query": "SELECT t2.JOB, t2.MIN_SAL, t2.MIN_DEPTNO, CAST(t2.SUM_SAL_2 * t3.f1 AS INTEGER) + 1 AS SUM_SAL_PLUS, t2.MAX_SAL, CAST(t2.SUM_SAL_2 * t3.f1 AS INTEGER) AS SUM_SAL_2, t2.COUNT_SAL * t3.f1 AS COUNT_SAL, t2.COUNT_MGR * t3.f1 AS COUNT_MGR FROM (SELECT JOB, MIN(SAL) AS MIN_SAL, MIN(DEPTNO) AS MIN_DEPTNO, SUM(SAL) AS SUM_SAL_2, MAX(SAL) AS MAX_SAL, COUNT(*) AS COUNT_SAL, COUNT(MGR) AS COUNT_MGR FROM EMP GROUP BY JOB) AS t2 INNER JOIN (SELECT NAME, COUNT(*) AS f1 FROM DEPT GROUP BY NAME) AS t3 ON t2.JOB = t3.NAME",
+        "rewritten_query": "SELECT t2.JOB, t2.MIN_SAL, t2.MIN_DEPTNO, CAST(t2.SUM_SAL_2 * t3.f1 AS INTEGER) + 1 AS SUM_SAL_PLUS, t2.MAX_SAL, CAST(t2.SUM_SAL_2 * t3.f1 AS INTEGER) AS SUM_SAL_2, t2.COUNT_SAL * t3.f1 AS COUNT_SAL, t2.COUNT_MGR * t3.f1 AS COUNT_MGR FROM (SELECT JOB, MIN(SAL) AS MIN_SAL, MIN(DEPTNO) AS MIN_DEPTNO, SUM(SAL) AS SUM_SAL_2, MAX(SAL) AS MAX_SAL, COUNT(*) AS COUNT_SAL, COUNT(MGR) AS COUNT_MGR FROM EMP GROUP BY JOB) AS t2 INNER JOIN (SELECT NAME, COUNT(*) AS f1 FROM DEPT GROUP BY NAME) AS t3 ON t2.JOB = t3.NAME",
+        "original_costs": 1015519.63,
+        "rewrite_costs": 1015519.63,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "PROJECT_REDUCE_EXPRESSIONS",
+            "AGGREGATE_REDUCE_FUNCTIONS"
+        ],
+        "time_cost": 91.71964955329895,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "连接优化",
+                "produced_suggestion": "检查t2.JOB = t3.NAME的关联逻辑是否合理。如果JOB和NAME字段语义不匹配（职位vs部门名称），这可能是错误的关联条件，会导致笛卡尔积或错误结果。建议验证业务逻辑，若需关联应使用正确的外键字段（如DEPTNO）。若确实需要此关联，考虑添加过滤条件或使用SEMI JOIN减少数据量。"
+            },
+            {
+                "group": "常量折叠",
+                "produced_suggestion": "表达式CAST(t2.SUM_SAL_2 * t3.f1 AS INTEGER)在SELECT中出现两次（SUM_SAL_PLUS和SUM_SAL_2列），可通过CTE或子查询预计算该表达式，避免重复计算。同时，t2.COUNT_SAL * t3.f1和t2.COUNT_MGR * t3.f1也可预先计算，减少投影层的计算开销。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "t3子查询对dept表按NAME分组仅计算COUNT(*)，而dept表只有45万行。若NAME基数较低，可考虑将t3的聚合结果物化为临时表或CTE，避免在JOIN时重复计算。同时检查dept.NAME字段是否有索引，若无且基数高，建议添加索引以加速分组聚合。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "emp表全表扫描代价极高（4500万行）。检查是否可以在t2子查询中添加WHERE条件过滤无效数据（如JOB IS NOT NULL、SAL > 0等），或根据业务逻辑限定时间范围、部门范围等，减少参与聚合的数据量。若JOB字段选择性高，考虑添加JOB字段索引以支持索引扫描+分组。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "最外层SELECT包含多个计算列（SUM_SAL_PLUS、SUM_SAL_2、COUNT_SAL、COUNT_MGR），其中部分列使用相同的中间结果。可通过CTE将t2和t3的JOIN结果及共享表达式提前计算，然后在最外层仅做简单投影，减少重复计算和数据传输开销。"
+            }
+        ]
+    },
+    {
+        "id": 19,
+        "original_query": "SELECT EMP0.ENAME FROM (SELECT * FROM EMP WHERE ENAME = 'A') AS t0 LEFT JOIN EMP AS EMP0 ON t0.JOB = EMP0.JOB GROUP BY EMP0.ENAME",
+        "rewritten_query": "SELECT EMP0.ENAME FROM EMP LEFT JOIN EMP AS EMP0 ON EMP.JOB = EMP0.JOB WHERE EMP.ENAME = 'A' GROUP BY EMP0.ENAME",
+        "original_costs": 1829039.55,
+        "rewrite_costs": 1829039.55,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "PROJECT_MERGE",
+            "FILTER_AGGREGATE_TRANSPOSE",
+            "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER"
+        ],
+        "time_cost": 82.07452416419983,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除派生表t0，将子查询条件ENAME='A'直接合并到主查询中。由于t0仅用于JOIN条件t0.JOB=EMP0.JOB，可将其展开为EMP表的直接引用，避免子查询物化开销。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "将LEFT JOIN转换为INNER JOIN。因为GROUP BY EMP0.ENAME会自动过滤掉EMP0.ENAME为NULL的行（LEFT JOIN未匹配情况），LEFT JOIN的语义等价于INNER JOIN，转换后可减少中间结果集并启用更多连接算法选择。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将过滤条件ENAME='A'下推到EMP表的基表扫描层，并考虑在JOB列上添加等值连接条件的索引提示。当前Filter在Seq Scan中执行，若能在索引扫描阶段过滤可大幅减少扫描行数（从45000000行降至满足条件的少量行）。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "优化列投影，仅保留必需列。子查询t0中SELECT *获取了所有列但实际只需JOB列用于连接，可改为SELECT JOB减少数据传输量；最终投影也仅需EMP0.ENAME，可在早期阶段裁剪无关列。"
+            }
+        ]
+    },
+    {
+        "id": 20,
+        "original_query": "SELECT t0.JOB FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A') AS t0 LEFT JOIN (SELECT DEPTNO, NAME, DEPTNO + 5 AS f2 FROM DEPT) AS t1 ON t0.JOB = t1.NAME AND t0.f9 = t1.f2 GROUP BY t0.JOB",
+        "rewritten_query": "SELECT t0.JOB FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A') AS t0 LEFT JOIN (SELECT DEPTNO, NAME, DEPTNO + 5 AS f2 FROM DEPT) AS t1 ON t0.JOB = t1.NAME AND t0.f9 = t1.f2 GROUP BY t0.JOB",
+        "original_costs": 715573.74,
+        "rewrite_costs": 715573.74,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": null,
+        "time_cost": 91.54079985618591,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": []
+    },
+    {
+        "id": 21,
+        "original_query": "SELECT t0.SAL FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, SLACKER, SAL AS SAL0, SAL = 4 AS f9 FROM EMPNULLABLES WHERE DEPTNO = 20 AND SAL > 1000) AS t0 INNER JOIN (SELECT t2.SAL, t5.SAL AS SAL0, t5.f9 FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, SLACKER FROM EMPNULLABLES WHERE DEPTNO = 20 AND SAL > 1000) AS t2 INNER JOIN (SELECT SAL, SAL = 4 AS f9 FROM EMPNULLABLES WHERE DEPTNO = 20 AND SAL > 1000 GROUP BY SAL, SAL = 4) AS t5 ON t2.SAL = t5.SAL OR t5.f9 GROUP BY t2.SAL, t5.SAL, t5.f9 HAVING t5.SAL = t2.SAL) AS t8 ON t0.SAL = t8.SAL0 AND t0.f9 = t8.f9",
+        "rewritten_query": "WITH base_data AS (\n  SELECT SAL, SAL = 4 AS f9\n  FROM EMPNULLABLES\n  WHERE DEPTNO = 20 AND SAL > 1000\n),\nagg_data AS (\n  SELECT SAL, f9\n  FROM base_data\n  GROUP BY SAL, f9\n)\nSELECT t0.SAL\nFROM base_data AS t0\nINNER JOIN (\n  SELECT t2.SAL AS SAL0, t5.f9\n  FROM base_data AS t2\n  INNER JOIN agg_data AS t5\n    ON t2.SAL = t5.SAL OR t5.f9\n  GROUP BY t2.SAL, t5.SAL, t5.f9\n  HAVING t5.SAL = t2.SAL\n) AS t8\n  ON t0.SAL = t8.SAL0 AND t0.f9 = t8.f9",
+        "original_costs": 2240072.17,
+        "rewrite_costs": 746675.49,
+        "costs_reduction_rate": 66.67,
+        "rewrite_rules": [
+            "STRATEGY_CTE_DECOMPOSITION",
+            "PROJECT_JOIN_TRANSPOSE"
+        ],
+        "time_cost": 56.95724940299988,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "将重复扫描empnullables表的3个子查询(t0、t2、t5)合并为单次CTE扫描，避免对4500万行表的重复全表扫描。使用WITH子句定义base_data AS (SELECT EMPNO, SAL, SAL=4 AS f9 FROM EMPNULLABLES WHERE DEPTNO=20 AND SAL>1000)，然后在主查询中复用该CTE"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "消除冗余列投影：1) t0子查询中EMPNO、ENAME、JOB、MGR、HIREDATE、COMM、SLACKER等列未被使用，仅需保留SAL和f9；2) t2子查询同样存在大量未使用列；3) 简化投影可减少数据传输和内存占用"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "简化冗余连接逻辑：1) t5的GROUP BY结果与t2进行JOIN后又在HAVING中重复过滤t5.SAL=t2.SAL，该条件已被JOIN ON覆盖，可消除HAVING子句；2) 分析JOIN条件't2.SAL=t5.SAL OR t5.f9'的语义，若f9恒为布尔值，可简化连接条件；3) 最外层JOIN的条件t0.SAL=t8.SAL0实际是SAL的自连接，可通过谓词传递简化"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "优化t5子查询的GROUP BY：当前按(SAL, SAL=4)分组，由于SAL=4是SAL的派生列，分组结果可预测。若SAL=4则f9=true只有1组，SAL≠4则f9=false按SAL分组。可考虑将GROUP BY下推或改写为DISTINCT来简化聚合逻辑"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "统一过滤条件下推：所有子查询都使用相同的WHERE条件(DEPTNO=20 AND SAL>1000)，应在CTE层面统一应用该过滤，避免在多个子查询中重复定义。同时检查是否可以利用empnullables表上的索引(当前仅有主键索引empnullables_pkey)来加速过滤"
+            }
+        ]
+    },
+    {
+        "id": 22,
+        "original_query": "SELECT SUM(CAST(t3.f1 * t4.SAL AS INTEGER)) FROM (SELECT SAL, COUNT(*) AS f1 FROM EMP GROUP BY SAL) AS t3 INNER JOIN (SELECT SAL FROM EMP GROUP BY SAL) AS t4 ON t3.SAL = t4.SAL",
+        "rewritten_query": "SELECT SUM(CAST(f1 * SAL AS INTEGER))\nFROM (\n  SELECT SAL, COUNT(*) AS f1\n  FROM EMP\n  GROUP BY SAL\n) AS t3",
+        "original_costs": 1455258.1,
+        "rewrite_costs": 751074.48,
+        "costs_reduction_rate": 48.39,
+        "rewrite_rules": [
+            "AGGREGATE_JOIN_REMOVE"
+        ],
+        "time_cost": 37.023082971572876,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "连接优化",
+                "produced_suggestion": "消除冗余的自连接：t4子查询(SELECT SAL FROM EMP GROUP BY SAL)与t3的JOIN条件ON t3.SAL=t4.SAL构成冗余自连接，因为t3已经按SAL分组，其SAL值必然唯一且存在。可直接移除t4子查询和JOIN操作，将SQL简化为SELECT SUM(CAST(t3.f1 * t3.SAL AS INTEGER)) FROM (SELECT SAL, COUNT(*) AS f1 FROM EMP GROUP BY SAL) AS t3"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除冗余聚合层：移除t4的GROUP BY SAL聚合操作后，可进一步简化子查询结构，直接在主查询中完成聚合计算，减少中间物化开销"
+            }
+        ]
+    },
+    {
+        "id": 23,
+        "original_query": "SELECT CASE WHEN COALESCE(SUM(t5.f2 * t6.f1), 0) = 0 THEN NULL ELSE COALESCE(SUM(CAST(t5.EXPR0 * t6.f1 AS INTEGER)), 0) END FROM (SELECT JOB, COALESCE(SUM(SAL), 0) AS EXPR0, COUNT(*) AS f2 FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t5 INNER JOIN (SELECT NAME, COUNT(*) AS f1 FROM DEPT GROUP BY NAME) AS t6 ON t5.JOB = t6.NAME",
+        "rewritten_query": "SELECT CASE WHEN SUM(t5.f2 * t6.f1) = 0 THEN NULL ELSE SUM(t5.EXPR0 * t6.f1) END\nFROM (\n  SELECT JOB, SUM(SAL) AS EXPR0, COUNT(*) AS f2\n  FROM EMP\n  WHERE ENAME = 'A'\n  GROUP BY JOB\n) AS t5\nINNER JOIN (\n  SELECT NAME, COUNT(*) AS f1\n  FROM DEPT\n  GROUP BY NAME\n) AS t6 ON t5.JOB = t6.NAME",
+        "original_costs": 714064.17,
+        "rewrite_costs": 714063.93,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "FILTER_REDUCE_EXPRESSIONS",
+            "PROJECT_REDUCE_EXPRESSIONS",
+            "AGGREGATE_REDUCE_FUNCTIONS"
+        ],
+        "time_cost": 91.41955089569092,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "将子查询t5的过滤条件ENAME='A'保留在子查询内，但考虑将GROUP BY JOB的聚合结果与t6的JOIN条件提前评估。若t6结果集较小，可先物化t6再与emp表JOIN后聚合，避免对emp全表先聚合再JOIN的低效模式。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "简化CASE WHEN逻辑：当前逻辑为'若SUM(t5.f2*t6.f1)=0则NULL，否则返回SUM(CAST(t5.EXPR0*t6.f1 AS INTEGER))'。由于t5.f2是COUNT(*)必然>=0，t6.f1也是COUNT(*)>=0，若SUM=0说明JOIN结果为空，此时两个SUM都为0。可简化为：NULLIF(SUM(CAST(t5.EXPR0*t6.f1 AS INTEGER)), 0)，减少一层COALESCE嵌套。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "子查询t6对dept表按NAME分组计数，而JOIN条件是t5.JOB=t6.NAME。若dept.NAME与emp.JOB存在外键关系或可提前过滤，建议先对dept表WHERE NAME IN (SELECT DISTINCT JOB FROM emp WHERE ENAME='A')，减少t6聚合结果集，降低JOIN代价。"
+            },
+            {
+                "group": "常量折叠",
+                "produced_suggestion": "COALESCE(SUM(SAL), 0)中，若emp表WHERE ENAME='A'结果为空，SUM(SAL)返回NULL，COALESCE转为0。但外层CASE WHEN已处理空集情况，可将内层COALESCE改为SUM(COALESCE(SAL,0))，将NULL值处理下推到聚合前，减少聚合后的NULL判断开销。"
+            }
+        ]
+    },
+    {
+        "id": 24,
+        "original_query": "SELECT * FROM (SELECT DEPT.DEPTNO, DEPT.NAME FROM DEPT INNER JOIN (SELECT DEPTNO FROM EMP GROUP BY DEPTNO) AS t0 ON DEPT.DEPTNO = t0.DEPTNO) AS t1 WHERE t1.DEPTNO <= 10",
+        "rewritten_query": "SELECT DEPT.DEPTNO, DEPT.NAME\nFROM DEPT\nWHERE DEPT.DEPTNO <= 10\n  AND EXISTS (\n    SELECT 1\n    FROM EMP\n    WHERE EMP.DEPTNO = DEPT.DEPTNO\n      AND EMP.DEPTNO <= 10\n  )",
+        "original_costs": 1991626.46,
+        "rewrite_costs": 704351.19,
+        "costs_reduction_rate": 64.63,
+        "rewrite_rules": [
+            "JOIN_TO_CORRELATE",
+            "JOIN_PUSH_TRANSITIVE_PREDICATES"
+        ],
+        "time_cost": 55.23389649391174,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将外层WHERE条件t1.DEPTNO<=10下推到DEPT表和EMP表，利用传递性在JOIN前过滤数据。具体：在DEPT表上添加WHERE DEPT.DEPTNO<=10，在EMP的GROUP BY子查询中添加WHERE DEPTNO<=10，减少聚合前的数据量从4500万行降至满足条件的少量行"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "利用JOIN条件的传递性优化：由于DEPT.DEPTNO=t0.DEPTNO且t1.DEPTNO<=10，可推导出t0.DEPTNO<=10和DEPT.DEPTNO<=10。将这些条件下推到各自数据源，使JOIN前数据集大幅缩小，避免对4500万行EMP数据进行全量GROUP BY"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "在EMP的GROUP BY子查询中添加WHERE DEPTNO<=10过滤条件，将聚合范围从全表4500万行缩减到仅满足DEPTNO<=10的行。这样可以显著降低Aggregate算子58.2%的代价消耗，并可能利用DEPTNO上的索引避免全表扫描"
+            }
+        ]
+    },
+    {
+        "id": 25,
+        "original_query": "SELECT t0.SAL + t1.COMM FROM (SELECT ENAME, SAL, DEPTNO = 10 AS EXPR0 FROM EMP) AS t0 INNER JOIN (SELECT ENAME, COMM FROM BONUS) AS t1 ON t0.ENAME = t1.ENAME AND t0.EXPR0",
+        "rewritten_query": "SELECT emp.SAL + bonus.COMM\nFROM emp\nINNER JOIN bonus ON emp.ENAME = bonus.ENAME\nWHERE emp.DEPTNO = 10",
+        "original_costs": 1668466.7,
+        "rewrite_costs": 1668466.7,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "PROJECT_MERGE",
+            "FILTER_REDUCE_EXPRESSIONS",
+            "JOIN_REDUCE_EXPRESSIONS"
+        ],
+        "time_cost": 55.082738637924194,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除派生表t0和t1，将子查询展开为直接表引用，减少投影层开销。将SELECT子句中的计算(SAL+COMM)保留，但移除中间投影步骤。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将t0.EXPR0(即DEPTNO=10的布尔结果)从JOIN条件中移除，直接在WHERE子句中使用EMP.DEPTNO=10作为过滤条件，使过滤在JOIN之前执行。这样可以大幅减少参与JOIN的emp表数据量(从4500万行降至约450万行，假设10%选择率)。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "优化后的JOIN条件简化为EMP.ENAME=BONUS.ENAME，配合WHERE EMP.DEPTNO=10的提前过滤，可以显著降低Hash Join的构建和探测代价。如果ENAME列存在索引，优化器可能选择更高效的连接策略。"
+            }
+        ]
+    },
+    {
+        "id": 26,
+        "original_query": "SELECT t5.JOB FROM (SELECT JOB FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t5 FULL JOIN (SELECT NAME FROM DEPT GROUP BY NAME) AS t6 ON t5.JOB = t6.NAME GROUP BY t5.JOB",
+        "rewritten_query": "SELECT t5.JOB FROM (SELECT JOB FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t5 FULL JOIN (SELECT NAME FROM DEPT GROUP BY NAME) AS t6 ON t5.JOB = t6.NAME GROUP BY t5.JOB",
+        "original_costs": 715957.35,
+        "rewrite_costs": 715957.35,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE",
+            "FILTER_SUB_QUERY_TO_CORRELATE",
+            "JOIN_CONDITION_PUSH"
+        ],
+        "time_cost": 192.52300667762756,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除子查询t5的冗余GROUP BY JOB：外层已对t5.JOB分组，内层分组无意义。改写为SELECT JOB FROM EMP WHERE ENAME='A'（保留DISTINCT若需去重）。同时评估t6的GROUP BY NAME是否可用DISTINCT替代或依赖外层去重。"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "内联展开子查询避免物化开销：将t5和t6直接展开为主查询，改写为SELECT e.JOB FROM EMP e WHERE e.ENAME='A' AND EXISTS(SELECT 1 FROM DEPT d WHERE d.NAME=e.JOB) GROUP BY e.JOB，或保留JOIN但消除子查询边界。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "降级FULL JOIN为LEFT JOIN或半连接：t5结果集已被ENAME='A'过滤为小集合，FULL JOIN的右侧NULL扩展无实际意义（外层GROUP BY t5.JOB会过滤NULL）。改为LEFT JOIN (SELECT DISTINCT NAME FROM DEPT) t6 ON t5.JOB=t6.NAME，或用EXISTS/IN子查询替代。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "索引建议（配合改写）：在EMP(ENAME)或EMP(ENAME, JOB)上创建索引，消除Seq Scan瓶颈（当前占98.2%代价）。若ENAME选择性高，索引扫描可将代价从702,880降至数百以内。这是性能提升的关键前提。"
+            }
+        ]
+    },
+    {
+        "id": 27,
+        "original_query": "SELECT MIN(EXPR0) FILTER (WHERE g_3), COUNT(SAL) FILTER (WHERE g_0_f_1) FROM (SELECT SAL, SUM(COMM) AS EXPR0, GROUPING(SAL, SAL > 1000) = 0 AND SAL > 1000 IS TRUE AS g_0_f_1, GROUPING(SAL, SAL > 1000) = 3 AS g_3 FROM EMP GROUP BY GROUPING SETS((SAL, SAL > 1000), ())) AS t3",
+        "rewritten_query": "SELECT MIN(EXPR0) FILTER (WHERE g_3), COUNT(SAL) FILTER (WHERE g_0_f_1)\nFROM (\n  SELECT SAL, SUM(COMM) AS EXPR0,\n    GROUPING(SAL, SAL > 1000) = 0 AND SAL > 1000 AS g_0_f_1,\n    GROUPING(SAL, SAL > 1000) = 3 AS g_3\n  FROM EMP\n  GROUP BY GROUPING SETS((SAL, SAL > 1000), ())\n) AS t3",
+        "original_costs": 1481076.51,
+        "rewrite_costs": 1481076.51,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": null,
+        "time_cost": 88.00497555732727,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": []
+    },
+    {
+        "id": 28,
+        "original_query": "SELECT ENAME, SAL, DEPTNO FROM (SELECT ENAME, SAL, DEPTNO FROM EMP GROUP BY ENAME, SAL, DEPTNO HAVING SAL > 5000) AS t4 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)",
+        "rewritten_query": "SELECT ENAME, SAL, DEPTNO FROM (SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ENAME, SAL, DEPTNO) AS t4 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)",
+        "original_costs": 704418.16,
+        "rewrite_costs": 704418.16,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE",
+            "PROJECT_REMOVE"
+        ],
+        "time_cost": 188.8176236152649,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除内层冗余GROUP BY和派生表：将SQL重写为单层结构 'SELECT ENAME, SAL, DEPTNO FROM EMP WHERE SAL > 5000 GROUP BY ROLLUP(ENAME, SAL, DEPTNO)'。理由：内层子查询对(ENAME,SAL,DEPTNO)做GROUP BY后，外层再对相同列集做ROLLUP聚合，内层GROUP BY无实际去重或聚合意义（ROLLUP本身会处理所有分组组合）。消除派生表后，执行计划应从'Seq Scan → Group(内层) → Group(外层ROLLUP)'简化为'Seq Scan → Group(ROLLUP)'，减少一个Group/Aggregate节点，降低内存和CPU消耗。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "展开派生表消除冗余投影：当前SQL中派生表t4的SELECT列表(ENAME,SAL,DEPTNO)与外层查询完全一致，派生表引入了额外的投影层。简化为单层查询后，投影操作仅需执行一次，减少列传递开销。"
+            }
+        ]
+    },
+    {
+        "id": 29,
+        "original_query": "SELECT t6.JOB FROM (SELECT JOB, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A' GROUP BY JOB, DEPTNO + EMPNO) AS t6 FULL JOIN (SELECT NAME, DEPTNO + 5 AS f2 FROM DEPT GROUP BY NAME, DEPTNO + 5) AS t8 ON t6.JOB = t8.NAME AND t6.f9 = t8.f2 GROUP BY t6.JOB",
+        "rewritten_query": "SELECT t6.JOB FROM (SELECT JOB, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A' GROUP BY JOB, DEPTNO + EMPNO) AS t6 FULL JOIN (SELECT NAME, DEPTNO + 5 AS f2 FROM DEPT GROUP BY NAME, DEPTNO + 5) AS t8 ON t6.JOB = t8.NAME AND t6.f9 = t8.f2 GROUP BY t6.JOB",
+        "original_costs": 754320.39,
+        "rewrite_costs": 754320.39,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE"
+        ],
+        "time_cost": 73.88138556480408,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除冗余聚合：外层GROUP BY t6.JOB是多余的，因为t6子查询已经按JOB分组，且FULL JOIN后只选择t6.JOB列，外层聚合可直接移除。参考历史案例AGGREGATE_REMOVE规则。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "简化子查询聚合：t6子查询中GROUP BY包含JOB和计算列f9(DEPTNO+EMPNO)，但外层只使用JOB进行连接和投影，可考虑将f9的GROUP BY移除或调整聚合粒度，减少分组开销。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "评估FULL JOIN必要性：当前FULL JOIN连接条件包含计算列，且只投影t6.JOB。若业务逻辑允许，可转换为LEFT JOIN或INNER JOIN，减少连接代价。特别是t8子查询结果集较大(dept 45万行)，FULL JOIN会保留所有不匹配行。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "优化过滤条件：emp表ENAME='A'过滤导致全表扫描(93.2%代价)。虽然当前无ENAME索引，但可通过调整查询结构，将过滤条件与其他谓词合并，或考虑先过滤再参与复杂计算，减少后续操作的数据量。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "列裁剪优化：t8子查询选择NAME和f2(DEPTNO+5)，但连接后只用于匹配条件，最终投影不包含t8列。可评估是否需要t8的完整GROUP BY结果，或简化为半连接(EXISTS)形式。"
+            }
+        ]
+    },
+    {
+        "id": 30,
+        "original_query": "SELECT MGR, SUM(SUM_SAL) FROM (SELECT MGR, SUM(SAL) AS SUM_SAL FROM EMP GROUP BY MGR, DEPTNO HAVING DEPTNO = 100) AS t2 GROUP BY MGR",
+        "rewritten_query": "SELECT MGR, SUM(SAL) AS SUM_SAL\nFROM EMP\nWHERE DEPTNO = 100\nGROUP BY MGR",
+        "original_costs": 703897.34,
+        "rewrite_costs": 703894.56,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "FILTER_AGGREGATE_TRANSPOSE",
+            "AGGREGATE_MERGE"
+        ],
+        "time_cost": 55.968425273895264,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将HAVING子句中的deptno=100条件下推为WHERE条件，在聚合前过滤数据。由于HAVING条件仅涉及分组列且为等值判断，可安全下推，这样能利用索引（如果存在deptno索引）或至少减少参与聚合的数据量"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除冗余的两层聚合结构。当前内层按(MGR, DEPTNO)分组计算SUM(SAL)，外层再按MGR聚合求和。由于HAVING deptno=100限定了单一DEPTNO值，内层的DEPTNO分组维度冗余，可直接改写为单层聚合：SELECT MGR, SUM(SAL) FROM EMP WHERE DEPTNO=100 GROUP BY MGR，减少一次分组和聚合计算"
+            }
+        ]
+    },
+    {
+        "id": 31,
+        "original_query": "SELECT t5.ENAME FROM (SELECT ENAME, JOB FROM EMP WHERE ENAME = 'A' GROUP BY ENAME, JOB) AS t5 LEFT JOIN (SELECT NAME FROM DEPT GROUP BY NAME) AS t6 ON t5.JOB = t6.NAME GROUP BY t5.ENAME",
+        "rewritten_query": "SELECT t5.ENAME FROM (SELECT ENAME, JOB FROM EMP WHERE ENAME = 'A') AS t5 GROUP BY t5.ENAME",
+        "original_costs": 703896.79,
+        "rewrite_costs": 703880.32,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE",
+            "PROJECT_JOIN_REMOVE"
+        ],
+        "time_cost": 641.9711017608643,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除子查询t5中的冗余GROUP BY：由于WHERE ENAME='A'是等值过滤，GROUP BY ENAME, JOB可简化为仅对JOB去重(若需要)或直接移除聚合。同时消除最外层的GROUP BY t5.ENAME，因为t5.ENAME恒为'A'，无需分组。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除子查询t6中的冗余GROUP BY：t6仅投影NAME列并进行GROUP BY NAME，这等价于SELECT DISTINCT NAME。由于后续LEFT JOIN使用t5.JOB = t6.NAME，可将t6简化为SELECT DISTINCT NAME FROM DEPT，或在JOIN时直接使用DEPT表并通过DISTINCT或EXISTS优化。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "简化投影链：t5投影ENAME和JOB，但最外层只需要ENAME。由于ENAME='A'是常量，可将整个查询简化为：SELECT 'A' AS ENAME WHERE EXISTS (SELECT 1 FROM EMP WHERE ENAME='A') AND (SELECT JOB FROM EMP WHERE ENAME='A' LIMIT 1) IN (SELECT NAME FROM DEPT)，或进一步优化为常量返回。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "优化LEFT JOIN逻辑：当前LEFT JOIN t6后未使用t6的任何列，仅保留t5.ENAME。可将LEFT JOIN转换为半连接或EXISTS检查：SELECT DISTINCT ENAME FROM EMP WHERE ENAME='A' AND (JOB IN (SELECT NAME FROM DEPT) OR JOB IS NULL)，减少不必要的连接开销。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "针对ENAME='A'的全表扫描问题：虽然当前无ENAME索引，但可通过查询重写减少扫描范围。建议将多层嵌套展开为单层查询：SELECT 'A' AS ENAME FROM EMP WHERE ENAME='A' AND EXISTS(SELECT 1 FROM DEPT WHERE DEPT.NAME = EMP.JOB) LIMIT 1，利用短路逻辑和LIMIT减少扫描行数。"
+            }
+        ]
+    },
+    {
+        "id": 32,
+        "original_query": "SELECT COALESCE(SUM(t1.EXPR0 * t2.EXPR0), 0) FROM (SELECT JOB, COUNT(*) AS EXPR0 FROM EMP GROUP BY JOB) AS t1 INNER JOIN (SELECT NAME, COUNT(*) AS EXPR0 FROM DEPT GROUP BY NAME) AS t2 ON t1.JOB = t2.NAME",
+        "rewritten_query": "SELECT COALESCE(SUM(t1.cnt * t2.cnt), 0) FROM (SELECT job, COUNT(*) AS cnt FROM emp GROUP BY job) AS t1 INNER JOIN (SELECT name, COUNT(*) AS cnt FROM dept GROUP BY name) AS t2 ON t1.job = t2.name",
+        "original_costs": 779712.54,
+        "rewrite_costs": 779712.54,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "PROJECT_SUB_QUERY_TO_CORRELATE",
+            "AGGREGATE_JOIN_REMOVE",
+            "FILTER_AGGREGATE_TRANSPOSE"
+        ],
+        "time_cost": 170.99690413475037,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "连接优化",
+                "produced_suggestion": "消除两个派生表子查询，将连接前置到聚合之前：直接 FROM emp INNER JOIN dept ON emp.job = dept.name，利用dept小表(45万行)通过JOIN条件过滤emp大表(4500万行)，避免emp全量GROUP BY所有job值。连接后的结果集规模将远小于当前emp全表聚合的中间结果，降低后续聚合代价。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "改为'先连接后聚合'策略：在emp JOIN dept之后执行 GROUP BY emp.job, dept.name 进行COUNT统计，最后外层SUM聚合。目标结构：SELECT COALESCE(SUM(cnt), 0) FROM (SELECT COUNT(*) as cnt FROM emp INNER JOIN dept ON emp.job = dept.name GROUP BY emp.job, dept.name) AS t。这样聚合仅处理JOIN后的匹配行，而非当前两个子查询各自全量聚合再JOIN的模式，可消除emp表84.1%代价占比的全表扫描+全量分组瓶颈。"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "展开两个派生表子查询为单层查询，消除子查询物化开销。当前t1和t2各自独立聚合后JOIN，导致优化器无法跨子查询边界优化连接顺序和谓词下推。展开后可让优化器统一考虑emp和dept的连接策略，可能选择Hash Join或Nested Loop(若dept.name有索引)，并将连接条件emp.job = dept.name作为过滤条件提前应用，减少参与聚合的数据量。"
+            }
+        ]
+    },
+    {
+        "id": 33,
+        "original_query": "SELECT t6.JOB, CAST(t6.EXPR1 * t7.f1 AS INTEGER) FROM (SELECT JOB, SUM(SAL) AS EXPR1 FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t6 INNER JOIN (SELECT NAME, COUNT(*) AS f1 FROM DEPT GROUP BY NAME) AS t7 ON t6.JOB = t7.NAME",
+        "rewritten_query": "SELECT\n  emp.JOB,\n  CAST(SUM(emp.SAL) * dept_agg.f1 AS INTEGER)\nFROM\n  EMP emp\n  INNER JOIN (\n    SELECT\n      NAME,\n      COUNT(*) AS f1\n    FROM\n      DEPT\n    WHERE\n      NAME IS NOT NULL\n    GROUP BY\n      NAME\n  ) AS dept_agg ON emp.JOB = dept_agg.NAME\nWHERE\n  emp.ENAME = 'A'\n  AND emp.JOB IS NOT NULL\nGROUP BY\n  emp.JOB,\n  dept_agg.f1",
+        "original_costs": 714062.18,
+        "rewrite_costs": 714477.35,
+        "costs_reduction_rate": -0.06,
+        "rewrite_rules": [
+            "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE",
+            "JOIN_PUSH_TRANSITIVE_PREDICATES",
+            "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+            "PROJECT_MERGE",
+            "PROJECT_REDUCE_EXPRESSIONS"
+        ],
+        "time_cost": 104.27762937545776,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "emp表缺少ENAME列索引导致全表扫描，虽然无法通过重写添加索引，但可以考虑：1)如果ENAME='A'过滤后数据量极小，当前查询已较优；2)检查是否可以通过添加更严格的过滤条件(如结合其他列)来减少扫描行数；3)评估是否ENAME列存在大量重复值，若'A'占比极低则当前过滤有效"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "子查询t7对dept表执行COUNT(*) GROUP BY NAME，但dept表仅45万行且NAME可能重复度高。建议：1)检查NAME列是否为唯一键或候选键，若是则COUNT(*)恒为1可消除聚合；2)若NAME重复度低，考虑将t7子查询结果物化或改写为窗口函数；3)评估是否可以将t7的聚合逻辑与t6合并，避免两次独立子查询"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "INNER JOIN条件t6.JOB=t7.NAME存在潜在问题：1)JOB列来自emp表，NAME列来自dept表，两者关联的选择性未知；2)若JOB值在dept.NAME中不存在会被过滤，建议检查是否可以提前在t6中添加EXISTS子查询预过滤；3)考虑调整JOIN顺序，先执行小表t7(dept 45万行)的聚合，再与t6(emp过滤后)关联"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "t6子查询中SUM(SAL) GROUP BY JOB在ENAME='A'过滤后执行，若过滤结果集很小则聚合代价可接受。但可优化：1)检查是否存在JOB为NULL的情况，NULL值的GROUP BY行为可能影响结果；2)若ENAME='A'对应的JOB值唯一或极少，考虑用DISTINCT替代GROUP BY；3)评估SUM(SAL)是否可以与后续CAST合并计算"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "最外层SELECT仅需要t6.JOB和计算列CAST(t6.EXPR1*t7.f1 AS INTEGER)，但子查询可能投影了多余列。建议：1)确认t6和t7子查询是否只投影必需列(JOB/EXPR1和NAME/f1)；2)检查CAST运算是否可以在子查询内完成，避免外层重复计算；3)若t7.f1恒为常量(如COUNT(*)=1)，可以消除乘法运算"
+            }
+        ]
+    },
+    {
+        "id": 34,
+        "original_query": "SELECT NAME, CAST(SUM(CN) FILTER (WHERE g_1) AS BIGINT), CAST(SUM(SM) FILTER (WHERE g_2) AS INTEGER) FROM (SELECT NAME, CN, SM, GROUPING(NAME, CN, SM) = 1 AS g_1, GROUPING(NAME, CN, SM) = 2 AS g_2 FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t3 GROUP BY GROUPING SETS((NAME, CN), (NAME, SM))) AS t5 GROUP BY NAME",
+        "rewritten_query": "SELECT\n  NAME,\n  CAST(SUM(CASE WHEN grp_id = 1 THEN cnt END) AS BIGINT) AS col1,\n  CAST(SUM(CASE WHEN grp_id = 2 THEN sum_deptno END) AS INTEGER) AS col2\nFROM (\n  SELECT\n    NAME,\n    1 AS grp_id,\n    COUNT(*) AS cnt,\n    NULL AS sum_deptno\n  FROM DEPT\n  GROUP BY NAME\n  UNION ALL\n  SELECT\n    NAME,\n    2 AS grp_id,\n    NULL AS cnt,\n    SUM(DEPTNO) AS sum_deptno\n  FROM DEPT\n  GROUP BY NAME\n) AS unified\nGROUP BY NAME",
+        "original_costs": 14341.08,
+        "rewrite_costs": 11325.15,
+        "costs_reduction_rate": 21.03,
+        "rewrite_rules": [
+            "AGGREGATE_MERGE",
+            "PROJECT_MERGE",
+            "AGGREGATE_REDUCE_FUNCTIONS"
+        ],
+        "time_cost": 87.22241950035095,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "将三层嵌套聚合结构合并为单层聚合：当前SQL先对dept按NAME做COUNT/SUM聚合得到(NAME,CN,SM)，再对结果做GROUPING SETS展开，最外层再按NAME汇总。可以直接在原始dept表上使用GROUPING SETS((NAME),(NAME))或等价的单次GROUP BY NAME，同时计算COUNT(*)和SUM(DEPTNO)，消除中间子查询t3和t5的物化，减少3次Aggregate算子为1次，参考重写：SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME，然后直接在应用层或单层SQL中完成FILTER逻辑，避免多层嵌套带来的重复聚合开销。"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除多层嵌套子查询（t3、t5），将GROUPING SETS逻辑直接下推到原始表dept上执行。当前查询通过子查询t3预聚合后再展开GROUPING SETS，导致数据被多次扫描和物化。可以重写为：SELECT NAME, CAST(SUM(CASE WHEN GROUPING(NAME,CN,SM)=1 THEN CN END) AS BIGINT), CAST(SUM(CASE WHEN GROUPING(NAME,CN,SM)=2 THEN SM END) AS INTEGER) FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) t GROUP BY NAME，或进一步验证业务语义后直接将GROUPING SETS计算合并到最底层，减少子查询嵌套层数。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "简化GROUPING()表达式的FILTER条件：当前通过GROUPING(NAME,CN,SM)=1和GROUPING(NAME,CN,SM)=2作为布尔列g_1/g_2传递，再在外层用FILTER(WHERE g_1)/FILTER(WHERE g_2)过滤。可以将g_1/g_2的计算内联到最终FILTER表达式中，避免额外的布尔列投影和传递开销，使优化器能更好地识别过滤条件并简化执行路径。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "消除中间层多余的列投影：子查询t3输出(NAME, CN, SM)，子查询t5在GROUPING SETS展开时对不参与当前分组的列产生NULL值，最外层再做聚合。这导致大量NULL值的无效传递和聚合计算。通过列裁剪和投影下推，确保每个中间节点只输出后续步骤实际需要的列，减少数据传输量。"
+            }
+        ]
+    },
+    {
+        "id": 35,
+        "original_query": "SELECT SUM(SAL) AS SUM_SAL, COUNT(DISTINCT CASE WHEN JOB = 'CLERK' THEN DEPTNO ELSE NULL END) AS COUNT_DISTINCT_CLERK, SUM(CASE WHEN DEPTNO = 10 THEN SAL ELSE NULL END) AS SUM_SAL_D10, SUM(CASE WHEN DEPTNO = 20 THEN SAL ELSE 0 END) AS SUM_SAL_D20, SUM(CASE WHEN DEPTNO = 30 THEN 1 ELSE 0 END) AS COUNT_D30, COUNT(CASE WHEN DEPTNO = 40 THEN 'x' ELSE NULL END) AS COUNT_D40, SUM(CASE WHEN DEPTNO = 45 THEN 1 ELSE NULL END) AS COUNT_D45, SUM(CASE WHEN DEPTNO = 50 THEN 1 ELSE NULL END) AS COUNT_D50, SUM(CAST(NULL AS DECIMAL(19, 9))) AS SUM_NULL_D60, SUM(CASE WHEN DEPTNO = 70 THEN NULL ELSE 1 END) AS SUM_NULL_D70, COUNT(CASE WHEN DEPTNO = 20 THEN 1 ELSE NULL END) AS COUNT_D20 FROM EMP",
+        "rewritten_query": "SELECT\n  SUM(SAL) AS SUM_SAL,\n  (SELECT COUNT(DISTINCT DEPTNO) FROM EMP WHERE JOB = 'CLERK') AS COUNT_DISTINCT_CLERK,\n  SUM(CASE WHEN DEPTNO = 10 THEN SAL END) AS SUM_SAL_D10,\n  SUM(CASE WHEN DEPTNO = 20 THEN SAL END) AS SUM_SAL_D20,\n  SUM(CASE WHEN DEPTNO = 30 THEN 1 END) AS COUNT_D30,\n  SUM(CASE WHEN DEPTNO = 40 THEN 1 END) AS COUNT_D40,\n  SUM(CASE WHEN DEPTNO = 45 THEN 1 END) AS COUNT_D45,\n  SUM(CASE WHEN DEPTNO = 50 THEN 1 END) AS COUNT_D50,\n  CAST(NULL AS DECIMAL(19, 9)) AS SUM_NULL_D60,\n  COUNT(*) - SUM(CASE WHEN DEPTNO = 70 THEN 1 END) AS SUM_NULL_D70,\n  SUM(CASE WHEN DEPTNO = 20 THEN 1 END) AS COUNT_D20\nFROM EMP",
+        "original_costs": 11182128.28,
+        "rewrite_costs": 2204775.8,
+        "costs_reduction_rate": 80.28,
+        "rewrite_rules": [
+            "PROJECT_REDUCE_EXPRESSIONS",
+            "AGGREGATE_REDUCE_FUNCTIONS",
+            "AGGREGATE_EXPAND_DISTINCT_AGGREGATES"
+        ],
+        "time_cost": 53.61544609069824,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将多个CASE WHEN条件中的常量比较(DEPTNO = 10/20/30/40/45/50/70)提取为WHERE子句或通过分区过滤，减少每行的条件判断次数。特别是DEPTNO=60/70的NULL计算可以简化或移除"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "优化COUNT(DISTINCT CASE WHEN JOB='CLERK' THEN DEPTNO)：可改写为子查询SELECT COUNT(DISTINCT DEPTNO) FROM EMP WHERE JOB='CLERK'，避免在主聚合中进行DISTINCT计算和Sort操作"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "简化冗余的CASE WHEN表达式：SUM(CASE WHEN DEPTNO=20 THEN SAL ELSE 0 END)中ELSE 0可省略(SUM自动忽略NULL)；COUNT(CASE WHEN DEPTNO=40 THEN 'x')可改为SUM(CASE WHEN DEPTNO=40 THEN 1 END)统一模式"
+            },
+            {
+                "group": "常量折叠",
+                "produced_suggestion": "移除无意义的常量计算：SUM(CAST(NULL AS DECIMAL))恒为NULL可直接返回NULL常量；SUM(CASE WHEN DEPTNO=70 THEN NULL ELSE 1 END)等价于COUNT(*)-COUNT(CASE WHEN DEPTNO=70 THEN 1)，可简化表达式"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "列裁剪：查询只需要SAL、JOB、DEPTNO三列，确保扫描阶段只投影必要列，减少数据传输量"
+            }
+        ]
+    },
+    {
+        "id": 36,
+        "original_query": "SELECT t6.JOB FROM (SELECT JOB, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A' GROUP BY JOB, DEPTNO + EMPNO) AS t6 LEFT JOIN (SELECT NAME, DEPTNO + 5 AS f2 FROM DEPT GROUP BY NAME, DEPTNO + 5) AS t8 ON t6.JOB = t8.NAME AND t6.f9 = t8.f2 GROUP BY t6.JOB",
+        "rewritten_query": "SELECT JOB\nFROM EMP\nWHERE ENAME = 'A'\nGROUP BY JOB",
+        "original_costs": 703893.87,
+        "rewrite_costs": 703893.01,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "PROJECT_JOIN_REMOVE"
+        ],
+        "time_cost": 144.75877237319946,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "连接优化",
+                "produced_suggestion": "移除无效 LEFT JOIN：t8 子查询（DEPT 表派生）仅参与 JOIN 条件但不影响最终结果集（外层仅投影 t6.JOB），且 LEFT JOIN 语义保证左表行不受右表影响。直接改写为 SELECT JOB FROM EMP WHERE ENAME='A' GROUP BY JOB，消除 DEPT 全表扫描（450000 行）和 Hash Join 开销，恢复优化器原有的 JOIN 消除优化。"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除冗余子查询 t6：移除 JOIN 后，t6 子查询中的 DEPTNO+EMPNO 计算列（f9）和对应 GROUP BY 子句失去作用（不再用于 JOIN 条件），可直接展开为 SELECT JOB FROM EMP WHERE ENAME='A' GROUP BY JOB，减少一层嵌套和无效计算。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "合并多层 GROUP BY：原 SQL 在 t6 子查询内按 JOB, DEPTNO+EMPNO 分组，外层再按 t6.JOB 分组，存在冗余。简化后的单表查询仅需 GROUP BY JOB，消除内层聚合的计算和物化开销。"
+            }
+        ]
+    },
+    {
+        "id": 37,
+        "original_query": "SELECT t12.SAL FROM (SELECT * FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, SLACKER, SAL AS SAL0, SAL = 4 AS f9 FROM EMPNULLABLES WHERE DEPTNO = 20 AND SAL > 1000) AS t11 WHERE SAL > 1000) AS t12 INNER JOIN (SELECT t14.SAL, t17.SAL AS SAL0, t17.f9 FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, SLACKER FROM EMPNULLABLES WHERE DEPTNO = 20 AND SAL > 1000) AS t14 INNER JOIN (SELECT SAL, SAL = 4 AS f9 FROM EMPNULLABLES WHERE DEPTNO = 20 AND SAL > 1000 GROUP BY SAL, SAL = 4) AS t17 ON t14.SAL = t17.SAL OR t17.f9 GROUP BY t14.SAL, t17.SAL, t17.f9 HAVING t17.SAL = t14.SAL) AS t20 ON t12.SAL = t20.SAL0 AND t12.f9 = t20.f9",
+        "rewritten_query": "WITH base_filtered AS (\n  SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, SLACKER, SAL AS SAL0, SAL = 4 AS f9\n  FROM EMPNULLABLES\n  WHERE DEPTNO = 20 AND SAL > 1000\n),\nagg_data AS (\n  SELECT SAL, SAL = 4 AS f9\n  FROM EMPNULLABLES\n  WHERE DEPTNO = 20 AND SAL > 1000\n  GROUP BY SAL, SAL = 4\n)\nSELECT b1.SAL\nFROM base_filtered b1\nINNER JOIN (\n  SELECT b2.SAL, a.SAL AS SAL0, a.f9\n  FROM base_filtered b2\n  INNER JOIN agg_data a ON b2.SAL = a.SAL OR a.f9\n  GROUP BY b2.SAL, a.SAL, a.f9\n  HAVING a.SAL = b2.SAL\n) t20 ON b1.SAL = t20.SAL0 AND b1.f9 = t20.f9",
+        "original_costs": 2286948.0,
+        "rewrite_costs": 1493344.99,
+        "costs_reduction_rate": 34.7,
+        "rewrite_rules": [
+            "STRATEGY_CTE_DECOMPOSITION",
+            "FILTER_REDUCE_EXPRESSIONS",
+            "PROJECT_JOIN_TRANSPOSE",
+            "FILTER_MERGE"
+        ],
+        "time_cost": 99.42525243759155,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "应用CTE分解策略：将三次重复扫描empnullables表(DEPTNO=20 AND SAL>1000)提取为公共CTE，消除重复的全表扫描(当前三次扫描总代价占比99.9%)，参考历史案例应用STRATEGY_CTE_DECOMPOSITION规则"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "消除冗余投影层：t11到t12的嵌套中SAL>1000条件重复过滤，且SAL AS SAL0和SAL=4 AS f9在多个子查询中重复计算，应用PROJECT_JOIN_TRANSPOSE规则将投影下推并合并重复计算列"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "简化冗余过滤条件：t11的WHERE子句中SAL>1000在外层t12中重复过滤，执行计划显示Filter条件为((sal > 1000) AND (sal > 1000))存在重复；同时HAVING子句中t17.SAL=t14.SAL与JOIN ON条件t14.SAL=t17.SAL语义重复，可消除HAVING中的冗余条件"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "优化JOIN结构：当前t12与t20的JOIN条件(t12.SAL=t20.SAL0 AND t12.f9=t20.f9)中，t20子查询内部已通过GROUP BY和HAVING确保t14.SAL=t17.SAL，可简化JOIN条件并考虑将GROUP BY操作与外层JOIN合并以减少中间结果集"
+            }
+        ]
+    },
+    {
+        "id": 38,
+        "original_query": "SELECT * FROM (SELECT DEPTNO FROM EMP WHERE DEPTNO < 4) AS t7 INNER JOIN (SELECT * FROM (SELECT DEPTNO FROM EMP WHERE DEPTNO > 7 UNION ALL SELECT DEPTNO FROM EMP) AS t11 WHERE DEPTNO < 4) AS t12 ON t7.DEPTNO = t12.DEPTNO",
+        "rewritten_query": "SELECT t7.DEPTNO, t12.DEPTNO FROM (SELECT DEPTNO FROM EMP WHERE DEPTNO < 4) AS t7 INNER JOIN (SELECT DEPTNO FROM EMP WHERE DEPTNO < 4) AS t12 ON t7.DEPTNO = t12.DEPTNO",
+        "original_costs": 2156658.62,
+        "rewrite_costs": 1406893.84,
+        "costs_reduction_rate": 34.77,
+        "rewrite_rules": [
+            "FILTER_REDUCE_EXPRESSIONS",
+            "UNION_REMOVE",
+            "PROJECT_MERGE"
+        ],
+        "time_cost": 70.00452184677124,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "识别并消除逻辑矛盾的过滤条件：子查询中'DEPTNO > 7 AND DEPTNO < 4'永远为假，可直接移除UNION ALL的第一个分支，避免无效的全表扫描"
+            },
+            {
+                "group": "集合优化",
+                "produced_suggestion": "简化UNION ALL结构：由于第一个分支结果集为空，整个UNION ALL可简化为仅保留第二个分支'SELECT DEPTNO FROM EMP WHERE DEPTNO < 4'"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除冗余嵌套子查询：简化后t12子查询与t7子查询完全相同(都是SELECT DEPTNO FROM EMP WHERE DEPTNO < 4)，可合并为单次扫描或使用CTE避免重复计算"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "优化自连接结构：由于两侧子查询简化后相同且连接条件为等值，可转换为单表查询'SELECT t.DEPTNO FROM (SELECT DISTINCT DEPTNO FROM EMP WHERE DEPTNO < 4) t'，彻底消除JOIN操作"
+            }
+        ]
+    },
+    {
+        "id": 39,
+        "original_query": "SELECT COALESCE(SUM(EXPR0), 0), T2 FROM (SELECT t5.T2, COUNT(CASE WHEN EMP1.DEPTNO = 0 THEN 1 ELSE NULL END) AS EXPR0 FROM EMP AS EMP1, (VALUES (1)) AS t5 (T2) GROUP BY t5.T2 UNION ALL SELECT t8.T2, COUNT(CASE WHEN EMP2.DEPTNO = 0 THEN 1 ELSE NULL END) AS EXPR0 FROM EMP AS EMP2, (VALUES (2)) AS t8 (T2) GROUP BY t8.T2) AS t11 GROUP BY T2",
+        "rewritten_query": "SELECT COALESCE(SUM(cnt), 0) AS total, T2\nFROM (\n  SELECT t5.T2, COUNT(*) FILTER (WHERE EMP1.DEPTNO = 0) AS cnt\n  FROM EMP AS EMP1\n  CROSS JOIN (VALUES (1)) AS t5 (T2)\n  GROUP BY t5.T2\n  UNION ALL\n  SELECT t8.T2, COUNT(*) FILTER (WHERE EMP2.DEPTNO = 0) AS cnt\n  FROM EMP AS EMP2\n  CROSS JOIN (VALUES (2)) AS t8 (T2)\n  GROUP BY t8.T2\n) AS t11\nGROUP BY T2",
+        "original_costs": 1144507.52,
+        "rewrite_costs": 1144507.52,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": null,
+        "time_cost": 69.9288547039032,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": []
+    },
+    {
+        "id": 40,
+        "original_query": "SELECT t4.NAME FROM (SELECT NAME, DEPTNO, DEPTNO - 10 AS DEPTNOMINUS FROM DEPT) AS t4 INNER JOIN (SELECT DEPTNO, SAL + 1 AS f9 FROM EMP GROUP BY DEPTNO, SAL + 1) AS t6 ON t4.DEPTNOMINUS = t6.f9 AND t4.DEPTNO = t6.DEPTNO",
+        "rewritten_query": "SELECT DISTINCT d.name FROM dept d INNER JOIN emp e ON d.deptno = e.sal + 11 AND d.deptno = e.deptno",
+        "original_costs": 3911897.85,
+        "rewrite_costs": 782863.1,
+        "costs_reduction_rate": 79.99,
+        "rewrite_rules": [
+            "PROJECT_REDUCE_EXPRESSIONS",
+            "JOIN_REDUCE_EXPRESSIONS",
+            "AGGREGATE_PROJECT_MERGE",
+            "AGGREGATE_REMOVE"
+        ],
+        "time_cost": 75.11092329025269,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除派生表t4和t6，将子查询内联到主查询中。t4的计算逻辑(DEPTNO-10)可直接在JOIN条件中表达，t6的GROUP BY可通过DISTINCT或直接JOIN后去重实现，避免子查询物化开销(Subquery Scan代价1.2%)和两次Aggregate操作(代价占比51.2%)。"
+            },
+            {
+                "group": "常量折叠",
+                "produced_suggestion": "预计算常量表达式：将JOIN条件中的't4.DEPTNOMINUS = t6.f9'展开为'DEPT.DEPTNO - 10 = EMP.SAL + 1'，进一步转换为'DEPT.DEPTNO = EMP.SAL + 11'，消除运行时重复计算，降低Aggregate和Hash Join的计算复杂度。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "简化连接条件：当前JOIN有两个条件't4.DEPTNOMINUS = t6.f9 AND t4.DEPTNO = t6.DEPTNO'，通过常量折叠后可合并为单一等值条件'DEPT.DEPTNO = EMP.SAL + 11'（因为DEPTNO - 10 = SAL + 1 且 DEPTNO = DEPTNO 时，第二个条件冗余）。这将显著降低Hash Join代价(当前1.8%)并可能触发索引使用。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除冗余GROUP BY：t6子查询的'GROUP BY DEPTNO, SAL + 1'在与DEPT表JOIN后，由于JOIN条件的唯一性约束(Inner Unique: true)，聚合操作可能是冗余的。改写为先JOIN再DISTINCT，或利用EXISTS半连接，避免对45M行emp表进行两次昂贵的Aggregate操作(代价占比51.2%)。"
+            }
+        ]
+    },
+    {
+        "id": 41,
+        "original_query": "SELECT t0.JOB, t1.NAME FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A') AS t0 LEFT JOIN (SELECT DEPTNO, NAME, DEPTNO + 5 AS f2 FROM DEPT) AS t1 ON t0.JOB = t1.NAME AND t0.f9 = t1.f2 GROUP BY t0.JOB, t1.NAME",
+        "rewritten_query": "SELECT EMP.JOB, DEPT.NAME\nFROM EMP\nLEFT JOIN DEPT ON EMP.JOB = DEPT.NAME AND (EMP.DEPTNO + EMP.EMPNO) = (DEPT.DEPTNO + 5)\nWHERE EMP.ENAME = 'A'",
+        "original_costs": 715574.0,
+        "rewrite_costs": 715570.75,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "PROJECT_JOIN_TRANSPOSE",
+            "JOIN_PROJECT_LEFT_TRANSPOSE_INCLUDE_OUTER",
+            "AGGREGATE_REMOVE"
+        ],
+        "time_cost": 82.70269918441772,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "投影优化",
+                "produced_suggestion": "子查询t0中选择了所有列(EMPNO,ENAME,JOB等)但最终只使用JOB和f9,建议裁剪无用列减少数据传输:SELECT JOB, DEPTNO+EMPNO AS f9 FROM EMP WHERE ENAME='A'"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "GROUP BY t0.JOB, t1.NAME在LEFT JOIN之后执行,但JOIN条件t0.JOB=t1.NAME(职位名=部门名)几乎不可能匹配,t1.NAME大概率全为NULL。若t1.NAME恒为NULL则GROUP BY等价于GROUP BY t0.JOB,可应用AGGREGATE_REMOVE规则消除冗余分组键"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "LEFT JOIN条件包含t0.JOB=t1.NAME和t0.f9=t1.f2两个等值条件,但t0.f9(DEPTNO+EMPNO)与t1.f2(DEPTNO+5)的匹配概率极低(需EMPNO=5)。建议先评估JOIN选择性,若选择性<0.01%可考虑将LEFT JOIN转换为CROSS JOIN LATERAL或直接投影NULL值"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "WHERE ENAME='A'过滤条件在emp表(4500万行)上执行全表扫描,虽无ename索引但可通过常量传播优化:若ENAME='A'的选择性极低(<0.001%),可考虑先物化过滤结果再JOIN,或通过CTE提示优化器调整执行顺序"
+            }
+        ]
+    },
+    {
+        "id": 42,
+        "original_query": "SELECT CAST(1 AS INTEGER) AS DEPTNO, ENAME FROM (SELECT ENAME FROM (SELECT ENAME, DEPTNO FROM EMPNULLABLES) AS t6 WHERE DEPTNO = 1 UNION ALL SELECT ENAME FROM (SELECT ENAME, DEPTNO FROM EMPNULLABLES) AS t9 WHERE DEPTNO = 1) AS t12",
+        "rewritten_query": "WITH filtered_emp AS (\n  SELECT ENAME\n  FROM EMPNULLABLES\n  WHERE DEPTNO = 1\n)\nSELECT CAST(1 AS INTEGER) AS DEPTNO, ENAME\nFROM filtered_emp\nUNION ALL\nSELECT CAST(1 AS INTEGER) AS DEPTNO, ENAME\nFROM filtered_emp",
+        "original_costs": 1398594.26,
+        "rewrite_costs": 699801.25,
+        "costs_reduction_rate": 49.96,
+        "rewrite_rules": [
+            "STRATEGY_CTE_DECOMPOSITION"
+        ],
+        "time_cost": 44.34161114692688,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "应用CTE分解优化：将两个UNION ALL分支中重复的子查询'SELECT ENAME, DEPTNO FROM EMPNULLABLES WHERE DEPTNO = 1'提取为公共表表达式(CTE)，避免对empnullables表进行两次相同条件的全表扫描。重写为：WITH filtered_emp AS (SELECT ENAME FROM EMPNULLABLES WHERE DEPTNO = 1) SELECT CAST(1 AS INTEGER) AS DEPTNO, ENAME FROM filtered_emp"
+            },
+            {
+                "group": "集合优化",
+                "produced_suggestion": "消除冗余UNION ALL：当前SQL的UNION ALL连接了两个完全相同的查询分支(都是SELECT ENAME WHERE DEPTNO=1)，这会导致结果集重复且执行两次相同扫描。由于两个分支逻辑完全一致，可以合并为单个查询，直接从过滤后的结果集中选择数据"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "简化多层嵌套投影：当前SQL存在三层SELECT嵌套(最外层、t12、t6/t9)但每层都只投影ENAME列。可以在CTE中直接完成DEPTNO过滤和ENAME投影，消除中间层不必要的子查询包装，减少查询树深度"
+            }
+        ]
+    },
+    {
+        "id": 43,
+        "original_query": "SELECT NAME, DDEPTNO, COUNT(*) AS C FROM (SELECT NAME AS NAME, DEPTNO AS DDEPTNO FROM DEPT) AS t3 WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((NAME, DDEPTNO), NAME)",
+        "rewritten_query": "WITH filtered AS (SELECT name, deptno FROM dept WHERE name = 'Charlie') SELECT name AS name, deptno AS ddeptno, COUNT(*) AS c FROM filtered GROUP BY GROUPING SETS ((name, deptno), (name))",
+        "original_costs": 6774.44,
+        "rewrite_costs": 6774.44,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "STRATEGY_CTE_DECOMPOSITION",
+            "UNION_PULL_UP_CONSTANTS",
+            "AGGREGATE_ANY_PULL_UP_CONSTANTS",
+            "PROJECT_MERGE"
+        ],
+        "time_cost": 164.3684425354004,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "使用CTE预先物化WHERE NAME='Charlie'的过滤结果集，然后在CTE结果上执行GROUPING SETS聚合，避免对dept基表的重复扫描。结构：WITH filtered AS (SELECT * FROM DEPT WHERE NAME='Charlie') SELECT NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM filtered GROUP BY GROUPING SETS((NAME,DEPTNO),NAME)"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "回退到原始GROUPING SETS语法，保留单次表扫描优势。若优化器支持，可尝试ROLLUP(NAME,DEPTNO)替代GROUPING SETS，部分数据库对ROLLUP有更优执行路径"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "在CTE或派生表中提前应用WHERE NAME='Charlie'过滤，确保后续聚合操作仅处理过滤后的小结果集，减少Gather Merge/Gather节点的数据传输开销"
+            }
+        ]
+    },
+    {
+        "id": 44,
+        "original_query": "SELECT NAME AS NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT GROUP BY GROUPING SETS((NAME, DEPTNO), NAME) HAVING NAME = 'Charlie'",
+        "rewritten_query": "SELECT NAME AS NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C\nFROM dept\nWHERE NAME = 'Charlie'\nGROUP BY GROUPING SETS((NAME, DEPTNO), NAME)",
+        "original_costs": 6774.44,
+        "rewrite_costs": 6774.44,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "FILTER_AGGREGATE_TRANSPOSE",
+            "AGGREGATE_UNION_TRANSPOSE",
+            "AGGREGATE_PROJECT_MERGE"
+        ],
+        "time_cost": 55.05871248245239,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将HAVING NAME='Charlie'转换为WHERE NAME='Charlie'，在GROUP BY之前过滤数据。由于NAME既在GROUP BY中又在HAVING中作为等值过滤，可以安全地下推到WHERE子句，避免对不符合条件的数据进行分组聚合计算，减少85%以上的计算量"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "应用FILTER_AGGREGATE_TRANSPOSE规则（参考历史案例1），将聚合层的过滤条件下推。由于GROUPING SETS包含NAME列，且HAVING条件仅涉及NAME='Charlie'，可以在聚合前过滤，使后续GROUP BY仅处理name='Charlie'的记录"
+            }
+        ]
+    },
+    {
+        "id": 45,
+        "original_query": "SELECT t5.JOB FROM (SELECT JOB FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t5 RIGHT JOIN (SELECT NAME FROM DEPT GROUP BY NAME) AS t6 ON t5.JOB = t6.NAME GROUP BY t5.JOB",
+        "rewritten_query": "SELECT e.JOB FROM DEPT d LEFT JOIN (SELECT DISTINCT JOB FROM EMP WHERE ENAME = 'A') e ON d.NAME = e.JOB GROUP BY e.JOB",
+        "original_costs": 715957.35,
+        "rewrite_costs": 713165.59,
+        "costs_reduction_rate": 0.39,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE",
+            "PROJECT_JOIN_REMOVE",
+            "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER",
+            "AGGREGATE_MERGE"
+        ],
+        "time_cost": 180.56298804283142,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除外层冗余GROUP BY t5.JOB：t5子查询已对JOB分组，RIGHT JOIN后外层再次分组无实际作用，直接移除外层GROUP BY。若DEPT.NAME列具有唯一性约束，同时消除t6子查询的GROUP BY NAME，简化为SELECT NAME FROM DEPT"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "展开派生表t5和t6为直接表引用：将(SELECT JOB FROM EMP WHERE ENAME='A' GROUP BY JOB)改写为对EMP表的直接过滤和去重操作，将(SELECT NAME FROM DEPT GROUP BY NAME)改写为对DEPT表的直接引用，消除子查询物化开销"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "将RIGHT JOIN转换为LEFT JOIN并调整表顺序：改写为SELECT e.JOB FROM DEPT d LEFT JOIN (SELECT DISTINCT JOB FROM EMP WHERE ENAME='A') e ON d.NAME=e.JOB，使小表DEPT(45万行)作为驱动表，避免大表EMP(4500万行)作为驱动表的低效扫描"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "针对EMP表ENAME='A'过滤条件建议创建索引：当前Seq Scan代价70万(98.2%)，若在ENAME列建立B-tree索引(CREATE INDEX idx_emp_ename ON EMP(ENAME))，可将扫描转为Index Scan，预期代价降至数百以内，是性能提升的关键"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "简化SELECT列表：由于外层仅需t5.JOB且经过去重，结合聚合消除后可直接投影EMP.JOB列，无需保留中间派生表的额外列，减少数据传输量"
+            }
+        ]
+    },
+    {
+        "id": 46,
+        "original_query": "SELECT t2.SAL, t2.EXPR1, t5.EXPR2, t9.EXPR3 FROM (SELECT SAL, SUM(COMM) AS EXPR1 FROM EMP GROUP BY SAL) AS t2 INNER JOIN (SELECT SAL, AVG(COMM) AS EXPR2 FROM (SELECT SAL, COMM FROM EMP GROUP BY SAL, COMM) AS t4 GROUP BY SAL) AS t5 ON t2.SAL IS NOT DISTINCT FROM t5.SAL INNER JOIN (SELECT SAL, SUM(SAL) AS EXPR3 FROM (SELECT SAL FROM EMP GROUP BY SAL) AS t8 GROUP BY SAL) AS t9 ON t2.SAL IS NOT DISTINCT FROM t9.SAL",
+        "rewritten_query": "WITH base_agg AS (\n  SELECT \n    SAL,\n    SUM(COMM) AS EXPR1,\n    AVG(COMM) AS EXPR2,\n    SUM(SAL) AS EXPR3\n  FROM EMP\n  GROUP BY SAL\n)\nSELECT SAL, EXPR1, EXPR2, EXPR3 FROM base_agg",
+        "original_costs": 2221688.84,
+        "rewrite_costs": 844822.39,
+        "costs_reduction_rate": 61.97,
+        "rewrite_rules": [
+            "STRATEGY_CTE_DECOMPOSITION",
+            "AGGREGATE_MERGE",
+            "AGGREGATE_REMOVE",
+            "JOIN_CONDITION_PUSH"
+        ],
+        "time_cost": 57.80539655685425,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除多层嵌套子查询,将3个独立的子查询(t2、t5、t9)合并为单次表扫描。当前查询对emp表扫描3次,可改写为一次扫描后通过窗口函数或单次聚合完成所有计算,避免重复的Seq Scan开销。"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "简化冗余的GROUP BY层级。t5子查询中存在两层GROUP BY(内层按SAL,COMM分组后外层再按SAL分组计算AVG),可直接在一层聚合中完成AVG(COMM) GROUP BY SAL。t9子查询中SUM(SAL) GROUP BY SAL实际等价于SAL本身,可直接消除该聚合。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "优化列裁剪和投影下推。t4子查询仅需SAL和COMM列但执行了完整GROUP BY,t8子查询仅需SAL列但也执行了GROUP BY。将必要列的提取下推到最底层,减少中间结果集大小和聚合计算量。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "消除冗余的JOIN操作。由于所有子查询都基于同一张表emp且按SAL分组,可将多个JOIN改写为单次扫描后的多列聚合,避免Hash Join的构建和探测开销。使用CASE WHEN或条件聚合函数在一次GROUP BY中完成所有计算。"
+            }
+        ]
+    },
+    {
+        "id": 47,
+        "original_query": "SELECT * FROM EMP LEFT JOIN (SELECT * FROM DEPT) AS t ON EMP.DEPTNO = t.DEPTNO ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY",
+        "rewritten_query": "SELECT s.empno, s.deptno, s.ename, s.job, s.mgr, s.hiredate, s.sal, s.comm, s.slacker, dept.deptno, dept.name FROM ( SELECT empno, deptno, ename, job, mgr, hiredate, sal, comm, slacker FROM emp ORDER BY sal FETCH NEXT 10 ROWS ONLY ) AS s LEFT JOIN dept ON s.deptno = dept.deptno ORDER BY s.sal",
+        "original_costs": 1452006.13,
+        "rewrite_costs": 1062273.19,
+        "costs_reduction_rate": 26.84,
+        "rewrite_rules": [
+            "JOIN_SUB_QUERY_TO_CORRELATE",
+            "SORT_JOIN_TRANSPOSE"
+        ],
+        "time_cost": 91.3995246887207,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除派生表子查询(SELECT * FROM DEPT) AS t，直接使用DEPT表进行LEFT JOIN，减少不必要的子查询物化开销"
+            },
+            {
+                "group": "排序优化",
+                "produced_suggestion": "将ORDER BY EMP.SAL FETCH NEXT 10与LEFT JOIN交换顺序：先对EMP表按SAL排序取TOP 10(利用索引或限制扫描范围)，再与DEPT进行LEFT JOIN。这样可将排序数据量从4500万行降至10行，大幅减少Sort和Gather Merge的代价"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "由于LIMIT 10只需少量结果且Inner Unique为true，可考虑将LEFT JOIN转换为相关子查询或LATERAL JOIN形式，使得对DEPT的查找仅针对最终10条EMP记录执行，避免全量Hash Join"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "检查是否真正需要SELECT *的所有列，如果只需部分列可进行列裁剪，减少数据传输和排序负担，特别是在并行执行(Gather Merge)场景下"
+            }
+        ]
+    },
+    {
+        "id": 48,
+        "original_query": "SELECT sal, SUM(comm), MIN(comm), SUM(DISTINCT sal) FROM emp GROUP BY sal",
+        "rewritten_query": "SELECT sal, SUM(comm) AS sum_comm, MIN(comm) AS min_comm, SUM(DISTINCT sal) AS sum_distinct_sal FROM emp GROUP BY sal",
+        "original_costs": 9047037.7,
+        "rewrite_costs": 9047037.7,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "AGGREGATE_REDUCE_FUNCTIONS"
+        ],
+        "time_cost": 60.01707649230957,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除冗余DISTINCT：SUM(DISTINCT sal)在GROUP BY sal下等价于SUM(sal)，因为同组内sal值相同，DISTINCT操作无实际作用但增加计算开销，建议改写为SUM(sal)"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "优化聚合执行方式：当前Sort+GroupAggregate模式导致84.9%排序代价，若数据库支持HashAggregate且内存充足，可通过增加work_mem或调整查询hint强制使用HashAggregate避免排序，将O(nlogn)降为O(n)"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "简化SELECT列表：sal既在GROUP BY中又在SELECT中重复出现，且SUM(DISTINCT sal)可简化，最终输出可精简为SELECT sal, SUM(comm) AS sum_comm, MIN(comm) AS min_comm, SUM(sal) AS sum_sal，减少聚合函数计算复杂度"
+            }
+        ]
+    },
+    {
+        "id": 49,
+        "original_query": "select * from emp e1  where e1.empno > SOME (select deptno from dept)",
+        "rewritten_query": "SELECT e1.*\nFROM emp e1\nCROSS JOIN (SELECT MIN(deptno) AS min_deptno FROM dept) AS sub_dept\nWHERE e1.empno > sub_dept.min_deptno",
+        "original_costs": 10412259.82,
+        "rewrite_costs": 733194.0,
+        "costs_reduction_rate": 92.96,
+        "rewrite_rules": [
+            "FILTER_SUB_QUERY_TO_CORRELATE"
+        ],
+        "time_cost": 48.39226722717285,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "将SOME子查询改写为JOIN+聚合形式：先对dept表求MIN(deptno)得到最小部门号，然后用简单比较替代SOME语义(empno > SOME等价于empno大于最小值)。改写为: SELECT e1.* FROM emp e1 CROSS JOIN (SELECT MIN(deptno) AS min_dept FROM dept) d WHERE e1.empno > d.min_dept。这样避免了Nested Loop Semi Join，将450K次内表扫描降为1次聚合计算。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "利用SOME语义特性简化谓词：empno > SOME(select deptno from dept)等价于empno > MIN(deptno)。通过标量子查询物化最小值，将半连接转换为简单过滤：WHERE e1.empno > (SELECT MIN(deptno) FROM dept)。PostgreSQL会将标量子查询InitPlan化，仅执行一次，消除Nested Loop。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "若必须保留Semi Join结构，建议在dept表deptno列上添加索引(当前仅有主键索引)，并通过MATERIALIZED CTE预先物化dept结果集：WITH dept_vals AS MATERIALIZED (SELECT DISTINCT deptno FROM dept) SELECT * FROM emp e1 WHERE EXISTS (SELECT 1 FROM dept_vals WHERE e1.empno > deptno)。物化可减少重复扫描，索引可加速内表查找。"
+            }
+        ]
+    },
+    {
+        "id": 50,
+        "original_query": "select e.mgr, d.mgr from emp as e full outer join emp as d on e.mgr = d.mgr group by d.mgr, e.mgr",
+        "rewritten_query": "SELECT e.mgr, d.mgr\nFROM emp AS e\nFULL OUTER JOIN emp AS d ON e.mgr = d.mgr\nGROUP BY e.mgr, d.mgr",
+        "original_costs": 540297517.6,
+        "rewrite_costs": 540297517.6,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": null,
+        "time_cost": 151.7725691795349,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "回退到原始 SQL 的 GROUP BY 结构：SELECT E.MGR, D.MGR FROM EMP AS E FULL OUTER JOIN EMP AS D ON E.MGR=D.MGR GROUP BY D.MGR, E.MGR。避免使用 UNION ALL 构造 CTE，直接在基表上执行 FULL OUTER JOIN + GROUP BY，利用 mgr 列的过滤和分组特性减少中间结果"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "移除当前 SQL 中的 UNION ALL 子查询和恒假 JOIN 条件（NULL=NULL）。原始 SQL 的 E.MGR=D.MGR 连接条件可以利用索引或 Hash Join 高效执行，而当前改写后的 NULL 常量连接导致笛卡尔积（45M × 45M），必须回退"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除 e_agg 和 d_agg 两个 CTE 子查询。这些子查询通过 UNION ALL 添加 NULL 行，但在 FULL OUTER JOIN 场景下无实际优化价值，反而增加扫描成本。直接使用原表 emp 进行 FULL OUTER JOIN 更高效"
+            }
+        ]
+    },
+    {
+        "id": 51,
+        "original_query": "select dname, ddeptno, c from              (select name dname, deptno ddeptno, count(*) as c              from dept group by grouping sets ((name,deptno),(name))) t               where dname = 'Charlie'",
+        "rewritten_query": "select dname, ddeptno, c from\n(select name dname, deptno ddeptno, count(*) as c\nfrom (select * from dept where name = 'Charlie') as filtered_dept\ngroup by grouping sets ((name,deptno),(name))) t",
+        "original_costs": 72482.93,
+        "rewrite_costs": 6774.44,
+        "costs_reduction_rate": 90.65,
+        "rewrite_rules": [
+            "FILTER_AGGREGATE_TRANSPOSE"
+        ],
+        "time_cost": 39.226141929626465,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将WHERE条件dname='Charlie'下推到子查询内部，在GROUP BY之前过滤dept表，利用name='Charlie'条件减少参与聚合的数据量，避免对全表450000行进行GROUPING SETS聚合后再过滤"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "由于过滤条件dname='Charlie'作用于name列，GROUPING SETS的两个分组(name,deptno)和(name)在name固定为'Charlie'时可以简化：先过滤name='Charlie'，然后分别对(name,deptno)和(name)进行聚合，减少Sort和Aggregate的数据处理量"
+            }
+        ]
+    },
+    {
+        "id": 52,
+        "original_query": "select distinct d.deptno from emp e right outer join dept d on e.deptno = d.deptno",
+        "rewritten_query": "SELECT deptno FROM dept",
+        "original_costs": 2050337.5,
+        "rewrite_costs": 6964.0,
+        "costs_reduction_rate": 99.66,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE"
+        ],
+        "time_cost": 37.96306014060974,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除冗余DISTINCT：RIGHT OUTER JOIN保证dept表所有行保留，DISTINCT d.deptno等价于dept表所有deptno值，且deptno为主键天然唯一，可直接改写为SELECT deptno FROM dept"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "消除无效JOIN：emp表仅通过deptno关联但未使用其任何列，RIGHT OUTER JOIN的语义仅需保留dept表数据，可完全移除emp表关联"
+            }
+        ]
+    },
+    {
+        "id": 53,
+        "original_query": "with e2 as (   select empno, case when true then deptno else null end as deptno   from emp) select empno,   deptno in (select deptno from e2 where empno < 20) as d from e2",
+        "rewritten_query": "WITH e2 AS (SELECT empno, CASE WHEN true THEN deptno ELSE null END AS deptno FROM emp) SELECT empno, deptno IN (SELECT deptno FROM e2 WHERE empno < 20) AS d FROM e2",
+        "original_costs": 2943527.13,
+        "rewrite_costs": 2943527.13,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "FILTER_REDUCE_EXPRESSIONS",
+            "PROJECT_REDUCE_EXPRESSIONS",
+            "PROJECT_MERGE",
+            "PROJECT_REMOVE"
+        ],
+        "time_cost": 151.13255095481873,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除 CTE e2 的物化，将其内联展开到主查询中，避免重复扫描 emp 表（4500 万行）造成的笛卡尔积效应"
+            },
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "将 EXISTS 相关子查询转换为 LEFT SEMI JOIN 或 IN 子查询，消除逐行探测导致的嵌套循环，利用 Hash Join 批量匹配"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将 CASE WHEN true THEN deptno ELSE null END 简化为 deptno，消除冗余的条件判断"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将 empno < 20 的过滤条件尽早下推到 emp 表扫描阶段，减少参与 JOIN 的数据量（从 4500 万行降至约 20 行）"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "消除外层 CASE WHEN EXISTS ... THEN TRUE ELSE FALSE END 的冗余布尔转换，直接使用 EXISTS 或 JOIN 结果的布尔值"
+            }
+        ]
+    },
+    {
+        "id": 54,
+        "original_query": "select empno, sum(sal), min(sal), max(sal),  bit_and(distinct sal), bit_or(sal), count(distinct sal),  grouping(deptno) from emp group by empno, deptno",
+        "rewritten_query": "select empno, sal as sum_sal, sal as min_sal, sal as max_sal, sal as bit_and_sal, sal as bit_or_sal, 1 as count_distinct_sal, 0 as grouping_deptno from emp",
+        "original_costs": 5012079.01,
+        "rewrite_costs": 918506.16,
+        "costs_reduction_rate": 81.67,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE"
+        ],
+        "time_cost": 60.704885721206665,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "移除GROUP BY中的冗余列deptno。由于empno是主键，每个empno唯一对应一行记录，添加deptno到分组键不会改变分组结果，反而增加排序和分组开销。建议改写为：GROUP BY empno"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "移除无意义的grouping(deptno)函数调用。该函数仅在ROLLUP/CUBE/GROUPING SETS场景下有意义，当前查询中恒返回0，属于冗余计算。移除后可减少SELECT列表的计算开销"
+            },
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "优化聚合函数使用。当前对sal列执行了多个聚合函数（sum/min/max/bit_and/bit_or/count distinct），且存在DISTINCT修饰符。由于GROUP BY empno后每组只有一行，这些聚合函数实际退化为简单的列值返回，建议评估是否可简化为直接SELECT sal相关列"
+            }
+        ]
+    },
+    {
+        "id": 55,
+        "original_query": "select empno, count(mgr) from emp group by empno, deptno",
+        "rewritten_query": "SELECT empno, COUNT(mgr) FROM emp GROUP BY empno",
+        "original_costs": 2312066.05,
+        "rewrite_costs": 2312066.05,
+        "costs_reduction_rate": 0.0,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE"
+        ],
+        "time_cost": 38.28665566444397,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "投影优化",
+                "produced_suggestion": "移除GROUP BY子句中的冗余列deptno。由于empno是主键（emp_pkey唯一索引），按empno分组已经唯一确定每一行，添加deptno到分组键不会改变分组结果，但会增加分组计算开销。建议改写为：SELECT empno, COUNT(mgr) FROM emp GROUP BY empno。这将减少Aggregate算子的分组维度，降低29.2%代价占比的聚合开销。"
+            }
+        ]
+    },
+    {
+        "id": 56,
+        "original_query": "select * from emp where empno > ANY (  select deptno from dept where emp.job = dept.name);",
+        "rewritten_query": "select * from emp where empno > ANY (  select deptno from dept where emp.job = dept.name);",
+        "original_costs": 2278896.74,
+        "rewrite_costs": 2278896.74,
+        "costs_reduction_rate": 0,
+        "rewrite_rules": null,
+        "time_cost": 150.56440663337708,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "子查询优化",
+                "produced_suggestion": "消除CTE中的DISTINCT去重：将'SELECT DISTINCT d.deptno, d.name FROM dept WHERE name IS NOT NULL'改为直接在主查询中关联'FROM emp e JOIN dept d ON e.job=d.name AND e.empno>d.deptno'，让优化器在Hash Join阶段通过Hash Cond完成job关联，empno>deptno作为额外Filter但在小表dept(45万行)侧先过滤后再与emp关联，避免在4500万行emp表上逐行计算Join Filter。若dept.name重复率高，可改为'FROM emp e WHERE e.empno > (SELECT MIN(deptno) FROM dept d WHERE d.name=e.job AND d.name IS NOT NULL)'，用聚合函数MIN替代DISTINCT，减少排序开销。"
+            },
+            {
+                "group": "连接优化",
+                "produced_suggestion": "反向驱动表顺序：当前执行计划是emp(4500万行)驱动dept_filtered，导致Join Filter在大表侧后置过滤。改写为'SELECT e.* FROM dept d JOIN emp e ON e.job=d.name AND e.empno>d.deptno WHERE d.name IS NOT NULL'，让优化器优先扫描小表dept(45万行)，通过dept.name过滤后再与emp关联，将empno>deptno条件在小表侧先计算(dept.deptno范围已确定)，减少Hash Join的行数输入。若优化器仍选择错误驱动顺序，可添加HINT或改为'SELECT e.* FROM (SELECT DISTINCT name, deptno FROM dept WHERE name IS NOT NULL) d JOIN emp e ON e.job=d.name AND e.empno>d.deptno'强制小表物化。"
+            },
+            {
+                "group": "谓词简化",
+                "produced_suggestion": "将empno>deptno条件改写为可索引的形式：当前'e.empno > df.deptno'是跨表比较，无法利用emp_pkey索引。若业务逻辑允许，可改写为'e.empno > (SELECT MAX(deptno) FROM dept WHERE name=e.job)'，将子查询结果作为常量与empno比较，优化器可能将其转换为Index Scan on emp_pkey的范围扫描。或者在dept表上创建复合索引(name, deptno)，让'WHERE d.name IS NOT NULL AND d.deptno < e.empno'能通过Index Scan快速定位，避免Seq Scan on dept(当前cost 5265.00)。"
+            },
+            {
+                "group": "保护机制",
+                "produced_suggestion": "写入防护触发：重写 cost 增幅 1336.5% 超过 1000%，输出已回退到原始 SQL。"
+            }
+        ]
+    },
+    {
+        "id": 57,
+        "original_query": "select deptno c, min(y), max(z) z, sum(r), sum(m) n, sum(x) sal from (    select deptno, ename, sum(sal) x, max(sal) z,       min(sal) y, count(hiredate) m, count(mgr) r    from emp group by deptno, ename) t group by deptno",
+        "rewritten_query": "SELECT deptno AS c, MIN(sal) AS min_y, MAX(sal) AS z, COUNT(mgr) AS sum_r, COUNT(hiredate) AS n, SUM(sal) AS sal FROM emp GROUP BY deptno",
+        "original_costs": 5065370.49,
+        "rewrite_costs": 2431854.35,
+        "costs_reduction_rate": 51.99,
+        "rewrite_rules": [
+            "AGGREGATE_MERGE",
+            "PROJECT_MERGE"
+        ],
+        "time_cost": 129.78990125656128,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除冗余两层聚合结构，将内外层聚合合并为单层。具体方案：直接在emp表上按deptno分组，计算MIN(sal)、MAX(sal)、SUM(sal)、COUNT(hiredate)、COUNT(mgr)。语义等价性验证：原SQL外层min(y)=min(min(sal) per ename)等价于min(sal) per deptno（MIN可结合），max(z)=max(max(sal) per ename)等价于max(sal) per deptno（MAX可结合），sum(x)=sum(sum(sal) per ename)等价于sum(sal) per deptno（SUM可结合），sum(m)=sum(count(hiredate) per ename)等价于count(hiredate) per deptno（COUNT可结合），sum(r)=sum(count(mgr) per ename)等价于count(mgr) per deptno（COUNT可结合）。目标SQL：SELECT deptno AS c, MIN(sal) AS min_y, MAX(sal) AS z, SUM(CASE WHEN mgr IS NOT NULL THEN 1 ELSE 0 END) AS sum_r, SUM(CASE WHEN hiredate IS NOT NULL THEN 1 ELSE 0 END) AS n, SUM(sal) AS sal FROM emp GROUP BY deptno。此改写可消除内层Aggregate（40.1%代价）、Sort（15.5%代价）、Gather Merge（24.6%代价）节点，仅保留单层Aggregate，预期总代价降低60%以上。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "在单层聚合重写后，确保SELECT列表仅包含必要的聚合计算列，避免冗余投影。当前目标SQL已包含所有必需列（c, min_y, z, sum_r, n, sal），无需额外裁剪。若后续发现外层查询仅使用部分列，可进一步裁剪聚合函数以减少计算开销。"
+            }
+        ]
+    },
+    {
+        "id": 58,
+        "original_query": "select coalesce(sum(count_comm), 0) from (   select deptno, count(comm) as count_comm   from emp   group by deptno, mgr) t",
+        "rewritten_query": "SELECT COALESCE(COUNT(comm), 0) FROM emp",
+        "original_costs": 4138767.94,
+        "rewrite_costs": 703880.35,
+        "costs_reduction_rate": 82.99,
+        "rewrite_rules": [
+            "AGGREGATE_REMOVE"
+        ],
+        "time_cost": 49.94724440574646,
+        "llm_costs": 0.0,
+        "rewrite_suggestion": [
+            {
+                "group": "聚合优化",
+                "produced_suggestion": "消除冗余的两层聚合结构：外层SUM(COUNT(comm) GROUP BY deptno,mgr)在数学上等价于COUNT(comm)（COUNT忽略NULL，SUM各分组COUNT之和即全表非NULL comm的总数）。将SQL重写为：SELECT COALESCE(COUNT(comm), 0) FROM emp，彻底去除子查询和GROUP BY，消除三个Aggregate算子的流水线阻塞，将执行计划从多阶段聚合简化为单次全表扫描+单次聚合。"
+            },
+            {
+                "group": "投影优化",
+                "produced_suggestion": "去除子查询中多余的deptno列投影，重写后仅需扫描comm列，减少Seq Scan阶段的数据读取宽度，降低I/O开销。"
+            }
+        ]
+    }
+]

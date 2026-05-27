@@ -1,0 +1,135 @@
+Query ID: 20
+==================================================
+
+Original: SELECT t0.JOB FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A') AS t0 LEFT JOIN (SELECT DEPTNO, NAME, DEPTNO + 5 AS f2 FROM DEPT) AS t1 ON t0.JOB = t1.NAME AND t0.f9 = t1.f2 GROUP BY t0.JOB
+Rewritten: SELECT t0.JOB FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A') AS t0 LEFT JOIN (SELECT DEPTNO, NAME, DEPTNO + 5 AS f2 FROM DEPT) AS t1 ON t0.JOB = t1.NAME AND t0.f9 = t1.f2 GROUP BY t0.JOB
+Time Cost: 91.54s
+Suggestion: []
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示对emp表（4500万行）进行全表顺序扫描，代价占比高达98.2%，是主要性能瓶颈。同时SQL存在多处可重写优化点：1) 子查询中SELECT了大量未被外层使用的列（EMPNO,MGR,HIREDATE,SAL,COMM,SLACKER等），可通过投影裁剪消除冗余列；2) 外层GROUP BY t0.JOB但LEFT JOIN右侧t1的列未被SELECT引用，该LEFT JOIN可能可消除或转换；3) 参考历史案例，PROJECT_JOIN_TRANSPOSE和AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则适用于此类结构，可将投影下推并简化连接与聚合。",
+  "advice": [
+    {
+      "group": "投影优化",
+      "produced_suggestion": "子查询t0中SELECT了EMPNO, ENAME, MGR, HIREDATE, SAL, COMM, SLACKER等外层未使用的列，应裁剪为仅保留外层需要的列：JOB、以及JOIN条件所需的f9(DEPTNO+EMPNO)。重写为：SELECT JOB, DEPTNO+EMPNO AS f9 FROM EMP WHERE ENAME='A'，减少中间结果集的数据量。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggest ion": "外层查询只SELECT t0.JOB并GROUP BY t0.JOB，而t1的列未出现在SELECT或GROUP BY中。LEFT JOIN在此场景下对结果行数无过滤作用（LEFT JOIN保留左侧所有行），可分析是否能将LEFT JOIN消除，直接对t0做GROUP BY；若JOIN条件不影响t0.JOB的distinct值，可移除该JOIN，改写为：SELECT JOB FROM EMP WHERE ENAME='A' GROUP BY JOB。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "参考历史案例AGGREGATE_JOIN_TRANSPOSE_EXTENDED规则，将聚合操作下推到JOIN之前执行。先对EMP子查询结果按JOB做GROUP BY预聚合，再与DEPT关联，减少参与JOIN的数据量，降低JOIN代价。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将ENAME='A'过滤条件尽早下推至基表扫描层，确保在最底层即完成过滤，避免将全表4500万行数据带入上层算子。当前子查询已包含WHERE ENAME='A'，确认优化器已下推；同时建议在ENAME列上创建索引以将Seq Scan转换为Index Scan，配合查询重写收益最大化。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.243
+   → AGGREGATE_VALUES: UCT=1.243
+   → JOIN_TO_CORRELATE: UCT=1.100
+```json
+{
+  "groups": "投影优化, 连接优化, 聚合优化",
+  "applied_rules": [
+    "PROJECT_JOIN_TRANSPOSE",
+    "JOIN_PROJECT_LEFT_TRANSPOSE_INCLUDE_OUTER",
+    "AGGREGATE_JOIN_REMOVE"
+  ],
+  "rule_effect_scores": {
+    "PROJECT_JOIN_TRANSPOSE": 0.35,
+    "JOIN_PROJECT_LEFT_TRANSPOSE_INCLUDE_OUTER": 0.30,
+    "AGGREGATE_JOIN_REMOVE": 0.35
+  },
+  "rule_effect_confidence": {
+    "PROJECT_JOIN_TRANSPOSE": 0.85,
+    "JOIN_PROJECT_LEFT_TRANSPOSE_INCLUDE_OUTER": 0.80,
+    "AGGREGATE_JOIN_REMOVE": 0.90
+  }
+}
+```
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "投影优化, 连接优化, 聚合优化",
+  "applied_rules": [
+    "PROJECT_JOIN_TRANSPOSE",
+    "JOIN_PROJECT_LEFT_TRANSPOSE_INCLUDE_OUTER",
+    "AGGREGATE_JOIN_REMOVE"
+  ],
+  "rewritten_sql": "SELECT JOB\nFROM EMP\nWHERE ENAME = 'A'\nGROUP BY JOB",
+  "semantic_correctness_guarantee": "1. **投影裁剪（PROJECT_JOIN_TRANSPOSE）**：原 SQL 子查询 t0 中 SELECT 了 EMPNO, ENAME, MGR, HIREDATE, SAL, COMM, SLACKER 等列，但外层仅使用 t0.JOB（SELECT 和 GROUP BY）以及 JOIN 条件中的 t0.f9（DEPTNO+EMPNO）。由于后续分析表明 JOIN 可被移除，因此这些冗余列在重写后完全不需要投影，仅保留 JOB 列用于最终输出和分组。\n\n2. **LEFT JOIN 消除（AGGREGATE_JOIN_REMOVE）**：原 SQL 外层查询仅 SELECT t0.JOB 并 GROUP BY t0.JOB，右表 t1（DEPT）的列未出现在 SELECT、WHERE、HAVING 或 GROUP BY 中。LEFT JOIN 语义保证左表所有行都保留，右表匹配失败时对应列为 NULL。由于右表列完全未被使用，LEFT JOIN 对最终结果集的行数和内容无任何影响（即使 JOIN 条件匹配或不匹配，都不改变左表行的 JOB 值）。因此可安全移除整个 LEFT JOIN 及右表子查询 t1。\n\n3. **子查询展开与简化**：移除 JOIN 后，原 t0 子查询变为唯一数据源。t0 定义为 SELECT ... FROM EMP WHERE ENAME='A'，外层对其做 GROUP BY t0.JOB。由于 t0 已是简单的基表过滤投影，可直接展开为：SELECT JOB FROM EMP WHERE ENAME='A' GROUP BY JOB，消除中间子查询层级。\n\n4. **GROUP BY 语义保持**：原 SQL 最终输出为对 t0.JOB 去重后的结果集（GROUP BY t0.JOB 且 SELECT 仅包含分组键）。重写后 GROUP BY JOB 作用于 EMP 表中 ENAME='A' 的行，返回这些行的 JOB 列去重值，与原 SQL 完全等价。\n\n5. **过滤条件保持**：原 SQL 在 t0 子查询中应用 WHERE ENAME='A'，重写后该条件直接保留在基表 EMP 上，过滤逻辑未改变，确保参与 GROUP BY 的行集合与原 SQL 一致。\n\n6. **结果集等价性验证**：原 SQL 执行流程为：EMP 表过滤 ENAME='A' → 构造 t0 子查询 → LEFT JOIN DEPT（右表列未使用）→ GROUP BY t0.JOB 输出去重 JOB 值。重写后流程为：EMP 表过滤 ENAME='A' → 直接 GROUP BY JOB 输出去重值。由于 LEFT JOIN 对结果无贡献且中间投影列已裁剪，两者返回相同的 JOB 列去重结果集，行数、列值、顺序（无 ORDER BY 时顺序不保证但集合相同）完全一致。\n\n7. **NULL 值与重复行处理**：EMP 表 JOB 列定义为 NOT NULL，因此 GROUP BY JOB 不涉及 NULL 分组问题。原 SQL 的 LEFT JOIN 即使右表不匹配也不会引入额外的 NULL（因右表列未被 SELECT），GROUP BY 对左表行去重。重写后直接对基表 GROUP BY，去重逻辑等价。\n\n8. **主键与相关性无关**：原 SQL 中 t0.f9（DEPTNO+EMPNO）与 t1.f2（DEPTNO+5）的 JOIN 条件在移除 JOIN 后不再需要计算。EMP 表主键为 EMPNO，但 GROUP BY 作用于非主键列 JOB，这在原 SQL 和重写 SQL 中行为一致（多行可能共享相同 JOB 值，GROUP BY 将其聚合为一行）。无相关子查询，无需考虑相关列绑定问题。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "LEFT JOIN 的 ON 条件包含 t0.JOB = t1.NAME，该条件会过滤掉 JOB 值在 DEPT.NAME 中不存在的行（LEFT JOIN 语义下右表不匹配时保留左表行，但 GROUP BY 前这些行仍参与分组），重写直接移除 JOIN 后会包含所有 ENAME='A' 的 JOB 值，结果集可能不同。",
+    "differences": [
+        {
+            "type": "JOIN条件过滤语义",
+            "description": "原SQL的LEFT JOIN ON条件 t0.JOB=t1.NAME 虽不影响行数（LEFT JOIN保留左表），但若某JOB值不在DEPT.NAME中，该行的t1列为NULL；重写移除JOIN后，所有JOB值都参与GROUP BY，可能产生原SQL中因JOIN条件不匹配而被隐式过滤的JOB分组",
+            "location": "LEFT JOIN ON t0.JOB = t1.NAME"
+        }
+    ]
+}
+```
+❌ 语义不等价: LEFT JOIN 的 ON 条件包含 t0.JOB = t1.NAME，该条件会过滤掉 JOB 值在 DEPT.NAME 中不存在的行（LEFT JOIN 语义下右表不匹配时保留左表行，但 GROUP BY 前这些行仍参与分组），重写直接移除 JOIN 后会包含所有 ENAME='A' 的 JOB 值，结果集可能不同。
+```json
+{"fixed_sql": "SELECT t0.JOB FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER, DEPTNO + EMPNO AS f9 FROM EMP WHERE ENAME = 'A') AS t0 LEFT JOIN (SELECT DEPTNO, NAME, DEPTNO + 5 AS f2 FROM DEPT) AS t1 ON t0.JOB = t1.NAME AND t0.f9 = t1.f2 GROUP BY t0.JOB", "note": "恢复LEFT JOIN结构，因为虽然JOIN不影响行数，但原SQL的GROUP BY在JOIN后执行，移除JOIN会改变语义边界"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL与原始SQL完全相同（逐字符一致），无任何差异。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（cost 715573.74，结构完全相同），说明本轮应用的规则（PROJECT_JOIN_TRANSPOSE、JOIN_PROJECT_LEFT_TRANSPOSE_INCLUDE_OUTER、AGGREGATE_JOIN_REMOVE）未产生实际改写效果。original_sql 与 enhanced_sql 文本完全相同，优化器生成的执行计划也完全相同（节点类型、行数估计、cost、并行度均无变化）。虽然 optimization_advice 中提出了投影裁剪、LEFT JOIN 消除、聚合下推等建议，但实际应用的规则未能触发这些改写。当前执行计划已采用并行 Hash Join + Gather Merge + Group 结构，无明显结构性缺陷。由于本轮重写未产生任何变化，继续迭代无意义，应终止优化流程。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": false,
+  "reason": "经过多轮优化尝试，当前SQL已无法通过查询重写进一步提升性能。核心瓶颈是emp表的全表扫描（Seq Scan，代价占比98.2%），这是由WHERE ENAME='A'条件导致的，但emp表上缺少ename列的索引。历史案例显示相似SQL曾应用PROJECT_JOIN_TRANSPOSE、AGGREGATE_REMOVE等规则，但上一轮反馈表明这些规则未产生实际改写效果（original_sql与enhanced_sql完全相同，执行计划完全一致）。当前执行计划已采用并行Hash Join + Gather Merge + Group结构，LEFT JOIN的右表dept仅45万行且已通过f9=f2和JOB=NAME条件过滤，聚合仅对t0.JOB分组，投影已最小化。由于LEFT JOIN的连接条件涉及计算列（DEPTNO+EMPNO和DEPTNO+5），且WHERE过滤在emp表上，无法通过谓词下推、JOIN消除、聚合下推等重写规则绕过全表扫描。性能提升需要物理优化：在emp.ename上创建索引（CREATE INDEX idx_emp_ename ON emp(ename)），将Seq Scan转为Index Scan，预计可将代价从70万降至数百。查询重写优化已达极限。",
+  "advice": []
+}
+```
+❌ SQL 无需优化，终止流程
+
+----------------------------------------
+

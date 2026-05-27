@@ -1,0 +1,304 @@
+Query ID: 43
+==================================================
+
+Original: SELECT NAME, DDEPTNO, COUNT(*) AS C FROM (SELECT NAME AS NAME, DEPTNO AS DDEPTNO FROM DEPT) AS t3 WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((NAME, DDEPTNO), NAME)
+Rewritten: WITH filtered AS (SELECT name, deptno FROM dept WHERE name = 'Charlie') SELECT name AS name, deptno AS ddeptno, COUNT(*) AS c FROM filtered GROUP BY GROUPING SETS ((name, deptno), (name))
+Time Cost: 164.37s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "使用CTE预先物化WHERE NAME='Charlie'的过滤结果集，然后在CTE结果上执行GROUPING SETS聚合，避免对dept基表的重复扫描。结构：WITH filtered AS (SELECT * FROM DEPT WHERE NAME='Charlie') SELECT NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM filtered GROUP BY GROUPING SETS((NAME,DEPTNO),NAME)"}, {'group': '聚合优化', 'produced_suggestion': '回退到原始GROUPING SETS语法，保留单次表扫描优势。若优化器支持，可尝试ROLLUP(NAME,DEPTNO)替代GROUPING SETS，部分数据库对ROLLUP有更优执行路径'}, {'group': '谓词简化', 'produced_suggestion': "在CTE或派生表中提前应用WHERE NAME='Charlie'过滤，确保后续聚合操作仅处理过滤后的小结果集，减少Gather Merge/Gather节点的数据传输开销"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示Seq Scan占总代价85.2%，对dept表进行全表扫描并过滤name='Charlie'。虽然dept表上没有name列的索引，但SQL存在多处可优化点：1)子查询t3仅做简单投影可消除 2)GROUPING SETS包含冗余分组维度(NAME单独分组已被(NAME,DDEPTNO)包含) 3)谓词可在投影消除后直接应用。参考历史案例(相似度0.8433)成功应用了FILTER_AGGREGATE_TRANSPOSE等规则优化类似GROUPING SETS查询。",
+  "advice": [
+    {
+      "group": "投影优化",
+      "produced_suggestion": "消除冗余子查询t3：子查询仅对列进行重命名(NAME AS NAME, DEPTNO AS DDEPTNO)，可直接展开为SELECT NAME, DEPTNO AS DDEPTNO FROM DEPT WHERE NAME='Charlie'，减少一层查询嵌套"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "过滤条件下推：WHERE NAME='Charlie'当前在子查询外层，消除子查询后可直接作用于基表，配合可能的索引扫描(若后续创建name索引)降低扫描代价"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "简化GROUPING SETS冗余维度：当前GROUPING SETS((NAME,DDEPTNO), NAME)中，NAME单独分组的结果集已被(NAME,DDEPTNO)分组包含(因WHERE已限定NAME='Charlie'为常量)，可简化为GROUP BY NAME, DDEPTNO并通过UNION ALL补充仅按NAME分组的结果，或直接使用ROLLUP(NAME,DDEPTNO)替代"
+    },
+    {
+      "group": "常量折叠",
+      "produced_suggestion": "利用常量谓词优化分组：由于WHERE NAME='Charlie'使NAME成为常量，GROUPING SETS的两个分组维度实际等价(NAME固定时按(NAME,DDEPTNO)分组等同于按DDEPTNO分组)，可重写为单一GROUP BY DDEPTNO并在SELECT中补充常量'Charlie' AS NAME"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.243
+   → AGGREGATE_VALUES: UCT=1.243
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "投影优化, 谓词简化, 聚合优化",
+  "applied_rules": [
+    "PROJECT_MERGE",
+    "FILTER_AGGREGATE_TRANSPOSE",
+    "AGGREGATE_UNION_TRANSPOSE"
+  ],
+  "rule_effect_scores": {
+    "PROJECT_MERGE": 0.25,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.45,
+    "AGGREGATE_UNION_TRANSPOSE": 0.30
+  },
+  "rule_effect_confidence": {
+    "PROJECT_MERGE": 0.85,
+    "FILTER_AGGREGATE_TRANSPOSE": 0.80,
+    "AGGREGATE_UNION_TRANSPOSE": 0.75
+  }
+}
+```
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "投影优化, 谓词简化, 聚合优化",
+  "applied_rules": [
+    "PROJECT_MERGE",
+    "FILTER_AGGREGATE_TRANSPOSE",
+    "AGGREGATE_UNION_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT NAME, DDEPTNO, SUM(C) AS C\nFROM (\n  SELECT 'Charlie' AS NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C\n  FROM DEPT\n  WHERE NAME = 'Charlie'\n  GROUP BY DEPTNO\n  UNION ALL\n  SELECT 'Charlie' AS NAME, NULL AS DDEPTNO, COUNT(*) AS C\n  FROM DEPT\n  WHERE NAME = 'Charlie'\n) AS u\nGROUP BY NAME, DDEPTNO",
+  "semantic_correctness_guarantee": "1. **PROJECT_MERGE应用**：消除了子查询t3，将其投影(NAME AS NAME, DEPTNO AS DDEPTNO)直接合并到外层查询。由于子查询仅做列重命名且无过滤/聚合逻辑，合并后语义完全等价。\n\n2. **FILTER_AGGREGATE_TRANSPOSE应用**：将WHERE NAME='Charlie'谓词从聚合外层下推到基表DEPT扫描阶段。由于NAME列来自基表且谓词不依赖聚合结果，下推后仅改变执行顺序(先过滤后聚合)，结果集不变。\n\n3. **GROUPING SETS语义展开**：原查询GROUPING SETS((NAME,DDEPTNO), NAME)生成两个分组维度的结果集：(1)按(NAME,DDEPTNO)分组 (2)仅按NAME分组。由于WHERE已限定NAME='Charlie'为常量，第二个分组维度实际聚合所有满足NAME='Charlie'的行(DDEPTNO为NULL标记)。重写使用UNION ALL显式分离两个分支：第一分支按DEPTNO分组(NAME固定为'Charlie')，第二分支全局聚合(DDEPTNO设为NULL)，完全复现GROUPING SETS语义。\n\n4. **AGGREGATE_UNION_TRANSPOSE应用**：在UNION ALL两个分支内分别执行COUNT(*)聚合，外层用SUM(C)合并。由于COUNT(*)可加性(分组后计数之和等于总计数)，且两分支数据不重叠(一个按DEPTNO分组，一个全局聚合)，外层SUM(C)与原聚合等价。\n\n5. **NULL语义保证**：原GROUPING SETS在仅按NAME分组时，DDEPTNO列自动填充NULL(标准GROUPING SETS行为)。重写在第二UNION ALL分支显式设置DDEPTNO为NULL，保持一致。\n\n6. **结果集列对应**：重写后SELECT NAME, DDEPTNO, SUM(C) AS C的列顺序、别名、数据类型与原查询SELECT NAME, DDEPTNO, COUNT(*) AS C完全一致。外层GROUP BY NAME, DDEPTNO确保结果按相同维度分组(NAME恒为'Charlie'，DDEPTNO区分不同部门或NULL)。\n\n7. **主键与重复行**：DEPT表主键为deptno，WHERE NAME='Charlie'可能匹配多行(不同deptno但name相同)。重写在第一分支按DEPTNO分组计数，第二分支全局计数，与原GROUPING SETS逻辑一致，不会产生额外重复或遗漏行。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在外层对UNION ALL结果再次GROUP BY NAME, DDEPTNO，导致原本应分离的两个分组集合(按DEPTNO分组的多行 + 全局聚合的1行)被错误地二次聚合合并，改变了结果集行数和语义。",
+    "differences": [
+        {
+            "type": "aggregation_semantics",
+            "description": "原SQL的GROUPING SETS直接产生最终分组结果(每个DEPTNO一行+全局NULL行)，重写SQL在UNION ALL后又执行了外层GROUP BY NAME, DDEPTNO，将本应独立的分组集合行错误地二次聚合",
+            "location": "外层GROUP BY NAME, DDEPTNO"
+        },
+        {
+            "type": "result_set_structure",
+            "description": "原SQL产生n+1行(n个不同DEPTNO各1行+1个全局汇总行DDEPTNO=NULL)，重写SQL的外层GROUP BY会将UNION ALL第二分支的全局汇总行(DDEPTNO=NULL)与第一分支按DEPTNO分组的行再次按(NAME,DDEPTNO)分组，但由于第一分支已按DEPTNO分组且DDEPTNO非NULL，第二分支DDEPTNO=NULL，外层GROUP BY实际不改变行数但逻辑上多了一层无意义的分组操作，且若UNION ALL两分支产生相同(NAME,DDEPTNO)组合则会错误合并",
+            "location": "整体查询结构"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在外层对UNION ALL结果再次GROUP BY NAME, DDEPTNO，导致原本应分离的两个分组集合(按DEPTNO分组的多行 + 全局聚合的1行)被错误地二次聚合合并，改变了结果集行数和语义。
+```json
+{
+  "fixed_sql": "SELECT NAME, DDEPTNO, C FROM (SELECT 'Charlie' AS NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY DEPTNO UNION ALL SELECT 'Charlie' AS NAME, NULL AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie') AS u",
+  "note": "移除外层GROUP BY NAME, DDEPTNO，使UNION ALL直接产生最终结果集，避免二次聚合导致的语义错误"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已移除上轮被否的外层GROUP BY，UNION ALL两分支直接产生最终结果集：第一分支按DEPTNO分组产生n行，第二分支全局聚合产生1行(DDEPTNO=NULL)，完全复现原SQL的GROUPING SETS((NAME,DDEPTNO), NAME)语义。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写将 GROUPING SETS 展开为 UNION ALL + 两次独立聚合，导致基表 dept 被扫描两次（Seq Scan 从 1 次增至 2 次），且引入 Append 节点协调两个子查询分支。虽然每次扫描均保留并行（Parallel Aware=true），但整体执行路径从"单次扫描+单次聚合"变为"双次扫描+双次聚合+合并"，结构上明确退化。行数估计求和从 50 增至 61（增幅 22%），cost 从 6774 增至 13547（翻倍），两者均指向负面。改进点：无明显改进；过滤下推在原 SQL 中已通过 Gather 下的 Seq Scan Filter 实现，重写未带来新的过滤优势。结论：本轮重写未能消除 GROUPING SETS 的计算开销，反而引入重复扫描，属于明确恶化。",
+  "no_further_optimization": false,
+  "next_step_advice": "回退到 original_sql 基础上重新优化：保留 GROUPING SETS 语义，但尝试通过 CTE 或派生表预先过滤 WHERE NAME='Charlie' 的结果集并物化，然后在该中间结果上执行 GROUPING SETS 聚合，避免重复扫描基表；或考虑用 ROLLUP(NAME, DEPTNO) 替代 GROUPING SETS，若优化器能更高效处理 ROLLUP。"
+}
+```
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示dept表被扫描两次（Seq Scan占比各42.6%），且两次扫描均使用相同过滤条件NAME='Charlie'。上一轮UNION ALL展开导致重复扫描，本轮应回退到GROUPING SETS语义，通过CTE物化过滤结果集，避免重复扫描基表。当前无NAME列索引，但可通过查询重写减少扫描次数。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "使用CTE预先物化WHERE NAME='Charlie'的过滤结果集，然后在CTE结果上执行GROUPING SETS聚合，避免对dept基表的重复扫描。结构：WITH filtered AS (SELECT * FROM DEPT WHERE NAME='Charlie') SELECT NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM filtered GROUP BY GROUPING SETS((NAME,DEPTNO),NAME)"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "回退到原始GROUPING SETS语法，保留单次表扫描优势。若优化器支持，可尝试ROLLUP(NAME,DEPTNO)替代GROUPING SETS，部分数据库对ROLLUP有更优执行路径"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "在CTE或派生表中提前应用WHERE NAME='Charlie'过滤，确保后续聚合操作仅处理过滤后的小结果集，减少Gather Merge/Gather节点的数据传输开销"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.245
+   → AGGREGATE_VALUES: UCT=1.245
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+分析当前SQL结构：
+
+```sql
+SELECT NAME, DDEPTNO, C FROM (
+  SELECT 'Charlie' AS NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY DEPTNO 
+  UNION ALL 
+  SELECT 'Charlie' AS NAME, NULL AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie'
+) AS u
+```
+
+**问题分析：**
+1. 当前SQL是上一轮将GROUPING SETS展开为UNION ALL的结果，导致dept表被扫描两次
+2. 两个分支都有常量 `'Charlie' AS NAME`，可以上提
+3. 外层SELECT是简单的列转发，可以合并/移除
+4. 两个分支共享相同的WHERE条件，但无法通过规则自动合并回CTE（CTE需要手动重写）
+
+**可用规则分析：**
+1. `UNION_PULL_UP_CONSTANTS` (UCT:1.100)：两个分支都有 `'Charlie' AS NAME` 常量列，可以上提到外层，减少UNION ALL分支的冗余计算
+2. `PROJECT_MERGE` (UCT:0.620)：外层SELECT只是简单转发列，可以与内层合并消除冗余层
+3. `FILTER_SET_OP_TRANSPOSE` (UCT:0.637)：外层无WHERE条件，不适用
+4. `AGGREGATE_ANY_PULL_UP_CONSTANTS` (UCT:1.100)：第一个分支GROUP BY中name是常量，可以分离
+5. `PROJECT_REMOVE` (UCT:0.587)：外层投影可以移除
+6. `STRATEGY_CTE_DECOMPOSITION` (UCT:0.521)：将重复的WHERE条件提取为CTE，避免两次扫描
+
+**核心瓶颈**：dept被扫描两次（各占42.6%成本）。最有效的方案是用CTE物化过滤结果，然后通过常量上提减少冗余。
+
+选择规则：
+1. `STRATEGY_CTE_DECOMPOSITION`：将重复的`DEPT WHERE NAME='Charlie'`提取为CTE
+2. `UNION_PULL_UP_CONSTANTS`：上提两分支中的常量NAME列
+3. `AGGREGATE_ANY_PULL_UP_CONSTANTS`：将GROUP BY中的常量列分离
+4. `PROJECT_MERGE`：合并外层冗余投影
+
+```json
+{
+  "groups": "子查询优化, 集合优化, 聚合优化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "UNION_PULL_UP_CONSTANTS",
+    "AGGREGATE_ANY_PULL_UP_CONSTANTS",
+    "PROJECT_MERGE"
+  ],
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.55,
+    "UNION_PULL_UP_CONSTANTS": 0.25,
+    "AGGREGATE_ANY_PULL_UP_CONSTANTS": 0.12,
+    "PROJECT_MERGE": 0.08
+  },
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.72,
+    "UNION_PULL_UP_CONSTANTS": 0.85,
+    "AGGREGATE_ANY_PULL_UP_CONSTANTS": 0.75,
+    "PROJECT_MERGE": 0.80
+  }
+}
+```
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 集合优化, 聚合优化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "UNION_PULL_UP_CONSTANTS",
+    "AGGREGATE_ANY_PULL_UP_CONSTANTS",
+    "PROJECT_MERGE"
+  ],
+  "rewritten_sql": "WITH filtered AS (\n  SELECT deptno\n  FROM dept\n  WHERE name = 'Charlie'\n)\nSELECT 'Charlie' AS name, deptno AS ddeptno, COUNT(*) AS c\nFROM filtered\nGROUP BY GROUPING SETS ((deptno), ())",
+  "semantic_correctness_guarantee": "1. **结构性改写**：应用 STRATEGY_CTE_DECOMPOSITION 将 WHERE name='Charlie' 过滤逻辑提取为 CTE (WITH filtered AS ...)，避免基表 dept 的重复扫描；原 SQL 中 UNION ALL 的两个分支（一个按 deptno 分组，一个全局聚合）通过 GROUPING SETS((deptno), ()) 统一表达，消除 UNION ALL 结构。\n\n2. **常量上提（UNION_PULL_UP_CONSTANTS + AGGREGATE_ANY_PULL_UP_CONSTANTS）**：原 SQL 两个分支均在 SELECT 子句中硬编码常量 'Charlie' AS name，重写后将该常量上提至最外层 SELECT，内层 CTE 和 GROUPING SETS 聚合仅处理变化列 deptno；GROUP BY 中不再包含常量 'Charlie'，仅保留 GROUPING SETS((deptno), ())，符合 AGGREGATE_ANY_PULL_UP_CONSTANTS 规则。\n\n3. **投影合并（PROJECT_MERGE）**：原 SQL 外层 SELECT name, ddeptno, c FROM (子查询 u)，重写后直接在最外层 SELECT 输出最终列名和表达式，消除中间派生表 u 的投影层。\n\n4. **GROUPING SETS 语义等价性**：原 SQL 第一分支 GROUP BY deptno 产生每个 deptno 的计数，第二分支无 GROUP BY（等价于全局聚合）产生总计数且 ddeptno=NULL；重写后 GROUPING SETS((deptno), ()) 在单次聚合中生成相同结果：(deptno) 对应按 deptno 分组的行，() 对应全局聚合行（deptno 列自动填充 NULL）。两者结果集在行数、列值、NULL 语义上完全一致。\n\n5. **过滤谓词作用域**：原 SQL 在 UNION ALL 两个分支中均独立应用 WHERE name='Charlie'，重写后在 CTE filtered 中统一过滤一次，后续 GROUPING SETS 聚合仅操作 filtered 结果集；由于 CTE 物化了过滤结果，且 GROUPING SETS 不改变行的来源，最终聚合的输入行集与原 SQL 两分支各自过滤后的行集完全相同。\n\n6. **列名与别名一致性**：原 SQL 输出列为 name='Charlie'（常量）、ddeptno（deptno 或 NULL）、c（COUNT(*) 结果）；重写后输出列同样为 name='Charlie'（外层常量）、ddeptno（GROUPING SETS 中 deptno 列，分组行保留值、全局聚合行为 NULL）、c（COUNT(*) 结果），列名、数据类型、NULL 语义完全对应。\n\n7. **易误判点说明**：GROUPING SETS((deptno), ()) 与 UNION ALL (GROUP BY deptno + 全局聚合) 在 PostgreSQL 等数据库中语义严格等价，均生成 N+1 行（N 为不同 deptno 数量，+1 为全局汇总行）；CTE 物化确保过滤逻辑仅执行一次，避免原 SQL 中基表的两次独立扫描，但结果集行数、列值、NULL 分布与原 SQL 完全一致，不存在重复行或遗漏行风险。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL的GROUPING SETS((NAME, DDEPTNO), NAME)会产生两种分组：(NAME, DDEPTNO)和(NAME)，后者在ddeptno列填充NULL；重写SQL的GROUPING SETS((deptno), ())产生的是按deptno分组和全局聚合（name和ddeptno均为NULL），两者结果集的行数、NULL分布和聚合粒度不一致。",
+    "differences": [
+        {
+            "type": "GROUPING_SETS_semantics",
+            "description": "原始SQL按(NAME, DDEPTNO)和NAME两种粒度分组，重写SQL按deptno和全局()分组，分组维度不等价",
+            "location": "GROUP BY子句"
+        },
+        {
+            "type": "constant_column_handling",
+            "description": "原始SQL在GROUP BY NAME中保留常量'Charlie'作为分组键，重写SQL将其上提为投影常量且全局聚合行中name也输出'Charlie'，改变了NULL语义",
+            "location": "SELECT和GROUP BY子句"
+        },
+        {
+            "type": "result_set_structure",
+            "description": "原始SQL产生按(name, deptno)分组的N行+按name分组的1行（ddeptno=NULL），重写SQL产生按deptno分组的N行+全局聚合1行（name和ddeptno均应为NULL但name被强制为'Charlie'）",
+            "location": "整体结果集"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL的GROUPING SETS((NAME, DDEPTNO), NAME)会产生两种分组：(NAME, DDEPTNO)和(NAME)，后者在ddeptno列填充NULL；重写SQL的GROUPING SETS((deptno), ())产生的是按deptno分组和全局聚合（name和ddeptno均为NULL），两者结果集的行数、NULL分布和聚合粒度不一致。
+```json
+{
+  "fixed_sql": "WITH filtered AS (SELECT name, deptno FROM dept WHERE name = 'Charlie') SELECT name AS name, deptno AS ddeptno, COUNT(*) AS c FROM filtered GROUP BY GROUPING SETS ((name, deptno), (name))",
+  "note": "恢复name列到CTE和GROUP BY中，使用GROUPING SETS((name, deptno), (name))匹配原始分组语义"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正为GROUPING SETS((name, deptno), (name))，与原始SQL的分组维度完全一致，消除了上轮的全局聚合问题；CTE提取过滤逻辑、常量上提和投影合并均为结构性优化，不改变结果集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（costs均为6774.44，节点结构、并行度、行数估计完全相同），说明优化器将CTE物化后的执行路径与原始派生表路径视为等价。重写SQL通过CTE显式组织公共中间结果（WHERE过滤），提升了SQL可读性和维护性，且未引入任何性能退化。结构上：两者均为Parallel Seq Scan → Gather → Sort → Aggregate(GROUPING SETS)，过滤条件均在Seq Scan阶段下推，无重复扫描或额外物化开销。虽然未实现进一步性能提升，但CTE改写本身是结构优化的正向信号（预过滤+复用意图明确），且已是第2轮优化，当前执行计划已较优（并行扫描+过滤下推+单次聚合），继续优化空间极小。综合判断：terminate=true。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 150
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'UNION_PULL_UP_CONSTANTS', 'AGGREGATE_ANY_PULL_UP_CONSTANTS', 'PROJECT_MERGE']
+   - 优化组别: 子查询优化, 集合优化, 聚合优化, 投影优化
+   - 估计代价: 原始=6774.44, 重写=6774.44，相对变化: 0.00%
+✅ 成功存储，记录ID: 291e6ce9-3e73-4de5-8e36-300ccaaf6166
+
+🎲 UCT Math Update: 4 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=6774.4400, rc=6774.4400)
+   结构分细节: rows 50.0->50.0 (score=+0.000), depth 4.0->4.0 (score=+0.000)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.550, conf=0.72, lambda=0.36, reward=+0.000, count=138, avg=+0.019
+   → UNION_PULL_UP_CONSTANTS: P(s,a)=N/A, effect=0.250, conf=0.85, lambda=0.42, reward=+0.000, count=1, avg=+0.000
+   → AGGREGATE_ANY_PULL_UP_CONSTANTS: P(s,a)=N/A, effect=0.120, conf=0.75, lambda=0.38, reward=+0.000, count=1, avg=+0.000
+   → PROJECT_MERGE: P(s,a)=N/A, effect=0.080, conf=0.80, lambda=0.40, reward=+0.000, count=11, avg=-0.003
+
+----------------------------------------
+

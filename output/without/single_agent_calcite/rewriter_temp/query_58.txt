@@ -1,0 +1,88 @@
+Query ID: 58
+==================================================
+
+Original: select coalesce(sum(count_comm), 0) from (   select deptno, count(comm) as count_comm   from emp   group by deptno, mgr) t
+Rewritten: SELECT COALESCE(COUNT(comm), 0) FROM emp
+Time Cost: 49.95s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '消除冗余的两层聚合结构：外层SUM(COUNT(comm) GROUP BY deptno,mgr)在数学上等价于COUNT(comm)（COUNT忽略NULL，SUM各分组COUNT之和即全表非NULL comm的总数）。将SQL重写为：SELECT COALESCE(COUNT(comm), 0) FROM emp，彻底去除子查询和GROUP BY，消除三个Aggregate算子的流水线阻塞，将执行计划从多阶段聚合简化为单次全表扫描+单次聚合。'}, {'group': '投影优化', 'produced_suggestion': '去除子查询中多余的deptno列投影，重写后仅需扫描comm列，减少Seq Scan阶段的数据读取宽度，降低I/O开销。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "根据相似历史案例（相似度1.0，命中AGGREGATE_REMOVE规则），该SQL存在明显的聚合冗余：外层的SUM(count_comm)实际上等价于直接COUNT(comm)，因为SUM of COUNT(comm) grouped by (deptno, mgr) = COUNT(comm) over all rows（忽略NULL）。子查询按(deptno, mgr)分组后对count_comm求和，等价于直接在emp表上执行COUNT(comm)。可将两层聚合合并为一个COUNT(comm)，消除内层GROUP BY和外层SUM，大幅减少Aggregate算子的流水线阻塞代价（当前三个Aggregate算子合计占比58.1%）。优化后SQL为：SELECT COALESCE(COUNT(comm), 0) FROM emp",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除冗余的两层聚合结构：外层SUM(COUNT(comm) GROUP BY deptno,mgr)在数学上等价于COUNT(comm)（COUNT忽略NULL，SUM各分组COUNT之和即全表非NULL comm的总数）。将SQL重写为：SELECT COALESCE(COUNT(comm), 0) FROM emp，彻底去除子查询和GROUP BY，消除三个Aggregate算子的流水线阻塞，将执行计划从多阶段聚合简化为单次全表扫描+单次聚合。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "去除子查询中多余的deptno列投影，重写后仅需扫描comm列，减少Seq Scan阶段的数据读取宽度，降低I/O开销。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.243
+   → AGGREGATE_VALUES: UCT=1.243
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "聚合优化",
+  "applied_rules": ["AGGREGATE_REMOVE"],
+  "rule_effect_scores": {
+    "AGGREGATE_REMOVE": 1.0
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_REMOVE": 0.95
+  }
+}
+```
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化",
+  "applied_rules": [
+    "AGGREGATE_REMOVE"
+  ],
+  "rewritten_sql": "SELECT COALESCE(COUNT(comm), 0) FROM emp",
+  "semantic_correctness_guarantee": "1. 结构性改写：消除了子查询和两层聚合结构。原SQL在子查询中按(deptno, mgr)分组计算每组的COUNT(comm)，外层对所有分组结果求SUM；重写后直接在全表上执行COUNT(comm)。\n\n2. 等价性数学证明：COUNT聚合函数的可加性保证了等价。设emp表按(deptno, mgr)划分为n个不相交分组G1, G2, ..., Gn，每个分组Gi中comm非NULL的行数为ci，则原SQL计算SUM(c1, c2, ..., cn) = c1+c2+...+cn，这正好等于全表中comm非NULL的总行数COUNT(comm)。SUM对COUNT结果的聚合在数学上等价于直接COUNT全表。\n\n3. GROUP BY列(deptno, mgr)的作用域分析：原SQL的GROUP BY仅用于将表分区后分别计数，但外层SUM会将所有分区的计数重新合并。由于COUNT函数对NULL值的处理是统一的(忽略NULL)，分组计数后求和与直接全表计数在comm列的NULL处理语义上完全一致。\n\n4. COALESCE处理：原SQL和重写SQL都使用COALESCE(..., 0)。当emp表为空时，原SQL子查询返回空结果集，SUM(空集)返回NULL，COALESCE转为0；重写SQL的COUNT(空表)返回0，COALESCE(0, 0)仍为0。当表非空但comm全为NULL时，原SQL各分组COUNT(comm)均为0，SUM(0,0,...)=0；重写SQL的COUNT(comm)=0。语义一致。\n\n5. 无聚合函数冲突：原SQL外层只有SUM聚合，没有其他SELECT列或HAVING/ORDER BY依赖分组键，因此去除GROUP BY不会影响结果集的列结构和行数(始终返回单行单列)。\n\n6. Schema约束验证：emp表的comm列定义为NOT NULL，但实际统计信息和查询逻辑表明需要处理NULL情况(使用了COUNT而非COUNT(*))。无论comm是否可为NULL，COUNT(comm)的语义(计数非NULL值)在分组求和与全表直接计数之间保持等价。\n\n7. 性能优化合理性：消除子查询和GROUP BY后，执行计划从\"Seq Scan -> Aggregate(GROUP BY) -> Aggregate(SUM)\"简化为\"Seq Scan -> Aggregate(COUNT)\"，减少了中间物化和多阶段聚合开销，在4500万行数据规模下收益显著，且不改变结果集语义。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "两层聚合折叠：原SQL内层按(deptno,mgr)分组COUNT(comm)，外层SUM所有分组计数；重写直接全表COUNT(comm)。根据COUNT可加性，SUM(各分组COUNT) = 全表COUNT，且COALESCE(0)处理一致，结果集相同。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 38550188.0 -> 18750094.0 (重写侧约为原的 48.6381%)
+✅ 估计代价降幅 83.0% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 111
+   - 规则序列: ['AGGREGATE_REMOVE']
+   - 优化组别: 聚合优化
+   - 估计代价: 原始=4138767.94, 重写=703880.35，相对变化: 82.99%
+✅ 成功存储，记录ID: d7e3e93f-37b9-43e4-bd56-171b8a66e558
+
+🎲 UCT Math Update: 1 rules, reward=+0.5144 (cost=+0.8299, rows=+0.5136, depth=+0.2000, oc=4138767.9400, rc=703880.3500)
+   结构分细节: rows 38550188.0->18750094.0 (score=+0.514), depth 5.0->4.0 (score=+0.200)
+✅ UCT Update Complete:
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=1.000, conf=0.95, lambda=0.47, reward=+0.514, count=21, avg=+0.186
+
+----------------------------------------
+

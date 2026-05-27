@@ -1,0 +1,94 @@
+Query ID: 49
+==================================================
+
+Original: select * from emp e1  where e1.empno > SOME (select deptno from dept)
+Rewritten: SELECT e1.*
+FROM emp e1
+CROSS JOIN (SELECT MIN(deptno) AS min_deptno FROM dept) AS sub_dept
+WHERE e1.empno > sub_dept.min_deptno
+Time Cost: 48.39s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将SOME子查询改写为JOIN+聚合形式：先对dept表求MIN(deptno)得到最小部门号，然后用简单比较替代SOME语义(empno > SOME等价于empno大于最小值)。改写为: SELECT e1.* FROM emp e1 CROSS JOIN (SELECT MIN(deptno) AS min_dept FROM dept) d WHERE e1.empno > d.min_dept。这样避免了Nested Loop Semi Join，将450K次内表扫描降为1次聚合计算。'}, {'group': '谓词简化', 'produced_suggestion': '利用SOME语义特性简化谓词：empno > SOME(select deptno from dept)等价于empno > MIN(deptno)。通过标量子查询物化最小值，将半连接转换为简单过滤：WHERE e1.empno > (SELECT MIN(deptno) FROM dept)。PostgreSQL会将标量子查询InitPlan化，仅执行一次，消除Nested Loop。'}, {'group': '连接优化', 'produced_suggestion': '若必须保留Semi Join结构，建议在dept表deptno列上添加索引(当前仅有主键索引)，并通过MATERIALIZED CTE预先物化dept结果集：WITH dept_vals AS MATERIALIZED (SELECT DISTINCT deptno FROM dept) SELECT * FROM emp e1 WHERE EXISTS (SELECT 1 FROM dept_vals WHERE e1.empno > deptno)。物化可减少重复扫描，索引可加速内表查找。'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) Nested Loop Semi Join占79.3%代价，处理45M行emp表与450K行dept表的半连接效率低下；2) 全表扫描emp表(6.3%代价)；3) SOME子查询转换为Semi Join后仍需对每行emp进行dept表扫描。SQL结构可通过子查询改写和谓词优化显著提升性能。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将SOME子查询改写为JOIN+聚合形式：先对dept表求MIN(deptno)得到最小部门号，然后用简单比较替代SOME语义(empno > SOME等价于empno大于最小值)。改写为: SELECT e1.* FROM emp e1 CROSS JOIN (SELECT MIN(deptno) AS min_dept FROM dept) d WHERE e1.empno > d.min_dept。这样避免了Nested Loop Semi Join，将450K次内表扫描降为1次聚合计算。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "利用SOME语义特性简化谓词：empno > SOME(select deptno from dept)等价于empno > MIN(deptno)。通过标量子查询物化最小值，将半连接转换为简单过滤：WHERE e1.empno > (SELECT MIN(deptno) FROM dept)。PostgreSQL会将标量子查询InitPlan化，仅执行一次，消除Nested Loop。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "若必须保留Semi Join结构，建议在dept表deptno列上添加索引(当前仅有主键索引)，并通过MATERIALIZED CTE预先物化dept结果集：WITH dept_vals AS MATERIALIZED (SELECT DISTINCT deptno FROM dept) SELECT * FROM emp e1 WHERE EXISTS (SELECT 1 FROM dept_vals WHERE e1.empno > deptno)。物化可减少重复扫描，索引可加速内表查找。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.244
+   → AGGREGATE_VALUES: UCT=1.244
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "子查询优化, 谓词简化",
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE"],
+  "rule_effect_scores": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 1.0
+  },
+  "rule_effect_confidence": {
+    "FILTER_SUB_QUERY_TO_CORRELATE": 0.75
+  }
+}
+```
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 谓词简化",
+  "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE"],
+  "rewritten_sql": "SELECT e1.*\nFROM emp e1\nCROSS JOIN (SELECT MIN(deptno) AS min_deptno FROM dept) AS sub_dept\nWHERE e1.empno > sub_dept.min_deptno",
+  "semantic_correctness_guarantee": "1. 【结构性改写：SOME子查询 → CROSS JOIN + 聚合标量子查询】\n   原始SQL使用 `empno > SOME (SELECT deptno FROM dept)` 语义，即：emp中的行当且仅当其empno大于dept中至少一个deptno时才保留。重写将该半连接结构改写为 CROSS JOIN 一个对dept求 MIN(deptno) 的派生表，并在WHERE子句中以 `e1.empno > sub_dept.min_deptno` 做简单比较过滤。\n\n2. 【SOME语义等价性：> SOME ≡ > MIN】\n   SQL标准定义：`x > SOME (SELECT v FROM ...)` 等价于 `EXISTS (SELECT v FROM ... WHERE x > v)`，即x大于子查询结果集中至少一个值。当子查询结果集非空时，这与 `x > MIN(子查询结果集)` 完全等价——若x大于最小值，则必然大于至少一个值；若x不大于最小值，则不大于任何值。因此两者语义完全一致。\n\n3. 【dept表非空假设与NULL处理】\n   dept.deptno 列定义为 `INTEGER NOT NULL`，不存在NULL值，MIN(deptno) 不会受NULL干扰。根据统计信息dept表有450,000行，表非空，MIN(deptno) 不会返回NULL。若dept表为空，SOME子查询结果集为空，原始SQL中所有行都不满足条件（返回空集）；重写中 MIN(deptno) 返回NULL，`e1.empno > NULL` 为UNKNOWN，WHERE过滤后同样返回空集，行为一致。\n\n4. 【SELECT * 等价性】\n   原始SQL为 `SELECT * FROM emp e1`，重写SQL为 `SELECT e1.*`，均展开为emp表的全部列（empno, deptno, ename, job, mgr, hiredate, sal, comm, slacker），列集合、列顺序、数据类型完全一致。CROSS JOIN的派生表列（min_deptno）仅用于过滤，不出现在SELECT投影中，不影响输出列。\n\n5. 【无重复行放大风险】\n   CROSS JOIN的右侧是单行聚合结果（MIN返回恰好一行），与左表emp做CROSS JOIN不会产生行数放大（1行 × N行 = N行），因此不需要DISTINCT去重，结果行数与原始查询完全一致。\n\n6. 【优化效果说明（不影响等价性）】\n   原始SOME子查询在执行时通常需要对dept表进行Nested Loop Semi Join（最坏情况450K次内表访问/每个emp行）；改写后派生表 MIN 聚合仅执行一次（1次全表扫描dept，450K行），将内层代价从O(emp×dept)降为O(dept)，大幅提升执行效率，且语义完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "原始SQL的 `empno > SOME (SELECT deptno FROM dept)` 在dept非空时等价于 `empno > MIN(deptno)`；重写通过CROSS JOIN单行聚合结果并用WHERE过滤，语义完全一致，dept表空时两者均返回空集。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 1->0, index-like 1->2 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 40150192.0 -> 30450146.0 (重写侧约为原的 75.8406%)
+✅ 估计代价降幅 93.0% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 66
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE']
+   - 优化组别: 子查询优化, 谓词简化
+   - 估计代价: 原始=10412259.82, 重写=733194.0，相对变化: 92.96%
+✅ 成功存储，记录ID: 11bd3f22-444e-4592-9f05-f753ef73cd96
+
+🎲 UCT Math Update: 1 rules, reward=+0.2755 (cost=+0.9296, rows=+0.2416, depth=-0.3333, oc=10412259.8200, rc=733194.0000)
+   结构分细节: rows 40150192.0->30450146.0 (score=+0.242), depth 3.0->4.0 (score=-0.333)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=1.000, conf=0.75, lambda=0.38, reward=+0.276, count=27, avg=+0.015
+
+----------------------------------------
+

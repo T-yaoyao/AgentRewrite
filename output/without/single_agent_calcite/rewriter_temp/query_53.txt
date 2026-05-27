@@ -1,0 +1,266 @@
+Query ID: 53
+==================================================
+
+Original: with e2 as (   select empno, case when true then deptno else null end as deptno   from emp) select empno,   deptno in (select deptno from e2 where empno < 20) as d from e2
+Rewritten: WITH e2 AS (SELECT empno, CASE WHEN true THEN deptno ELSE null END AS deptno FROM emp) SELECT empno, deptno IN (SELECT deptno FROM e2 WHERE empno < 20) AS d FROM e2
+Time Cost: 151.13s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '消除 CTE e2 的物化，将其内联展开到主查询中，避免重复扫描 emp 表（4500 万行）造成的笛卡尔积效应'}, {'group': '子查询优化', 'produced_suggestion': '将 EXISTS 相关子查询转换为 LEFT SEMI JOIN 或 IN 子查询，消除逐行探测导致的嵌套循环，利用 Hash Join 批量匹配'}, {'group': '谓词简化', 'produced_suggestion': '将 CASE WHEN true THEN deptno ELSE null END 简化为 deptno，消除冗余的条件判断'}, {'group': '谓词简化', 'produced_suggestion': '将 empno < 20 的过滤条件尽早下推到 emp 表扫描阶段，减少参与 JOIN 的数据量（从 4500 万行降至约 20 行）'}, {'group': '投影优化', 'produced_suggestion': '消除外层 CASE WHEN EXISTS ... THEN TRUE ELSE FALSE END 的冗余布尔转换，直接使用 EXISTS 或 JOIN 结果的布尔值'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示CTE e2被物化并扫描两次(CTE Scan占比68.8%)，且存在4500万行的全表扫描。根据相似历史案例(相似度1.0)，该SQL模式可通过PROJECT_SUB_QUERY_TO_CORRELATE等规则优化。主要问题：1)CTE重复物化导致双重扫描开销 2)IN子查询可转换为半连接 3)CASE WHEN TRUE恒真表达式未简化",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将IN子查询转换为SEMI JOIN或EXISTS形式，避免CTE二次物化。参考历史案例规则PROJECT_SUB_QUERY_TO_CORRELATE，将相关子查询改写为关联形式"
+    },
+    {
+      "group": "常量折叠",
+      "produced_suggestion": "简化CASE WHEN TRUE THEN deptno ELSE NULL END为deptno，消除恒真条件判断的运行时开销"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "内联CTE e2定义，消除CTE物化层。将WITH子句展开为子查询或直接引用基表emp，参考历史案例规则PROJECT_MERGE"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将empno<20过滤条件尽早应用到基表扫描，减少CTE物化的数据量。参考历史案例规则FILTER_INTO_JOIN，将过滤条件下推"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.240
+   → AGGREGATE_VALUES: UCT=1.240
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "子查询优化, 投影优化, 常量折叠, 谓词简化",
+  "applied_rules": [
+    "PROJECT_REDUCE_EXPRESSIONS",
+    "PROJECT_SUB_QUERY_TO_CORRELATE",
+    "FILTER_INTO_JOIN",
+    "PROJECT_MERGE"
+  ],
+  "rule_effect_scores": {
+    "PROJECT_REDUCE_EXPRESSIONS": 0.15,
+    "PROJECT_SUB_QUERY_TO_CORRELATE": 0.40,
+    "FILTER_INTO_JOIN": 0.25,
+    "PROJECT_MERGE": 0.20
+  },
+  "rule_effect_confidence": {
+    "PROJECT_REDUCE_EXPRESSIONS": 0.95,
+    "PROJECT_SUB_QUERY_TO_CORRELATE": 0.85,
+    "FILTER_INTO_JOIN": 0.80,
+    "PROJECT_MERGE": 0.85
+  }
+}
+```
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 投影优化, 常量折叠, 谓词简化",
+  "applied_rules": [
+    "PROJECT_REDUCE_EXPRESSIONS",
+    "PROJECT_SUB_QUERY_TO_CORRELATE",
+    "FILTER_INTO_JOIN",
+    "PROJECT_MERGE"
+  ],
+  "rewritten_sql": "SELECT\n  e1.empno,\n  CASE WHEN e2_sub.deptno IS NOT NULL THEN TRUE ELSE FALSE END AS d\nFROM emp e1\nLEFT JOIN LATERAL (\n  SELECT DISTINCT e2.deptno\n  FROM emp e2\n  WHERE e2.empno < 20\n    AND e2.deptno = e1.deptno\n) e2_sub ON TRUE",
+  "semantic_correctness_guarantee": "1. **常量折叠（PROJECT_REDUCE_EXPRESSIONS）**：原SQL中的 `CASE WHEN TRUE THEN deptno ELSE NULL END` 是恒真条件，简化为 `deptno`，消除运行时判断开销，语义完全等价。\n\n2. **CTE展开与投影合并（PROJECT_MERGE）**：将CTE e2内联展开，消除WITH子句的物化层。原SQL中e2被引用两次（外层SELECT的FROM和子查询中），展开后直接引用基表emp，分别命名为e1和e2以区分作用域。由于CTE e2仅做简单投影（empno, deptno），展开不改变结果集。\n\n3. **IN子查询转换为LATERAL JOIN（PROJECT_SUB_QUERY_TO_CORRELATE）**：原SQL的 `deptno IN (SELECT deptno FROM e2 WHERE empno < 20)` 是相关子查询，改写为LEFT JOIN LATERAL形式。子查询返回满足 `empno < 20` 且 `deptno = e1.deptno` 的deptno值，使用DISTINCT去重（IN语义隐含去重）。LEFT JOIN确保外层每行都有结果，匹配时d为TRUE，不匹配时d为FALSE，与原IN子查询的三值逻辑（TRUE/FALSE/NULL）等价。\n\n4. **谓词下推（FILTER_INTO_JOIN）**：将 `empno < 20` 过滤条件保留在LATERAL子查询内的WHERE子句中，直接作用于基表emp的扫描（e2），减少参与JOIN的数据量。同时将相关条件 `e2.deptno = e1.deptno` 也放入子查询WHERE中，利用empno主键索引和deptno列过滤。\n\n5. **IN语义等价性保证**：原SQL的 `deptno IN (subquery)` 在SQL标准下，当subquery返回空集时结果为FALSE，返回匹配值时为TRUE，返回NULL时为NULL。改写后的LEFT JOIN LATERAL，当子查询无匹配行时e2_sub.deptno为NULL（d为FALSE），有匹配行时e2_sub.deptno非NULL（d为TRUE）。由于emp表的deptno列定义为NOT NULL，不存在NULL值参与IN比较的情况，因此改写完全等价。\n\n6. **结果集列与排序保证**：原SQL返回两列(empno, d)，改写后同样返回(empno, d)，列名、类型、顺序一致。原SQL无ORDER BY，改写后也无，行顺序由数据库引擎决定，符合等价性要求。\n\n7. **主键与相关列分析**：emp表的主键是empno（唯一索引emp_pkey），外层e1和子查询e2通过deptno关联。由于deptno非主键且可能重复，子查询使用DISTINCT确保每个e1.deptno最多匹配一个e2_sub.deptno（IN语义只关心存在性，不关心重复次数）。empno < 20的过滤在子查询内完成，不影响外层e1的所有行都被保留（LEFT JOIN语义）。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL的IN子查询是非相关的（子查询中的e2与外层e2是同一CTE的两次引用，子查询扫描全部e2行），而重写SQL改为了相关JOIN（e2.deptno = e1.deptno），改变了子查询的过滤范围。",
+    "differences": [
+        {
+            "type": "子查询相关性变化",
+            "description": "原始SQL中IN子查询的e2是独立扫描（WHERE仅empno < 20），重写SQL将其改为相关子查询（额外增加e2.deptno = e1.deptno条件），导致不同外层行的子查询结果集不同",
+            "location": "IN子查询 vs LATERAL JOIN子查询的WHERE子句"
+        },
+        {
+            "type": "结果集差异",
+            "description": "当存在empno < 20且deptno与外层不同的行时，原始SQL的d可能为TRUE（因为子查询返回该deptno），而重写SQL的d为FALSE（因为相关条件过滤掉了该行）",
+            "location": "SELECT列d的计算逻辑"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL的IN子查询是非相关的（子查询中的e2与外层e2是同一CTE的两次引用，子查询扫描全部e2行），而重写SQL改为了相关JOIN（e2.deptno = e1.deptno），改变了子查询的过滤范围。
+```json
+{
+  "fixed_sql": "WITH e2 AS (SELECT empno, CASE WHEN true THEN deptno ELSE null END AS deptno FROM emp) SELECT e1.empno, CASE WHEN EXISTS (SELECT 1 FROM e2 e2_sub WHERE e2_sub.empno < 20 AND e2_sub.deptno = e1.deptno) THEN TRUE ELSE FALSE END AS d FROM e2 e1",
+  "note": "移除LATERAL JOIN中错误的相关条件e2.deptno = e1.deptno，改用EXISTS保持原始IN子查询的独立扫描语义，仅在empno < 20的e2行中检查deptno匹配"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已将IN子查询改写为EXISTS相关子查询，与原始SQL语义完全等价：两者均对每个外层e2行检查是否存在empno<20且deptno相等的e2行。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+⚠️ 检测到成本爆炸：重写 cost 增幅 1719891906.6% (> 1000%)，判定当前重写性能更差，进入下一轮优化。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮重写引入了 CTE 和相关子查询导致 cost 爆炸（增幅 1719891906%），执行计划显示 CTE Scan 代价占比 100%，累积消耗达 50 万亿。当前 SQL 存在 CTE + EXISTS 相关子查询的嵌套结构，需要回退激进改写，消除 CTE 物化和相关子查询，恢复简单的过滤与连接路径。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除 CTE e2 的物化，将其内联展开到主查询中，避免重复扫描 emp 表（4500 万行）造成的笛卡尔积效应"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将 EXISTS 相关子查询转换为 LEFT SEMI JOIN 或 IN 子查询，消除逐行探测导致的嵌套循环，利用 Hash Join 批量匹配"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将 CASE WHEN true THEN deptno ELSE null END 简化为 deptno，消除冗余的条件判断"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将 empno < 20 的过滤条件尽早下推到 emp 表扫描阶段，减少参与 JOIN 的数据量（从 4500 万行降至约 20 行）"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "消除外层 CASE WHEN EXISTS ... THEN TRUE ELSE FALSE END 的冗余布尔转换，直接使用 EXISTS 或 JOIN 结果的布尔值"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.239
+   → AGGREGATE_VALUES: UCT=1.239
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "子查询优化, 谓词简化, 投影优化",
+  "applied_rules": [
+    "FILTER_REDUCE_EXPRESSIONS",
+    "PROJECT_REDUCE_EXPRESSIONS",
+    "PROJECT_MERGE",
+    "PROJECT_REMOVE"
+  ],
+  "rule_effect_scores": {
+    "FILTER_REDUCE_EXPRESSIONS": 0.35,
+    "PROJECT_REDUCE_EXPRESSIONS": 0.35,
+    "PROJECT_MERGE": 0.20,
+    "PROJECT_REMOVE": 0.10
+  },
+  "rule_effect_confidence": {
+    "FILTER_REDUCE_EXPRESSIONS": 0.85,
+    "PROJECT_REDUCE_EXPRESSIONS": 0.85,
+    "PROJECT_MERGE": 0.75,
+    "PROJECT_REMOVE": 0.70
+  }
+}
+```
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 谓词简化, 投影优化",
+  "applied_rules": [
+    "FILTER_REDUCE_EXPRESSIONS",
+    "PROJECT_REDUCE_EXPRESSIONS",
+    "PROJECT_MERGE",
+    "PROJECT_REMOVE"
+  ],
+  "rewritten_sql": "SELECT empno,\n       EXISTS (\n         SELECT 1\n         FROM emp e2\n         WHERE e2.empno < 20\n           AND e2.deptno = emp.deptno\n       ) AS d\nFROM emp",
+  "semantic_correctness_guarantee": "1. **CTE e2 内联展开**：原 SQL 中 CTE e2 定义为 `SELECT empno, CASE WHEN true THEN deptno ELSE null END AS deptno FROM emp`，由于 CASE WHEN true 恒真，简化为 `SELECT empno, deptno FROM emp`，与直接引用 emp 表等价；将 CTE e2 内联到主查询后，外层 `FROM e2 e1` 替换为 `FROM emp`，消除物化开销。\n\n2. **PROJECT_REDUCE_EXPRESSIONS 应用**：CTE e2 中的 `CASE WHEN true THEN deptno ELSE null END` 是冗余表达式（条件恒真），简化为 `deptno`；外层 `CASE WHEN EXISTS(...) THEN TRUE ELSE FALSE END` 也是冗余布尔转换，直接使用 `EXISTS(...)` 返回布尔值，语义完全等价。\n\n3. **相关子查询保持不变**：原 SQL 的 EXISTS 子查询中 `e2_sub.deptno = e1.deptno` 是相关条件，重写后改为 `e2.deptno = emp.deptno`，相关列从外层 emp 表引用，语义保持一致；子查询内的 `e2_sub.empno < 20` 过滤条件未改变，仍作用于内层扫描。\n\n4. **投影列保持一致**：原 SQL 外层投影 `e1.empno` 和布尔列 `d`，重写后投影 `emp.empno` 和 `EXISTS(...) AS d`，列名、数据类型、语义完全一致；empno 来自 emp 表主键（非空唯一），deptno 为 NOT NULL 列，不存在 NULL 值影响等价性的情况。\n\n5. **结果集行数与顺序**：原 SQL 外层 `FROM e2 e1` 返回 emp 表全部行（4500 万行），重写后 `FROM emp` 同样返回全部行；无 GROUP BY、DISTINCT 或 LIMIT，行数与原 SQL 一致；无 ORDER BY，行顺序未定义，符合 SQL 标准。\n\n6. **EXISTS 子查询语义**：原 SQL 中 EXISTS 子查询对每行 e1 检查是否存在满足 `e2_sub.empno < 20 AND e2_sub.deptno = e1.deptno` 的 e2_sub 行；重写后对每行 emp 检查是否存在满足 `e2.empno < 20 AND e2.deptno = emp.deptno` 的 e2 行；由于 e2 与 emp 表内容等价（CTE 仅做恒真 CASE 简化），子查询结果集完全相同。\n\n7. **无结构性风险点**：重写未引入 JOIN、GROUP BY、HAVING 或聚合函数，仅做表达式简化与 CTE 内联；emp 表主键 empno 保证无重复行；deptno 为 NOT NULL 列，无 NULL 值导致的三值逻辑问题；相关子查询的相关列 deptno 在内外层均为同一语义列，不存在作用域混淆。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL的CTE e2对deptno做了CASE WHEN true处理后在外层和子查询中都引用e2，而重写SQL在外层FROM emp但子查询中FROM emp e2，导致子查询的相关条件e2.deptno与外层emp.deptno比较时，两者引用的是同一张物理表的不同别名扫描，而非原始SQL中外层e2(别名e1)与子查询e2(别名e2_sub)都来自同一个CTE物化结果的语义。",
+    "differences": [
+        {
+            "type": "子查询数据源",
+            "description": "原始SQL子查询FROM的e2是CTE定义的结果集，重写SQL子查询FROM emp e2直接扫描基表，当EXISTS子查询中e2.deptno与外层emp.deptno做相关比较时，原始SQL是CTE e2的两次引用(外层作e1、子查询作e2_sub)，重写SQL是基表emp的两个独立扫描实例",
+            "location": "EXISTS子查询FROM子句"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL的CTE e2对deptno做了CASE WHEN true处理后在外层和子查询中都引用e2，而重写SQL在外层FROM emp但子查询中FROM emp e2，导致子查询的相关条件e2.deptno与外层emp.deptno比较时，两者引用的是同一张物理表的不同别名扫描，而非原始SQL中外层e2(别名e1)与子查询e2(别名e2_sub)都来自同一个CTE物化结果的语义。
+```json
+{
+  "fixed_sql": "WITH e2 AS (SELECT empno, CASE WHEN true THEN deptno ELSE null END AS deptno FROM emp) SELECT empno, deptno IN (SELECT deptno FROM e2 WHERE empno < 20) AS d FROM e2",
+  "note": "恢复CTE e2定义及其在主查询和子查询中的引用，保证子查询数据源与原始SQL一致"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正为与原始SQL完全一致（仅格式化差异），CTE e2定义、外层FROM e2、子查询FROM e2均保持原样，语义完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（cost 2943527.13，结构无任何变化）：两版本均为 CTE e2 物化后扫描 4500 万行，子查询 SubPlan 2 再次扫描 CTE e2 并过滤 empno < 20（估计 4500 行）。应用的规则（FILTER_REDUCE_EXPRESSIONS、PROJECT_REDUCE_EXPRESSIONS 等）未触发实质性重写，CASE WHEN true 未被简化，CTE 未内联，子查询未去相关。结构信号：无改进也无恶化，但存在明显优化空间（CTE 物化导致重复扫描、子查询相关探测、谓词未下推）。cost 持平不能掩盖结构未优化的事实。依据终止条件，既无明确改进也无明确恶化，但仍有可执行优化路径，应继续下一轮。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 rewritten_sql 继续改写：1) 手动简化 CASE WHEN true THEN deptno ELSE null END 为 deptno（规则未生效需强制改写）；2) 内联 CTE e2，将其定义直接展开到主查询和子查询中，消除物化开销；3) 将 IN 子查询改写为 LEFT SEMI JOIN 或 EXISTS，并将 empno < 20 下推到 emp 表扫描阶段（WHERE empno < 20），减少参与 JOIN 的数据量；4) 确保最终形式类似 SELECT emp.empno, EXISTS(SELECT 1 FROM emp AS emp2 WHERE emp2.empno < 20 AND emp2.deptno = emp.deptno) AS d FROM emp，利用 Hash Semi Join 批量匹配，避免逐行探测和重复扫描。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 158
+   - 规则序列: ['FILTER_REDUCE_EXPRESSIONS', 'PROJECT_REDUCE_EXPRESSIONS', 'PROJECT_MERGE', 'PROJECT_REMOVE']
+   - 优化组别: 子查询优化, 谓词简化, 投影优化
+   - 估计代价: 原始=2943527.13, 重写=2943527.13，相对变化: 0.00%
+✅ 成功存储，记录ID: aa0c4bac-1766-4a6c-a11d-8e3ab91a798c
+
+🎲 UCT Math Update: 4 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=2943527.1300, rc=2943527.1300)
+   结构分细节: rows 90004932.0->90004932.0 (score=+0.000), depth 2.0->2.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.350, conf=0.85, lambda=0.42, reward=+0.000, count=58, avg=+0.015
+   → PROJECT_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.350, conf=0.85, lambda=0.42, reward=+0.000, count=13, avg=+0.059
+   → PROJECT_MERGE: P(s,a)=N/A, effect=0.200, conf=0.75, lambda=0.38, reward=+0.000, count=12, avg=-0.003
+   → PROJECT_REMOVE: P(s,a)=N/A, effect=0.100, conf=0.70, lambda=0.35, reward=+0.000, count=35, avg=+0.012
+
+----------------------------------------
+

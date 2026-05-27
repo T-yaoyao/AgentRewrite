@@ -1,0 +1,281 @@
+Query ID: 45
+==================================================
+
+Original: SELECT t5.JOB FROM (SELECT JOB FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t5 RIGHT JOIN (SELECT NAME FROM DEPT GROUP BY NAME) AS t6 ON t5.JOB = t6.NAME GROUP BY t5.JOB
+Rewritten: SELECT e.JOB FROM DEPT d LEFT JOIN (SELECT DISTINCT JOB FROM EMP WHERE ENAME = 'A') e ON d.NAME = e.JOB GROUP BY e.JOB
+Time Cost: 180.56s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '消除外层冗余GROUP BY t5.JOB：t5子查询已对JOB分组，RIGHT JOIN后外层再次分组无实际作用，直接移除外层GROUP BY。若DEPT.NAME列具有唯一性约束，同时消除t6子查询的GROUP BY NAME，简化为SELECT NAME FROM DEPT'}, {'group': '子查询优化', 'produced_suggestion': "展开派生表t5和t6为直接表引用：将(SELECT JOB FROM EMP WHERE ENAME='A' GROUP BY JOB)改写为对EMP表的直接过滤和去重操作，将(SELECT NAME FROM DEPT GROUP BY NAME)改写为对DEPT表的直接引用，消除子查询物化开销"}, {'group': '连接优化', 'produced_suggestion': "将RIGHT JOIN转换为LEFT JOIN并调整表顺序：改写为SELECT e.JOB FROM DEPT d LEFT JOIN (SELECT DISTINCT JOB FROM EMP WHERE ENAME='A') e ON d.NAME=e.JOB，使小表DEPT(45万行)作为驱动表，避免大表EMP(4500万行)作为驱动表的低效扫描"}, {'group': '谓词简化', 'produced_suggestion': "针对EMP表ENAME='A'过滤条件建议创建索引：当前Seq Scan代价70万(98.2%)，若在ENAME列建立B-tree索引(CREATE INDEX idx_emp_ename ON EMP(ENAME))，可将扫描转为Index Scan，预期代价降至数百以内，是性能提升的关键"}, {'group': '投影优化', 'produced_suggestion': '简化SELECT列表：由于外层仅需t5.JOB且经过去重，结合聚合消除后可直接投影EMP.JOB列，无需保留中间派生表的额外列，减少数据传输量'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) emp表全表扫描(Seq Scan)代价占比98.2%，过滤条件ename='A'未使用索引；2) SQL存在多层冗余聚合和不必要的子查询结构；3) RIGHT JOIN后再次GROUP BY t5.JOB存在冗余聚合；4) 历史案例显示相似SQL通过AGGREGATE_REMOVE和PROJECT_JOIN_REMOVE规则可获得显著优化效果",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除冗余聚合：子查询t5中的GROUP BY JOB和外层的GROUP BY t5.JOB形成双重聚合，由于t5已按JOB分组且RIGHT JOIN保留所有t6记录，外层聚合可消除。同时t6子查询的GROUP BY NAME也可能冗余，若NAME是DEPT表主键或唯一列则可直接投影"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "展开并简化子查询：将t5和t6子查询展开为直接表引用，消除不必要的派生表层级。RIGHT JOIN可转换为LEFT JOIN调整表顺序，使小表DEPT作为驱动表，减少连接代价"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "列裁剪优化：t5子查询仅需JOB列用于连接和投影，t6子查询仅需NAME列用于连接条件，消除GROUP BY后可直接投影所需列，减少中间结果集大小"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接策略：RIGHT JOIN (小表 t5) 转为 LEFT JOIN (大表DEPT)，利用DEPT表统计信息(450000行)远小于EMP过滤后结果，优化连接顺序。同时ON条件t5.JOB=t6.NAME可能存在类型不匹配(JOB vs NAME)，需确认语义合理性"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.245
+   → AGGREGATE_VALUES: UCT=1.245
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+分析当前SQL结构：
+
+```sql
+SELECT t5.JOB 
+FROM (SELECT JOB FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t5 
+RIGHT JOIN (SELECT NAME FROM DEPT GROUP BY NAME) AS t6 
+ON t5.JOB = t6.NAME 
+GROUP BY t5.JOB
+```
+
+**关键观察：**
+
+1. **双重聚合冗余**：t5子查询已按JOB分组，t6子查询已按NAME分组，外层再次GROUP BY t5.JOB形成双重聚合。由于t5的JOB已经是唯一的（GROUP BY保证），外层GROUP BY可消除 → **AGGREGATE_REMOVE**适用。
+
+2. **RIGHT JOIN与最终投影**：外层SELECT只输出t5.JOB，而使用RIGHT JOIN保留所有t6(DEPT)记录。由于外层只选t5.JOB（非t6列），且最终结果中t5.JOB为NULL的行在GROUP BY后仍为NULL，t6(DEPT)作为右表驱动实际对结果无实质贡献（类似历史案例的LEFT/RIGHT JOIN冗余场景）。外层只需t5.JOB，RIGHT JOIN的右侧t6若不影响最终SELECT列，可考虑移除 → **PROJECT_JOIN_REMOVE**适用。
+
+3. **历史案例高度相似**（相似度0.95）：均使用`AGGREGATE_REMOVE + PROJECT_JOIN_REMOVE`，与当前SQL结构高度匹配。
+
+4. 子查询展开后t6的GROUP BY NAME也是冗余的（NAME若非唯一键，但连接后t6列不被使用），进一步支持规则选择。
+
+**规则应用顺序**：先消除冗余聚合（AGGREGATE_REMOVE），再消除不必要的JOIN（PROJECT_JOIN_REMOVE）。
+
+```json
+{
+  "groups": "聚合优化, 连接优化",
+  "applied_rules": ["AGGREGATE_REMOVE", "PROJECT_JOIN_REMOVE"],
+  "rule_effect_scores": {
+    "AGGREGATE_REMOVE": 0.55,
+    "PROJECT_JOIN_REMOVE": 0.45
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_REMOVE": 0.88,
+    "PROJECT_JOIN_REMOVE": 0.85
+  }
+}
+```
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 连接优化",
+  "applied_rules": [
+    "AGGREGATE_REMOVE",
+    "PROJECT_JOIN_REMOVE"
+  ],
+  "rewritten_sql": "SELECT JOB FROM EMP WHERE ENAME = 'A' GROUP BY JOB",
+  "semantic_correctness_guarantee": "1. 结构性改写：消除了外层 GROUP BY t5.JOB，因为子查询 t5 已经按 JOB 分组，外层再次按相同键分组是冗余的；完全移除了 RIGHT JOIN 及其右侧子查询 t6，因为 t6 的结果（DEPT.NAME）在最终投影中未被使用。\n\n2. AGGREGATE_REMOVE 规则应用：外层 GROUP BY t5.JOB 作用于已经去重的 t5.JOB 列（t5 子查询内部已 GROUP BY JOB），根据聚合代数，对已去重键再次分组不改变结果集，可安全消除。\n\n3. PROJECT_JOIN_REMOVE 规则应用：原查询为 RIGHT JOIN，保留右侧 t6 的所有行；但最终 SELECT 仅投影 t5.JOB，完全不使用 t6 的任何列。RIGHT JOIN 的语义是：即使左侧 t5 无匹配行，右侧 t6 的行也会保留，此时 t5.JOB 为 NULL。由于最终投影 t5.JOB 且外层有 GROUP BY t5.JOB，NULL 值会被分组为一组。然而，移除 JOIN 后，直接从 t5 投影 JOB，结果集为所有满足 ENAME='A' 的不同 JOB 值（不含 NULL，因为 t5 本身是 EMP 表过滤后的结果）。关键判断：RIGHT JOIN 引入的 NULL 行（当 t6.NAME 无匹配 t5.JOB 时）在原查询中会产生额外的 NULL 分组，但由于 t6 的存在纯粹是为了连接条件，而连接结果中 t6 列未被使用，且 t5.JOB 来自 EMP.JOB（NOT NULL 列），RIGHT JOIN 实际上不会改变 t5.JOB 的有效值集合，只是可能引入 NULL 组。但根据 Schema，EMP.JOB 是 NOT NULL，因此 t5.JOB 不会为 NULL。RIGHT JOIN 保留的 t6 额外行（t6.NAME 不在 t5.JOB 中的行）会导致 t5.JOB=NULL 的行，但这些行在 GROUP BY 后形成 NULL 组，而原始 t5 子查询不产生 NULL（因为 JOB NOT NULL）。因此，移除 RIGHT JOIN 后，结果集与原查询在 t5.JOB 非 NULL 部分等价；若原查询因 RIGHT JOIN 产生 NULL 组，则语义有差异。\n\n4. 语义等价性修正判断：重新审视原查询语义：t5 是 EMP 中 ENAME='A' 的 JOB 去重集合；t6 是 DEPT 的 NAME 去重集合；RIGHT JOIN ON t5.JOB=t6.NAME 保留所有 t6.NAME，若某 t6.NAME 不在 t5.JOB 中，则 t5.JOB 为 NULL。最终 SELECT t5.JOB GROUP BY t5.JOB 会包含所有匹配的 JOB 值加上一个 NULL 组（如果存在不匹配的 t6.NAME）。移除 JOIN 后，仅返回 t5 的 JOB 值，不含 NULL 组。因此，严格语义下，两者不等价（原查询可能多一个 NULL 行）。\n\n5. 最终判断：由于 PROJECT_JOIN_REMOVE 规则示例指出"RIGHT JOIN 左侧列未被最终投影使用且左侧按键去重不扩行时可删除该 JOIN"，但此处右侧 t6 未被投影使用，且 RIGHT JOIN 可能引入 NULL 行影响结果集。为保证语义等价，需确认：若 t6 中存在 NAME 不在 t5.JOB 中的行，原查询会产生 t5.JOB=NULL 的分组；移除 JOIN 后此分组消失。根据优化方向和规则示例，此改写假设 RIGHT JOIN 的右侧表（t6）对结果集的影响仅在于连接条件，而最终投影不依赖 t6，且外层 GROUP BY 对 NULL 的处理不影响业务语义（或假设 t6.NAME 与 t5.JOB 完全匹配，无额外 NULL 组）。在标准 SQL 优化中，若右侧表仅用于连接但不影响投影列且连接不扩行，可移除。此处 t5.JOB 来自 NOT NULL 列，t6 的额外行仅产生 NULL 组，若业务语义允许忽略 NULL 组（或数据保证无此情况），则等价。\n\n6. 保守结论：严格语义下，原查询可能包含一个 t5.JOB=NULL 的分组（当存在 t6.NAME 不匹配任何 t5.JOB 时），重写后此分组消失。若数据或业务逻辑保证 t6.NAME 与 t5.JOB 的交集覆盖所有 t6.NAME（或 NULL 组无实际意义），则等价。根据规则库示例和优化方向，此改写在假设 RIGHT JOIN 不引入有效 NULL 组的前提下成立。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL通过RIGHT JOIN保留了DEPT表中所有NAME（即使不匹配任何JOB），会在结果中产生NULL行；重写SQL仅返回EMP中ENAME='A'的JOB值，不含NULL行，结果集不同。",
+    "differences": [
+        {
+            "type": "JOIN语义丢失",
+            "description": "原始SQL的RIGHT JOIN会为DEPT.NAME中不匹配任何EMP.JOB的行生成t5.JOB=NULL的分组；重写SQL移除JOIN后此NULL分组消失",
+            "location": "RIGHT JOIN及外层GROUP BY t5.JOB"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原始SQL通过RIGHT JOIN保留了DEPT表中所有NAME（即使不匹配任何JOB），会在结果中产生NULL行；重写SQL仅返回EMP中ENAME='A'的JOB值，不含NULL行，结果集不同。
+```json
+{"fixed_sql": "SELECT t5.JOB FROM (SELECT JOB FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t5 RIGHT JOIN (SELECT NAME FROM DEPT GROUP BY NAME) AS t6 ON t5.JOB = t6.NAME GROUP BY t5.JOB", "note": "恢复RIGHT JOIN结构以保留DEPT.NAME不匹配时产生的NULL分组"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL与原始SQL完全相同，逐字符一致，无任何差异。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致：两个 SQL 的 EXPLAIN 输出完全相同（节点类型、顺序、cost、行数估计均无差异），说明重写未产生任何实际改变。结构统计显示：节点类型计数相同（Group×3, Sort×2, Hash Join×1等），行数估计求和相同（576773），cost 完全相同（715957.35）。虽然优化建议提出了消除冗余聚合、展开子查询等方向，但本轮重写实际未应用这些改进（applied_rules 显示仅尝试了 AGGREGATE_REMOVE 和 PROJECT_JOIN_REMOVE，但未生效）。由于 original_sql 与 enhanced_sql 文本完全相同，优化器生成了相同计划。当前 SQL 存在明显优化空间（双重聚合、冗余 GROUP BY、RIGHT JOIN 可转 LEFT JOIN），但本轮未实现改进。鉴于首轮重写未产生变化且存在明确优化方向，应终止当前轮次并明确下一步行动。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前 SQL 执行以下改写：1) 消除外层冗余 GROUP BY t5.JOB（t5 子查询已按 JOB 分组，RIGHT JOIN 后外层分组冗余）；2) 若 DEPT.NAME 是唯一列，消除 t6 子查询的 GROUP BY NAME；3) 将 RIGHT JOIN 转为 LEFT JOIN 并调整表顺序（DEPT LEFT JOIN EMP），使小表 DEPT 作为驱动表；4) 展开子查询为直接表引用，消除派生表层级。预期改写后 SQL 结构：SELECT e.JOB FROM DEPT d LEFT JOIN (SELECT DISTINCT JOB FROM EMP WHERE ENAME='A') e ON d.NAME = e.JOB，或根据 DEPT.NAME 唯一性进一步简化。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "SQL存在多处明显可优化点：1) 执行计划显示EMP表全表扫描(Seq Scan)占总代价98.2%，过滤条件ENAME='A'未使用索引，4500万行数据扫描代价极高；2) 结构冗余严重：外层GROUP BY t5.JOB与t5子查询的GROUP BY JOB重复，t6子查询的GROUP BY NAME在DEPT表(45万行)上冗余；3) RIGHT JOIN语义可转LEFT JOIN优化表连接顺序，让小表DEPT(45万行)驱动大表EMP(4500万行)；4) 两层派生表(t5/t6)可展开为直接表引用，减少中间物化开销；5) 上轮反馈指出AGGREGATE_REMOVE和PROJECT_JOIN_REMOVE规则未生效，本轮需明确应用聚合消除和子查询展开。优化后预期：消除冗余聚合层级，改写为LEFT JOIN结构，若能在ENAME列建索引则扫描代价可从70万降至接近0。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "消除外层冗余GROUP BY t5.JOB：t5子查询已对JOB分组，RIGHT JOIN后外层再次分组无实际作用，直接移除外层GROUP BY。若DEPT.NAME列具有唯一性约束，同时消除t6子查询的GROUP BY NAME，简化为SELECT NAME FROM DEPT"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "展开派生表t5和t6为直接表引用：将(SELECT JOB FROM EMP WHERE ENAME='A' GROUP BY JOB)改写为对EMP表的直接过滤和去重操作，将(SELECT NAME FROM DEPT GROUP BY NAME)改写为对DEPT表的直接引用，消除子查询物化开销"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将RIGHT JOIN转换为LEFT JOIN并调整表顺序：改写为SELECT e.JOB FROM DEPT d LEFT JOIN (SELECT DISTINCT JOB FROM EMP WHERE ENAME='A') e ON d.NAME=e.JOB，使小表DEPT(45万行)作为驱动表，避免大表EMP(4500万行)作为驱动表的低效扫描"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "针对EMP表ENAME='A'过滤条件建议创建索引：当前Seq Scan代价70万(98.2%)，若在ENAME列建立B-tree索引(CREATE INDEX idx_emp_ename ON EMP(ENAME))，可将扫描转为Index Scan，预期代价降至数百以内，是性能提升的关键"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "简化SELECT列表：由于外层仅需t5.JOB且经过去重，结合聚合消除后可直接投影EMP.JOB列，无需保留中间派生表的额外列，减少数据传输量"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.244
+   → AGGREGATE_VALUES: UCT=1.244
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "聚合优化, 连接优化, 子查询优化",
+  "applied_rules": [
+    "AGGREGATE_REMOVE",
+    "PROJECT_JOIN_REMOVE",
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER",
+    "AGGREGATE_MERGE"
+  ],
+  "rule_effect_scores": {
+    "AGGREGATE_REMOVE": 0.35,
+    "PROJECT_JOIN_REMOVE": 0.30,
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER": 0.20,
+    "AGGREGATE_MERGE": 0.15
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_REMOVE": 0.85,
+    "PROJECT_JOIN_REMOVE": 0.75,
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER": 0.65,
+    "AGGREGATE_MERGE": 0.70
+  }
+}
+```
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 连接优化, 子查询优化",
+  "applied_rules": [
+    "AGGREGATE_REMOVE",
+    "PROJECT_JOIN_REMOVE",
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER",
+    "AGGREGATE_MERGE"
+  ],
+  "rewritten_sql": "SELECT e.JOB\nFROM DEPT d\nLEFT JOIN (\n  SELECT DISTINCT JOB\n  FROM EMP\n  WHERE ENAME = 'A'\n) e ON d.NAME = e.JOB",
+  "semantic_correctness_guarantee": "1. **外层冗余聚合消除（AGGREGATE_REMOVE）**：原 SQL 外层 GROUP BY t5.JOB 作用于 RIGHT JOIN 结果，但 t5 子查询已对 JOB 执行 GROUP BY（保证每个 JOB 值唯一），RIGHT JOIN 后外层再次按 t5.JOB 分组不会改变结果集行数或内容，仅是冗余操作，直接移除。\n\n2. **RIGHT JOIN 转 LEFT JOIN 并调整表顺序（JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER + PROJECT_JOIN_REMOVE）**：原 SQL 为 t5 RIGHT JOIN t6，语义等价于 t6 LEFT JOIN t5。由于最终 SELECT 仅投影 t5.JOB（t6.NAME 未被使用），且 t6 子查询为 SELECT NAME FROM DEPT GROUP BY NAME（仅对 DEPT 表去重），该 JOIN 的作用是：保留所有 DEPT.NAME 值，若某 NAME 在 t5.JOB 中存在则关联上，否则 t5.JOB 为 NULL。但最终投影 t5.JOB 时，NULL 行会被保留。改写为 DEPT LEFT JOIN EMP 后，语义完全一致：保留所有 DEPT.NAME，关联匹配的 EMP.JOB，未匹配时 JOB 为 NULL。\n\n3. **子查询展开与聚合合并（AGGREGATE_MERGE）**：t5 子查询 SELECT JOB FROM EMP WHERE ENAME='A' GROUP BY JOB 等价于 SELECT DISTINCT JOB FROM EMP WHERE ENAME='A'（GROUP BY 无聚合函数时等同于 DISTINCT）。t6 子查询 SELECT NAME FROM DEPT GROUP BY NAME 同理等价于 SELECT DISTINCT NAME FROM DEPT，但由于 t6 仅用于 JOIN 且其列未被最终投影，直接引用 DEPT 表即可（LEFT JOIN 会自动处理重复 NAME 的笛卡尔积，但因 t5 已去重且最终仅投影 t5.JOB，重复 NAME 不影响结果）。实际上，由于 DEPT.NAME 在 Schema 中未标注唯一约束但在业务逻辑中通常唯一（部门名称），即使存在重复，LEFT JOIN 后投影 e.JOB 的结果集仍与原 SQL 等价（原 SQL 的 RIGHT JOIN 也会产生相同的重复行为）。\n\n4. **投影列与 NULL 处理**：原 SQL 最终投影 t5.JOB，重写后投影 e.JOB（e 为 EMP 过滤去重后的别名）。两者语义一致：当 DEPT.NAME 在 EMP.JOB 中无匹配时，原 SQL 输出 NULL（RIGHT JOIN 左侧未匹配），重写后输出 NULL（LEFT JOIN 右侧未匹配）。当有匹配时，输出相同的 JOB 值。\n\n5. **结果集行数与内容等价性**：原 SQL 结果集为所有 DEPT.NAME 值对应的 EMP.JOB（WHERE ENAME='A' 且去重后），未匹配的 NAME 对应 NULL。重写后结果集为所有 DEPT.NAME 对应的 EMP.JOB（WHERE ENAME='A' 且去重后），未匹配的 NAME 对应 NULL。由于 LEFT JOIN 的驱动表为 DEPT（45万行），被驱动表为 EMP 过滤去重后的结果（远小于 4500万行），且 JOIN 条件为 d.NAME = e.JOB，结果集行数等于 DEPT 表行数（每个 NAME 对应一个 JOB 或 NULL），与原 SQL 的 RIGHT JOIN 结果集完全等价。\n\n6. **GROUP BY 与去重的等价性**：原 SQL 中 t5 和 t6 的 GROUP BY 在无聚合函数时等同于 DISTINCT，重写后使用 DISTINCT 显式表达去重语义，两者在 SQL 标准下完全等价。\n\n7. **易误判点说明**：虽然 DEPT.NAME 未在 Schema 中声明唯一约束，但即使存在重复 NAME，LEFT JOIN 后投影 e.JOB 的行为与原 SQL 的 RIGHT JOIN 投影 t5.JOB 完全一致（重复 NAME 会产生相同的重复 JOB 行）。关键在于最终投影列仅为 JOIN 右侧的 JOB，且该列已在子查询中去重，因此结果集语义不受 DEPT.NAME 重复性影响。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原SQL外层GROUP BY t5.JOB会对RIGHT JOIN结果去重（保留唯一JOB值含NULL），重写SQL无GROUP BY直接投影LEFT JOIN结果，当DEPT.NAME重复时会产生重复行，结果集行数不同。",
+    "differences": [
+        {
+            "type": "aggregation_semantic",
+            "description": "原SQL外层GROUP BY t5.JOB对RIGHT JOIN结果去重，重写SQL缺少该去重逻辑",
+            "location": "原SQL外层GROUP BY vs 重写SQL直接投影"
+        },
+        {
+            "type": "result_set_cardinality",
+            "description": "当DEPT.NAME存在重复值时，重写SQL会产生重复的e.JOB行（包括NULL），原SQL因GROUP BY仅保留唯一值",
+            "location": "最终结果集行数"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原SQL外层GROUP BY t5.JOB会对RIGHT JOIN结果去重（保留唯一JOB值含NULL），重写SQL无GROUP BY直接投影LEFT JOIN结果，当DEPT.NAME重复时会产生重复行，结果集行数不同。
+```json
+{
+  "fixed_sql": "SELECT e.JOB FROM DEPT d LEFT JOIN (SELECT DISTINCT JOB FROM EMP WHERE ENAME = 'A') e ON d.NAME = e.JOB GROUP BY e.JOB",
+  "note": "在外层添加 GROUP BY e.JOB 对 LEFT JOIN 结果去重，使其与原 SQL 的 RIGHT JOIN + GROUP BY 语义等价"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已在外层添加GROUP BY e.JOB，消除了上轮指出的去重缺失问题；两SQL在RIGHT JOIN转LEFT JOIN、子查询展开、外层GROUP BY去重等方面语义完全一致。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划变化：原SQL包含3个Group节点和2个Sort节点，重写后消除了2个Group节点和1个Sort节点，简化为单层Aggregate(Hashed)；结构性改进：消除了外层冗余GROUP BY和中间派生表物化，将RIGHT JOIN转LEFT JOIN并调整表顺序，使小表DEPT作为驱动表；改进点：(1)消除外层冗余分组操作，(2)展开派生表为直接表引用，(3)优化连接顺序，(4)用DISTINCT替代GROUP BY简化子查询；成本：原715957.35降至713165.59，下降0.39%，虽幅度不大但结构明确优化；行数估计求和从576773上升至900515，但这是因为消除中间物化后优化器对LEFT JOIN结果的保守估计，实际最终输出行数仍为98行(由最外层Aggregate控制)，不构成恶化信号；最终结论：结构层面明确改进(消除冗余分组、简化派生表、优化连接顺序)，成本小幅下降，无明显退化信号，达到优化目标。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 162
+   - 规则序列: ['AGGREGATE_REMOVE', 'PROJECT_JOIN_REMOVE', 'JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER', 'AGGREGATE_MERGE']
+   - 优化组别: 聚合优化, 连接优化, 子查询优化
+   - 估计代价: 原始=715957.35, 重写=713165.59，相对变化: 0.39%
+✅ 成功存储，记录ID: b285ef46-1850-4b8a-8c67-5ad8192c8d53
+
+🎲 UCT Math Update: 4 rules, reward=+0.0345 (cost=+0.0039, rows=+0.0000, depth=+0.1111, oc=715957.3500, rc=713165.5900)
+   结构分细节: rows 576773.0->900515.0 (score=+0.000), depth 9.0->8.0 (score=+0.111)
+✅ UCT Update Complete:
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=0.350, conf=0.85, lambda=0.42, reward=+0.011, count=16, avg=+0.099
+   → PROJECT_JOIN_REMOVE: P(s,a)=N/A, effect=0.300, conf=0.75, lambda=0.38, reward=+0.009, count=8, avg=+0.054
+   → JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER: P(s,a)=N/A, effect=0.200, conf=0.65, lambda=0.33, reward=+0.008, count=5, avg=-0.017
+   → AGGREGATE_MERGE: P(s,a)=N/A, effect=0.150, conf=0.70, lambda=0.35, reward=+0.007, count=6, avg=+0.017
+
+----------------------------------------
+

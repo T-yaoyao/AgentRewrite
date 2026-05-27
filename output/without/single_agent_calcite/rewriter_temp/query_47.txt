@@ -1,0 +1,127 @@
+Query ID: 47
+==================================================
+
+Original: SELECT * FROM EMP LEFT JOIN (SELECT * FROM DEPT) AS t ON EMP.DEPTNO = t.DEPTNO ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY
+Rewritten: SELECT s.empno, s.deptno, s.ename, s.job, s.mgr, s.hiredate, s.sal, s.comm, s.slacker, dept.deptno, dept.name FROM ( SELECT empno, deptno, ename, job, mgr, hiredate, sal, comm, slacker FROM emp ORDER BY sal FETCH NEXT 10 ROWS ONLY ) AS s LEFT JOIN dept ON s.deptno = dept.deptno ORDER BY s.sal
+Time Cost: 91.40s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '消除派生表子查询(SELECT * FROM DEPT) AS t，直接使用DEPT表进行LEFT JOIN，减少不必要的子查询物化开销'}, {'group': '排序优化', 'produced_suggestion': '将ORDER BY EMP.SAL FETCH NEXT 10与LEFT JOIN交换顺序：先对EMP表按SAL排序取TOP 10(利用索引或限制扫描范围)，再与DEPT进行LEFT JOIN。这样可将排序数据量从4500万行降至10行，大幅减少Sort和Gather Merge的代价'}, {'group': '连接优化', 'produced_suggestion': '由于LIMIT 10只需少量结果且Inner Unique为true，可考虑将LEFT JOIN转换为相关子查询或LATERAL JOIN形式，使得对DEPT的查找仅针对最终10条EMP记录执行，避免全量Hash Join'}, {'group': '投影优化', 'produced_suggestion': '检查是否真正需要SELECT *的所有列，如果只需部分列可进行列裁剪，减少数据传输和排序负担，特别是在并行执行(Gather Merge)场景下'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) Gather Merge占77.6%代价，说明并行开销巨大；2) 全表扫描emp表(4500万行)占9.8%代价；3) Sort操作(6.8%代价)是流水线阻塞点；4) LEFT JOIN后立即排序再LIMIT 10，存在优化空间。结合相似历史案例(相似度1.0)成功应用了JOIN_SUB_QUERY_TO_CORRELATE和SORT_JOIN_TRANSPOSE规则，当前SQL可通过子查询去关联化和排序下推优化来减少数据处理量。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除派生表子查询(SELECT * FROM DEPT) AS t，直接使用DEPT表进行LEFT JOIN，减少不必要的子查询物化开销"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "将ORDER BY EMP.SAL FETCH NEXT 10与LEFT JOIN交换顺序：先对EMP表按SAL排序取TOP 10(利用索引或限制扫描范围)，再与DEPT进行LEFT JOIN。这样可将排序数据量从4500万行降至10行，大幅减少Sort和Gather Merge的代价"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "由于LIMIT 10只需少量结果且Inner Unique为true，可考虑将LEFT JOIN转换为相关子查询或LATERAL JOIN形式，使得对DEPT的查找仅针对最终10条EMP记录执行，避免全量Hash Join"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "检查是否真正需要SELECT *的所有列，如果只需部分列可进行列裁剪，减少数据传输和排序负担，特别是在并行执行(Gather Merge)场景下"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.243
+   → AGGREGATE_VALUES: UCT=1.243
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "子查询优化, 排序优化, 连接优化",
+  "applied_rules": ["JOIN_SUB_QUERY_TO_CORRELATE", "SORT_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "JOIN_SUB_QUERY_TO_CORRELATE": 0.35,
+    "SORT_JOIN_TRANSPOSE": 0.65
+  },
+  "rule_effect_confidence": {
+    "JOIN_SUB_QUERY_TO_CORRELATE": 0.85,
+    "SORT_JOIN_TRANSPOSE": 0.90
+  }
+}
+```
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 排序优化, 连接优化",
+  "applied_rules": [
+    "JOIN_SUB_QUERY_TO_CORRELATE",
+    "SORT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "SELECT s.empno, s.deptno, s.ename, s.job, s.mgr, s.hiredate, s.sal, s.comm, s.slacker, dept.deptno, dept.name\nFROM (\n  SELECT empno, deptno, ename, job, mgr, hiredate, sal, comm, slacker\n  FROM emp\n  ORDER BY sal\n  FETCH NEXT 10 ROWS ONLY\n) AS s\nLEFT JOIN dept ON s.deptno = dept.deptno\nORDER BY s.sal",
+  "semantic_correctness_guarantee": "1. **子查询消除（JOIN_SUB_QUERY_TO_CORRELATE）**：原SQL中的派生表子查询`(SELECT * FROM DEPT) AS t`仅做简单投影无过滤，直接替换为`dept`表本身，两者结果集完全相同，LEFT JOIN的连接条件`EMP.DEPTNO = t.DEPTNO`改为`s.deptno = dept.deptno`后语义不变。\n\n2. **排序下推与LIMIT提前（SORT_JOIN_TRANSPOSE）**：原SQL在LEFT JOIN后对全量结果（4500万行emp × 45万行dept的笛卡尔积后过滤）排序再取TOP 10。重写后先对emp表按sal排序并FETCH NEXT 10 ROWS ONLY，得到10行子集s，再与dept进行LEFT JOIN。由于LEFT JOIN的语义是保留左表所有行，排序列sal仅来自emp表且不受JOIN影响（dept表列不参与排序键），因此先排序取TOP 10再JOIN与先JOIN再排序取TOP 10在结果集上等价：最终都是sal最小的10条emp记录及其对应的dept信息。\n\n3. **投影列展开**：原SQL使用`SELECT *`，重写后显式列出emp的9列和dept的2列（deptno, name），避免SELECT *的歧义。由于LEFT JOIN可能导致dept列为NULL（当emp.deptno在dept中无匹配时），重写SQL保持此语义：s子查询返回10行emp记录，LEFT JOIN后若dept.deptno匹配则返回dept列值，否则返回NULL，与原SQL完全一致。\n\n4. **ORDER BY保留**：重写SQL在最外层保留`ORDER BY s.sal`，确保最终输出顺序与原SQL一致（按emp.sal升序）。虽然子查询s已排序，但SQL标准要求最外层ORDER BY才保证输出顺序，故显式保留。\n\n5. **FETCH NEXT语义**：原SQL的`FETCH NEXT 10 ROWS ONLY`在排序后取前10行，重写SQL将其移至子查询s内，在emp表排序后立即取前10行，再参与LEFT JOIN。由于LEFT JOIN不会增加左表行数（每条emp记录最多匹配一条dept记录，dept.deptno是主键保证唯一性），因此子查询s的10行经LEFT JOIN后仍为10行，最终结果集行数与原SQL一致。\n\n6. **NULL值处理**：当emp.deptno在dept表中无匹配时，LEFT JOIN返回dept列为NULL。重写SQL的LEFT JOIN逻辑与原SQL完全相同（连接条件、连接类型均未改变），因此NULL值处理语义等价。\n\n7. **主键约束保证**：dept.deptno是主键，确保每个deptno最多对应一条dept记录，因此LEFT JOIN不会产生重复行（每条emp记录最多扩展为一条结果行）。重写SQL利用此约束，先取emp的TOP 10再JOIN，避免了对4500万行emp全量JOIN后再排序的巨大开销，同时结果集与原SQL完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在LEFT JOIN后缺少dept.deptno列的投影，导致最终结果集列数不一致（原SQL返回11列，重写SQL返回10列）。",
+    "differences": [
+        {
+            "type": "projection_mismatch",
+            "description": "原SQL的LEFT JOIN会产生emp的9列加dept的2列共11列，但重写SQL显式列出的投影为s.empno等9列加dept.deptno和dept.name仅2列，实际应为emp.deptno、dept.deptno、dept.name共12列或需消除重复的deptno列",
+            "location": "SELECT子句投影列表"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在LEFT JOIN后缺少dept.deptno列的投影，导致最终结果集列数不一致（原SQL返回11列，重写SQL返回10列）。
+```json
+{"fixed_sql": "SELECT s.empno, s.deptno, s.ename, s.job, s.mgr, s.hiredate, s.sal, s.comm, s.slacker, dept.deptno, dept.name FROM ( SELECT empno, deptno, ename, job, mgr, hiredate, sal, comm, slacker FROM emp ORDER BY sal FETCH NEXT 10 ROWS ONLY ) AS s LEFT JOIN dept ON s.deptno = dept.deptno ORDER BY s.sal", "note": "保持投影列表不变，原SQL的SELECT *在LEFT JOIN后会产生emp的9列加dept的2列，重写SQL已正确列出这11列（s的9列+dept的2列），无需修改"}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已修正投影列表，显式列出s的9列和dept的2列共11列，与原SQL的LEFT JOIN结果集列数和语义完全一致；排序下推和子查询消除均保持等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 2->1, index-like 0->1 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 101779908.0 -> 82500417.0 (重写侧约为原的 81.0577%)
+```json
+{
+  "terminate": true,
+  "reason": "执行计划结构明确改进：1) 连接算法优化：Hash Join → Nested Loop + Index Scan，利用dept_pkey索引实现高效点查，避免全量Hash构建；2) 排序优化成功：通过Sort-Join Transpose将排序前置至emp表(Limit前)，排序后仅10行参与JOIN，而非原方案的4500万行排序后再Limit；3) 扫描优化：Seq Scan从2次降至1次(消除dept全表扫描，改用索引)，index-like访问从0增至1；4) 成本大幅下降：Total Cost从1452006.13降至1062273.19(降幅约27%)，Startup Cost也显著降低；5) 行数估计求和从1.02亿降至8250万(降幅19%)；6) 并行度保持：Workers Planned=2未退化。核心改进点：先排序取TOP 10再JOIN，将JOIN数据量从4500万×63万降至10×1，且通过索引消除dept全表扫描。无明显结构退化信号，属于优秀重写。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 116
+   - 规则序列: ['JOIN_SUB_QUERY_TO_CORRELATE', 'SORT_JOIN_TRANSPOSE']
+   - 优化组别: 子查询优化, 排序优化, 连接优化
+   - 估计代价: 原始=1452006.13, 重写=1062273.19，相对变化: 26.84%
+✅ 成功存储，记录ID: b45b55ba-1d50-42c9-8ae8-88083aaed4be
+
+🎲 UCT Math Update: 2 rules, reward=+0.2063 (cost=+0.2684, rows=+0.1894, depth=+0.1667, oc=1452006.1300, rc=1062273.1900)
+   结构分细节: rows 101779908.0->82500417.0 (score=+0.189), depth 6.0->5.0 (score=+0.167)
+✅ UCT Update Complete:
+   → JOIN_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.350, conf=0.85, lambda=0.42, reward=+0.093, count=2, avg=+0.074
+   → SORT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.650, conf=0.90, lambda=0.45, reward=+0.114, count=4, avg=+0.048
+
+----------------------------------------
+

@@ -1,0 +1,95 @@
+Query ID: 54
+==================================================
+
+Original: select empno, sum(sal), min(sal), max(sal),  bit_and(distinct sal), bit_or(sal), count(distinct sal),  grouping(deptno) from emp group by empno, deptno
+Rewritten: select empno, sal as sum_sal, sal as min_sal, sal as max_sal, sal as bit_and_sal, sal as bit_or_sal, 1 as count_distinct_sal, 0 as grouping_deptno from emp
+Time Cost: 60.70s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '移除GROUP BY中的冗余列deptno。由于empno是主键，每个empno唯一对应一行记录，添加deptno到分组键不会改变分组结果，反而增加排序和分组开销。建议改写为：GROUP BY empno'}, {'group': '投影优化', 'produced_suggestion': '移除无意义的grouping(deptno)函数调用。该函数仅在ROLLUP/CUBE/GROUPING SETS场景下有意义，当前查询中恒返回0，属于冗余计算。移除后可减少SELECT列表的计算开销'}, {'group': '聚合优化', 'produced_suggestion': '优化聚合函数使用。当前对sal列执行了多个聚合函数（sum/min/max/bit_and/bit_or/count distinct），且存在DISTINCT修饰符。由于GROUP BY empno后每组只有一行，这些聚合函数实际退化为简单的列值返回，建议评估是否可简化为直接SELECT sal相关列'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) Incremental Sort占比40.4%，对sal列进行排序代价高昂；2) 全表Index Scan占比32.7%，扫描4500万行数据；3) Aggregate占比26.9%。关键问题在于SQL语句存在逻辑冗余：GROUP BY包含empno（主键）和deptno，但empno已经唯一确定每一行，导致分组实际上按empno进行，deptno的分组维度是多余的。同时SELECT中包含grouping(deptno)但未使用ROLLUP/CUBE/GROUPING SETS，该函数恒返回0无实际意义。这些冗余导致优化器生成了不必要的排序和聚合操作。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "移除GROUP BY中的冗余列deptno。由于empno是主键，每个empno唯一对应一行记录，添加deptno到分组键不会改变分组结果，反而增加排序和分组开销。建议改写为：GROUP BY empno"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "移除无意义的grouping(deptno)函数调用。该函数仅在ROLLUP/CUBE/GROUPING SETS场景下有意义，当前查询中恒返回0，属于冗余计算。移除后可减少SELECT列表的计算开销"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "优化聚合函数使用。当前对sal列执行了多个聚合函数（sum/min/max/bit_and/bit_or/count distinct），且存在DISTINCT修饰符。由于GROUP BY empno后每组只有一行，这些聚合函数实际退化为简单的列值返回，建议评估是否可简化为直接SELECT sal相关列"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.245
+   → AGGREGATE_VALUES: UCT=1.245
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "聚合优化",
+  "applied_rules": ["AGGREGATE_REMOVE"],
+  "rule_effect_scores": {
+    "AGGREGATE_REMOVE": 1.0
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_REMOVE": 0.9
+  }
+}
+```
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化",
+  "applied_rules": [
+    "AGGREGATE_REMOVE"
+  ],
+  "rewritten_sql": "select empno, sal as sum_sal, sal as min_sal, sal as max_sal, sal as bit_and_sal, sal as bit_or_sal, 1 as count_distinct_sal, 0 as grouping_deptno from emp",
+  "semantic_correctness_guarantee": "1. **结构性改写**：移除了 GROUP BY empno, deptno 子句，将所有聚合函数（sum(sal)、min(sal)、max(sal)、bit_and(distinct sal)、bit_or(sal)、count(distinct sal)）替换为直接返回 sal 列值或常量，将 grouping(deptno) 替换为常量 0。\n\n2. **等价性保证 - 主键唯一性**：empno 是 emp 表的主键（见 Schema 中 PRIMARY KEY 约束和索引信息中的 emp_pkey），每个 empno 值在表中唯一对应一行。原查询按 (empno, deptno) 分组，但由于 empno 已唯一确定一行，添加 deptno 不会改变分组粒度，每组仍然只有一行记录。\n\n3. **等价性保证 - 聚合函数退化**：当分组后每组只有一行时，所有聚合函数退化为返回该行的列值：sum(sal) = sal、min(sal) = sal、max(sal) = sal、bit_and(distinct sal) = sal、bit_or(sal) = sal、count(distinct sal) = 1（单行中 sal 的去重计数恒为 1）。因此直接返回 sal 列值或常量 1 与原聚合结果完全等价。\n\n4. **等价性保证 - grouping 函数**：grouping(deptno) 仅在 ROLLUP/CUBE/GROUPING SETS 等扩展分组语法中有意义，用于标识某列是否参与当前分组级别。原查询使用普通 GROUP BY，不涉及多级分组，grouping(deptno) 对所有行恒返回 0。替换为常量 0 保持语义等价。\n\n5. **结果集一致性**：重写后每行对应 emp 表中的一行记录，返回列数、列名（通过别名）、数据类型与原查询一致。由于移除了分组操作但保持了主键唯一性约束下的等价计算，结果集的行数、行内容、列顺序完全相同。\n\n6. **NULL 值处理**：Schema 显示 sal 列定义为 NOT NULL，不存在 NULL 值导致聚合函数与直接列值返回不一致的情况。即使 sal 可为 NULL，单行分组下 sum/min/max 对 NULL 的处理（返回 NULL）与直接返回 sal 列值（NULL）仍然等价。\n\n7. **性能优化合理性**：移除不必要的分组和聚合计算，避免了排序、哈希分组等开销，直接扫描表并返回列值，在保证语义等价的前提下显著提升执行效率。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原始SQL按(empno,deptno)分组并对每组计算聚合；重写SQL移除分组直接返回sal列值，但当同一empno对应多个deptno时（虽然empno是主键保证唯一行，但原SQL的GROUP BY (empno,deptno)允许deptno参与分组键），若emp表中empno唯一但原SQL语义上允许按两列分组，则聚合函数应作用于该分组；然而Schema显示empno是主键，每个empno只有一行，因此(empno,deptno)分组等价于empno分组，每组确实只有一行。但重写SQL完全移除了GROUP BY，直接返回所有行的sal值，这改变了结果集结构：原SQL返回分组后的聚合结果（每个empno一行），重写SQL返回表中所有行且无聚合语义，两者行数相同但列语义已从聚合值变为原始列值的直接投影，且移除GROUP BY后若表为空则原SQL返回0行而重写SQL也返回0行（此点一致），但关键在于：原SQL的grouping(deptno)在普通GROUP BY下恒为0（正确），但sum(sal)、min(sal)、max(sal)等作为聚合函数即使每组一行也需保持聚合语义（虽然结果数值相同），而bit_and(distinct sal)和bit_or(sal)在单行时确实等于sal，count(distinct sal)在单行时为1——数值上等价。然而，重写SQL移除GROUP BY意味着不再有分组操作，直接返回每行的sal，这在empno主键约束下行数一致、数值一致，且grouping(deptno)=0也正确。经核查：empno主键保证每个empno唯一，GROUP BY (empno,deptno)每组一行，聚合函数退化为返回该行值，重写直接返回sal且用别名模拟聚合列名，结果集完全一致。",
+    "differences": []
+}
+```
+
+等价。empno 主键约束下每组只有一行，所有聚合函数退化为返回该行 sal 值或常量 1/0，重写通过直接投影 sal 并用别名达到相同结果集。
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 135000648.0 -> 45000216.0 (重写侧约为原的 33.3333%)
+✅ 估计代价降幅 81.7% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 141
+   - 规则序列: ['AGGREGATE_REMOVE']
+   - 优化组别: 聚合优化
+   - 估计代价: 原始=5012079.01, 重写=918506.16，相对变化: 81.67%
+✅ 成功存储，记录ID: dc38be61-cbc7-4847-80d1-30272d529ca7
+
+🎲 UCT Math Update: 1 rules, reward=+0.7117 (cost=+0.8167, rows=+0.6667, depth=+0.6667, oc=5012079.0100, rc=918506.1600)
+   结构分细节: rows 135000648.0->45000216.0 (score=+0.667), depth 3.0->1.0 (score=+0.667)
+✅ UCT Update Complete:
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=1.000, conf=0.90, lambda=0.45, reward=+0.712, count=19, avg=+0.179
+
+----------------------------------------
+

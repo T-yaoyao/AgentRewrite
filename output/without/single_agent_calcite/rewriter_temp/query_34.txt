@@ -1,0 +1,136 @@
+Query ID: 34
+==================================================
+
+Original: SELECT NAME, CAST(SUM(CN) FILTER (WHERE g_1) AS BIGINT), CAST(SUM(SM) FILTER (WHERE g_2) AS INTEGER) FROM (SELECT NAME, CN, SM, GROUPING(NAME, CN, SM) = 1 AS g_1, GROUPING(NAME, CN, SM) = 2 AS g_2 FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t3 GROUP BY GROUPING SETS((NAME, CN), (NAME, SM))) AS t5 GROUP BY NAME
+Rewritten: SELECT
+  NAME,
+  CAST(SUM(CASE WHEN grp_id = 1 THEN cnt END) AS BIGINT) AS col1,
+  CAST(SUM(CASE WHEN grp_id = 2 THEN sum_deptno END) AS INTEGER) AS col2
+FROM (
+  SELECT
+    NAME,
+    1 AS grp_id,
+    COUNT(*) AS cnt,
+    NULL AS sum_deptno
+  FROM DEPT
+  GROUP BY NAME
+  UNION ALL
+  SELECT
+    NAME,
+    2 AS grp_id,
+    NULL AS cnt,
+    SUM(DEPTNO) AS sum_deptno
+  FROM DEPT
+  GROUP BY NAME
+) AS unified
+GROUP BY NAME
+Time Cost: 87.22s
+Suggestion: [{'group': '聚合优化', 'produced_suggestion': '将三层嵌套聚合结构合并为单层聚合：当前SQL先对dept按NAME做COUNT/SUM聚合得到(NAME,CN,SM)，再对结果做GROUPING SETS展开，最外层再按NAME汇总。可以直接在原始dept表上使用GROUPING SETS((NAME),(NAME))或等价的单次GROUP BY NAME，同时计算COUNT(*)和SUM(DEPTNO)，消除中间子查询t3和t5的物化，减少3次Aggregate算子为1次，参考重写：SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME，然后直接在应用层或单层SQL中完成FILTER逻辑，避免多层嵌套带来的重复聚合开销。'}, {'group': '子查询优化', 'produced_suggestion': '消除多层嵌套子查询（t3、t5），将GROUPING SETS逻辑直接下推到原始表dept上执行。当前查询通过子查询t3预聚合后再展开GROUPING SETS，导致数据被多次扫描和物化。可以重写为：SELECT NAME, CAST(SUM(CASE WHEN GROUPING(NAME,CN,SM)=1 THEN CN END) AS BIGINT), CAST(SUM(CASE WHEN GROUPING(NAME,CN,SM)=2 THEN SM END) AS INTEGER) FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) t GROUP BY NAME，或进一步验证业务语义后直接将GROUPING SETS计算合并到最底层，减少子查询嵌套层数。'}, {'group': '谓词简化', 'produced_suggestion': '简化GROUPING()表达式的FILTER条件：当前通过GROUPING(NAME,CN,SM)=1和GROUPING(NAME,CN,SM)=2作为布尔列g_1/g_2传递，再在外层用FILTER(WHERE g_1)/FILTER(WHERE g_2)过滤。可以将g_1/g_2的计算内联到最终FILTER表达式中，避免额外的布尔列投影和传递开销，使优化器能更好地识别过滤条件并简化执行路径。'}, {'group': '投影优化', 'produced_suggestion': '消除中间层多余的列投影：子查询t3输出(NAME, CN, SM)，子查询t5在GROUPING SETS展开时对不参与当前分组的列产生NULL值，最外层再做聚合。这导致大量NULL值的无效传递和聚合计算。通过列裁剪和投影下推，确保每个中间节点只输出后续步骤实际需要的列，减少数据传输量。'}]
+🔍 开始初始优化可行性检查...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示总代价14,341，存在4个主要瓶颈：1个Seq Scan占48.6%代价（dept表450000行全表扫描），3个Aggregate流水线阻塞算子合计占51.5%代价。当前SQL结构存在多层嵌套聚合：最内层对dept按NAME做GROUP BY聚合，中间层再做GROUPING SETS((NAME,CN),(NAME,SM))展开，最外层再按NAME聚合并用FILTER分别提取两个分组的结果。这种三层嵌套聚合模式可以通过聚合合并/下推优化，将多次扫描和聚合合并为单次GROUP BY GROUPING SETS直接在原表上完成，消除中间物化层，减少Aggregate算子数量，从而降低整体执行代价。",
+  "advice": [
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "将三层嵌套聚合结构合并为单层聚合：当前SQL先对dept按NAME做COUNT/SUM聚合得到(NAME,CN,SM)，再对结果做GROUPING SETS展开，最外层再按NAME汇总。可以直接在原始dept表上使用GROUPING SETS((NAME),(NAME))或等价的单次GROUP BY NAME，同时计算COUNT(*)和SUM(DEPTNO)，消除中间子查询t3和t5的物化，减少3次Aggregate算子为1次，参考重写：SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME，然后直接在应用层或单层SQL中完成FILTER逻辑，避免多层嵌套带来的重复聚合开销。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除多层嵌套子查询（t3、t5），将GROUPING SETS逻辑直接下推到原始表dept上执行。当前查询通过子查询t3预聚合后再展开GROUPING SETS，导致数据被多次扫描和物化。可以重写为：SELECT NAME, CAST(SUM(CASE WHEN GROUPING(NAME,CN,SM)=1 THEN CN END) AS BIGINT), CAST(SUM(CASE WHEN GROUPING(NAME,CN,SM)=2 THEN SM END) AS INTEGER) FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) t GROUP BY NAME，或进一步验证业务语义后直接将GROUPING SETS计算合并到最底层，减少子查询嵌套层数。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "简化GROUPING()表达式的FILTER条件：当前通过GROUPING(NAME,CN,SM)=1和GROUPING(NAME,CN,SM)=2作为布尔列g_1/g_2传递，再在外层用FILTER(WHERE g_1)/FILTER(WHERE g_2)过滤。可以将g_1/g_2的计算内联到最终FILTER表达式中，避免额外的布尔列投影和传递开销，使优化器能更好地识别过滤条件并简化执行路径。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "消除中间层多余的列投影：子查询t3输出(NAME, CN, SM)，子查询t5在GROUPING SETS展开时对不参与当前分组的列产生NULL值，最外层再做聚合。这导致大量NULL值的无效传递和聚合计算。通过列裁剪和投影下推，确保每个中间节点只输出后续步骤实际需要的列，减少数据传输量。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.244
+   → AGGREGATE_VALUES: UCT=1.244
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+```json
+{
+  "groups": "聚合优化, 投影优化",
+  "applied_rules": [
+    "AGGREGATE_MERGE",
+    "PROJECT_MERGE",
+    "AGGREGATE_REDUCE_FUNCTIONS"
+  ],
+  "rule_effect_scores": {
+    "AGGREGATE_MERGE": 0.6,
+    "PROJECT_MERGE": 0.25,
+    "AGGREGATE_REDUCE_FUNCTIONS": 0.15
+  },
+  "rule_effect_confidence": {
+    "AGGREGATE_MERGE": 0.85,
+    "PROJECT_MERGE": 0.75,
+    "AGGREGATE_REDUCE_FUNCTIONS": 0.65
+  }
+}
+```
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "聚合优化, 投影优化",
+  "applied_rules": [
+    "AGGREGATE_MERGE",
+    "PROJECT_MERGE",
+    "AGGREGATE_REDUCE_FUNCTIONS"
+  ],
+  "rewritten_sql": "SELECT\n  NAME,\n  CAST(SUM(CASE WHEN grp_id = 1 THEN cnt END) AS BIGINT) AS col1,\n  CAST(SUM(CASE WHEN grp_id = 2 THEN sum_deptno END) AS INTEGER) AS col2\nFROM (\n  SELECT\n    NAME,\n    1 AS grp_id,\n    COUNT(*) AS cnt,\n    NULL AS sum_deptno\n  FROM DEPT\n  GROUP BY NAME\n  UNION ALL\n  SELECT\n    NAME,\n    2 AS grp_id,\n    NULL AS cnt,\n    SUM(DEPTNO) AS sum_deptno\n  FROM DEPT\n  GROUP BY NAME\n) AS unified\nGROUP BY NAME",
+  "semantic_correctness_guarantee": "1. **AGGREGATE_MERGE应用**：原SQL包含三层聚合嵌套：最内层t3对DEPT按NAME做COUNT(*)和SUM(DEPTNO)；中间层t5对t3结果应用GROUPING SETS((NAME,CN),(NAME,SM))展开为两个分组；最外层t5按NAME再次聚合并用FILTER分别提取g_1和g_2对应的CN和SM。重写后通过UNION ALL将两个分组路径(grp_id=1对应CN, grp_id=2对应SM)合并为单层子查询unified，外层只需一次GROUP BY NAME聚合，消除了中间物化和多次聚合开销。\n\n2. **PROJECT_MERGE应用**：原SQL中间层t5投影出NAME、CN、SM、g_1、g_2五列，外层t5只使用NAME、g_1过滤后的CN、g_2过滤后的SM。重写后unified子查询直接投影NAME、grp_id、cnt、sum_deptno四列，外层只需NAME和CASE表达式，消除了g_1/g_2布尔列的冗余投影和传递。\n\n3. **GROUPING SETS语义等价性**：原SQL的GROUPING SETS((NAME,CN),(NAME,SM))在t3结果(NAME,CN,SM)上展开，产生两个分组：(NAME,CN)时SM为NULL且GROUPING(NAME,CN,SM)=2；(NAME,SM)时CN为NULL且GROUPING(NAME,CN,SM)=1。重写后通过UNION ALL显式构造两个分支：grp_id=1分支对应(NAME,CN)分组计算COUNT(*)，sum_deptno置NULL；grp_id=2分支对应(NAME,SM)分组计算SUM(DEPTNO)，cnt置NULL。两种表示在逻辑上完全等价，均为每个NAME生成两行记录，一行携带COUNT结果，另一行携带SUM结果。\n\n4. **外层聚合与FILTER等价性**：原SQL最外层对每个NAME，通过FILTER(WHERE g_1)提取CN(即GROUPING=1对应的行)，通过FILTER(WHERE g_2)提取SM(即GROUPING=2对应的行)。重写后外层通过CASE WHEN grp_id=1 THEN cnt和CASE WHEN grp_id=2 THEN sum_deptno实现相同逻辑：SUM(CASE...)会忽略NULL值，因此grp_id=1的行只贡献cnt到col1，grp_id=2的行只贡献sum_deptno到col2，与原SQL的FILTER语义完全一致。\n\n5. **CAST类型保持**：原SQL对CN结果CAST AS BIGINT，对SM结果CAST AS INTEGER。重写后col1和col2分别保持相同的CAST，确保输出列的数据类型与原SQL一致。\n\n6. **NULL值处理**：原SQL中GROUPING SETS展开后，不参与当前分组的列自动置NULL(如(NAME,CN)分组时SM为NULL)。重写后通过显式NULL赋值(grp_id=1分支sum_deptno为NULL，grp_id=2分支cnt为NULL)模拟相同行为，外层SUM(CASE...)自动忽略NULL，结果集完全等价。\n\n7. **主键与分组键**：DEPT表主键为deptno，但查询按NAME分组。原SQL和重写SQL均对NAME做GROUP BY，不依赖主键唯一性，因此NAME可能有重复值时两者行为一致。每个NAME在unified中产生两行(grp_id=1和grp_id=2)，外层按NAME聚合后每个NAME输出一行，包含两个聚合结果，与原SQL最外层按NAME聚合的语义完全对应。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写通过UNION ALL将GROUPING SETS的两个分组路径显式展开，外层用CASE表达式替代FILTER，消除了中间聚合层，结果集完全等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "结构明确改进且成本显著下降。执行计划变化：1) 引入并行执行(Gather Merge + Workers Planned: 2)，提升大表扫描效率；2) 通过UNION ALL + CASE WHEN替代GROUPING SETS嵌套，消除了原SQL的三层Aggregate嵌套结构，减少重复聚合开销；3) 使用Append节点并行处理两个独立聚合分支，避免原SQL中GROUPING SETS的多次数据展开和物化。改进点：SQL逻辑层面将复杂的GROUPING()条件转换为显式的grp_id标识，语义更清晰；执行计划层面从串行三层聚合优化为并行两路聚合+最终合并，减少中间结果传递。成本从14341.08降至11325.15(降幅21%)，虽然行数估计求和上升(576K→1020K)，但这是UNION ALL展开两个独立聚合分支的正常现象，实际数据流更高效。虽然Seq Scan从1增至2，但两次扫描是并行独立执行且各自聚合后立即收敛，避免了原SQL中间层的数据膨胀和重复聚合，整体结构优于原SQL的单次扫描+三层嵌套聚合。综合判断为优秀重写，达到终止标准。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 323
+   - 规则序列: ['AGGREGATE_MERGE', 'PROJECT_MERGE', 'AGGREGATE_REDUCE_FUNCTIONS']
+   - 优化组别: 聚合优化, 投影优化
+   - 估计代价: 原始=14341.08, 重写=11325.15，相对变化: 21.03%
+✅ 成功存储，记录ID: 86b7c30c-25e3-452b-8dbc-0dc19f08061f
+
+🎲 UCT Math Update: 3 rules, reward=-0.1619 (cost=+0.2103, rows=+0.0000, depth=-0.7500, oc=14341.0800, rc=11325.1500)
+   结构分细节: rows 576455.0->1020320.0 (score=+0.000), depth 4.0->7.0 (score=-0.750)
+✅ UCT Update Complete:
+   → AGGREGATE_MERGE: P(s,a)=N/A, effect=0.600, conf=0.85, lambda=0.42, reward=-0.074, count=5, avg=+0.018
+   → PROJECT_MERGE: P(s,a)=N/A, effect=0.250, conf=0.75, lambda=0.38, reward=-0.048, count=9, avg=-0.009
+   → AGGREGATE_REDUCE_FUNCTIONS: P(s,a)=N/A, effect=0.150, conf=0.65, lambda=0.33, reward=-0.040, count=3, avg=-0.049
+
+----------------------------------------
+

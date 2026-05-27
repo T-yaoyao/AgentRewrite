@@ -1,0 +1,227 @@
+Query ID: 9
+==================================================
+
+Original: SELECT t2.EMPNO, t2.ENAME, t2.JOB, t2.MGR, t2.HIREDATE, t2.SAL, t2.COMM, t2.DEPTNO, t2.SLACKER, t3.DEPTNO AS DEPTNO0, t3.NAME FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS t2 LEFT JOIN (SELECT * FROM DEPT) AS t3 ON t2.DEPTNO = t3.DEPTNO ORDER BY t2.SAL FETCH NEXT 10 ROWS ONLY
+Rewritten: SELECT emp.EMPNO, emp.ENAME, emp.JOB, emp.MGR, emp.HIREDATE, emp.SAL, emp.COMM, emp.DEPTNO, emp.SLACKER, dept.DEPTNO AS DEPTNO0, dept.NAME
+FROM EMP
+LEFT JOIN DEPT ON emp.DEPTNO = dept.DEPTNO
+ORDER BY emp.SAL
+FETCH NEXT 10 ROWS ONLY
+Time Cost: 165.74s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "消除内层派生表t2的独立排序和FETCH子句。当前'(SELECT ... FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS t2'强制优化器在子查询内完成排序，导致全表扫描+Sort。应展平为直接引用EMP表，将排序和LIMIT统一到外层：'SELECT emp.EMPNO, emp.ENAME, ... FROM EMP LEFT JOIN DEPT ... ORDER BY emp.SAL FETCH NEXT 10 ROWS ONLY'。这使优化器能延迟排序至JOIN后，或利用索引扫描(若sal有索引)直接获取TOP 10行，避免对4500万行全排序。"}, {'group': '排序优化', 'produced_suggestion': "消除双重排序冗余。当前内层't2: ORDER BY SAL FETCH 10'和外层'ORDER BY t2.SAL FETCH 10'语义重复，但优化器因子查询边界无法合并，导致执行两次排序逻辑(实际计划中体现为单次全表Sort但代价未优化)。展平子查询后，单一外层'ORDER BY emp.SAL FETCH 10'可触发优化器的Top-N Heap Sort或Index Scan+Limit策略，将Sort代价从452057.93降至接近0(若有sal索引)或显著降低(Top-N堆排序仅需O(N log 10)而非O(N log N))。"}, {'group': '连接优化', 'produced_suggestion': "调整JOIN执行时机，先对EMP表应用LIMIT再JOIN DEPT。当前计划隐含'全表扫描emp -> 排序 -> 取10行 -> JOIN dept'，但dept表45万行的JOIN发生在排序后。展平子查询后，优化器可选择'Index Scan on emp ORDER BY sal LIMIT 10 -> Nested Loop Join dept ON deptno'，使JOIN仅处理10行而非全表，dept表的dept_pkey索引可用于高效查找，JOIN代价从O(4500万)降至O(10)。若无sal索引，至少确保Sort后立即LIMIT再JOIN，避免不必要的大表关联。"}, {'group': '投影优化', 'produced_suggestion': "保持当前投影裁剪(t3仅SELECT DEPTNO, NAME)，但需确认展平后列引用正确。去除派生表t2和t3后，直接引用'emp.EMPNO, emp.ENAME, ..., dept.DEPTNO AS DEPTNO0, dept.NAME'，避免额外投影层。当前t3的列裁剪已优化(dept表仅3列且仅用2列)，重写后需保持此优化，确保dept表扫描或索引查找仅涉及必要列，减少I/O开销。"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) emp表全表扫描(Seq Scan)代价656,004.90，占比10.4%，处理4500万行数据；2) 存在两次排序操作(Sort)，代价452,057.93，造成流水线阻塞；3) 子查询中的ORDER BY + FETCH NEXT与外层的ORDER BY + FETCH NEXT重复，导致不必要的排序开销；4) dept表的子查询(SELECT *)是冗余的投影操作。结合相似历史案例(相似度0.9558)成功应用SORT_REMOVE和PROJECT_JOIN_TRANSPOSE规则的经验，该SQL可通过排序优化、投影优化和子查询优化显著提升性能。",
+  "advice": [
+    {
+      "group": "排序优化",
+      "produced_suggestion": "消除内层子查询的冗余排序：子查询t2中的'ORDER BY SAL FETCH NEXT 10 ROWS ONLY'与外层的排序条件完全相同，但由于LEFT JOIN可能增加行数，内层排序结果会被外层排序覆盖。建议移除内层排序，仅保留外层排序，避免对4500万行数据进行两次排序操作，消除Sort算子的流水线阻塞瓶颈"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "消除dept表的冗余子查询投影：子查询t3定义为'SELECT * FROM DEPT'是不必要的包装，直接使用DEPT表即可。将'LEFT JOIN (SELECT * FROM DEPT) AS t3'改写为'LEFT JOIN DEPT t3'，减少一层投影操作，简化执行计划"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "展平emp表的派生子查询：子查询t2仅做简单投影和排序，无聚合或复杂逻辑，可直接在主查询中引用EMP表。将子查询展平后，优化器可以更好地利用索引(emp_pkey)并重新评估访问路径，避免全表扫描"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "优化LEFT JOIN的执行顺序：由于只需要TOP 10行，且dept表较小(45万行)，建议先对emp表按SAL排序取TOP 10(利用索引或部分排序)，再与dept表进行LEFT JOIN。这样JOIN操作只处理10行而非全表，大幅降低Gather Merge和Sort的代价"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.237
+   → AGGREGATE_VALUES: UCT=1.237
+   → JOIN_TO_CORRELATE: UCT=1.100
+```json
+{
+  "groups": "排序优化, 投影优化, 连接优化",
+  "applied_rules": ["SORT_REMOVE", "PROJECT_JOIN_TRANSPOSE"],
+  "rule_effect_scores": {
+    "SORT_REMOVE": 0.7,
+    "PROJECT_JOIN_TRANSPOSE": 0.3
+  },
+  "rule_effect_confidence": {
+    "SORT_REMOVE": 0.9,
+    "PROJECT_JOIN_TRANSPOSE": 0.75
+  }
+}
+```
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "排序优化, 投影优化, 连接优化",
+  "applied_rules": ["SORT_REMOVE", "PROJECT_JOIN_TRANSPOSE"],
+  "rewritten_sql": "SELECT t2.EMPNO, t2.ENAME, t2.JOB, t2.MGR, t2.HIREDATE, t2.SAL, t2.COMM, t2.DEPTNO, t2.SLACKER, t3.DEPTNO AS DEPTNO0, t3.NAME\nFROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER FROM EMP FETCH NEXT 10 ROWS ONLY) AS t2\nLEFT JOIN (SELECT DEPTNO, NAME FROM DEPT) AS t3 ON t2.DEPTNO = t3.DEPTNO\nORDER BY t2.SAL\nFETCH NEXT 10 ROWS ONLY",
+  "semantic_correctness_guarantee": "1. **SORT_REMOVE规则应用**：移除了子查询t2内部的'ORDER BY SAL'排序操作。原SQL在子查询t2中先按SAL排序取前10行，然后在外层再次按t2.SAL排序取前10行。由于LEFT JOIN操作可能增加行数（当emp.deptno在dept表中有匹配时保持1行，无匹配时也保持1行），但JOIN后仍保持emp表的行标识，外层排序会完全覆盖内层排序结果。因此内层排序是冗余的，移除后不影响最终结果集的顺序和内容。\n\n2. **PROJECT_JOIN_TRANSPOSE规则应用**：对JOIN右侧的dept表子查询进行投影下推优化。原SQL中't3'定义为'SELECT * FROM DEPT'，选择dept表的所有列(deptno, name)。重写后改为'SELECT DEPTNO, NAME FROM DEPT'，明确只投影外层查询实际需要的列(t3.DEPTNO作为DEPTNO0, t3.NAME)。这是等价的投影优化，不改变结果集内容。\n\n3. **FETCH NEXT语义保持**：子查询t2的'FETCH NEXT 10 ROWS ONLY'在移除ORDER BY后仍然保留，确保从emp表中取前10行（物理顺序）。外层的'ORDER BY t2.SAL FETCH NEXT 10 ROWS ONLY'对这10行（LEFT JOIN后可能仍是10行或略多，但由于emp.empno是主键且LEFT JOIN基于deptno，每个emp行最多匹配1个dept行）按SAL排序并取前10行。由于子查询已限制为10行，外层FETCH实际上是对这最多10行的再排序和截取，结果集大小和内容与原SQL一致。\n\n4. **LEFT JOIN语义等价性**：LEFT JOIN的连接条件't2.DEPTNO = t3.DEPTNO'保持不变，连接语义完全相同。emp表的每一行都会保留，匹配的dept行会附加到结果中，不匹配时dept列为NULL。投影优化只是减少了dept表的列选择范围，不影响JOIN匹配逻辑。\n\n5. **列投影等价性**：外层SELECT子句'SELECT t2.EMPNO, t2.ENAME, ..., t3.DEPTNO AS DEPTNO0, t3.NAME'保持完全不变，所有列名、别名、数据类型均与原SQL一致。子查询t2的投影列表也保持不变，确保外层引用的所有t2列都可用。\n\n6. **主键约束保证行唯一性**：emp表的empno是主键，dept表的deptno是主键。子查询t2从emp表取10行时，每行的empno唯一。LEFT JOIN基于deptno连接时，由于dept.deptno是主键，每个emp行最多匹配1个dept行，不会产生笛卡尔积导致行数膨胀超过10行。因此外层FETCH NEXT 10 ROWS ONLY实际处理的行数不超过10行，与原SQL的两次FETCH语义一致。\n\n7. **排序键引用有效性**：外层'ORDER BY t2.SAL'引用的SAL列在子查询t2的投影列表中明确包含，且emp表的SAL列在Schema中定义为INTEGER NOT NULL，排序操作有效且确定性。移除内层排序后，外层排序仍能正确按SAL对最终结果集排序，保证与原SQL相同的输出顺序。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "子查询t2内部移除ORDER BY后，FETCH NEXT 10 ROWS ONLY取的是物理顺序的前10行，而非按SAL排序的前10行，导致结果集可能不同。",
+    "differences": [
+        {
+            "type": "fetch_semantics",
+            "description": "原始SQL子查询t2先ORDER BY SAL再FETCH前10行，重写SQL子查询t2无ORDER BY直接FETCH前10行，两者选出的emp行集合可能不同",
+            "location": "子查询t2的FETCH NEXT 10 ROWS ONLY"
+        }
+    ]
+}
+```
+❌ 语义不等价: 子查询t2内部移除ORDER BY后，FETCH NEXT 10 ROWS ONLY取的是物理顺序的前10行，而非按SAL排序的前10行，导致结果集可能不同。
+```json
+{
+  "fixed_sql": "SELECT t2.EMPNO, t2.ENAME, t2.JOB, t2.MGR, t2.HIREDATE, t2.SAL, t2.COMM, t2.DEPTNO, t2.SLACKER, t3.DEPTNO AS DEPTNO0, t3.NAME FROM (SELECT EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS t2 LEFT JOIN (SELECT DEPTNO, NAME FROM DEPT) AS t3 ON t2.DEPTNO = t3.DEPTNO ORDER BY t2.SAL FETCH NEXT 10 ROWS ONLY",
+  "note": "在子查询t2的FETCH前恢复ORDER BY SAL，确保与原始SQL选出相同的前10行emp记录"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已在子查询t2中恢复ORDER BY SAL，与原始SQL在所有语义层面完全一致，仅对dept子查询做了等价的投影优化。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，costs相同(1062273.19)，结构无任何变化。本轮重写仅将'SELECT * FROM DEPT'改为'SELECT DEPTNO, NAME FROM DEPT'，属于投影列裁剪，但由于dept表仅3列且JOIN后仅使用DEPTNO和NAME，优化器已自动完成投影下推，故重写未产生实际收益。关键瓶颈(4500万行emp表的Parallel Seq Scan + Sort)未被触及。但根据optimization_context，本轮仅应用了SORT_REMOVE和PROJECT_JOIN_TRANSPOSE规则，而核心建议(消除内层排序、展平子查询、优化JOIN顺序)均未实施。鉴于当前重写无害且无退化，可terminate=true；但需明确指出下一轮必须基于当前SQL继续改写以解决核心瓶颈。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：1)消除内层子查询t2的'ORDER BY SAL FETCH NEXT 10 ROWS ONLY'，仅保留外层排序和LIMIT；2)展平t2子查询，直接在主查询中引用EMP表；3)若可能，利用emp表上的索引(如emp_pkey或sal索引)避免全表扫描和大规模排序。重写目标：将'Parallel Seq Scan on emp (cost=656004.9, rows=18750090) -> Sort (cost=1061187.6)'路径优化为索引扫描或部分排序，使JOIN仅处理TOP 10行而非全表。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮重写未触及核心瓶颈：4500万行emp表的全表扫描(656004.9 cost)和大规模排序(452057.93 cost)占总代价99.6%。当前SQL存在双重排序冗余：内层子查询t2已ORDER BY SAL FETCH 10，外层再次ORDER BY t2.SAL FETCH 10，导致优化器对全表排序后仅取10行。关键优化点：1)消除内层排序，仅保留外层LIMIT；2)展平子查询，使优化器能利用emp_pkey或创建sal索引实现Index Scan+Limit，避免全表扫描和Sort算子；3)LEFT JOIN dept表(45万行)在取TOP 10后执行，可大幅降低JOIN代价。emp表缺少sal列索引是物理瓶颈，但查询重写可通过消除冗余排序和子查询展平，使优化器选择更优路径。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "消除内层派生表t2的独立排序和FETCH子句。当前'(SELECT ... FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS t2'强制优化器在子查询内完成排序，导致全表扫描+Sort。应展平为直接引用EMP表，将排序和LIMIT统一到外层：'SELECT emp.EMPNO, emp.ENAME, ... FROM EMP LEFT JOIN DEPT ... ORDER BY emp.SAL FETCH NEXT 10 ROWS ONLY'。这使优化器能延迟排序至JOIN后，或利用索引扫描(若sal有索引)直接获取TOP 10行，避免对4500万行全排序。"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "消除双重排序冗余。当前内层't2: ORDER BY SAL FETCH 10'和外层'ORDER BY t2.SAL FETCH 10'语义重复，但优化器因子查询边界无法合并，导致执行两次排序逻辑(实际计划中体现为单次全表Sort但代价未优化)。展平子查询后，单一外层'ORDER BY emp.SAL FETCH 10'可触发优化器的Top-N Heap Sort或Index Scan+Limit策略，将Sort代价从452057.93降至接近0(若有sal索引)或显著降低(Top-N堆排序仅需O(N log 10)而非O(N log N))。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN执行时机，先对EMP表应用LIMIT再JOIN DEPT。当前计划隐含'全表扫描emp -> 排序 -> 取10行 -> JOIN dept'，但dept表45万行的JOIN发生在排序后。展平子查询后，优化器可选择'Index Scan on emp ORDER BY sal LIMIT 10 -> Nested Loop Join dept ON deptno'，使JOIN仅处理10行而非全表，dept表的dept_pkey索引可用于高效查找，JOIN代价从O(4500万)降至O(10)。若无sal索引，至少确保Sort后立即LIMIT再JOIN，避免不必要的大表关联。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "保持当前投影裁剪(t3仅SELECT DEPTNO, NAME)，但需确认展平后列引用正确。去除派生表t2和t3后，直接引用'emp.EMPNO, emp.ENAME, ..., dept.DEPTNO AS DEPTNO0, dept.NAME'，避免额外投影层。当前t3的列裁剪已优化(dept表仅3列且仅用2列)，重写后需保持此优化，确保dept表扫描或索引查找仅涉及必要列，减少I/O开销。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → AGGREGATE_VALUES: UCT=1.234
+   → AGGREGATE_VALUES: UCT=1.234
+   → JOIN_TO_CORRELATE: UCT=1.100
+```json
+{
+  "groups": "子查询优化, 排序优化, 连接优化",
+  "applied_rules": [
+    "PROJECT_MERGE",
+    "SORT_REMOVE",
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER"
+  ],
+  "rule_effect_scores": {
+    "PROJECT_MERGE": 0.15,
+    "SORT_REMOVE": 0.60,
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER": 0.25
+  },
+  "rule_effect_confidence": {
+    "PROJECT_MERGE": 0.85,
+    "SORT_REMOVE": 0.75,
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER": 0.70
+  }
+}
+```
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 排序优化, 连接优化",
+  "applied_rules": [
+    "PROJECT_MERGE",
+    "SORT_REMOVE",
+    "JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER"
+  ],
+  "rewritten_sql": "SELECT emp.EMPNO, emp.ENAME, emp.JOB, emp.MGR, emp.HIREDATE, emp.SAL, emp.COMM, emp.DEPTNO, emp.SLACKER, dept.DEPTNO AS DEPTNO0, dept.NAME\nFROM EMP\nLEFT JOIN DEPT ON emp.DEPTNO = dept.DEPTNO\nORDER BY emp.SAL\nFETCH NEXT 10 ROWS ONLY",
+  "semantic_correctness_guarantee": "1. 结构性改写：展平了两层派生表t2和t3，将'(SELECT ... FROM EMP ORDER BY SAL FETCH NEXT 10 ROWS ONLY) AS t2'和'(SELECT DEPTNO, NAME FROM DEPT) AS t3'直接替换为对基表EMP和DEPT的引用；消除了内层子查询t2中的'ORDER BY SAL FETCH NEXT 10 ROWS ONLY'，仅保留外层的排序和LIMIT子句。\n2. 投影合并（PROJECT_MERGE）：原SQL中t2子查询投影所有EMP列，t3子查询投影DEPT的DEPTNO和NAME列，外层再次投影这些列；重写后直接在主查询中引用emp.*和dept.DEPTNO、dept.NAME，消除了中间投影层，列集合完全一致（emp的9列+dept的2列，其中dept.DEPTNO别名为DEPTNO0）。\n3. 排序去重（SORT_REMOVE）：原SQL存在双重排序——内层't2: ORDER BY SAL FETCH 10'和外层'ORDER BY t2.SAL FETCH 10'，两者排序键相同且LIMIT值相同；根据SQL语义，内层FETCH NEXT 10已限制结果集为10行，外层再次'ORDER BY t2.SAL FETCH 10'对这10行重新排序并取前10行，结果集不变；重写后仅保留外层'ORDER BY emp.SAL FETCH NEXT 10 ROWS ONLY'，直接对JOIN后的结果排序并取前10行，与原SQL语义等价（因内层排序的10行经外层排序后仍是同样的10行）。\n4. JOIN投影下推（JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER）：原SQL中LEFT JOIN的两侧均为派生表（t2和t3），重写后将投影上提至JOIN之上，直接对基表EMP和DEPT执行LEFT JOIN；LEFT JOIN语义保持不变：对于EMP表中每一行，若dept.DEPTNO匹配则返回dept的DEPTNO和NAME，否则返回NULL（dept.DEPTNO0和dept.NAME为NULL），与原SQL的LEFT JOIN t3行为完全一致。\n5. 结果集等价性保证：原SQL执行流程为'EMP全表扫描 -> 排序取前10行(t2) -> LEFT JOIN DEPT(t3) -> 再次排序取前10行'；由于内层已FETCH 10行，外层JOIN后最多10行（LEFT JOIN不增加左表行数），外层排序的输入即为这10行，再FETCH 10等同于对这10行排序；重写后'EMP LEFT JOIN DEPT -> 排序取前10行'，因LEFT JOIN不改变行数逻辑（每个emp行对应0或1个dept行），排序键emp.SAL在JOIN前后值不变，故排序结果与原SQL一致；最终返回的10行emp记录及其关联的dept信息完全相同。\n6. 关键等价性判定：emp表主键为empno，排序键为sal（非主键），FETCH NEXT 10基于sal排序；LEFT JOIN的ON条件为emp.DEPTNO = dept.DEPTNO，dept表主键为deptno；因LEFT JOIN且dept为右表，每个emp行最多匹配1个dept行（dept.deptno为主键），JOIN不产生重复行；排序和LIMIT作用于emp.SAL列，该列在JOIN前后值不变（来自左表emp），故先JOIN再排序与先排序再JOIN（当内外层排序键相同时）结果等价；原SQL的双重FETCH 10（内层10行经外层排序仍为10行）与重写后的单次FETCH 10语义一致。\n7. NULL和边界情况：若emp.DEPTNO在dept表中无匹配，LEFT JOIN返回dept.DEPTNO0和dept.NAME为NULL，与原SQL't3子查询LEFT JOIN'行为一致；排序时NULL值的处理（NULLS FIRST/LAST）由数据库默认规则决定，原SQL和重写SQL均未显式指定，故行为一致；emp表的sal列为NOT NULL（根据Schema），排序无NULL歧义。\n8. 列别名一致性：原SQL中't3.DEPTNO AS DEPTNO0'在重写后保持为'dept.DEPTNO AS DEPTNO0'，列名和别名完全一致；所有emp列（EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO, SLACKER）和dept列（DEPTNO0, NAME）的顺序、类型、别名均与原SQL输出一致，确保结果集schema等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": true,
+    "message": "重写SQL通过展平派生表、消除冗余内层排序和投影，与原SQL在结果集上完全等价：LEFT JOIN语义保持不变，最终均返回按emp.SAL排序的前10行及其关联的dept信息。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 1->0, Hash/Merge 0->1
+```json
+{
+  "terminate": false,
+  "reason": "结构分析：重写消除了内层派生表和双重排序逻辑，将Nested Loop改为Hash Join，这是正向结构改进。但执行计划显示关键问题：1) 原计划通过Nested Loop + Index Scan实现了"先LIMIT 10行再JOIN"的高效路径(内层Limit先取10行，外层仅对10行做Index Scan查找dept)，总处理行数约8250万；2) 重写后Hash Join必须先完成全表JOIN(4500万行emp × 45万行dept)再排序LIMIT，总处理行数增至1.02亿，且Sort节点处理1875万行(每worker)而非原来的10行。虽然消除了派生表边界，但丢失了关键的"提前过滤"优势。Cost从106万增至145万(+37%)是结构退化的合理反映，非优化器误判。行数估计求和上升23%且未达到"降至10%以下"的强正信号阈值。结论：本轮重写在逻辑简化上有价值,但执行效率明显退化,不应终止。下一步需在保持展平优化的基础上,通过CTE或派生表强制优化器先对emp应用ORDER BY + LIMIT,再用结果集JOIN dept,恢复提前过滤优势。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续改写：使用CTE或派生表显式分离排序和JOIN阶段,强制优化器先执行'WITH top_emp AS (SELECT * FROM EMP ORDER BY SAL LIMIT 10) SELECT top_emp.*, dept.DEPTNO AS DEPTNO0, dept.NAME FROM top_emp LEFT JOIN DEPT ON top_emp.DEPTNO = dept.DEPTNO ORDER BY top_emp.SAL',或使用派生表'SELECT t.*, dept.DEPTNO AS DEPTNO0, dept.NAME FROM (SELECT * FROM EMP ORDER BY SAL LIMIT 10) t LEFT JOIN DEPT ON t.DEPTNO = dept.DEPTNO ORDER BY t.SAL'。关键是通过物化边界(CTE/派生表)阻止优化器将JOIN提前至LIMIT之前,确保仅对10行结果集执行JOIN操作,恢复Nested Loop + Index Scan的高效路径,同时保留展平后的逻辑简洁性。"
+}
+```
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 332
+   - 规则序列: ['PROJECT_MERGE', 'SORT_REMOVE', 'JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER']
+   - 优化组别: 子查询优化, 排序优化, 连接优化
+   - 估计代价: 原始=1062273.19, 重写=1452006.13，相对变化: -36.69%
+✅ 成功存储，记录ID: 1ea387b4-8009-4077-a7ec-01d0ca329eb9
+
+🎲 UCT Math Update: 3 rules, reward=-0.1101 (cost=-0.3669, rows=+0.0000, depth=+0.0000, oc=1062273.1900, rc=1452006.1300)
+   结构分细节: rows 82500427.0->101779908.0 (score=+0.000), depth 6.0->6.0 (score=+0.000)
+✅ UCT Update Complete:
+   → PROJECT_MERGE: P(s,a)=N/A, effect=0.150, conf=0.85, lambda=0.42, reward=-0.031, count=3, avg=-0.017
+   → SORT_REMOVE: P(s,a)=N/A, effect=0.600, conf=0.75, lambda=0.38, reward=-0.048, count=11, avg=+0.026
+   → JOIN_PROJECT_BOTH_TRANSPOSE_INCLUDE_OUTER: P(s,a)=N/A, effect=0.250, conf=0.70, lambda=0.35, reward=-0.031, count=3, avg=-0.030
+
+----------------------------------------
+
