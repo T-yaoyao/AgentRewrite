@@ -266,7 +266,7 @@ class Evaluation():
                     pass
                 print(f"Query execution exceeded {timeout} seconds and was terminated.")
                 # self.restart_postgresql()
-                return -2, -2
+                return (-2, None) if return_flag else -2
             else:
                 try:
                     conn.rollback()
@@ -351,8 +351,8 @@ class Evaluation():
             original_result = -2
         else:
             # execute original query
+            ORIGINAL_TIME_OUT = False
             for i in range(iteration + 1):
-                ORIGINAL_TIME_OUT = False
                 if conn is None:
                     return None, None, None, None, None, None  
                 
@@ -370,6 +370,12 @@ class Evaluation():
 
                 original_time = self.execute_query(conn, cursor, original_query, timeout)
                 print(f"the {i}-th/{iteration} iteration original query excute time: {original_time}")
+                if original_time == -2:
+                    ORIGINAL_TIME_OUT = True
+                    original_result = -2
+                    break
+                elif original_time == -1:
+                    break
                 if original_time and original_time > 0:
                     original_times.append(original_time)
             
@@ -394,8 +400,8 @@ class Evaluation():
         cursor = conn.cursor()
 
         try:
+            REWRITTEN_TIME_OUT = False
             for i in range(iteration + 1):
-                REWRITTEN_TIME_OUT = False 
                 if conn is None:
                     return None, None, None, None, None, None 
                 
@@ -429,6 +435,12 @@ class Evaluation():
                         continue
                 rewritten_time = self.execute_query(conn, cursor, rewritten_query, timeout)
                 print(f"the {i}-th/{iteration} iteration rewrite query excute time: {rewritten_time}")
+                if rewritten_time == -2:
+                    REWRITTEN_TIME_OUT = True
+                    rewritten_result = -2
+                    break
+                elif rewritten_time == -1:
+                    break
                 if rewritten_time and rewritten_time > 0:
                     rewritten_times.append(rewritten_time)
 
