@@ -1,0 +1,229 @@
+Query ID: 115
+==================================================
+
+Original: select  c_customer_id as customer_id        , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername  from customer      ,customer_address      ,customer_demographics      ,household_demographics      ,income_band      ,store_returns  where ca_city	        =  'Hopewell'    and c_current_addr_sk = ca_address_sk    and ib_lower_bound   >=  32287    and ib_upper_bound   <=  32287 + 50000    and ib_income_band_sk = hd_income_band_sk    and cd_demo_sk = c_current_cdemo_sk    and hd_demo_sk = c_current_hdemo_sk    and sr_cdemo_sk = cd_demo_sk  order by c_customer_id  limit 100;
+Rewritten: WITH eligible_income_bands AS (
+  SELECT ib_income_band_sk
+  FROM income_band
+  WHERE ib_lower_bound >= 32287 AND ib_upper_bound <= 82287
+),
+eligible_hdemo AS (
+  SELECT hd_demo_sk
+  FROM household_demographics
+  WHERE hd_income_band_sk IN (SELECT ib_income_band_sk FROM eligible_income_bands)
+),
+eligible_cdemo AS (
+  SELECT DISTINCT sr_cdemo_sk AS cd_demo_sk
+  FROM store_returns
+)
+SELECT
+  c.c_customer_id AS customer_id,
+  COALESCE(c.c_last_name, '') || ', ' || COALESCE(c.c_first_name, '') AS customername
+FROM customer c
+WHERE c.c_current_addr_sk IN (
+  SELECT ca_address_sk
+  FROM customer_address
+  WHERE ca_city = 'Hopewell'
+)
+AND c.c_current_cdemo_sk IN (SELECT cd_demo_sk FROM eligible_cdemo)
+AND c.c_current_hdemo_sk IN (SELECT hd_demo_sk FROM eligible_hdemo)
+ORDER BY c.c_customer_id
+LIMIT 100;
+Time Cost: 237.20s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将income_band和household_demographics的收入范围过滤提取为CTE，生成hd_demo_sk白名单。避免派生表嵌套，改用WHERE EXISTS或直接JOIN CTE结果，消除上一轮引入的物化开销和重复扫描。'}, {'group': '连接优化', 'produced_suggestion': '回退到平坦JOIN结构：1) 保留customer与customer_address的索引嵌套连接（idx_customer_addr + idx_customer_address_sk）；2) 用income_band CTE通过Semi Join或EXISTS过滤customer，避免多表重复连接；3) store_returns改用idx_store_returns_customer索引扫描而非全表扫描，确保并行执行；4) 移除外层冗余的customer_address/household_demographics/income_band重复连接。'}, {'group': '谓词简化', 'produced_suggestion': "将ca_city='Hopewell'谓词保留在customer_address的索引扫描阶段，而非外层Hash Condition；将ib_lower_bound >= 32287 AND ib_upper_bound <= 82287紧贴income_band扫描，避免过滤延迟；将cd_demo_sk的Semi Join条件改为EXISTS子查询，直接在customer扫描阶段过滤。"}, {'group': '投影优化', 'produced_suggestion': '在CTE和Semi Join中仅投影必需的连接键列（hd_demo_sk, cd_demo_sk, ca_address_sk），减少中间结果数据量；最终SELECT仅从customer表提取c_customer_id, c_last_name, c_first_name，避免携带冗余维度表列。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) store_returns表全表扫描(Seq Scan)代价占比87.7%，扫描719万行数据；2) 多表笛卡尔积连接导致中间结果集膨胀；3) customer_address表全表扫描后过滤(ca_city='Hopewell')，代价占比4%；4) 连接条件未充分利用索引。历史案例显示相似SQL通过谓词下推、连接条件优化和半连接转换获得显著提升。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将customer_address的过滤条件ca_city='Hopewell'尽早下推，减少连接前的数据量。利用idx_customer_address_sk索引，先过滤出符合城市条件的地址记录，避免全表扫描250000行后再过滤。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "重新组织连接顺序，优先连接小表和有过滤条件的表。建议顺序：1)先用income_band的范围条件过滤household_demographics；2)再与customer_demographics、customer连接；3)最后才关联store_returns大表。避免store_returns作为驱动表导致的笛卡尔积膨胀。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将store_returns与customer_demographics的连接条件sr_cdemo_sk=cd_demo_sk提前利用。通过idx_store_returns_cdemo索引(如存在)或先从customer侧收集满足条件的cd_demo_sk集合，转换为半连接(SEMI JOIN)过滤store_returns，避免全表扫描719万行。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将income_band的范围条件(ib_lower_bound>=32287 AND ib_upper_bound<=32337)转换为子查询或CTE，先获取符合条件的ib_income_band_sk集合，然后用IN子句过滤household_demographics，减少连接复杂度。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将传递闭包谓词显式添加到查询中。例如从ca_city='Hopewell'和c_current_addr_sk=ca_address_sk可推导出customer的过滤条件，提前过滤customer表，利用idx_customer_addr索引减少Nested Loop的内表扫描次数。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+    "applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "JOIN_PUSH_TRANSITIVE_PREDICATES", "JOIN_ADD_REDUNDANT_SEMI_JOIN"],
+    "groups": "连接优化, 谓词简化",
+    "rule_effect_confidence": {
+        "FILTER_REDUCE_EXPRESSIONS": 0.8,
+        "FILTER_INTO_JOIN": 0.7,
+        "JOIN_CONDITION_PUSH": 0.7,
+        "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.7,
+        "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.6
+    },
+    "rule_effect_scores": {
+        "FILTER_REDUCE_EXPRESSIONS": 0.2,
+        "FILTER_INTO_JOIN": 0.2,
+        "JOIN_CONDITION_PUSH": 0.2,
+        "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.2,
+        "JOIN_ADD_REDUNDANT_SEMI_JOIN": 0.2
+    }
+}
+✅ 选择了 5 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化, 谓词简化",
+  "applied_rules": [
+    "FILTER_REDUCE_EXPRESSIONS",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_ADD_REDUNDANT_SEMI_JOIN"
+  ],
+  "rewritten_sql": "SELECT\n  c.c_customer_id AS customer_id,\n  COALESCE(c.c_last_name, '') || ', ' || COALESCE(c.c_first_name, '') AS customername\nFROM\n  (\n    SELECT *\n    FROM customer\n    WHERE c_current_addr_sk IN (\n      SELECT ca_address_sk\n      FROM customer_address\n      WHERE ca_city = 'Hopewell'\n    )\n    AND c_current_cdemo_sk IN (\n      SELECT cd_demo_sk\n      FROM customer_demographics\n      WHERE cd_demo_sk IN (\n        SELECT sr_cdemo_sk\n        FROM store_returns\n      )\n    )\n    AND c_current_hdemo_sk IN (\n      SELECT hd_demo_sk\n      FROM household_demographics\n      WHERE hd_income_band_sk IN (\n        SELECT ib_income_band_sk\n        FROM income_band\n        WHERE ib_lower_bound >= 32287\n        AND ib_upper_bound <= 82287\n      )\n    )\n  ) AS c\n  JOIN customer_address AS ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_city = 'Hopewell'\n  JOIN customer_demographics AS cd ON c.c_current_cdemo_sk = cd.cd_demo_sk\n  JOIN household_demographics AS hd ON c.c_current_hdemo_sk = hd.hd_demo_sk\n  JOIN income_band AS ib ON hd.hd_income_band_sk = ib.ib_income_band_sk AND ib.ib_lower_bound >= 32287 AND ib.ib_upper_bound <= 82287\n  JOIN store_returns AS sr ON sr.sr_cdemo_sk = cd.cd_demo_sk\nORDER BY c.c_customer_id\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **FILTER_REDUCE_EXPRESSIONS应用**：简化了income_band的范围条件，将ib_upper_bound <= 32287 + 50000改写为ib_upper_bound <= 82287，消除了常量表达式计算，语义完全等价。\n\n2. **JOIN_ADD_REDUNDANT_SEMI_JOIN应用（多层半连接过滤）**：在customer表上添加了三个半连接过滤（IN子查询），分别针对customer_address（ca_city='Hopewell'）、customer_demographics（存在于store_returns中的cd_demo_sk）、household_demographics（满足income_band范围的hd_demo_sk）。这些半连接提前过滤customer表，减少后续JOIN的输入行数，但不改变最终结果集，因为原始查询的WHERE条件和JOIN条件已经隐含了这些过滤逻辑。\n\n3. **JOIN_CONDITION_PUSH应用**：将customer_address的ca_city='Hopewell'条件、income_band的范围条件推入JOIN ON子句中。这样做的原因是这些条件原本在WHERE子句中，推入ON子句后可以在JOIN阶段就进行过滤，利用索引idx_customer_address_sk和income_band_pkey提前减少JOIN的中间结果。由于这是INNER JOIN，WHERE条件和ON条件在语义上等价。\n\n4. **JOIN_PUSH_TRANSITIVE_PREDICATES应用**：利用传递性推导谓词。例如，从c.c_current_addr_sk = ca.ca_address_sk和ca.ca_city='Hopewell'，推导出customer表必须满足c_current_addr_sk在满足ca_city='Hopewell'的ca_address_sk集合中，这已通过半连接实现。同样，从sr.sr_cdemo_sk = cd.cd_demo_sk推导出customer必须关联到store_returns中存在的cd_demo_sk，也通过半连接实现。\n\n5. **FILTER_INTO_JOIN应用**：将只依赖单表的过滤条件推入到该表的子查询或JOIN ON子句中。具体包括：ca_city='Hopewell'推入customer_address的JOIN ON条件；ib_lower_bound >= 32287 AND ib_upper_bound <= 82287推入income_band的JOIN ON条件；这些条件原本在WHERE子句中，推入后可以更早触发索引扫描和过滤。\n\n6. **结果集等价性保证**：重写后的查询仍然返回相同的列（customer_id和customername），相同的排序（ORDER BY c_customer_id），相同的行数限制（LIMIT 100）。所有原始查询的JOIN条件和WHERE条件都被保留，只是通过半连接提前过滤和条件下推改变了执行顺序和中间结果大小，最终结果集与原始查询完全一致。\n\n7. **关键等价性判定点**：半连接（IN子查询）只过滤掉那些最终会被WHERE和JOIN条件淘汰的行，不会引入新行或错误过滤有效行。原始查询是六表笛卡尔积后用WHERE过滤，重写查询是先用半连接缩小customer范围，再进行六表JOIN。由于所有过滤条件都源自原始WHERE子句，且INNER JOIN的WHERE条件可以自由移动到ON子句或子查询中而不改变结果集（NULL语义在此场景不产生差异，因为所有JOIN键都参与等值连接），因此重写查询与原始查询在逻辑上等价。\n\n8. **ORDER BY和LIMIT的保留**：重写查询保持了原始查询的ORDER BY c_customer_id和LIMIT 100，确保返回的100行顺序和内容与原始查询一致。由于过滤条件没有改变，只是执行顺序优化，因此排序和限制的结果不受影响。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "重写SQL引入严重结构性退化：1) store_returns全表扫描从并行执行（2999248行/worker）退化为串行扫描719万行，且被重复扫描两次（一次在派生表子查询，一次在最终JOIN）；2) 派生表引入3层Materialize嵌套物化，额外增加数据物化成本；3) 并行度从原2 workers降为单worker或串行；4) cost从169K增至393K（+131%），且行数估计求和从300万增至1021万（+240%）；5) 虽尝试用半连接过滤，但派生表内部的Semi Join执行在已物化数据上，未能有效减少主干数据量。结构信号明确恶化：关键大表被重复扫描、并行度丢失、物化开销激增，且无任何补偿性收益（未见去相关、子计划减少、或CTE复用）。",
+  "no_further_optimization": false,
+  "next_step_advice": "回退派生表设计，保留原始平坦JOIN结构。具体改进：1) 保持customer与customer_address的Index Scan嵌套连接（已验证高效）；2) 将income_band和household_demographics的过滤前置为CTE或子查询，生成hd_demo_sk白名单；3) 用该白名单通过Semi Join过滤customer，避免派生表嵌套；4) 保留原Hash Join处理store_returns与customer_demographics的连接，维持并行执行；5) 确保ca_city和income_band范围谓词紧贴对应表扫描，避免过滤延迟。目标：消除重复扫描和物化，恢复并行度，同时利用索引和谓词下推。"
+}
+```
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮尝试引入派生表和多层Semi Join导致store_returns全表扫描被重复执行且并行度丢失。当前SQL存在结构性冗余：派生表内已通过IN子查询过滤customer，但外层又重复JOIN相同维度表。执行计划显示store_returns被扫描两次（总代价占比86.4%），且存在Right Semi Join后仍需Hash Join的低效模式。需回退到平坦结构，利用索引消除全表扫描，通过CTE前置过滤减少连接数据量。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将income_band和household_demographics的收入范围过滤提取为CTE，生成hd_demo_sk白名单。避免派生表嵌套，改用WHERE EXISTS或直接JOIN CTE结果，消除上一轮引入的物化开销和重复扫描。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "回退到平坦JOIN结构：1) 保留customer与customer_address的索引嵌套连接（idx_customer_addr + idx_customer_address_sk）；2) 用income_band CTE通过Semi Join或EXISTS过滤customer，避免多表重复连接；3) store_returns改用idx_store_returns_customer索引扫描而非全表扫描，确保并行执行；4) 移除外层冗余的customer_address/household_demographics/income_band重复连接。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将ca_city='Hopewell'谓词保留在customer_address的索引扫描阶段，而非外层Hash Condition；将ib_lower_bound >= 32287 AND ib_upper_bound <= 82287紧贴income_band扫描，避免过滤延迟；将cd_demo_sk的Semi Join条件改为EXISTS子查询，直接在customer扫描阶段过滤。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在CTE和Semi Join中仅投影必需的连接键列（hd_demo_sk, cd_demo_sk, ca_address_sk），减少中间结果数据量；最终SELECT仅从customer表提取c_customer_id, c_last_name, c_first_name，避免携带冗余维度表列。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+    "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "PROJECT_JOIN_TRANSPOSE"],
+    "groups": "子查询优化, 谓词简化, 投影优化",
+    "rule_effect_confidence": {
+        "STRATEGY_CTE_DECOMPOSITION": 0.9,
+        "FILTER_INTO_JOIN": 0.7,
+        "JOIN_CONDITION_PUSH": 0.6,
+        "PROJECT_JOIN_TRANSPOSE": 0.8
+    },
+    "rule_effect_scores": {
+        "STRATEGY_CTE_DECOMPOSITION": 0.4,
+        "FILTER_INTO_JOIN": 0.2,
+        "JOIN_CONDITION_PUSH": 0.2,
+        "PROJECT_JOIN_TRANSPOSE": 0.2
+    }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 谓词简化, 投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "WITH eligible_income_bands AS (\n  SELECT ib_income_band_sk\n  FROM income_band\n  WHERE ib_lower_bound >= 32287 AND ib_upper_bound <= 82287\n),\neligible_hdemo AS (\n  SELECT hd_demo_sk\n  FROM household_demographics\n  WHERE hd_income_band_sk IN (SELECT ib_income_band_sk FROM eligible_income_bands)\n),\neligible_cdemo AS (\n  SELECT DISTINCT sr_cdemo_sk AS cd_demo_sk\n  FROM store_returns\n)\nSELECT\n  c.c_customer_id AS customer_id,\n  COALESCE(c.c_last_name, '') || ', ' || COALESCE(c.c_first_name, '') AS customername\nFROM customer c\nWHERE c.c_current_addr_sk IN (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_city = 'Hopewell'\n)\nAND c.c_current_cdemo_sk IN (SELECT cd_demo_sk FROM eligible_cdemo)\nAND c.c_current_hdemo_sk IN (SELECT hd_demo_sk FROM eligible_hdemo)\nORDER BY c.c_customer_id\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **CTE提取与语义等价性**：eligible_income_bands提取income_band的收入范围过滤（ib_lower_bound >= 32287 AND ib_upper_bound <= 82287），与原SQL中income_band子查询的WHERE条件完全一致；eligible_hdemo通过IN子查询关联eligible_income_bands，等价于原SQL中household_demographics通过hd_income_band_sk关联income_band的嵌套子查询；eligible_cdemo从store_returns提取DISTINCT sr_cdemo_sk，等价于原SQL中customer_demographics通过cd_demo_sk IN (SELECT sr_cdemo_sk FROM store_returns)的Semi Join语义。这三个CTE分别生成hd_demo_sk、cd_demo_sk和ca_address_sk的白名单，与原SQL的IN子查询过滤逻辑在集合语义上完全等价。\n\n2. **从派生表+JOIN回退到WHERE IN子查询**：原base_sql使用派生表嵌套IN子查询，再与5张表做显式JOIN，导致重复连接和物化开销。重写SQL将过滤逻辑改为WHERE子句中的IN子查询：c_current_addr_sk IN (customer_address的ca_city过滤)、c_current_cdemo_sk IN (eligible_cdemo CTE)、c_current_hdemo_sk IN (eligible_hdemo CTE)。因customer表的c_current_*_sk列与对应维度表的主键列构成外键关系（TPC-DS Schema保证），IN子查询的Semi Join语义与原SQL的显式JOIN + 派生表过滤完全等价：只要customer的外键值存在于白名单中，该行即被保留，且最终只从customer表投影列，不携带维度表的其他列。\n\n3. **消除冗余JOIN与重复扫描**：原base_sql在派生表内部已通过IN子查询过滤customer，外层又显式JOIN customer_address、customer_demographics、household_demographics、income_band、store_returns五张表，且重复应用相同谓词（ca_city='Hopewell'、ib_lower_bound/ib_upper_bound范围）。这些外层JOIN除了重复验证已在派生表内满足的条件外，不提供额外过滤或列投影（最终SELECT仅用customer的列）。重写SQL通过CTE将维度表过滤前置，customer表的WHERE IN子查询直接消费白名单CTE，避免了多表连接的笛卡尔积中间结果和重复扫描（如store_returns在原base_sql中被扫描两次）。\n\n4. **投影下推与列裁剪**：eligible_income_bands仅投影ib_income_band_sk（连接键），eligible_hdemo仅投影hd_demo_sk（连接键），eligible_cdemo仅投影cd_demo_sk（连接键）。最终SELECT仅从customer表提取c_customer_id、c_last_name、c_first_name三列，与原SQL的投影列表完全一致。CTE中的列裁剪减少中间结果数据量，且不影响最终结果集的列数、列名或数据类型。\n\n5. **ORDER BY与LIMIT保持一致**：重写SQL保留ORDER BY c.c_customer_id和LIMIT 100，与原SQL完全一致，确保结果集排序和行数限制语义不变。\n\n6. **NULL与重复行处理**：原SQL的IN子查询和显式JOIN在遇到NULL外键值时，均返回空结果（SQL标准Semi Join语义）。重写SQL的WHERE IN子查询保持相同行为：若c_current_addr_sk/c_current_cdemo_sk/c_current_hdemo_sk为NULL，IN子查询返回FALSE，该行被过滤。eligible_cdemo使用DISTINCT确保cd_demo_sk白名单无重复，与原SQL的Semi Join隐式去重一致（IN子查询只关心键是否存在，不关心右表重复行数）。\n\n7. **关键等价性保证**：原SQL通过派生表内IN子查询+外层显式JOIN实现多表过滤，但外层JOIN的连接条件（ca_city、ib范围、sr_cdemo_sk）与派生表内IN子查询的过滤条件重复，导致逻辑冗余。重写SQL将这些过滤提前到CTE中，customer表的WHERE IN子查询直接消费CTE白名单，消除了冗余连接但保留了相同的过滤语义。因TPC-DS Schema中customer的c_current_*_sk列是外键，且维度表的主键列（ca_address_sk、cd_demo_sk、hd_demo_sk）唯一，IN子查询的Semi Join与显式JOIN在过滤结果上等价（只要外键值在白名单中，行被保留；最终投影不依赖维度表列，故JOIN携带的额外列对结果集无影响）。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+{
+  "equivalent": true,
+  "message": "当前重写SQL通过CTE和WHERE IN子查询简化原始SQL的多表JOIN逻辑，过滤条件和连接语义保持一致，且投影、排序、LIMIT无变化，符合Schema和规则意图，故判等价。",
+  "differences": []
+}
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 4->3, Hash/Merge 1->1 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。
+```json
+{
+  "terminate": false,
+  "reason": "结构明确恶化：1) 原计划：Parallel Hash Join驱动全表扫描store_returns(2.99M行)，与Nested Loop构建的小结果集(18行)做哈希连接，Workers=2，执行一次；2) 重写计划：store_returns被全表扫描后强制Hash Aggregate去重(Plan Rows 2.99M→278K)，再经Gather Merge + Unique + Sort形成物化中间结果，然后与customer做Merge Join；3) 灾难性退化证据：a) store_returns从一次并行Hash Join探测变为全表扫描+聚合+两轮排序+物化；b) 原计划的customer侧过滤链(Nested Loop 4层)将数据降至18行后再与store_returns连接，重写将此过滤链延后至Merge Join之后；c) 原Parallel Hash Join的并行度2降为串行Merge Join，且customer侧Gather仅用于前置过滤而非主干连接；d) 新增高开销的Hash Aggregate(310K→336K cost) + Gather Merge(366K→444K cost)；4) cost从169K增至456K(增幅168%)，虽不单独作为依据但佐证结构退化；5) 估计行数求和从3.0M增至4.5M(增幅50%)，反映中间物化膨胀；6) 虽引入CTE但未实现复用收益，反而因IN子查询的物化和排序抵消了原有的索引Nested Loop优势。下一轮建议：回退到Nested Loop驱动模式，保留customer→customer_address的索引嵌套连接作为过滤链起点，将income_band/household_demographics条件通过EXISTS或Semi Join前置到customer扫描阶段，最后用Hash Semi Join(而非Merge Join)过滤store_returns的cd_demo_sk，避免强制排序和物化。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前enhanced_sql继续改写：1) 移除CTE eligible_income_bands和eligible_hdemo，改用EXISTS子查询直接嵌入customer的WHERE条件：WHERE EXISTS (SELECT 1 FROM customer_address ca WHERE ca.ca_address_sk=c.c_current_addr_sk AND ca.ca_city='Hopewell') AND EXISTS (SELECT 1 FROM household_demographics hd JOIN income_band ib ON hd.hd_income_band_sk=ib.ib_income_band_sk WHERE hd.hd_demo_sk=c.c_current_hdemo_sk AND ib.ib_lower_bound>=32287 AND ib.ib_upper_bound<=82287)；2) 保留CTE eligible_cdemo但将其改为Hash Semi Join而非Merge Join：在主查询中FROM customer c JOIN (SELECT DISTINCT sr_cdemo_sk FROM store_returns) sr ON c.c_current_cdemo_sk=sr.sr_cdemo_sk；3) 确保customer与customer_address通过索引Nested Loop连接，避免IN子查询导致的物化；4) 利用idx_customer_addr索引从customer_address过滤出ca_city='Hopewell'的地址键，驱动customer表的索引扫描。最终目标：恢复原计划的Nested Loop过滤链优势，同时将store_returns从全表聚合改为Hash Semi Join探测。"
+}
+```
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+ℹ️  估计代价上升 168.5%（> 50.0%），计划结构分析建议保留当前重写，不回退。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 473
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH', 'PROJECT_JOIN_TRANSPOSE']
+   - 优化组别: 子查询优化, 谓词简化, 投影优化
+   - 估计代价: 原始=169857.88, 重写=456103.75，相对变化: -168.52%
+✅ 成功存储，记录ID: 5c0d64bf-7d47-45fa-917f-a292acb18fb6
+
+🎲 UCT Math Update: 4 rules, reward=-0.2400 (cost=-1.0000, rows=+0.0000, depth=+0.2000, oc=169857.8800, rc=456103.7500)
+   结构分细节: rows 3000139.0->4501645.0 (score=+0.000), depth 10.0->8.0 (score=+0.200)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.400, conf=0.90, lambda=0.45, reward=-0.081, count=175, avg=+0.012
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=-0.057, count=186, avg=+0.003
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.200, conf=0.60, lambda=0.30, reward=-0.053, count=160, avg=+0.003
+   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.200, conf=0.80, lambda=0.40, reward=-0.049, count=58, avg=+0.005
+
+----------------------------------------
+

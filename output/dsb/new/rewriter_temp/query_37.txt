@@ -1,0 +1,207 @@
+Query ID: 37
+==================================================
+
+Original: select   i_item_id  ,i_item_desc  ,s_store_id  ,s_store_name  ,sum(ss_net_profit) as store_sales_profit  ,sum(sr_net_loss) as store_returns_loss  ,sum(cs_net_profit) as catalog_sales_profit  from  store_sales  ,store_returns  ,catalog_sales  ,date_dim d1  ,date_dim d2  ,date_dim d3  ,store  ,item  where  d1.d_moy = 8  and d1.d_year = 2001  and d1.d_date_sk = ss_sold_date_sk  and i_item_sk = ss_item_sk  and s_store_sk = ss_store_sk  and ss_customer_sk = sr_customer_sk  and ss_item_sk = sr_item_sk  and ss_ticket_number = sr_ticket_number  and sr_returned_date_sk = d2.d_date_sk  and d2.d_moy               between 8 and  8 + 2  and d2.d_year              = 2001  and sr_customer_sk = cs_bill_customer_sk  and sr_item_sk = cs_item_sk  and cs_sold_date_sk = d3.d_date_sk  and d3.d_moy               between 8 and  8 + 2  and d3.d_year              = 2001  group by  i_item_id  ,i_item_desc  ,s_store_id  ,s_store_name  order by  i_item_id  ,i_item_desc  ,s_store_id  ,s_store_name  limit 100;
+Rewritten: WITH d1_filtered AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_moy = 8 AND d_year = 2001
+),
+d2_filtered AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_moy BETWEEN 8 AND 10 AND d_year = 2001
+),
+d3_filtered AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_moy BETWEEN 8 AND 10 AND d_year = 2001
+),
+ss_projected AS (
+  SELECT ss_sold_date_sk, ss_item_sk, ss_store_sk, ss_customer_sk, ss_ticket_number, ss_net_profit
+  FROM store_sales
+  WHERE ss_sold_date_sk IS NOT NULL
+    AND ss_item_sk IS NOT NULL
+    AND ss_store_sk IS NOT NULL
+    AND ss_customer_sk IS NOT NULL
+    AND ss_ticket_number IS NOT NULL
+),
+sr_projected AS (
+  SELECT sr_returned_date_sk, sr_customer_sk, sr_item_sk, sr_ticket_number, sr_net_loss
+  FROM store_returns
+  WHERE sr_returned_date_sk IS NOT NULL
+    AND sr_customer_sk IS NOT NULL
+    AND sr_item_sk IS NOT NULL
+    AND sr_ticket_number IS NOT NULL
+),
+cs_projected AS (
+  SELECT cs_sold_date_sk, cs_bill_customer_sk, cs_item_sk, cs_net_profit
+  FROM catalog_sales
+  WHERE cs_sold_date_sk IS NOT NULL
+    AND cs_bill_customer_sk IS NOT NULL
+    AND cs_item_sk IS NOT NULL
+),
+item_projected AS (
+  SELECT i_item_sk, i_item_id, i_item_desc
+  FROM item
+  WHERE i_item_sk IS NOT NULL
+),
+store_projected AS (
+  SELECT s_store_sk, s_store_id, s_store_name
+  FROM store
+  WHERE s_store_sk IS NOT NULL
+)
+SELECT
+  i_item_id,
+  i_item_desc,
+  s_store_id,
+  s_store_name,
+  SUM(ss_net_profit) AS store_sales_profit,
+  SUM(sr_net_loss) AS store_returns_loss,
+  SUM(cs_net_profit) AS catalog_sales_profit
+FROM ss_projected
+JOIN d1_filtered ON d1_filtered.d_date_sk = ss_projected.ss_sold_date_sk
+JOIN item_projected ON item_projected.i_item_sk = ss_projected.ss_item_sk
+JOIN store_projected ON store_projected.s_store_sk = ss_projected.ss_store_sk
+JOIN sr_projected ON sr_projected.sr_customer_sk = ss_projected.ss_customer_sk
+  AND sr_projected.sr_item_sk = ss_projected.ss_item_sk
+  AND sr_projected.sr_ticket_number = ss_projected.ss_ticket_number
+JOIN d2_filtered ON d2_filtered.d_date_sk = sr_projected.sr_returned_date_sk
+JOIN cs_projected ON cs_projected.cs_bill_customer_sk = sr_projected.sr_customer_sk
+  AND cs_projected.cs_item_sk = sr_projected.sr_item_sk
+JOIN d3_filtered ON d3_filtered.d_date_sk = cs_projected.cs_sold_date_sk
+GROUP BY
+  i_item_id,
+  i_item_desc,
+  s_store_id,
+  s_store_name
+ORDER BY
+  i_item_id,
+  i_item_desc,
+  s_store_id,
+  s_store_name
+LIMIT 100
+Time Cost: 112.54s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将d1、d2、d3的过滤条件(d_moy、d_year)提前应用，减少date_dim参与连接的行数。d1已有精确过滤(d_moy=8, d_year=2001)，d2和d3使用范围过滤(d_moy between 8 and 10, d_year=2001)，可通过FILTER_INTO_JOIN规则将这些条件下推到扫描阶段'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，优先执行高选择性的连接。建议先连接d1与store_sales(利用idx_store_sales_sold_date索引和d1的精确过滤)，再连接item和store(小维度表)，最后连接store_returns和catalog_sales。应用JOIN_CONDITION_PUSH规则将连接条件前置'}, {'group': '连接优化', 'produced_suggestion': '当前d2表通过Nested Loop分别与store_sales(28M行)和store_returns(7M行)连接，代价极高。利用JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE推导NOT NULL过滤条件，并考虑将d2的过滤结果物化后再参与连接，避免重复扫描'}, {'group': '子查询优化', 'produced_suggestion': '考虑将三个date_dim实例(d1、d2、d3)的过滤逻辑提取为CTE，应用STRATEGY_CTE_DECOMPOSITION规则。由于d1、d2、d3的过滤条件相似但不完全相同，CTE可减少date_dim的重复扫描开销'}, {'group': '投影优化', 'produced_suggestion': '应用PROJECT_JOIN_TRANSPOSE规则，将投影操作下推到连接之前。当前查询最终只需要i_item_id、i_item_desc、s_store_id、s_store_name和聚合列，可在连接前裁剪不必要的列，减少数据传输量'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示两个高代价的Nested Loop连接(共占87.4%)，其中d2表被重复扫描(Index Scan占8.8%)。该查询涉及三个事实表(store_sales、store_returns、catalog_sales)和三个date_dim实例(d1、d2、d3)的复杂连接，存在显著的查询重写优化空间。相似案例显示FILTER_INTO_JOIN、JOIN_CONDITION_PUSH、JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE等规则在类似场景下有效。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将d1、d2、d3的过滤条件(d_moy、d_year)提前应用，减少date_dim参与连接的行数。d1已有精确过滤(d_moy=8, d_year=2001)，d2和d3使用范围过滤(d_moy between 8 and 10, d_year=2001)，可通过FILTER_INTO_JOIN规则将这些条件下推到扫描阶段"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，优先执行高选择性的连接。建议先连接d1与store_sales(利用idx_store_sales_sold_date索引和d1的精确过滤)，再连接item和store(小维度表)，最后连接store_returns和catalog_sales。应用JOIN_CONDITION_PUSH规则将连接条件前置"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "当前d2表通过Nested Loop分别与store_sales(28M行)和store_returns(7M行)连接，代价极高。利用JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE推导NOT NULL过滤条件，并考虑将d2的过滤结果物化后再参与连接，避免重复扫描"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑将三个date_dim实例(d1、d2、d3)的过滤逻辑提取为CTE，应用STRATEGY_CTE_DECOMPOSITION规则。由于d1、d2、d3的过滤条件相似但不完全相同，CTE可减少date_dim的重复扫描开销"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "应用PROJECT_JOIN_TRANSPOSE规则，将投影操作下推到连接之前。当前查询最终只需要i_item_id、i_item_desc、s_store_id、s_store_name和聚合列，可在连接前裁剪不必要的列，减少数据传输量"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+    "applied_rules": [
+        "FILTER_INTO_JOIN",
+        "JOIN_CONDITION_PUSH",
+        "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE",
+        "STRATEGY_CTE_DECOMPOSITION",
+        "PROJECT_JOIN_TRANSPOSE"
+    ],
+    "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
+    "rule_effect_confidence": {
+        "FILTER_INTO_JOIN": 0.8,
+        "JOIN_CONDITION_PUSH": 0.8,
+        "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.7,
+        "STRATEGY_CTE_DECOMPOSITION": 0.4,
+        "PROJECT_JOIN_TRANSPOSE": 0.8
+    },
+    "rule_effect_scores": {
+        "FILTER_INTO_JOIN": 0.3,
+        "JOIN_CONDITION_PUSH": 0.2,
+        "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.2,
+        "STRATEGY_CTE_DECOMPOSITION": 0.1,
+        "PROJECT_JOIN_TRANSPOSE": 0.2
+    }
+}
+✅ 选择了 5 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 连接优化, 子查询优化, 投影优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE",
+    "STRATEGY_CTE_DECOMPOSITION",
+    "PROJECT_JOIN_TRANSPOSE"
+  ],
+  "rewritten_sql": "WITH d1_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_moy = 8 AND d_year = 2001\n),\nd2_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_moy BETWEEN 8 AND 10 AND d_year = 2001\n),\nd3_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_moy BETWEEN 8 AND 10 AND d_year = 2001\n),\nss_projected AS (\n  SELECT ss_sold_date_sk, ss_item_sk, ss_store_sk, ss_customer_sk, ss_ticket_number, ss_net_profit\n  FROM store_sales\n  WHERE ss_sold_date_sk IS NOT NULL\n    AND ss_item_sk IS NOT NULL\n    AND ss_store_sk IS NOT NULL\n    AND ss_customer_sk IS NOT NULL\n    AND ss_ticket_number IS NOT NULL\n),\nsr_projected AS (\n  SELECT sr_returned_date_sk, sr_customer_sk, sr_item_sk, sr_ticket_number, sr_net_loss\n  FROM store_returns\n  WHERE sr_returned_date_sk IS NOT NULL\n    AND sr_customer_sk IS NOT NULL\n    AND sr_item_sk IS NOT NULL\n    AND sr_ticket_number IS NOT NULL\n),\ncs_projected AS (\n  SELECT cs_sold_date_sk, cs_bill_customer_sk, cs_item_sk, cs_net_profit\n  FROM catalog_sales\n  WHERE cs_sold_date_sk IS NOT NULL\n    AND cs_bill_customer_sk IS NOT NULL\n    AND cs_item_sk IS NOT NULL\n),\nitem_projected AS (\n  SELECT i_item_sk, i_item_id, i_item_desc\n  FROM item\n  WHERE i_item_sk IS NOT NULL\n),\nstore_projected AS (\n  SELECT s_store_sk, s_store_id, s_store_name\n  FROM store\n  WHERE s_store_sk IS NOT NULL\n)\nSELECT\n  i_item_id,\n  i_item_desc,\n  s_store_id,\n  s_store_name,\n  SUM(ss_net_profit) AS store_sales_profit,\n  SUM(sr_net_loss) AS store_returns_loss,\n  SUM(cs_net_profit) AS catalog_sales_profit\nFROM ss_projected\nJOIN d1_filtered ON d1_filtered.d_date_sk = ss_projected.ss_sold_date_sk\nJOIN item_projected ON item_projected.i_item_sk = ss_projected.ss_item_sk\nJOIN store_projected ON store_projected.s_store_sk = ss_projected.ss_store_sk\nJOIN sr_projected ON sr_projected.sr_customer_sk = ss_projected.ss_customer_sk\n  AND sr_projected.sr_item_sk = ss_projected.ss_item_sk\n  AND sr_projected.sr_ticket_number = ss_projected.ss_ticket_number\nJOIN d2_filtered ON d2_filtered.d_date_sk = sr_projected.sr_returned_date_sk\nJOIN cs_projected ON cs_projected.cs_bill_customer_sk = sr_projected.sr_customer_sk\n  AND cs_projected.cs_item_sk = sr_projected.sr_item_sk\nJOIN d3_filtered ON d3_filtered.d_date_sk = cs_projected.cs_sold_date_sk\nGROUP BY\n  i_item_id,\n  i_item_desc,\n  s_store_id,\n  s_store_name\nORDER BY\n  i_item_id,\n  i_item_desc,\n  s_store_id,\n  s_store_name\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **CTE提取（STRATEGY_CTE_DECOMPOSITION）**：将三个date_dim实例（d1、d2、d3）的过滤逻辑提取为独立CTE（d1_filtered、d2_filtered、d3_filtered），仅保留d_date_sk列。d1_filtered应用精确过滤(d_moy=8, d_year=2001)，d2_filtered和d3_filtered应用范围过滤(d_moy BETWEEN 8 AND 10, d_year=2001)。这些CTE与原SQL中WHERE子句对date_dim的过滤条件完全等价，仅改变了表达形式（从WHERE子句移至CTE定义），不改变结果集。\n\n2. **投影下推（PROJECT_JOIN_TRANSPOSE）**：为store_sales、store_returns、catalog_sales、item、store创建投影CTE（ss_projected、sr_projected、cs_projected、item_projected、store_projected），仅保留后续JOIN、GROUP BY和聚合所需列。原SQL中这些表的所有列均可访问，但最终只使用部分列；投影下推不改变可见列的值和行数，仅减少数据传输量，结果集语义完全等价。\n\n3. **IS NOT NULL推导（JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE）**：在各投影CTE中，对参与INNER JOIN的连接键（ss_sold_date_sk、ss_item_sk、ss_store_sk、ss_customer_sk、ss_ticket_number、sr_returned_date_sk、sr_customer_sk、sr_item_sk、sr_ticket_number、cs_sold_date_sk、cs_bill_customer_sk、cs_item_sk、i_item_sk、s_store_sk）添加IS NOT NULL过滤。由于原SQL使用INNER JOIN，连接键为NULL的行在JOIN时会被自动过滤；显式添加IS NOT NULL不改变结果集，仅提前过滤，与原SQL语义等价。\n\n4. **过滤条件下推（FILTER_INTO_JOIN与JOIN_CONDITION_PUSH）**：date_dim的过滤条件已通过CTE定义实现下推（在CTE中过滤后再JOIN）；store_sales、store_returns、catalog_sales的IS NOT NULL条件已下推到各自CTE中；item和store的IS NOT NULL条件同样下推。原SQL的WHERE子句中所有条件均已转化为CTE内部过滤或JOIN ON条件，未遗漏任何过滤逻辑。\n\n5. **JOIN条件与连接顺序**：重写SQL保持与原SQL相同的JOIN语义：ss_projected先与d1_filtered、item_projected、store_projected连接（对应原SQL中的store_sales、date_dim d1、item、store连接），再与sr_projected连接（对应store_returns，连接键ss_customer_sk=sr_customer_sk、ss_item_sk=sr_item_sk、ss_ticket_number=sr_ticket_number），再与d2_filtered连接（对应date_dim d2，连接键sr_returned_date_sk=d_date_sk），再与cs_projected连接（对应catalog_sales，连接键sr_customer_sk=cs_bill_customer_sk、sr_item_sk=cs_item_sk），最后与d3_filtered连接（对应date_dim d3，连接键cs_sold_date_sk=d_date_sk）。所有JOIN条件与原SQL完全一致，仅改变了表达形式（使用CTE别名），不改变连接逻辑。\n\n6. **GROUP BY与聚合列**：重写SQL的GROUP BY子句（i_item_id、i_item_desc、s_store_id、s_store_name）与原SQL完全一致；聚合函数SUM(ss_net_profit)、SUM(sr_net_loss)、SUM(cs_net_profit)的输入列与原SQL一致，仅列名前缀改为CTE别名（如ss_projected.ss_net_profit），值与原SQL相同。聚合结果在语义上完全等价。\n\n7. **ORDER BY与LIMIT**：重写SQL的ORDER BY子句（i_item_id、i_item_desc、s_store_id、s_store_name）和LIMIT 100与原SQL完全一致，排序顺序和返回行数不变。\n\n8. **易误判点说明**：(1) CTE d2_filtered和d3_filtered定义相同（均为d_moy BETWEEN 8 AND 10, d_year=2001），但在原SQL中它们分别对应独立的date_dim实例d2和d3；重写SQL中两个CTE独立存在，JOIN时分别引用，与原SQL的两次date_dim扫描语义等价。(2) 所有IS NOT NULL条件均针对INNER JOIN的连接键，原SQL中这些行在JOIN时已被隐式过滤，显式添加不改变结果集。(3) 投影下推仅保留必需列，未裁剪任何后续使用的列（如聚合列ss_net_profit、sr_net_loss、cs_net_profit，GROUP BY列i_item_id、i_item_desc、s_store_id、s_store_name，以及连接键），确保聚合和排序结果不变。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过CTE提取、投影下推、IS NOT NULL推导和条件下推实现等价变换，所有JOIN条件、过滤逻辑、GROUP BY和聚合列与原SQL完全一致，结果集相同。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 7641.0 -> 7185.0 (重写侧约为原的 94.0322%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划结构基本一致(Nested Loop 7层, Index Scan 7次, Bitmap Scan 3次),无结构性退化。重写引入8个CTE(含预聚合CTE)明确体现公共中间结果复用意图,且行数估计求和从7641降至7185(降幅6%),cost从35795.01降至34413.4(降幅3.9%)。虽改进幅度不大,但无恶化信号,已达优化目标。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 828
+   - 规则序列: ['FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH', 'JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE', 'STRATEGY_CTE_DECOMPOSITION', 'PROJECT_JOIN_TRANSPOSE']
+   - 优化组别: 谓词简化, 连接优化, 子查询优化, 投影优化
+   - 估计代价: 原始=35795.01, 重写=34413.4，相对变化: 3.86%
+✅ 成功存储，记录ID: 56b9252b-e159-444b-95e4-1d0dfea31644
+
+🎲 UCT Math Update: 5 rules, reward=+0.0355 (cost=+0.0386, rows=+0.0597, depth=+0.0000, oc=35795.0100, rc=34413.4000)
+   结构分细节: rows 7641.0->7185.0 (score=+0.060), depth 12.0->12.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.300, conf=0.80, lambda=0.40, reward=+0.009, count=133, avg=+0.002
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.200, conf=0.80, lambda=0.40, reward=+0.007, count=121, avg=+0.001
+   → JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=+0.007, count=23, avg=+0.001
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.100, conf=0.40, lambda=0.20, reward=+0.006, count=119, avg=+0.016
+   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.200, conf=0.80, lambda=0.40, reward=+0.006, count=43, avg=+0.005
+
+----------------------------------------
+

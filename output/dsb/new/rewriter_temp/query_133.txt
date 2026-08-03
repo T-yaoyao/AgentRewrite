@@ -1,0 +1,245 @@
+Query ID: 133
+==================================================
+
+Original: select           min(cc_call_center_id),         min(cc_name),         min(cc_manager),         min(cr_net_loss),         min(cr_item_sk),         min(cr_order_number) from         call_center,         catalog_returns,         date_dim,         customer,         customer_address,         customer_demographics,         household_demographics where         cr_call_center_sk       = cc_call_center_sk and     cr_returned_date_sk     = d_date_sk and     cr_returning_customer_sk= c_customer_sk and     cd_demo_sk              = c_current_cdemo_sk and     hd_demo_sk              = c_current_hdemo_sk and     ca_address_sk           = c_current_addr_sk and     d_year                  = 1999  and     d_moy                   = 5 and     ( (cd_marital_status       = 'M' and cd_education_status     = 'Unknown')         or(cd_marital_status       = 'W' and cd_education_status     = 'Advanced Degree')) and     hd_buy_potential like '0-500%' and     ca_gmt_offset           = -7 ;
+Rewritten: WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 1999 AND d_moy = 5
+),
+filtered_household_demographics AS (
+    SELECT hd_demo_sk
+    FROM household_demographics
+    WHERE hd_buy_potential LIKE '0-500%'
+),
+filtered_customer_demographics AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')
+       OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')
+),
+filtered_customer_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_gmt_offset = -7
+),
+filtered_catalog_returns AS (
+    SELECT cr_call_center_sk, cr_returning_customer_sk, cr_net_loss, cr_item_sk, cr_order_number
+    FROM catalog_returns
+    WHERE cr_returned_date_sk IN (SELECT d_date_sk FROM filtered_date)
+),
+filtered_customer AS (
+    SELECT c.c_customer_sk, c.c_current_cdemo_sk, c.c_current_hdemo_sk, c.c_current_addr_sk
+    FROM customer c
+    INNER JOIN filtered_customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+    INNER JOIN filtered_customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk
+    INNER JOIN filtered_household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk
+)
+SELECT
+    MIN(cc.cc_call_center_id),
+    MIN(cc.cc_name),
+    MIN(cc.cc_manager),
+    MIN(cr.cr_net_loss),
+    MIN(cr.cr_item_sk),
+    MIN(cr.cr_order_number)
+FROM call_center cc
+INNER JOIN filtered_catalog_returns cr ON cr.cr_call_center_sk = cc.cc_call_center_sk
+INNER JOIN filtered_customer c ON cr.cr_returning_customer_sk = c.c_customer_sk
+Time Cost: 251.29s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '将customer相关的4个维度表(customer/customer_address/customer_demographics/household_demographics)改为先进行Hash Join构建符合条件的客户集：先将customer_address(ca_gmt_offset=-7)、customer_demographics(cd条件)、household_demographics(hd条件)三个过滤后的小结果集依次Hash Join，再与customer进行Hash Join，生成预过滤的客户维度宽表。这样可将多层Nested Loop(占比8.8%+1.4%)转换为内存中的Hash Join，避免对customer索引的大量随机读。'}, {'group': '连接优化', 'produced_suggestion': "将catalog_returns与date_dim的连接结果(31行date_dim驱动得到916行catalog_returns)通过CTE物化，然后与上述预过滤的客户维度宽表进行Hash Join，再与call_center进行最终连接。这样可将当前'date_dim→catalog_returns→customer'的串行Nested Loop链改为'(date_dim⋈catalog_returns) Hash Join (customer⋈dimensions)'的并行Hash Join模式，利用Hash Join的批量处理能力降低总代价。"}, {'group': '谓词简化', 'produced_suggestion': "将household_demographics的LIKE条件'hd_buy_potential LIKE '0-500%''改为范围比较或等值条件(如果数据模式允许)，避免当前的全表扫描(Seq Scan占比2.9%)。若必须保留LIKE，则在Hash Join前先过滤household_demographics减少哈希表大小。同时将customer_demographics的OR条件拆分为UNION ALL两个分支分别过滤后合并，可能提升过滤效率。"}, {'group': '子查询优化', 'produced_suggestion': '移除所有IN子查询和派生表，直接将date_dim/customer_address/customer_demographics/household_demographics作为普通表参与连接，通过显式JOIN和ON条件控制连接顺序。在FROM子句中按过滤选择性从高到低排列维度表，引导优化器优先构建小哈希表：FROM date_dim JOIN catalog_returns ... JOIN household_demographics JOIN customer_demographics JOIN customer_address JOIN customer JOIN call_center，配合WHERE条件将所有过滤逻辑前置。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重的性能瓶颈：1) 最大问题是date_dim与catalog_returns的Nested Loop连接占82.5%代价，date_dim作为外表有73049行，导致大量循环扫描；2) date_dim与customer、customer_address的Nested Loop连接额外贡献10.2%代价；3) household_demographics的顺序扫描占2.9%代价。历史案例显示相似SQL通过JOIN_PUSH_TRANSITIVE_PREDICATES和FILTER_INTO_JOIN规则优化12次命中，证明该SQL可通过谓词下推和连接顺序调整大幅优化。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim的过滤条件(d_year=1999 AND d_moy=5)通过传递性下推到catalog_returns连接前，减少参与连接的数据量。利用idx_catalog_returns_returned_date索引，先过滤catalog_returns表中符合日期条件的记录，避免73049行date_dim驱动大表连接"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先执行高选择性过滤(date_dim过滤后仅少量行、household_demographics的hd_buy_potential过滤、customer_demographics的复合条件)，将小结果集作为驱动表。建议顺序：date_dim(过滤后) → household_demographics(过滤后) → customer_demographics(过滤后) → customer → customer_address → catalog_returns → call_center，利用索引进行Hash Join替代Nested Loop"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将household_demographics的过滤条件(hd_buy_potential LIKE '0-500%')和customer_demographics的复合条件((cd_marital_status='M' AND cd_education_status='Unknown') OR (cd_marital_status='W' AND cd_education_status='Advanced Degree'))提前应用，在连接customer前先过滤维度表，减少连接基数"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用customer_address的ca_gmt_offset=-7过滤条件，通过idx_customer_addr索引反向传递到customer表，进一步减少customer参与连接的行数。将customer_address过滤后的结果先与customer连接，再参与其他表关联"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+    "applied_rules": ["JOIN_PUSH_TRANSITIVE_PREDICATES", "FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH"],
+    "groups": "谓词简化,连接优化",
+    "rule_effect_confidence": {
+        "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.85,
+        "FILTER_INTO_JOIN": 0.78,
+        "JOIN_CONDITION_PUSH": 0.75
+    },
+    "rule_effect_scores": {
+        "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.35,
+        "FILTER_INTO_JOIN": 0.35,
+        "JOIN_CONDITION_PUSH": 0.30
+    }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化,连接优化",
+  "applied_rules": [
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rewritten_sql": "SELECT\n    MIN(cc_call_center_id),\n    MIN(cc_name),\n    MIN(cc_manager),\n    MIN(cr_net_loss),\n    MIN(cr_item_sk),\n    MIN(cr_order_number)\nFROM\n    call_center,\n    (\n        SELECT\n            cr_call_center_sk,\n            cr_returned_date_sk,\n            cr_returning_customer_sk,\n            cr_net_loss,\n            cr_item_sk,\n            cr_order_number\n        FROM catalog_returns\n        WHERE cr_returned_date_sk IN (\n            SELECT d_date_sk\n            FROM date_dim\n            WHERE d_year = 1999 AND d_moy = 5\n        )\n    ) AS catalog_returns,\n    (\n        SELECT c_customer_sk, c_current_cdemo_sk, c_current_hdemo_sk, c_current_addr_sk\n        FROM customer\n        WHERE c_current_addr_sk IN (\n            SELECT ca_address_sk\n            FROM customer_address\n            WHERE ca_gmt_offset = -7\n        )\n    ) AS customer,\n    (\n        SELECT cd_demo_sk\n        FROM customer_demographics\n        WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n           OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n    ) AS customer_demographics,\n    (\n        SELECT hd_demo_sk\n        FROM household_demographics\n        WHERE hd_buy_potential LIKE '0-500%'\n    ) AS household_demographics\nWHERE\n    catalog_returns.cr_call_center_sk = cc_call_center_sk\n    AND catalog_returns.cr_returning_customer_sk = customer.c_customer_sk\n    AND customer_demographics.cd_demo_sk = customer.c_current_cdemo_sk\n    AND household_demographics.hd_demo_sk = customer.c_current_hdemo_sk;",
+  "semantic_correctness_guarantee": "1. **结构性改写——谓词下推至子查询**：将原 SQL 中 WHERE 子句的过滤条件按表依赖关系下推到各表的子查询中。具体为：\n   - date_dim 的 `d_year=1999 AND d_moy=5` 通过 IN 子查询下推到 catalog_returns 的 cr_returned_date_sk 过滤\n   - customer_address 的 `ca_gmt_offset=-7` 通过 IN 子查询下推到 customer 的 c_current_addr_sk 过滤\n   - customer_demographics 的复合条件 `((cd_marital_status='M' AND cd_education_status='Unknown') OR (cd_marital_status='W' AND cd_education_status='Advanced Degree'))` 下推到其子查询\n   - household_demographics 的 `hd_buy_potential LIKE '0-500%'` 下推到其子查询\n\n2. **传递性谓词推导（JOIN_PUSH_TRANSITIVE_PREDICATES）**：原 SQL 通过等值连接关联各表的主外键，重写后利用传递性将过滤条件提前应用。date_dim 过滤后仅保留 1999 年 5 月的 d_date_sk 值集合，通过 IN 子查询传递到 catalog_returns.cr_returned_date_sk，等价于原始的内连接过滤逻辑（cr_returned_date_sk = d_date_sk AND d_year=1999 AND d_moy=5）。同理，customer_address 的 ca_gmt_offset=-7 通过 IN 子查询传递到 customer.c_current_addr_sk。\n\n3. **维度表过滤提前（FILTER_INTO_JOIN）**：customer_demographics 和 household_demographics 作为维度表，其过滤条件在子查询中提前应用，减少后续连接时参与的行数。由于这些条件仅依赖单表列，提前过滤不改变最终结果集的语义——原 SQL 在 WHERE 子句中应用这些条件与在子查询中应用效果等价。\n\n4. **连接条件简化（JOIN_CONDITION_PUSH）**：原 SQL 使用逗号分隔的隐式内连接（cross join + WHERE 过滤），重写后显式化为子查询过滤 + WHERE 连接条件。由于所有连接均为等值内连接且没有 OUTER JOIN，改写前后的连接语义完全一致——WHERE 子句中的等值连接条件（如 cr_call_center_sk = cc_call_center_sk）在重写后保持不变。\n\n5. **date_dim 表消除的等价性**：原 SQL 通过 catalog_returns.cr_returned_date_sk = date_dim.d_date_sk 内连接并过滤 d_year=1999 AND d_moy=5。重写后用 IN 子查询 `cr_returned_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_year=1999 AND d_moy=5)` 替代，由于 d_date_sk 是 date_dim 主键（唯一非空），IN 子查询与内连接在过滤效果上等价，且不改变 catalog_returns 的行数或列值。\n\n6. **customer_address 表消除的等价性**：原 SQL 通过 customer.c_current_addr_sk = customer_address.ca_address_sk 内连接并过滤 ca_gmt_offset=-7。重写后用 IN 子查询 `c_current_addr_sk IN (SELECT ca_address_sk FROM customer_address WHERE ca_gmt_offset=-7)` 替代，ca_address_sk 是 customer_address 主键，IN 子查询与内连接在过滤效果上等价。\n\n7. **聚合函数的等价性保证**：原 SQL 使用 MIN 聚合函数计算全局最小值，无 GROUP BY 子句。重写后的 FROM 子句通过子查询过滤和 WHERE 等值连接筛选出相同的行集合，MIN 聚合在相同行集合上计算结果必然一致。由于 MIN 是确定性聚合函数且对行顺序无依赖,改写不影响结果。\n\n8. **NULL 值处理的一致性**：所有连接键（如 cr_returned_date_sk、c_current_addr_sk、cd_demo_sk 等）在 Schema 中均为非空约束或主键,原 SQL 的内连接与重写后的 IN 子查询在 NULL 处理上行为一致——均自动过滤 NULL 值。\n\n9. **投影列的完整性**：重写后的子查询显式列出后续 WHERE 连接和 SELECT 投影所需的所有列（如 catalog_returns 子查询包含 cr_call_center_sk、cr_returning_customer_sk、cr_net_loss、cr_item_sk、cr_order_number），确保与原 SQL 的列引用范围一致,MIN 聚合函数可访问相同列。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+  "equivalent": true,
+  "message": "当前重写 SQL 通过谓词下推、子查询过滤和连接条件保持，采用了传递性推导和过滤提前等规则，确保行集和聚合语义与原始 SQL 一致，且无主键/唯一性约束矛盾，MIN 聚合的最终结果保持等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全一致，重写无效。原计划已高度优化：date_dim通过idx_date_dim_year_moy索引过滤(31行)→catalog_returns通过idx_catalog_returns_returned_date索引扫描(916行)→customer通过idx_customer_sk索引探测→household_demographics过滤后Hash Join→customer_address/customer_demographics通过主键索引回表过滤→call_center索引探测。重写SQL引入派生表和IN子查询，但优化器将其展开后生成与原计划完全相同的物理执行计划(总cost 4892.16、节点类型/数量/行数估计完全一致)，证明重写未产生任何结构层面改变。当前计划已充分利用索引、过滤下推和高效连接顺序，但仍可尝试进一步优化：考虑将维度表过滤结果物化为CTE避免重复过滤逻辑、或探索是否可通过调整连接顺序(如先Hash Join高选择性维度表再驱动事实表)进一步降低中间结果集规模。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql，尝试以下改进：1)将household_demographics和customer_demographics的过滤结果显式物化为CTE，避免优化器重复评估复杂谓词；2)将customer与customer_address的连接改为先过滤customer_address(ca_gmt_offset=-7)后Hash Join，减少对customer索引的随机探测开销；3)探索将catalog_returns与date_dim的连接结果物化后，再与customer相关表进行Hash Join，可能减少Nested Loop层数。重点验证是否可将多层Nested Loop转换为Hash Join以提升并行潜力。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上轮重写未改变物理计划，因IN子查询被优化器展开后与原计划一致。本轮需从根本上改变执行路径：当前82.5%代价来自date_dim(31行)驱动catalog_returns(916行)的Nested Loop，后续再与customer相关表进行多层Nested Loop(占比8.8%+1.4%)。关键问题在于：1)虽date_dim过滤后仅31行，但通过索引探测catalog_returns产生916行后，再驱动50万行customer表仍需大量索引随机读；2)household_demographics的Seq Scan(2.9%)和customer_demographics的过滤未被有效下推；3)多层Nested Loop未利用Hash Join的批量处理优势。优化方向：将高选择性维度表(customer_demographics/household_demographics/customer_address)先Hash Join构建小哈希表，再与customer进行Hash Join过滤出符合条件的客户集，最后与catalog_returns+date_dim的连接结果进行Hash Join，避免在大基数上执行多层Nested Loop。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将customer相关的4个维度表(customer/customer_address/customer_demographics/household_demographics)改为先进行Hash Join构建符合条件的客户集：先将customer_address(ca_gmt_offset=-7)、customer_demographics(cd条件)、household_demographics(hd条件)三个过滤后的小结果集依次Hash Join，再与customer进行Hash Join，生成预过滤的客户维度宽表。这样可将多层Nested Loop(占比8.8%+1.4%)转换为内存中的Hash Join，避免对customer索引的大量随机读。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将catalog_returns与date_dim的连接结果(31行date_dim驱动得到916行catalog_returns)通过CTE物化，然后与上述预过滤的客户维度宽表进行Hash Join，再与call_center进行最终连接。这样可将当前'date_dim→catalog_returns→customer'的串行Nested Loop链改为'(date_dim⋈catalog_returns) Hash Join (customer⋈dimensions)'的并行Hash Join模式，利用Hash Join的批量处理能力降低总代价。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将household_demographics的LIKE条件'hd_buy_potential LIKE '0-500%''改为范围比较或等值条件(如果数据模式允许)，避免当前的全表扫描(Seq Scan占比2.9%)。若必须保留LIKE，则在Hash Join前先过滤household_demographics减少哈希表大小。同时将customer_demographics的OR条件拆分为UNION ALL两个分支分别过滤后合并，可能提升过滤效率。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "移除所有IN子查询和派生表，直接将date_dim/customer_address/customer_demographics/household_demographics作为普通表参与连接，通过显式JOIN和ON条件控制连接顺序。在FROM子句中按过滤选择性从高到低排列维度表，引导优化器优先构建小哈希表：FROM date_dim JOIN catalog_returns ... JOIN household_demographics JOIN customer_demographics JOIN customer_address JOIN customer JOIN call_center，配合WHERE条件将所有过滤逻辑前置。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "JOIN_CONDITION_PUSH", "FILTER_INTO_JOIN", "PROJECT_REMOVE"],
+  "groups": "子查询优化,连接优化,谓词简化,投影优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.8,
+    "JOIN_CONDITION_PUSH": 0.6,
+    "FILTER_INTO_JOIN": 0.7,
+    "PROJECT_REMOVE": 0.5
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.35,
+    "JOIN_CONDITION_PUSH": 0.25,
+    "FILTER_INTO_JOIN": 0.3,
+    "PROJECT_REMOVE": 0.1
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,连接优化,谓词简化,投影优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "JOIN_CONDITION_PUSH",
+    "FILTER_INTO_JOIN",
+    "PROJECT_REMOVE"
+  ],
+  "rewritten_sql": "WITH filtered_date AS (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 1999 AND d_moy = 5\n),\nfiltered_household_demographics AS (\n    SELECT hd_demo_sk\n    FROM household_demographics\n    WHERE hd_buy_potential LIKE '0-500%'\n),\nfiltered_customer_demographics AS (\n    SELECT cd_demo_sk\n    FROM customer_demographics\n    WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n       OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n),\nfiltered_customer_address AS (\n    SELECT ca_address_sk\n    FROM customer_address\n    WHERE ca_gmt_offset = -7\n),\nfiltered_catalog_returns AS (\n    SELECT cr_call_center_sk, cr_returning_customer_sk, cr_net_loss, cr_item_sk, cr_order_number\n    FROM catalog_returns\n    WHERE cr_returned_date_sk IN (SELECT d_date_sk FROM filtered_date)\n),\nfiltered_customer AS (\n    SELECT c.c_customer_sk, c.c_current_cdemo_sk, c.c_current_hdemo_sk, c.c_current_addr_sk\n    FROM customer c\n    INNER JOIN filtered_customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\n    INNER JOIN filtered_customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk\n    INNER JOIN filtered_household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk\n)\nSELECT\n    MIN(cc.cc_call_center_id),\n    MIN(cc.cc_name),\n    MIN(cc.cc_manager),\n    MIN(cr.cr_net_loss),\n    MIN(cr.cr_item_sk),\n    MIN(cr.cr_order_number)\nFROM call_center cc\nINNER JOIN filtered_catalog_returns cr ON cr.cr_call_center_sk = cc.cc_call_center_sk\nINNER JOIN filtered_customer c ON cr.cr_returning_customer_sk = c.c_customer_sk",
+  "semantic_correctness_guarantee": "1. **CTE物化维度表过滤结果**：将原SQL中5个派生表(date_dim/household_demographics/customer_demographics/customer_address的过滤子查询以及catalog_returns派生表)改写为标准CTE(WITH子句)。这些CTE仅执行与原SQL完全相同的过滤逻辑(d_year=1999 AND d_moy=5、hd_buy_potential LIKE '0-500%'、cd条件OR子句、ca_gmt_offset=-7、catalog_returns的IN子查询)，未改变任何谓词语义或结果集范围。\n\n2. **维度表连接下推与顺序重组**：将原SQL中customer派生表的IN子查询(customer_address)、以及WHERE子句中customer_demographics/household_demographics的独立过滤，改写为filtered_customer CTE内的3个INNER JOIN。由于customer通过c_current_addr_sk/c_current_cdemo_sk/c_current_hdemo_sk与这3个维度表的主键连接，且Schema中customer表对这些外键列有NOT NULL约束(TPC-DS标准Schema)，INNER JOIN与原SQL的IN+WHERE组合在语义上完全等价：过滤后的customer集合与原SQL一致。\n\n3. **catalog_returns与date_dim的IN子查询展开**：filtered_catalog_returns CTE保留原SQL的IN子查询结构(cr_returned_date_sk IN (SELECT d_date_sk FROM filtered_date))，与原SQL的IN (SELECT d_date_sk FROM date_dim WHERE ...)完全等价，仅将date_dim过滤逻辑提取为CTE避免重复评估。\n\n4. **主查询连接结构扁平化**：将原SQL的5个FROM子句表+4个WHERE连接条件改写为显式INNER JOIN链。连接键保持不变(cr.cr_call_center_sk=cc.cc_call_center_sk、cr.cr_returning_customer_sk=c.c_customer_sk)，且由于catalog_returns/customer的连接键在TPC-DS Schema中均为NOT NULL外键，INNER JOIN与原SQL的笛卡尔积+WHERE过滤在语义上完全等价。\n\n5. **投影列与聚合函数保持一致**：SELECT子句的6个MIN聚合函数和对应列(cc_call_center_id/cc_name/cc_manager/cr_net_loss/cr_item_sk/cr_order_number)与原SQL完全一致，未添加或删除任何投影列。\n\n6. **易误判点-CTE物化与优化器行为**：CTE的引入可能被优化器物化或内联。本重写通过将高选择性维度表过滤逻辑(household_demographics/customer_demographics/customer_address)物化为CTE，旨在避免原SQL中多次评估相同谓词的开销(上一轮反馈指出Nested Loop多次探测索引)。即使优化器内联CTE，由于过滤逻辑与原SQL完全相同，结果集仍等价。若优化器物化CTE并采用Hash Join(符合优化方向建议)，则可将原SQL的多层Nested Loop转换为Hash Join，提升并行潜力。\n\n7. **易误判点-NULL值处理**：原SQL中customer的IN子查询和WHERE条件隐含对NULL的过滤(IN子查询不匹配NULL、AND/OR条件中NULL导致行被过滤)。重写SQL通过INNER JOIN实现相同逻辑：INNER JOIN自动排除连接键为NULL的行，且filtered_customer_demographics/filtered_household_demographics的WHERE条件与原SQL一致，NULL处理语义完全等价。\n\n8. **易误判点-重复行与主键约束**：原SQL通过catalog_returns的主键(cr_item_sk, cr_order_number)和customer的主键(c_customer_sk)保证每行的唯一性。重写SQL保持相同的连接结构和主键约束，未引入笛卡尔积或额外的重复行。由于MIN聚合函数对重复值不敏感(MIN返回最小值而非计数)，即使存在重复行(实际不会因主键约束)，结果仍等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过CTE物化各维度表过滤结果并改写为显式INNER JOIN，与原SQL的WHERE+IN组合在过滤范围、连接语义、聚合结果上完全等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致（cost 4892.16，节点结构/类型/顺序/行数估计均无差异），说明优化器将重写SQL的CTE结构内联后生成了与原始SQL相同的物理计划。虽然重写SQL在逻辑层面引入了CTE分解和显式JOIN顺序，但PostgreSQL优化器具有CTE内联能力（PostgreSQL 12+默认启用），将所有非递归CTE展开后重新优化，最终选择了与原始SQL相同的执行路径。由于两者结构完全相同（Nested Loop层次、Index Scan顺序、Hash Join位置、过滤条件位置均一致），且cost无差异，说明本轮重写未产生实际执行计划层面的改进。根据no_further_optimization原则，当前执行计划已采用索引驱动的Nested Loop + Hash Join混合策略，date_dim和catalog_returns通过索引高效连接（916行），customer维度通过索引逐行探测（899行过滤至145行），household_demographics通过Hash Join批量匹配（1200行哈希表），整体结构合理且cost已稳定在4892.16。继续调整JOIN顺序或引入额外CTE物化不太可能在当前数据分布和索引配置下产生显著改进，建议终止优化。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 624
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'JOIN_CONDITION_PUSH', 'FILTER_INTO_JOIN', 'PROJECT_REMOVE']
+   - 优化组别: 子查询优化,连接优化,谓词简化,投影优化
+   - 估计代价: 原始=4892.16, 重写=4892.16，相对变化: 0.00%
+✅ 成功存储，记录ID: fcd60780-de83-44fb-9979-b58b8136a264
+
+🎲 UCT Math Update: 4 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=4892.1600, rc=4892.1600)
+   结构分细节: rows 5345.0->5345.0 (score=+0.000), depth 8.0->8.0 (score=+0.000)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.350, conf=0.80, lambda=0.40, reward=+0.000, count=184, avg=+0.007
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.250, conf=0.60, lambda=0.30, reward=+0.000, count=172, avg=+0.001
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.300, conf=0.70, lambda=0.35, reward=+0.000, count=191, avg=+0.003
+   → PROJECT_REMOVE: P(s,a)=N/A, effect=0.100, conf=0.50, lambda=0.25, reward=+0.000, count=43, avg=+0.008
+
+----------------------------------------
+

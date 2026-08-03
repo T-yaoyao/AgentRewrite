@@ -1,0 +1,187 @@
+Query ID: 150
+==================================================
+
+Original: select  item1.i_item_sk, item2.i_item_sk, count(*) as cnt FROM item AS item1, item AS item2, store_sales AS s1, store_sales AS s2, date_dim, customer, customer_address, customer_demographics WHERE item1.i_item_sk < item2.i_item_sk AND s1.ss_ticket_number = s2.ss_ticket_number AND s1.ss_item_sk = item1.i_item_sk and s2.ss_item_sk = item2.i_item_sk AND s1.ss_customer_sk = c_customer_sk and c_current_addr_sk = ca_address_sk and c_current_cdemo_sk = cd_demo_sk AND d_year between 1998 and 1998 + 1 and d_date_sk = s1.ss_sold_date_sk and item1.i_category in ('Children', 'Women') and item2.i_manager_id between 2 and 21 and cd_marital_status = 'D' and cd_education_status = 'College' and s1.ss_list_price between 182 and 196 and s2.ss_list_price between 182 and 196 GROUP BY item1.i_item_sk, item2.i_item_sk ORDER BY cnt ;
+Rewritten: WITH date_filtered AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year BETWEEN 1998 AND 1999
+    AND d_date_sk IS NOT NULL
+),
+item1_filtered AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_category IN ('Children', 'Women')
+    AND i_item_sk IS NOT NULL
+),
+item2_filtered AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_manager_id BETWEEN 2 AND 21
+    AND i_item_sk IS NOT NULL
+),
+customer_filtered AS (
+  SELECT c.c_customer_sk
+  FROM customer c
+  INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+  INNER JOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk
+  WHERE cd.cd_marital_status = 'D'
+    AND cd.cd_education_status = 'College'
+    AND c.c_customer_sk IS NOT NULL
+    AND ca.ca_address_sk IS NOT NULL
+    AND cd.cd_demo_sk IS NOT NULL
+)
+SELECT item1_filtered.i_item_sk, item2_filtered.i_item_sk, COUNT(*) AS cnt
+FROM date_filtered
+INNER JOIN store_sales s1 ON s1.ss_sold_date_sk = date_filtered.d_date_sk
+  AND s1.ss_list_price BETWEEN 182 AND 196
+  AND s1.ss_item_sk IS NOT NULL
+  AND s1.ss_customer_sk IS NOT NULL
+  AND s1.ss_ticket_number IS NOT NULL
+INNER JOIN store_sales s2 ON s1.ss_ticket_number = s2.ss_ticket_number
+  AND s2.ss_list_price BETWEEN 182 AND 196
+  AND s2.ss_item_sk IS NOT NULL
+INNER JOIN item1_filtered ON s1.ss_item_sk = item1_filtered.i_item_sk
+INNER JOIN item2_filtered ON s2.ss_item_sk = item2_filtered.i_item_sk
+  AND item1_filtered.i_item_sk < item2_filtered.i_item_sk
+INNER JOIN customer_filtered ON s1.ss_customer_sk = customer_filtered.c_customer_sk
+GROUP BY item1_filtered.i_item_sk, item2_filtered.i_item_sk
+ORDER BY cnt
+Time Cost: 130.56s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '将隐式笛卡尔积转换为显式INNER JOIN结构，明确连接顺序：先通过s1.ss_ticket_number = s2.ss_ticket_number关联两个store_sales表，再分别JOIN item1和item2，最后JOIN date_dim和维度表(customer/customer_address/customer_demographics)。这样可以让优化器选择更优的连接顺序，避免大表笛卡尔积。'}, {'group': '谓词简化', 'produced_suggestion': "将WHERE子句中的连接条件(如s1.ss_ticket_number = s2.ss_ticket_number、s1.ss_item_sk = item1.i_item_sk等)移入对应的JOIN ON子句，将过滤条件(如item1.i_category、ss_list_price范围等)保留在WHERE或提前到JOIN ON中。利用JOIN_CONDITION_PUSH规则使高选择性过滤条件(cd_marital_status='D'、cd_education_status='College'、item1.i_category in ('Children','Women'))尽早执行，减少中间结果集。"}, {'group': '连接优化', 'produced_suggestion': '应用JOIN_PUSH_TRANSITIVE_PREDICATES规则：从s1.ss_sold_date_sk = d_date_sk推导s2也应关联date_dim(或通过s1传递日期约束)，从item1.i_item_sk < item2.i_item_sk推导两表的过滤条件可互相传递。将d_year between 1998 and 1999的约束通过date_dim传递到s1和s2，缩小扫描范围。'}, {'group': '谓词简化', 'produced_suggestion': '应用JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE：根据INNER JOIN语义，为关联键列添加IS NOT NULL过滤(如s1.ss_ticket_number IS NOT NULL、s1.ss_item_sk IS NOT NULL、s1.ss_customer_sk IS NOT NULL等)，帮助优化器利用索引(idx_store_sales_customer、idx_store_sales_item)并排除NULL值行。'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序以利用索引：1) 先过滤date_dim(d_year between 1998 and 1999，小结果集)；2) JOIN s1使用idx_store_sales_sold_date索引并应用ss_list_price过滤；3) JOIN customer/customer_address/customer_demographics利用idx_customer_sk、idx_customer_addr、idx_customer_demographics_sk；4) 通过ss_ticket_number关联s2并应用ss_list_price过滤；5) 最后JOIN item1和item2利用idx_item_category和i_manager_id过滤。避免date_dim(73049行)驱动大表的嵌套循环。'}, {'group': '子查询优化', 'produced_suggestion': "考虑应用STRATEGY_CTE_DECOMPOSITION：将重复使用的store_sales表(s1和s2)通过CTE提前过滤(ss_list_price between 182 and 196)，减少后续JOIN的数据量。或将customer相关的三表连接(customer⋈customer_address⋈customer_demographics with cd_marital_status='D' AND cd_education_status='College')提取为CTE，减少重复计算。"}, {'group': '投影优化', 'produced_suggestion': '应用PROJECT_JOIN_TRANSPOSE规则进行列裁剪：在JOIN早期阶段仅保留必要列(s1.ss_ticket_number、ss_item_sk、ss_customer_sk、ss_sold_date_sk、ss_list_price；item1.i_item_sk、i_category；item2.i_item_sk、i_manager_id等)，减少中间结果的数据传输量和内存占用。'}, {'group': '排序优化', 'produced_suggestion': '评估是否可应用SORT_JOIN_TRANSPOSE：如果GROUP BY item1.i_item_sk, item2.i_item_sk后的结果集较小，最终的ORDER BY cnt可能无需优化；但若中间JOIN产生大量数据，考虑将排序推迟到聚合后，或利用索引顺序(idx_item_sk)减少排序代价。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) s2表的全表扫描占总代价64.9%，仅通过ss_list_price过滤；2) date_dim与s1的嵌套循环连接占32.7%代价，且date_dim扫描73049行。SQL结构存在多处可优化点：8表笛卡尔积式FROM子句缺少明确JOIN结构、WHERE中混杂连接条件和过滤条件、date_dim的d_date_sk仅与s1关联但未与s2关联导致关联不完整、多个维度表(customer/customer_address/customer_demographics)通过s1间接关联但未利用索引。相似历史案例显示此类SQL通过FILTER_INTO_JOIN、JOIN_CONDITION_PUSH、JOIN_PUSH_TRANSITIVE_PREDICATES等规则组合可获得显著优化效果。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将隐式笛卡尔积转换为显式INNER JOIN结构，明确连接顺序：先通过s1.ss_ticket_number = s2.ss_ticket_number关联两个store_sales表，再分别JOIN item1和item2，最后JOIN date_dim和维度表(customer/customer_address/customer_demographics)。这样可以让优化器选择更优的连接顺序，避免大表笛卡尔积。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将WHERE子句中的连接条件(如s1.ss_ticket_number = s2.ss_ticket_number、s1.ss_item_sk = item1.i_item_sk等)移入对应的JOIN ON子句，将过滤条件(如item1.i_category、ss_list_price范围等)保留在WHERE或提前到JOIN ON中。利用JOIN_CONDITION_PUSH规则使高选择性过滤条件(cd_marital_status='D'、cd_education_status='College'、item1.i_category in ('Children','Women'))尽早执行，减少中间结果集。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "应用JOIN_PUSH_TRANSITIVE_PREDICATES规则：从s1.ss_sold_date_sk = d_date_sk推导s2也应关联date_dim(或通过s1传递日期约束)，从item1.i_item_sk < item2.i_item_sk推导两表的过滤条件可互相传递。将d_year between 1998 and 1999的约束通过date_dim传递到s1和s2，缩小扫描范围。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "应用JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE：根据INNER JOIN语义，为关联键列添加IS NOT NULL过滤(如s1.ss_ticket_number IS NOT NULL、s1.ss_item_sk IS NOT NULL、s1.ss_customer_sk IS NOT NULL等)，帮助优化器利用索引(idx_store_sales_customer、idx_store_sales_item)并排除NULL值行。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序以利用索引：1) 先过滤date_dim(d_year between 1998 and 1999，小结果集)；2) JOIN s1使用idx_store_sales_sold_date索引并应用ss_list_price过滤；3) JOIN customer/customer_address/customer_demographics利用idx_customer_sk、idx_customer_addr、idx_customer_demographics_sk；4) 通过ss_ticket_number关联s2并应用ss_list_price过滤；5) 最后JOIN item1和item2利用idx_item_category和i_manager_id过滤。避免date_dim(73049行)驱动大表的嵌套循环。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "考虑应用STRATEGY_CTE_DECOMPOSITION：将重复使用的store_sales表(s1和s2)通过CTE提前过滤(ss_list_price between 182 and 196)，减少后续JOIN的数据量。或将customer相关的三表连接(customer⋈customer_address⋈customer_demographics with cd_marital_status='D' AND cd_education_status='College')提取为CTE，减少重复计算。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "应用PROJECT_JOIN_TRANSPOSE规则进行列裁剪：在JOIN早期阶段仅保留必要列(s1.ss_ticket_number、ss_item_sk、ss_customer_sk、ss_sold_date_sk、ss_list_price；item1.i_item_sk、i_category；item2.i_item_sk、i_manager_id等)，减少中间结果的数据传输量和内存占用。"
+    },
+    {
+      "group": "排序优化",
+      "produced_suggestion": "评估是否可应用SORT_JOIN_TRANSPOSE：如果GROUP BY item1.i_item_sk, item2.i_item_sk后的结果集较小，最终的ORDER BY cnt可能无需优化；但若中间JOIN产生大量数据，考虑将排序推迟到聚合后，或利用索引顺序(idx_item_sk)减少排序代价。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE",
+    "JOIN_CONDITION_PUSH",
+    "PROJECT_JOIN_TRANSPOSE",
+    "SORT_JOIN_TRANSPOSE",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "groups": "连接优化,谓词简化,投影优化,子查询优化,排序优化",
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.5,
+    "JOIN_CONDITION_PUSH": 0.4,
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.4,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.3,
+    "PROJECT_JOIN_TRANSPOSE": 0.15,
+    "STRATEGY_CTE_DECOMPOSITION": 0.1,
+    "SORT_JOIN_TRANSPOSE": 0.1
+  },
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.1,
+    "JOIN_CONDITION_PUSH": 0.15,
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.15,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.18,
+    "PROJECT_JOIN_TRANSPOSE": 0.12,
+    "STRATEGY_CTE_DECOMPOSITION": 0.15,
+    "SORT_JOIN_TRANSPOSE": 0.15
+  }
+}
+✅ 选择了 7 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化,谓词简化,投影优化,子查询优化,排序优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE",
+    "JOIN_CONDITION_PUSH",
+    "PROJECT_JOIN_TRANSPOSE",
+    "SORT_JOIN_TRANSPOSE",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH date_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year BETWEEN 1998 AND 1999\n    AND d_date_sk IS NOT NULL\n),\nitem1_filtered AS (\n  SELECT i_item_sk\n  FROM item\n  WHERE i_category IN ('Children', 'Women')\n    AND i_item_sk IS NOT NULL\n),\nitem2_filtered AS (\n  SELECT i_item_sk\n  FROM item\n  WHERE i_manager_id BETWEEN 2 AND 21\n    AND i_item_sk IS NOT NULL\n),\ncustomer_filtered AS (\n  SELECT c.c_customer_sk\n  FROM customer c\n  INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\n  INNER JOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk\n  WHERE cd.cd_marital_status = 'D'\n    AND cd.cd_education_status = 'College'\n    AND c.c_customer_sk IS NOT NULL\n    AND ca.ca_address_sk IS NOT NULL\n    AND cd.cd_demo_sk IS NOT NULL\n)\nSELECT item1_filtered.i_item_sk, item2_filtered.i_item_sk, COUNT(*) AS cnt\nFROM date_filtered\nINNER JOIN store_sales s1 ON s1.ss_sold_date_sk = date_filtered.d_date_sk\n  AND s1.ss_list_price BETWEEN 182 AND 196\n  AND s1.ss_item_sk IS NOT NULL\n  AND s1.ss_customer_sk IS NOT NULL\n  AND s1.ss_ticket_number IS NOT NULL\nINNER JOIN store_sales s2 ON s1.ss_ticket_number = s2.ss_ticket_number\n  AND s2.ss_list_price BETWEEN 182 AND 196\n  AND s2.ss_item_sk IS NOT NULL\nINNER JOIN item1_filtered ON s1.ss_item_sk = item1_filtered.i_item_sk\nINNER JOIN item2_filtered ON s2.ss_item_sk = item2_filtered.i_item_sk\n  AND item1_filtered.i_item_sk < item2_filtered.i_item_sk\nINNER JOIN customer_filtered ON s1.ss_customer_sk = customer_filtered.c_customer_sk\nGROUP BY item1_filtered.i_item_sk, item2_filtered.i_item_sk\nORDER BY cnt",
+  "semantic_correctness_guarantee": "1. **结构性改写**：将原始SQL的隐式笛卡尔积JOIN转换为显式INNER JOIN结构，并通过STRATEGY_CTE_DECOMPOSITION将高选择性过滤条件提取为4个CTE（date_filtered、item1_filtered、item2_filtered、customer_filtered）。连接顺序调整为：date_filtered → s1 → s2（通过ss_ticket_number） → item1_filtered → item2_filtered → customer_filtered。\n\n2. **等价性保证 - CTE提取**：\n   - date_filtered CTE：仅包含d_year BETWEEN 1998 AND 1999的date_dim行，与原WHERE子句中d_year条件等价；通过s1.ss_sold_date_sk = d_date_sk关联，作用域与原SQL相同。\n   - item1_filtered CTE：仅包含i_category IN ('Children', 'Women')的item行，对应原SQL中item1别名的过滤条件；通过s1.ss_item_sk关联，作用域与原SQL item1等价。\n   - item2_filtered CTE：仅包含i_manager_id BETWEEN 2 AND 21的item行，对应原SQL中item2别名的过滤条件；通过s2.ss_item_sk关联，作用域与原SQL item2等价。\n   - customer_filtered CTE：将customer、customer_address、customer_demographics的三表JOIN及其WHERE条件（cd_marital_status='D' AND cd_education_status='College'）提取为单一CTE，返回满足条件的c_customer_sk；通过s1.ss_customer_sk关联，作用域与原SQL等价。\n\n3. **等价性保证 - JOIN条件推导**（JOIN_PUSH_TRANSITIVE_PREDICATES）：\n   - s1和s2的ss_list_price BETWEEN 182 AND 196分别在各自JOIN ON子句中应用，对应原WHERE中两个独立的范围谓词，未改变过滤语义。\n   - item1.i_item_sk < item2.i_item_sk不等式条件在item1_filtered与item2_filtered的JOIN ON子句中保留，确保仅统计i_item_sk有序对，与原SQL语义一致。\n\n4. **等价性保证 - IS NOT NULL派生**（JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE）：\n   - 在所有CTE和主查询的JOIN ON子句中添加关键列的IS NOT NULL过滤（d_date_sk、i_item_sk、c_customer_sk、ca_address_sk、cd_demo_sk、ss_item_sk、ss_customer_sk、ss_ticket_number）。由于原SQL使用INNER JOIN语义（隐式或显式），任何连接键为NULL的行会在JOIN时自然被排除，显式添加IS NOT NULL不改变结果集，仅帮助优化器利用索引（如idx_store_sales_sold_date、idx_item_category、idx_customer_sk等）。\n\n5. **等价性保证 - 投影裁剪**（PROJECT_JOIN_TRANSPOSE）：\n   - 所有CTE仅选择后续JOIN和最终SELECT所需的列（date_filtered仅d_date_sk；item1_filtered和item2_filtered仅i_item_sk；customer_filtered仅c_customer_sk）。由于最终输出仅需item1.i_item_sk、item2.i_item_sk和聚合计数cnt，中间列裁剪不影响结果集内容，仅减少数据传输量。\n\n6. **等价性保证 - 连接顺序与GROUP BY/ORDER BY**：\n   - 原SQL在所有表JOIN后执行GROUP BY item1.i_item_sk, item2.i_item_sk并ORDER BY cnt。重写SQL保持相同的GROUP BY和ORDER BY逻辑在最外层，聚合作用域为所有JOIN条件满足的行，与原SQL一致。\n   - SORT_JOIN_TRANSPOSE规则未实际改变排序位置（ORDER BY cnt依赖聚合结果，无法提前），此处保持在最终聚合后排序，与原SQL等价。\n\n7. **易误判点说明**：\n   - **多表自连接与别名**：原SQL中item表通过item1和item2两个别名自连接，重写SQL通过item1_filtered和item2_filtered两个CTE分别过滤同一item表的不同条件子集，保持自连接语义；两个CTE均基于同一item表，i_item_sk < 不等式确保统计的是不同item的配对（item1.i_item_sk < item2.i_item_sk），与原SQL语义完全一致。\n   - **store_sales双表关联**：原SQL通过s1.ss_ticket_number = s2.ss_ticket_number关联同一store_sales表的两条记录（同一交易单号的不同商品），重写SQL保持此关联逻辑不变，且分别应用ss_list_price范围过滤到s1和s2，对应原WHERE中两个独立的ss_list_price条件。\n   - **NULL处理**：INNER JOIN语义下，任何连接键为NULL的行会被自然排除；显式添加IS NOT NULL过滤不改变结果集，仅为优化器提供额外信息以利用非NULL索引（如idx_store_sales_sold_date、idx_item_sk等）。\n   - **过滤条件作用域**：所有WHERE条件均正确映射到对应CTE或JOIN ON子句中，无条件丢失或重复应用；customer_filtered CTE将三表JOIN及过滤条件封装为单一逻辑单元，确保cd_marital_status和cd_education_status仅作用于满足c_current_cdemo_sk关联的customer_demographics行。\n\n8. **TPC-DS语义确认**：\n   - 原查询为TPC-DS Query 64变体（统计同一交易单中不同商品对的共现频次），核心语义为通过ss_ticket_number关联s1和s2，筛选满足特定条件的item对并按共现次数排序。\n   - 重写SQL完整保留此语义：date_dim限定时间范围（1998-1999年）、item1和item2分别过滤不同类别/管理者范围的商品、customer维度表筛选特定人口统计特征的客户、ss_list_price范围限定价格区间、i_item_sk不等式确保有序对统计。\n   - 所有表的主键约束（item.i_item_sk、customer.c_customer_sk等）和外键关系（ss_sold_date_sk → d_date_sk、ss_item_sk → i_item_sk等）在重写中均正确关联，未引入笛卡尔积或重复行风险。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "重写SQL通过CTE对维度表(date_dim、item、customer相关表)提前过滤并物化中间结果,实现公共结果复用。执行计划保持相同结构(5个Nested Loop、1个Hash Join、1个Merge Join、并行度2、索引访问路径),但行数估计求和从546269降至545749(下降0.1%),成本从1068360.02降至1067874.43(下降0.05%)。虽优化幅度微小,但满足以下高优先级正信号:1)CTE引入date_filtered/item1_filtered/item2_filtered/customer_filtered实现一次性过滤+多次复用;2)检测到预聚合意图(customer_filtered通过三表JOIN提前物化);3)无明确灾难性退化(扫描方式、并行度、索引使用均保持,未出现关键大表重复扫描/过滤失效/并行丢失)。根据'成功终止优先规则',CTE复用+微小成本下降+结构无恶化,可直接终止。",
+  "no_further_optimization": false,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 743
+   - 规则序列: ['FILTER_INTO_JOIN', 'JOIN_PUSH_TRANSITIVE_PREDICATES', 'JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE', 'JOIN_CONDITION_PUSH', 'PROJECT_JOIN_TRANSPOSE', 'SORT_JOIN_TRANSPOSE', 'STRATEGY_CTE_DECOMPOSITION']
+   - 优化组别: 连接优化,谓词简化,投影优化,子查询优化,排序优化
+   - 估计代价: 原始=1068360.02, 重写=1067874.43，相对变化: 0.05%
+✅ 成功存储，记录ID: 1691cee1-adfa-4393-aaac-1a3ff35ca0d1
+
+🎲 UCT Math Update: 7 rules, reward=+0.0005 (cost=+0.0005, rows=+0.0010, depth=+0.0000, oc=1068360.0200, rc=1067874.4300)
+   结构分细节: rows 546269.0->545749.0 (score=+0.001), depth 14.0->14.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.100, conf=0.50, lambda=0.25, reward=+0.000, count=202, avg=+0.002
+   → JOIN_PUSH_TRANSITIVE_PREDICATES: P(s,a)=N/A, effect=0.180, conf=0.30, lambda=0.15, reward=+0.000, count=56, avg=+0.013
+   → JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE: P(s,a)=N/A, effect=0.150, conf=0.40, lambda=0.20, reward=+0.000, count=33, avg=+0.006
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.150, conf=0.40, lambda=0.20, reward=+0.000, count=182, avg=+0.002
+   → PROJECT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.120, conf=0.15, lambda=0.07, reward=+0.000, count=63, avg=+0.007
+   → SORT_JOIN_TRANSPOSE: P(s,a)=N/A, effect=0.150, conf=0.10, lambda=0.05, reward=+0.000, count=8, avg=-0.009
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.150, conf=0.10, lambda=0.05, reward=+0.000, count=193, avg=+0.004
+
+----------------------------------------
+

@@ -1,0 +1,159 @@
+Query ID: 16
+==================================================
+
+Original: select min(ss_quantity)        ,min(ss_ext_sales_price)        ,min(ss_ext_wholesale_cost)        ,min(ss_ext_wholesale_cost)  from store_sales      ,store      ,customer_demographics      ,household_demographics      ,customer_address      ,date_dim  where s_store_sk = ss_store_sk  and  ss_sold_date_sk = d_date_sk and d_year = 2001  and((ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'U'   and cd_education_status = 'College'   and ss_sales_price between 100.00 and 150.00   and hd_dep_count = 3      )or      (ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'W'   and cd_education_status = '2 yr Degree'   and ss_sales_price between 50.00 and 100.00   and hd_dep_count = 1      ) or      (ss_hdemo_sk=hd_demo_sk   and cd_demo_sk = ss_cdemo_sk   and cd_marital_status = 'S'   and cd_education_status = 'College'   and ss_sales_price between 150.00 and 200.00   and hd_dep_count = 1      ))  and((ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('IN', 'NM', 'VA')   and ss_net_profit between 100 and 200      ) or      (ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('MT', 'OH', 'OR')   and ss_net_profit between 150 and 300      ) or      (ss_addr_sk = ca_address_sk   and ca_country = 'United States'   and ca_state in ('GA', 'IL', 'TX')   and ss_net_profit between 50 and 250      )) ;
+Rewritten: WITH filtered_date_dim AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2001
+),
+filtered_customer_demographics AS (
+  SELECT cd_demo_sk, cd_marital_status, cd_education_status
+  FROM customer_demographics
+  WHERE (cd_marital_status = 'U' AND cd_education_status = 'College')
+     OR (cd_marital_status = 'W' AND cd_education_status = '2 yr Degree')
+     OR (cd_marital_status = 'S' AND cd_education_status = 'College')
+),
+filtered_household_demographics AS (
+  SELECT hd_demo_sk, hd_dep_count
+  FROM household_demographics
+  WHERE hd_dep_count IN (1, 3)
+),
+filtered_customer_address AS (
+  SELECT ca_address_sk, ca_state
+  FROM customer_address
+  WHERE ca_country = 'United States'
+    AND ca_state IN ('IN', 'NM', 'VA', 'MT', 'OH', 'OR', 'GA', 'IL', 'TX')
+)
+SELECT 
+  min(ss_quantity),
+  min(ss_ext_sales_price),
+  min(ss_ext_wholesale_cost),
+  min(ss_ext_wholesale_cost)
+FROM store_sales
+JOIN filtered_date_dim ON ss_sold_date_sk = d_date_sk
+JOIN store ON s_store_sk = ss_store_sk
+JOIN filtered_customer_demographics ON cd_demo_sk = ss_cdemo_sk
+JOIN filtered_household_demographics ON ss_hdemo_sk = hd_demo_sk
+JOIN filtered_customer_address ON ss_addr_sk = ca_address_sk
+WHERE (
+  (cd_marital_status = 'U' AND cd_education_status = 'College' 
+   AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3)
+  OR
+  (cd_marital_status = 'W' AND cd_education_status = '2 yr Degree' 
+   AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1)
+  OR
+  (cd_marital_status = 'S' AND cd_education_status = 'College' 
+   AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)
+)
+AND (
+  (ca_state IN ('IN', 'NM', 'VA') AND ss_net_profit BETWEEN 100 AND 200)
+  OR
+  (ca_state IN ('MT', 'OH', 'OR') AND ss_net_profit BETWEEN 150 AND 300)
+  OR
+  (ca_state IN ('GA', 'IL', 'TX') AND ss_net_profit BETWEEN 50 AND 250)
+)
+Time Cost: 132.26s
+Suggestion: [{'group': '谓词简化', 'produced_suggestion': '将WHERE子句中的复杂OR条件分解为UNION ALL子查询，每个子查询对应一个OR分支。这样可以将ss_sales_price、ss_net_profit、cd_marital_status、cd_education_status、hd_dep_count、ca_state等过滤条件在各子查询中精确下推到对应表，利用idx_store_sales_sold_date、idx_customer_demographics_sk、idx_customer_address_sk等索引，避免全表关联后再过滤'}, {'group': '连接优化', 'produced_suggestion': '调整连接顺序，先将date_dim(d_year=2001过滤后约365行)与store_sales通过idx_store_sales_sold_date索引进行Hash Join，然后再与小维度表(customer_demographics、household_demographics、customer_address)进行连接。将date_dim从Nested Loop外表改为Hash Join构建端，避免对2880万行store_sales的重复扫描'}, {'group': '子查询优化', 'produced_suggestion': '参考历史案例1的CTE分解策略，将三组OR条件(人口统计+价格区间、地址+利润区间的笛卡尔组合)提取为CTE，在CTE内完成过滤和连接，然后对结果集进行MIN聚合。这样可以避免在主查询中对大表进行多次扫描，并利用CTE物化中间结果'}, {'group': '连接优化', 'produced_suggestion': '将ss_hdemo_sk=hd_demo_sk、cd_demo_sk=ss_cdemo_sk、ss_addr_sk=ca_address_sk等连接条件与对应的过滤条件(如hd_dep_count、cd_marital_status、ca_state)组合，形成带过滤的连接条件。利用idx_store_sales_hdemo、idx_store_sales_cdemo、idx_store_sales_addr等索引，在连接时直接过滤不符合条件的行'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) Nested Loop连接占总代价97.5%，date_dim(73049行)作为外表与store_sales大表(2880万行)进行嵌套循环连接，效率极低；2) date_dim的Index Scan虽有d_year=2001过滤，但仍扫描73049行；3) WHERE子句包含复杂的OR条件组合，涉及多表连接且未充分利用索引；4) 历史案例显示相似SQL通过CTE分解、过滤条件下推、连接条件优化等规则获得显著改善。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将WHERE子句中的复杂OR条件分解为UNION ALL子查询，每个子查询对应一个OR分支。这样可以将ss_sales_price、ss_net_profit、cd_marital_status、cd_education_status、hd_dep_count、ca_state等过滤条件在各子查询中精确下推到对应表，利用idx_store_sales_sold_date、idx_customer_demographics_sk、idx_customer_address_sk等索引，避免全表关联后再过滤"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序，先将date_dim(d_year=2001过滤后约365行)与store_sales通过idx_store_sales_sold_date索引进行Hash Join，然后再与小维度表(customer_demographics、household_demographics、customer_address)进行连接。将date_dim从Nested Loop外表改为Hash Join构建端，避免对2880万行store_sales的重复扫描"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "参考历史案例1的CTE分解策略，将三组OR条件(人口统计+价格区间、地址+利润区间的笛卡尔组合)提取为CTE，在CTE内完成过滤和连接，然后对结果集进行MIN聚合。这样可以避免在主查询中对大表进行多次扫描，并利用CTE物化中间结果"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将ss_hdemo_sk=hd_demo_sk、cd_demo_sk=ss_cdemo_sk、ss_addr_sk=ca_address_sk等连接条件与对应的过滤条件(如hd_dep_count、cd_marital_status、ca_state)组合，形成带过滤的连接条件。利用idx_store_sales_hdemo、idx_store_sales_cdemo、idx_store_sales_addr等索引，在连接时直接过滤不符合条件的行"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → JOIN_TO_CORRELATE: UCT=1.100
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+{
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH"],
+  "groups": "子查询优化,谓词简化,连接优化",
+  "rule_effect_confidence": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.7,
+    "FILTER_INTO_JOIN": 0.6,
+    "JOIN_CONDITION_PUSH": 0.5
+  },
+  "rule_effect_scores": {
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "FILTER_INTO_JOIN": 0.3,
+    "JOIN_CONDITION_PUSH": 0.2
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,谓词简化,连接优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rewritten_sql": "WITH filtered_date_dim AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2001\n),\nfiltered_customer_demographics AS (\n  SELECT cd_demo_sk, cd_marital_status, cd_education_status\n  FROM customer_demographics\n  WHERE (cd_marital_status = 'U' AND cd_education_status = 'College')\n     OR (cd_marital_status = 'W' AND cd_education_status = '2 yr Degree')\n     OR (cd_marital_status = 'S' AND cd_education_status = 'College')\n),\nfiltered_household_demographics AS (\n  SELECT hd_demo_sk, hd_dep_count\n  FROM household_demographics\n  WHERE hd_dep_count IN (1, 3)\n),\nfiltered_customer_address AS (\n  SELECT ca_address_sk, ca_state\n  FROM customer_address\n  WHERE ca_country = 'United States'\n    AND ca_state IN ('IN', 'NM', 'VA', 'MT', 'OH', 'OR', 'GA', 'IL', 'TX')\n)\nSELECT \n  min(ss_quantity),\n  min(ss_ext_sales_price),\n  min(ss_ext_wholesale_cost),\n  min(ss_ext_wholesale_cost)\nFROM store_sales\nJOIN filtered_date_dim ON ss_sold_date_sk = d_date_sk\nJOIN store ON s_store_sk = ss_store_sk\nJOIN filtered_customer_demographics ON cd_demo_sk = ss_cdemo_sk\nJOIN filtered_household_demographics ON ss_hdemo_sk = hd_demo_sk\nJOIN filtered_customer_address ON ss_addr_sk = ca_address_sk\nWHERE (\n  (cd_marital_status = 'U' AND cd_education_status = 'College' \n   AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3)\n  OR\n  (cd_marital_status = 'W' AND cd_education_status = '2 yr Degree' \n   AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1)\n  OR\n  (cd_marital_status = 'S' AND cd_education_status = 'College' \n   AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)\n)\nAND (\n  (ca_state IN ('IN', 'NM', 'VA') AND ss_net_profit BETWEEN 100 AND 200)\n  OR\n  (ca_state IN ('MT', 'OH', 'OR') AND ss_net_profit BETWEEN 150 AND 300)\n  OR\n  (ca_state IN ('GA', 'IL', 'TX') AND ss_net_profit BETWEEN 50 AND 250)\n)",
+  "semantic_correctness_guarantee": "1. **CTE分解（STRATEGY_CTE_DECOMPOSITION）**：将date_dim、customer_demographics、household_demographics、customer_address四张维度表的过滤条件提取为CTE，分别是filtered_date_dim（d_year=2001）、filtered_customer_demographics（三组婚姻状态+教育状态的OR条件）、filtered_household_demographics（hd_dep_count IN (1,3)）、filtered_customer_address（ca_country='United States'且ca_state在9个州的OR条件）。这些CTE仅对原WHERE子句中仅依赖单表的谓词进行提前过滤，不改变连接语义，只是将过滤逻辑前置到维度表扫描阶段。\n\n2. **过滤条件下推到JOIN输入（FILTER_INTO_JOIN）**：原SQL在WHERE子句中对date_dim、customer_demographics、household_demographics、customer_address的过滤条件，现在通过CTE在JOIN之前完成。这些过滤条件（d_year=2001、婚姻状态/教育状态组合、hd_dep_count、ca_country和ca_state）仅依赖各自维度表，下推到CTE子查询中不会改变最终结果集，因为这些条件与store_sales的连接键无关，只是减少了参与JOIN的行数。\n\n3. **JOIN条件与过滤条件的组合（JOIN_CONDITION_PUSH）**：原SQL的复杂OR条件包含两部分：人口统计相关（cd_marital_status、cd_education_status、ss_sales_price、hd_dep_count）和地址相关（ca_state、ss_net_profit）。重写后保持这些条件在主查询WHERE子句中，但维度表已通过CTE预过滤。JOIN条件（ss_sold_date_sk=d_date_sk、s_store_sk=ss_store_sk、cd_demo_sk=ss_cdemo_sk、ss_hdemo_sk=hd_demo_sk、ss_addr_sk=ca_address_sk）保持不变，确保连接语义等价。\n\n4. **OR条件的语义等价性**：原SQL的两组复杂OR条件（三个人口统计分支×三个地址分支）在重写后完全保留在WHERE子句中。虽然维度表通过CTE预过滤，但WHERE子句中的精确条件（如cd_marital_status='U' AND cd_education_status='College' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count=3）确保只有满足原始OR逻辑的行才会被选中。CTE的预过滤（如filtered_customer_demographics包含所有三组婚姻状态+教育状态组合）是这些精确条件的超集，不会排除任何原SQL会保留的行。\n\n5. **聚合函数的等价性**：重写前后都对同一组列（ss_quantity、ss_ext_sales_price、ss_ext_wholesale_cost）执行MIN聚合。由于CTE和WHERE条件的组合与原SQL的WHERE子句逻辑等价，参与聚合的行集合相同，因此MIN结果相同。\n\n6. **索引利用与结果集不变性**：重写利用idx_store_sales_sold_date、idx_store_sales_cdemo、idx_store_sales_hdemo、idx_store_sales_addr等索引，通过CTE减少JOIN输入行数，但这仅是执行优化。原SQL的隐式INNER JOIN语义（所有连接条件在WHERE中）与重写后的显式INNER JOIN完全等价，因为WHERE条件仍然过滤所有不满足OR逻辑的行。\n\n7. **NULL值处理**：原SQL的连接条件（如ss_sold_date_sk=d_date_sk）和WHERE条件会自然排除连接键为NULL的行。重写后的INNER JOIN语义相同，CTE预过滤不涉及连接键的NULL判断，主查询WHERE条件中的ss_sales_price、ss_net_profit的BETWEEN条件会排除NULL值（标准SQL BETWEEN不匹配NULL），与原SQL行为一致。\n\n8. **易误判点说明**：原SQL的两组OR条件可能被误认为需要UNION ALL分解，但由于WHERE子句中的条件是针对已连接结果集的过滤，直接通过CTE预过滤维度表并保留WHERE条件的组合逻辑，可以在不改变语义的前提下利用索引。重写后的WHERE子句仍然是两组嵌套OR的笛卡尔组合，确保与原SQL的过滤逻辑完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+{
+  "equivalent": true,
+  "message": "当前重写 SQL 通过将各维度表过滤条件提前为 CTE 并在主查询中保持原有的复杂 OR 条件逻辑，实现了与原始 SQL 完全等价的行集筛选和聚合计算，且未改变连接或聚合语义，符合规则 STRATEGY_CTE_DECOMPOSITION、FILTER_INTO_JOIN 和 JOIN_CONDITION_PUSH 的典型应用，经过对谓词、连接、NULL 处理和聚合的详尽比较，没有发现任何会导致结果集变化的差异。",
+  "differences": []
+}
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 2->1, index-like 4->5 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 7742.0 -> 3476.0 (重写侧约为原的 44.8980%) | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": true,
+  "reason": "执行计划结构未发生明显变化，重写SQL引入的CTE未被优化器实际物化或复用，反而增加了冗余过滤条件导致轻微成本上升。主要对比：1) 扫描方式：原SQL使用2次SeqScan+4次IndexScan，重写SQL使用1次SeqScan+5次IndexScan（含1次IndexOnlyScan），索引使用略有增加但整体访问路径未改变；2) 连接结构：两者均为3-4层NestedLoop + HashJoin混合，重写SQL增加1层NestedLoop但未消除任何子计划或重复扫描；3) 过滤条件：重写SQL在household_demographics和customer_demographics的Filter中出现条件重复（如'hd_dep_count IN (1,3) AND (hd_dep_count=3 OR hd_dep_count=1 OR hd_dep_count=1)'），引入冗余计算；4) 并行度：两者均为Workers Planned=2，无变化；5) 行数估计求和：7742→3476（降至44.9%），但这主要是因为household_demographics过滤后行数从1951降至390（引入了更严格的IN条件），并非结构优化带来的收益；6) 成本：243437.65→243085.82，仅下降0.14%，属于误差范围内的微小波动。结论：CTE未产生实质复用效果（优化器可能将CTE内联展开），重写SQL未解决原SQL的核心问题（date_dim与store_sales的NestedLoop + 多层过滤后再聚合），反而因冗余过滤条件带来额外开销。当前重写未达成明确改进，但也未造成灾难性退化，且进一步优化空间有限（需从根本上改变连接顺序或引入UNION ALL分支优化，但这类改写风险较高且可能不被优化器接受），建议终止优化流程。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1049
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH']
+   - 优化组别: 子查询优化,谓词简化,连接优化
+   - 估计代价: 原始=243437.65, 重写=243085.82，相对变化: 0.14%
+✅ 成功存储，记录ID: 4e2ef0bb-8577-4d1d-b1a1-f215d006b8f3
+
+🎲 UCT Math Update: 3 rules, reward=+0.2208 (cost=+0.0014, rows=+0.5510, depth=+0.0000, oc=243437.6500, rc=243085.8200)
+   结构分细节: rows 7742.0->3476.0 (score=+0.551), depth 9.0->9.0 (score=+0.000)
+✅ UCT Update Complete:
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.500, conf=0.70, lambda=0.35, reward=+0.091, count=105, avg=+0.018
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.300, conf=0.60, lambda=0.30, reward=+0.070, count=117, avg=+0.002
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.200, conf=0.50, lambda=0.25, reward=+0.060, count=109, avg=+0.001
+
+----------------------------------------
+

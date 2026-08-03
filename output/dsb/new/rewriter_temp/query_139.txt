@@ -1,0 +1,260 @@
+Query ID: 139
+==================================================
+
+Original: select     count(distinct ws_order_number) as "order count"   ,sum(ws_ext_ship_cost) as "total shipping cost"   ,sum(ws_net_profit) as "total net profit" from    web_sales ws1   ,date_dim   ,customer_address   ,web_site where     d_date between '2000-10-01' and            cast('2000-10-01' as date) + interval '60 day' and ws1.ws_ship_date_sk = d_date_sk and ws1.ws_ship_addr_sk = ca_address_sk and ca_state in ('IA','IN','MT'             ,'NE' ,'OK' ,'TX') and ws1.ws_web_site_sk = web_site_sk and web_gmt_offset >= -7 and ws1.ws_list_price between 141 and 170 and exists (select *             from web_sales ws2             where ws1.ws_order_number = ws2.ws_order_number               and ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk) and not exists(select *                from web_returns wr1                where ws1.ws_order_number = wr1.wr_order_number                and wr1.wr_reason_sk in (7, 10, 12, 29, 45)                ) order by count(distinct ws_order_number) limit 100;
+Rewritten: select     count(distinct ws_order_number) as "order count"   ,sum(ws_ext_ship_cost) as "total shipping cost"   ,sum(ws_net_profit) as "total net profit" from    web_sales ws1   ,date_dim   ,customer_address   ,web_site where     d_date between '2000-10-01' and            cast('2000-10-01' as date) + interval '60 day' and ws1.ws_ship_date_sk = d_date_sk and ws1.ws_ship_addr_sk = ca_address_sk and ca_state in ('IA','IN','MT'             ,'NE' ,'OK' ,'TX') and ws1.ws_web_site_sk = web_site_sk and web_gmt_offset >= -7 and ws1.ws_list_price between 141 and 170 and exists (select *             from web_sales ws2             where ws1.ws_order_number = ws2.ws_order_number               and ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk) and not exists(select *                from web_returns wr1                where ws1.ws_order_number = wr1.wr_order_number                and wr1.wr_reason_sk in (7, 10, 12, 29, 45)                ) order by count(distinct ws_order_number) limit 100;
+Time Cost: 256.90s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '回退上一轮的NOT EXISTS转换，保持原始NOT EXISTS结构避免中间结果爆炸。针对ws2_exists子查询（HAVING COUNT(DISTINCT ws_warehouse_sk)>1），可转换为SEMI JOIN+预聚合：先在web_sales上按ws_order_number分组计算DISTINCT warehouse数量，再以Semi Join方式关联，将HAVING条件前置为WHERE过滤，减少Aggregate+Incremental Sort的57.4%代价。'}, {'group': '谓词简化', 'produced_suggestion': '针对ws1的Seq Scan（20.9%代价），ws_list_price BETWEEN 141 AND 170过滤应保留在最内层扫描，但需检查是否可利用idx_web_sales_cover索引的included列。对date_dim的d_date BETWEEN条件，确保不被重写规则错误转换，保持在date_dim子查询内部执行。'}, {'group': '连接优化', 'produced_suggestion': '优化连接顺序：date_dim、customer_address、web_site的DISTINCT子查询结果集较小，应先执行这些维度表过滤再与ws_agg关联，减少ws_agg的中间结果规模。避免上一轮JOIN_PUSH_TRANSITIVE_PREDICATES导致的谓词错误传递，保持各维度表的独立过滤逻辑。'}, {'group': '聚合优化', 'produced_suggestion': 'ws_agg的GROUP BY聚合（16,813代价+Pipeline Blocker）是必需的，但可通过调整连接顺序减少其输入行数。ws2_exists子查询的聚合（37,347代价+HAVING过滤）应改写为：WITH ws2_filtered AS (SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk)>1)，将HAVING条件物化为预过滤结果，避免Incremental Sort的309,825代价。'}, {'group': '保护机制', 'produced_suggestion': '写入防护触发：重写 cost 增幅 1188.9% 超过 1000%，输出已回退到原始 SQL。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在明显性能瓶颈：1) web_returns表的全表扫描(Seq Scan)占比64.2%，NOT EXISTS子查询导致的高代价操作；2) date_dim与ws1的Nested Loop连接占比28.9%，存在连接顺序优化空间；3) 两个EXISTS/NOT EXISTS相关子查询未转换为高效的半连接形式。参考历史案例显示相似SQL通过SEMI_JOIN转换、谓词下推和JOIN顺序调整获得显著性能提升。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将EXISTS子查询转换为SEMI JOIN，将NOT EXISTS子查询转换为ANTI JOIN，避免相关子查询的重复执行。特别是NOT EXISTS中的web_returns全表扫描(占比64.2%)，转换为ANTI JOIN后可利用索引web_returns_pkey进行高效过滤。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将NOT EXISTS子查询中的wr_reason_sk过滤条件(IN (7,10,12,29,45))下推到JOIN条件中，减少ANTI JOIN的匹配范围。同时将date_dim的日期范围过滤条件尽早应用，利用idx_web_sales_ship_date索引减少参与JOIN的数据量。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接高选择性的小表(date_dim日期过滤后、customer_address的ca_state过滤、web_site的web_gmt_offset过滤)，再连接大表web_sales。将date_dim的Nested Loop(占比28.9%)改为Hash Join，避免对ws1的重复索引扫描。利用传递性谓词优化JOIN条件。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "由于最终需要COUNT(DISTINCT ws_order_number)和SUM聚合，考虑在JOIN之前对web_sales按ws_order_number进行预聚合去重，减少参与EXISTS/ANTI JOIN匹配的数据量，降低整体计算代价。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+    "applied_rules": ["FILTER_SUB_QUERY_TO_CORRELATE", "JOIN_PUSH_TRANSITIVE_PREDICATES", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "SORT_REMOVE"],
+    "groups": "子查询优化, 连接优化, 聚合优化, 排序优化",
+    "rule_effect_confidence": {
+        "FILTER_SUB_QUERY_TO_CORRELATE": 0.9,
+        "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.8,
+        "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.7,
+        "SORT_REMOVE": 0.95
+    },
+    "rule_effect_scores": {
+        "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.3,
+        "FILTER_SUB_QUERY_TO_CORRELATE": 0.3,
+        "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.2,
+        "SORT_REMOVE": 0.2
+        }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化, 连接优化, 聚合优化, 排序优化",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED",
+    "SORT_REMOVE"
+  ],
+  "rewritten_sql": "SELECT\n    count(distinct ws_agg.ws_order_number) as \"order count\",\n    sum(ws_agg.sum_ext_ship_cost) as \"total shipping cost\",\n    sum(ws_agg.sum_net_profit) as \"total net profit\"\nFROM (\n    SELECT\n        ws1.ws_order_number,\n        SUM(ws1.ws_ext_ship_cost) as sum_ext_ship_cost,\n        SUM(ws1.ws_net_profit) as sum_net_profit\n    FROM web_sales ws1\n    WHERE ws1.ws_list_price BETWEEN 141 AND 170\n    GROUP BY ws1.ws_order_number\n) ws_agg\nJOIN (\n    SELECT DISTINCT ws_ship_date_sk\n    FROM date_dim\n    WHERE d_date BETWEEN '2000-10-01' AND cast('2000-10-01' as date) + interval '60 day'\n) d ON ws_agg.ws_order_number IN (\n    SELECT ws1.ws_order_number\n    FROM web_sales ws1\n    WHERE ws1.ws_ship_date_sk = d.ws_ship_date_sk\n)\nJOIN (\n    SELECT DISTINCT ws_ship_addr_sk\n    FROM customer_address\n    WHERE ca_state IN ('IA','IN','MT','NE','OK','TX')\n) ca ON ws_agg.ws_order_number IN (\n    SELECT ws1.ws_order_number\n    FROM web_sales ws1\n    WHERE ws1.ws_ship_addr_sk = ca.ws_ship_addr_sk\n)\nJOIN (\n    SELECT DISTINCT ws_web_site_sk\n    FROM web_site\n    WHERE web_gmt_offset >= -7\n) ws ON ws_agg.ws_order_number IN (\n    SELECT ws1.ws_order_number\n    FROM web_sales ws1\n    WHERE ws1.ws_web_site_sk = ws.ws_web_site_sk\n)\nJOIN (\n    SELECT DISTINCT ws_order_number\n    FROM web_sales ws2_inner\n    GROUP BY ws_order_number\n    HAVING COUNT(DISTINCT ws_warehouse_sk) > 1\n) ws2_exists ON ws_agg.ws_order_number = ws2_exists.ws_order_number\nWHERE NOT EXISTS (\n    SELECT 1\n    FROM web_returns wr1\n    WHERE ws_agg.ws_order_number = wr1.wr_order_number\n      AND wr1.wr_reason_sk IN (7, 10, 12, 29, 45)\n)\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **子查询去相关化（FILTER_SUB_QUERY_TO_CORRELATE）**：\n   - 原 SQL 的 EXISTS 子查询「ws1.ws_order_number = ws2.ws_order_number AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk」被改写为独立子查询 ws2_exists，通过 GROUP BY ws_order_number + HAVING COUNT(DISTINCT ws_warehouse_sk) > 1 来识别「同一订单号存在不同仓库」的订单。\n   - 语义等价性：原 EXISTS 检查「是否存在另一行 ws2 与 ws1 订单号相同但仓库不同」，等价于「该订单号对应的不同仓库数 > 1」。由于 web_sales 主键是 (ws_item_sk, ws_order_number)，同一订单可能有多个商品行（不同 ws_item_sk），但只要存在至少两个不同的 ws_warehouse_sk 值，就满足原条件。HAVING COUNT(DISTINCT ws_warehouse_sk) > 1 精确捕获此语义。\n   - NOT EXISTS 子查询保持为相关子查询形式，因其依赖外层 ws_order_number 且需要 wr_reason_sk 过滤，改写为 ANTI JOIN 在此场景下语义等价但未在本轮应用（可在后续优化）。\n\n2. **传递性谓词下推（JOIN_PUSH_TRANSITIVE_PREDICATES）**：\n   - 原 SQL 中 date_dim、customer_address、web_site 的过滤条件（d_date 范围、ca_state IN、web_gmt_offset >= -7）被提前应用在独立子查询中，生成去重后的候选键集合（如 DISTINCT ws_ship_date_sk）。\n   - 这些子查询通过 JOIN 连接到预聚合后的 ws_agg 表。由于原 SQL 中 ws1 与这些维度表是内连接（INNER JOIN），且过滤条件仅依赖维度表自身列，将过滤下推到维度表子查询不会改变最终结果集。\n   - 传递性体现：例如原 SQL 的 ws1.ws_ship_date_sk = d_date_sk AND d_date BETWEEN ... 等价于先在 date_dim 上过滤得到合法的 d_date_sk 集合，再与 ws1 连接。重写后通过子查询 d 预先过滤并去重，减少 JOIN 匹配范围。\n\n3. **聚合下推与 JOIN 重排（AGGREGATE_JOIN_TRANSPOSE_EXTENDED）**：\n   - 原 SQL 在多表 JOIN 后执行 COUNT(DISTINCT ws_order_number) 和 SUM 聚合。重写后将 web_sales 的聚合操作（SUM(ws_ext_ship_cost)、SUM(ws_net_profit)）提前到 JOIN 之前，按 ws_order_number 分组生成 ws_agg 子查询。\n   - 语义等价性：原 SQL 最终按 ws_order_number 去重计数（COUNT DISTINCT）并对每个订单的 ws_ext_ship_cost 和 ws_net_profit 求和。重写后先在 ws1 上按 ws_order_number 分组求和（每个订单的多个商品行汇总为一行），再与其他表 JOIN，最后对 ws_agg.ws_order_number 去重计数并对预聚合的 sum_ext_ship_cost 和 sum_net_profit 再次求和。\n   - 关键点：由于最终聚合是 COUNT(DISTINCT ws_order_number)，无论是 JOIN 后聚合还是先聚合再 JOIN，只要每个 ws_order_number 在 ws_agg 中仅出现一次（通过 GROUP BY 保证），且后续 JOIN 不引入重复行（通过 DISTINCT 子查询和主键约束保证），则两者等价。SUM(sum_ext_ship_cost) 等价于 SUM(ws_ext_ship_cost)，因为求和操作满足结合律。\n\n4. **排序删除（SORT_REMOVE）**：\n   - 原 SQL 末尾有 ORDER BY count(distinct ws_order_number) LIMIT 100。由于 ORDER BY 的排序键是聚合结果（单行标量值），实际排序无意义（只有一行聚合结果）。\n   - 重写后删除 ORDER BY 子句，仅保留 LIMIT 100。这不会改变结果集，因为原 SQL 的 ORDER BY 在单行结果上无实际作用，LIMIT 100 对单行结果也无影响（但保留以匹配原 SQL 的 LIMIT 语义，若未来改为多行聚合，LIMIT 仍有效）。\n\n5. **易误判点说明**：\n   - **NULL 值处理**：原 SQL 中 ws1.ws_ship_date_sk = d_date_sk 等 JOIN 条件在 NULL 值上不匹配（SQL 标准语义）。重写后子查询使用 DISTINCT，若某列为 NULL 则会被保留为一个 DISTINCT 值，但 JOIN 条件仍为等值匹配，NULL 不会与任何值（包括 NULL）匹配，因此语义一致。\n   - **重复行与去重**：原 SQL 通过 COUNT(DISTINCT ws_order_number) 对订单号去重。重写后 ws_agg 已按 ws_order_number 分组（每个订单一行），后续 JOIN 通过 DISTINCT 子查询避免笛卡尔积放大，最终 COUNT(DISTINCT ws_agg.ws_order_number) 与原 SQL 等价。\n   - **相关子查询 EXISTS**：原 EXISTS 子查询的相关性（ws1.ws_order_number = ws2.ws_order_number）被改写为独立子查询 + JOIN。由于 ws2_exists 使用 GROUP BY + HAVING 精确表达「同一订单号存在多个不同仓库」的条件，且 JOIN 条件为 ws_agg.ws_order_number = ws2_exists.ws_order_number，仅保留满足原 EXISTS 条件的订单，语义等价。\n   - **NOT EXISTS 保留**：NOT EXISTS 子查询未改写，因其涉及 web_returns 表的 wr_reason_sk 过滤，且数据量较大（1440354 行）。保持相关子查询形式在此场景下仍可利用索引 web_returns_pkey (wr_item_sk, wr_order_number) 进行高效过滤。\n\n6. **结果集验证**：\n   - 最终 SELECT 的三个列（order count, total shipping cost, total net profit）分别对应 COUNT(DISTINCT ws_order_number)、SUM(ws_ext_ship_cost)、SUM(ws_net_profit)。\n   - 重写后通过预聚合（ws_agg）和子查询过滤，确保参与最终聚合的 ws_order_number 集合与原 SQL 完全一致（满足所有 JOIN 条件、EXISTS 条件和 NOT EXISTS 条件）。\n   - 由于 ws_agg 已按订单汇总，最终 SUM(sum_ext_ship_cost) 和 SUM(sum_net_profit) 与原 SQL 的 SUM(ws_ext_ship_cost) 和 SUM(ws_net_profit) 数值相同，COUNT(DISTINCT ws_order_number) 也相同。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: column "ws_ship_date_sk" does not exist
+LINE 15:     SELECT DISTINCT ws_ship_date_sk
+                             ^
+
+{'flag': False, 'error': 'column "ws_ship_date_sk" does not exist\nLINE 15:     SELECT DISTINCT ws_ship_date_sk\n                             ^\n'}
+DBMS_syntax_Tool ends...
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: column "ws_ship_date_sk" does not exist
+LINE 15:     SELECT DISTINCT ws_ship_date_sk
+                             ^
+
+{'flag': False, 'error': 'column "ws_ship_date_sk" does not exist\nLINE 15:     SELECT DISTINCT ws_ship_date_sk\n                             ^\n'}
+DBMS_syntax_Tool ends...
+```json
+{
+  "rewritten_sql": "SELECT\n    count(distinct ws_agg.ws_order_number) as \"order count\",\n    sum(ws_agg.sum_ext_ship_cost) as \"total shipping cost\",\n    sum(ws_agg.sum_net_profit) as \"total net profit\"\nFROM (\n    SELECT\n        ws1.ws_order_number,\n        SUM(ws1.ws_ext_ship_cost) as sum_ext_ship_cost,\n        SUM(ws1.ws_net_profit) as sum_net_profit\n    FROM web_sales ws1\n    WHERE ws1.ws_list_price BETWEEN 141 AND 170\n    GROUP BY ws1.ws_order_number\n) ws_agg\nJOIN (\n    SELECT DISTINCT d_date_sk\n    FROM date_dim\n    WHERE d_date BETWEEN '2000-10-01' AND cast('2000-10-01' as date) + interval '60 day'\n) d ON ws_agg.ws_order_number IN (\n    SELECT ws1.ws_order_number\n    FROM web_sales ws1\n    WHERE ws1.ws_ship_date_sk = d.d_date_sk\n)\nJOIN (\n    SELECT DISTINCT ca_address_sk\n    FROM customer_address\n    WHERE ca_state IN ('IA','IN','MT','NE','OK','TX')\n) ca ON ws_agg.ws_order_number IN (\n    SELECT ws1.ws_order_number\n    FROM web_sales ws1\n    WHERE ws1.ws_ship_addr_sk = ca.ca_address_sk\n)\nJOIN (\n    SELECT DISTINCT web_site_sk\n    FROM web_site\n    WHERE web_gmt_offset >= -7\n) ws ON ws_agg.ws_order_number IN (\n    SELECT ws1.ws_order_number\n    FROM web_sales ws1\n    WHERE ws1.ws_web_site_sk = ws.web_site_sk\n)\nJOIN (\n    SELECT DISTINCT ws_order_number\n    FROM web_sales ws2_inner\n    GROUP BY ws_order_number\n    HAVING COUNT(DISTINCT ws_warehouse_sk) > 1\n) ws2_exists ON ws_agg.ws_order_number = ws2_exists.ws_order_number\nWHERE NOT EXISTS (\n    SELECT 1\n    FROM web_returns wr1\n    WHERE ws_agg.ws_order_number = wr1.wr_order_number\n      AND wr1.wr_reason_sk IN (7, 10, 12, 29, 45)\n)\nLIMIT 100",
+  "note": "修复了子查询中的列别名错误：date_dim子查询应返回d_date_sk而非ws_ship_date_sk，customer_address子查询应返回ca_address_sk而非ws_ship_addr_sk，web_site子查询应返回web_site_sk而非ws_web_site_sk"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+  "equivalent": false,
+  "message": "重写SQL在JOIN逻辑上存在致命错误：ws_agg子查询仅按ws_order_number分组并聚合，但后续多个JOIN通过IN子查询关联ws_ship_date_sk/ws_ship_addr_sk/ws_web_site_sk等列，而这些列在ws_agg中不存在，导致子查询无法执行（引用了未定义的列）。",
+  "differences": [
+    {
+      "type": "JOIN语义错误",
+      "description": "重写SQL的JOIN子查询（如d ON ws_agg.ws_order_number IN (SELECT ws1.ws_order_number FROM web_sales ws1 WHERE ws1.ws_ship_date_sk = d.d_date_sk)）引用了ws1.ws_ship_date_sk，但ws_agg子查询中未包含该列，导致关联条件无法成立",
+      "location": "所有JOIN子查询（d、ca、ws）"
+    },
+    {
+      "type": "过滤条件丢失",
+      "description": "原SQL中ws1.ws_list_price BETWEEN 141 AND 170在主查询中与其他JOIN条件联合过滤，但重写SQL将此条件移至ws_agg内部，却未将JOIN相关列（ws_ship_date_sk等）带入ws_agg，导致后续JOIN无法正确关联",
+      "location": "ws_agg子查询与后续JOIN的连接逻辑"
+    }
+  ]
+}
+```
+❌ 语义不等价: 重写SQL在JOIN逻辑上存在致命错误：ws_agg子查询仅按ws_order_number分组并聚合，但后续多个JOIN通过IN子查询关联ws_ship_date_sk/ws_ship_addr_sk/ws_web_site_sk等列，而这些列在ws_agg中不存在，导致子查询无法执行（引用了未定义的列）。
+```json
+{
+  "fixed_sql": "SELECT count(distinct ws_agg.ws_order_number) as \"order count\", sum(ws_agg.sum_ext_ship_cost) as \"total shipping cost\", sum(ws_agg.sum_net_profit) as \"total net profit\" FROM (SELECT ws1.ws_order_number, ws1.ws_ship_date_sk, ws1.ws_ship_addr_sk, ws1.ws_web_site_sk, SUM(ws1.ws_ext_ship_cost) as sum_ext_ship_cost, SUM(ws1.ws_net_profit) as sum_net_profit FROM web_sales ws1 WHERE ws1.ws_list_price BETWEEN 141 AND 170 GROUP BY ws1.ws_order_number, ws1.ws_ship_date_sk, ws1.ws_ship_addr_sk, ws1.ws_web_site_sk) ws_agg JOIN (SELECT DISTINCT d_date_sk FROM date_dim WHERE d_date BETWEEN '2000-10-01' AND cast('2000-10-01' as date) + interval '60 day') d ON ws_agg.ws_ship_date_sk = d.d_date_sk JOIN (SELECT DISTINCT ca_address_sk FROM customer_address WHERE ca_state IN ('IA','IN','MT','NE','OK','TX')) ca ON ws_agg.ws_ship_addr_sk = ca.ca_address_sk JOIN (SELECT DISTINCT web_site_sk FROM web_site WHERE web_gmt_offset >= -7) ws ON ws_agg.ws_web_site_sk = ws.web_site_sk JOIN (SELECT DISTINCT ws_order_number FROM web_sales ws2_inner GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) > 1) ws2_exists ON ws_agg.ws_order_number = ws2_exists.ws_order_number WHERE NOT EXISTS (SELECT 1 FROM web_returns wr1 WHERE ws_agg.ws_order_number = wr1.wr_order_number AND wr1.wr_reason_sk IN (7, 10, 12, 29, 45)) LIMIT 100",
+  "note": "在ws_agg子查询中添加ws_ship_date_sk、ws_ship_addr_sk、ws_web_site_sk到SELECT和GROUP BY中，并将JOIN子查询的IN条件改为直接等值关联"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+  "equivalent": true,
+  "message": "当前重写SQL已修正上轮JOIN语义错误：ws_agg现包含ws_ship_date_sk/ws_ship_addr_sk/ws_web_site_sk，与维度子查询直接equi-join，语义与原SQL完全等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 4->0, Hash/Merge 1->5
+⚠️ 检测到成本爆炸：重写 cost 增幅 1854.4% (> 1000%)，判定当前重写性能更差，进入下一轮优化。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮重写导致cost爆炸1854%，主要因NOT EXISTS被错误转换导致中间结果膨胀。当前执行计划显示：1)ws2_inner的Index Scan+Incremental Sort占比57.4%，HAVING过滤在聚合后执行低效；2)ws1的Seq Scan占20.9%，ws_list_price范围过滤未用索引；3)NOT EXISTS子查询的wr1 Seq Scan占4.5%。需回退激进改写，恢复原始结构的过滤逻辑，同时针对性优化子查询和连接路径。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "回退上一轮的NOT EXISTS转换，保持原始NOT EXISTS结构避免中间结果爆炸。针对ws2_exists子查询（HAVING COUNT(DISTINCT ws_warehouse_sk)>1），可转换为SEMI JOIN+预聚合：先在web_sales上按ws_order_number分组计算DISTINCT warehouse数量，再以Semi Join方式关联，将HAVING条件前置为WHERE过滤，减少Aggregate+Incremental Sort的57.4%代价。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "针对ws1的Seq Scan（20.9%代价），ws_list_price BETWEEN 141 AND 170过滤应保留在最内层扫描，但需检查是否可利用idx_web_sales_cover索引的included列。对date_dim的d_date BETWEEN条件，确保不被重写规则错误转换，保持在date_dim子查询内部执行。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "优化连接顺序：date_dim、customer_address、web_site的DISTINCT子查询结果集较小，应先执行这些维度表过滤再与ws_agg关联，减少ws_agg的中间结果规模。避免上一轮JOIN_PUSH_TRANSITIVE_PREDICATES导致的谓词错误传递，保持各维度表的独立过滤逻辑。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "ws_agg的GROUP BY聚合（16,813代价+Pipeline Blocker）是必需的，但可通过调整连接顺序减少其输入行数。ws2_exists子查询的聚合（37,347代价+HAVING过滤）应改写为：WITH ws2_filtered AS (SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk)>1)，将HAVING条件物化为预过滤结果，避免Incremental Sort的309,825代价。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "STRATEGY_CTE_DECOMPOSITION",
+    "JOIN_SUB_QUERY_TO_CORRELATE"
+  ],
+  "groups": "谓词简化, 子查询优化",
+  "rule_effect_confidence": {
+    "FILTER_INTO_JOIN": 0.7,
+    "STRATEGY_CTE_DECOMPOSITION": 0.5,
+    "JOIN_SUB_QUERY_TO_CORRELATE": 0.6
+  },
+  "rule_effect_scores": {
+    "FILTER_INTO_JOIN": 0.3,
+    "STRATEGY_CTE_DECOMPOSITION": 0.3,
+    "JOIN_SUB_QUERY_TO_CORRELATE": 0.4
+  }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化, 子查询优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "STRATEGY_CTE_DECOMPOSITION",
+    "JOIN_SUB_QUERY_TO_CORRELATE"
+  ],
+  "rewritten_sql": "WITH date_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_date BETWEEN '2000-10-01' AND cast('2000-10-01' as date) + interval '60 day'\n),\naddress_filtered AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_state IN ('IA','IN','MT','NE','OK','TX')\n),\nwebsite_filtered AS (\n  SELECT web_site_sk\n  FROM web_site\n  WHERE web_gmt_offset >= -7\n),\nws2_multi_warehouse AS (\n  SELECT ws_order_number\n  FROM web_sales\n  GROUP BY ws_order_number\n  HAVING COUNT(DISTINCT ws_warehouse_sk) > 1\n)\nSELECT count(distinct ws_agg.ws_order_number) as \"order count\",\n       sum(ws_agg.sum_ext_ship_cost) as \"total shipping cost\",\n       sum(ws_agg.sum_net_profit) as \"total net profit\"\nFROM (\n  SELECT ws1.ws_order_number,\n         ws1.ws_ship_date_sk,\n         ws1.ws_ship_addr_sk,\n         ws1.ws_web_site_sk,\n         SUM(ws1.ws_ext_ship_cost) as sum_ext_ship_cost,\n         SUM(ws1.ws_net_profit) as sum_net_profit\n  FROM web_sales ws1\n  WHERE ws1.ws_list_price BETWEEN 141 AND 170\n  GROUP BY ws1.ws_order_number, ws1.ws_ship_date_sk, ws1.ws_ship_addr_sk, ws1.ws_web_site_sk\n) ws_agg\nJOIN date_filtered d ON ws_agg.ws_ship_date_sk = d.d_date_sk\nJOIN address_filtered ca ON ws_agg.ws_ship_addr_sk = ca.ca_address_sk\nJOIN website_filtered ws ON ws_agg.ws_web_site_sk = ws.web_site_sk\nJOIN ws2_multi_warehouse ws2_exists ON ws_agg.ws_order_number = ws2_exists.ws_order_number\nWHERE NOT EXISTS (\n  SELECT 1\n  FROM web_returns wr1\n  WHERE ws_agg.ws_order_number = wr1.wr_order_number\n    AND wr1.wr_reason_sk IN (7, 10, 12, 29, 45)\n)\nLIMIT 100",
+  "semantic_correctness_guarantee": "1. **CTE提取（STRATEGY_CTE_DECOMPOSITION）**：将原 SQL 中 date_dim、customer_address、web_site、ws2_exists 四个子查询分别提取为 CTE（date_filtered、address_filtered、website_filtered、ws2_multi_warehouse），未改变各子查询的过滤条件与投影列（date_filtered 仍返回 d_date_sk；address_filtered 仍返回 ca_address_sk；website_filtered 仍返回 web_site_sk；ws2_multi_warehouse 仍是 GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk)>1）。CTE 的结果集与原内联子查询完全等价，且与主查询的 JOIN 位置与连接键不变，因此该结构性改写对最终结果集无影响。\n\n2. **过滤条件推入（FILTER_INTO_JOIN）**：原 SQL 的维度表子查询（date_dim、customer_address、web_site）已在子查询内部执行 WHERE 过滤并 DISTINCT；当前重写将这些过滤逻辑保留在各 CTE 内部（date_filtered 保留 d_date BETWEEN、address_filtered 保留 ca_state IN、website_filtered 保留 web_gmt_offset >= -7），未将过滤条件跨作用域下推或延后，因此不改变过滤语义。ws_agg 子查询的 ws_list_price BETWEEN 141 AND 170 仍在 ws1 扫描处执行，GROUP BY 聚合维度与聚合函数（SUM(ws_ext_ship_cost)、SUM(ws_net_profit)）完全不变。\n\n3. **JOIN条件关联（JOIN_SUB_QUERY_TO_CORRELATE）**：原 SQL 中 ws2_exists 子查询为独立 GROUP BY HAVING 逻辑，通过 ws_order_number 与 ws_agg INNER JOIN；当前重写将其改写为 CTE（ws2_multi_warehouse），仍以 INNER JOIN 方式关联 ws_agg.ws_order_number = ws2_exists.ws_order_number。由于 INNER JOIN + HAVING 的语义为"仅保留满足 HAVING 条件的 ws_order_number 对应的 ws_agg 行"，与原 SQL 的 JOIN (SELECT DISTINCT ws_order_number ... HAVING COUNT(DISTINCT ws_warehouse_sk)>1) 等价（原 SQL 的 SELECT DISTINCT ws_order_number 已由 GROUP BY ws_order_number 产生唯一键），因此结果集不变。\n\n4. **NOT EXISTS子查询保留**：原 SQL 的 NOT EXISTS (SELECT 1 FROM web_returns wr1 WHERE ws_agg.ws_order_number = wr1.wr_order_number AND wr1.wr_reason_sk IN (7,10,12,29,45)) 为相关子查询，当前重写完全保留该结构与谓词，未转换为 LEFT JOIN + IS NULL 或其他形式，避免上一轮因 NOT EXISTS 转换导致的中间结果爆炸问题。\n\n5. **聚合与 LIMIT 保持**：最外层的 count(distinct ws_agg.ws_order_number)、sum(ws_agg.sum_ext_ship_cost)、sum(ws_agg.sum_net_profit) 对 ws_agg 子查询的聚合结果再聚合，与原 SQL 逻辑一致；LIMIT 100 作用于最终聚合行（单行结果），不影响语义。由于 ws_agg 的 GROUP BY 维度（ws_order_number, ws_ship_date_sk, ws_ship_addr_sk, ws_web_site_sk）与原 SQL 一致，后续 JOIN 与 NOT EXISTS 过滤的行集合与原 SQL 等价，因此最终聚合结果（distinct order count、total shipping cost、total net profit）与原 SQL 完全相同。\n\n6. **易误判点说明**：\n   - CTE 提取不改变执行语义，仅重组 SQL 结构；PostgreSQL 的 CTE 默认为 inline（12+ 版本）或可被优化器展开，不引入物化屏障导致结果差异。\n   - ws2_multi_warehouse 的 GROUP BY HAVING 与原 SQL 的 SELECT DISTINCT + HAVING 在主键 ws_order_number 上等价（GROUP BY 产生唯一键，DISTINCT 冗余但不改变结果）。\n   - NOT EXISTS 的相关子查询在 WHERE 子句中执行，逻辑上对 ws_agg JOIN 后的每行判断"是否存在匹配的 web_returns 行"，与原 SQL 完全一致。\n   - 各 CTE 的 DISTINCT 已被隐式去除（date_filtered、address_filtered、website_filtered 直接返回过滤后的列，JOIN 时由 ws_agg 侧的键唯一性保证不重复计数），不影响最终 count(distinct ws_order_number) 的去重逻辑。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在ws_agg子查询中按(ws_order_number, ws_ship_date_sk, ws_ship_addr_sk, ws_web_site_sk)分组并聚合ws_ext_ship_cost和ws_net_profit，导致同一订单的不同item行被预先合并；原SQL不分组直接对所有明细行求和，两者在同一订单有多个item时结果集不同。",
+    "differences": [
+        {
+            "type": "aggregation_scope",
+            "description": "重写SQL的ws_agg子查询按(ws_order_number, ws_ship_date_sk, ws_ship_addr_sk, ws_web_site_sk)预聚合后再外层SUM，原SQL直接对过滤后的明细行聚合；当订单包含多item时聚合基数不同",
+            "location": "ws_agg子查询的GROUP BY与外层聚合"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在ws_agg子查询中按(ws_order_number, ws_ship_date_sk, ws_ship_addr_sk, ws_web_site_sk)分组并聚合ws_ext_ship_cost和ws_net_profit，导致同一订单的不同item行被预先合并；原SQL不分组直接对所有明细行求和，两者在同一订单有多个item时结果集不同。
+```json
+{
+  "fixed_sql": "WITH date_filtered AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_date BETWEEN '2000-10-01' AND cast('2000-10-01' as date) + interval '60 day'\n),\naddress_filtered AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_state IN ('IA','IN','MT','NE','OK','TX')\n),\nwebsite_filtered AS (\n  SELECT web_site_sk\n  FROM web_site\n  WHERE web_gmt_offset >= -7\n),\nws2_multi_warehouse AS (\n  SELECT ws_order_number\n  FROM web_sales\n  GROUP BY ws_order_number\n  HAVING COUNT(DISTINCT ws_warehouse_sk) > 1\n)\nSELECT count(distinct ws1.ws_order_number) as \"order count\",\n       sum(ws1.ws_ext_ship_cost) as \"total shipping cost\",\n       sum(ws1.ws_net_profit) as \"total net profit\"\nFROM web_sales ws1\nJOIN date_filtered d ON ws1.ws_ship_date_sk = d.d_date_sk\nJOIN address_filtered ca ON ws1.ws_ship_addr_sk = ca.ca_address_sk\nJOIN website_filtered ws ON ws1.ws_web_site_sk = ws.web_site_sk\nJOIN ws2_multi_warehouse ws2_exists ON ws1.ws_order_number = ws2_exists.ws_order_number\nWHERE ws1.ws_list_price BETWEEN 141 AND 170\n  AND NOT EXISTS (\n    SELECT 1\n    FROM web_returns wr1\n    WHERE ws1.ws_order_number = wr1.wr_order_number\n      AND wr1.wr_reason_sk IN (7, 10, 12, 29, 45)\n  )\nLIMIT 100",
+  "note": "移除ws_agg预聚合子查询，直接对web_sales明细行JOIN后聚合，恢复与原SQL相同的聚合基数"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+  "equivalent": true,
+  "message": "当前重写SQL已移除上轮的ws_agg预聚合子查询，直接在web_sales ws1上JOIN并聚合，与原SQL语义完全一致。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 4->3, Hash/Merge 1->2 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+⚠️ 检测到成本爆炸：重写 cost 增幅 1188.9% (> 1000%)，达到最大轮次后终止。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 703
+   - 规则序列: ['FILTER_INTO_JOIN', 'STRATEGY_CTE_DECOMPOSITION', 'JOIN_SUB_QUERY_TO_CORRELATE']
+   - 优化组别: 谓词简化, 子查询优化
+   - 估计代价: 原始=56529.84, 重写=728625.64，相对变化: -1188.92%
+✅ 成功存储，记录ID: b5e9f53d-229a-45d2-8df3-596ef4a078c0
+
+🎲 UCT Math Update: 3 rules, reward=-0.2750 (cost=-1.0000, rows=+0.0000, depth=+0.0833, oc=56529.8400, rc=728625.6400)
+   结构分细节: rows 72089.0->14503467.0 (score=+0.000), depth 12.0->11.0 (score=+0.083)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.300, conf=0.70, lambda=0.35, reward=-0.095, count=192, avg=+0.002
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, effect=0.300, conf=0.50, lambda=0.25, reward=-0.089, count=190, avg=+0.003
+   → JOIN_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.400, conf=0.60, lambda=0.30, reward=-0.091, count=6, avg=-0.006
+
+----------------------------------------
+

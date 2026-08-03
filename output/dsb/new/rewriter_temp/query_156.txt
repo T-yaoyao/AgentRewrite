@@ -1,0 +1,281 @@
+Query ID: 156
+==================================================
+
+Original: select  c_customer_sk, c_first_name, c_last_name, count(*) as cnt FROM store_sales, store_returns, web_sales, date_dim d1, date_dim d2, item, customer, customer_address, household_demographics WHERE ss_ticket_number = sr_ticket_number AND ss_customer_sk = ws_bill_customer_sk AND ss_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk AND c_current_hdemo_sk = hd_demo_sk AND ss_item_sk = sr_item_sk AND sr_item_sk = ws_item_sk AND i_item_sk = ss_item_sk AND i_category IN ('Jewelry', 'Music', 'Sports') AND sr_returned_date_sk = d1.d_date_sk AND ws_sold_date_sk = d2.d_date_sk AND d2.d_date between d1.d_date AND (d1.d_date + interval '90' day) AND ca_state in ('IA', 'KS', 'MD', 'MO', 'OK') AND d1.d_year = 2000 AND hd_income_band_sk BETWEEN 14 AND 20 AND hd_buy_potential = '0-500' AND ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 58 * 0.01 GROUP BY c_customer_sk, c_first_name, c_last_name ORDER BY cnt ;
+Rewritten: SELECT c.c_customer_sk, c.c_first_name, c.c_last_name, COUNT(*) AS cnt FROM store_sales ss INNER JOIN store_returns sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk INNER JOIN item i ON ss.ss_item_sk = i.i_item_sk INNER JOIN date_dim d1 ON sr.sr_returned_date_sk = d1.d_date_sk INNER JOIN web_sales ws ON ss.ss_item_sk = ws.ws_item_sk AND ss.ss_customer_sk = ws.ws_bill_customer_sk INNER JOIN date_dim d2 ON ws.ws_sold_date_sk = d2.d_date_sk AND d2.d_date BETWEEN d1.d_date AND d1.d_date + INTERVAL '90' day INNER JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk WHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 0.38 AND 0.58 AND i.i_category IN ('Jewelry', 'Music', 'Sports') AND d1.d_year = 2000 AND ca.ca_state IN ('IA', 'KS', 'MD', 'MO', 'OK') AND hd.hd_income_band_sk BETWEEN 14 AND 20 AND hd.hd_buy_potential = '0-500' GROUP BY c.c_customer_sk, c.c_first_name, c.c_last_name ORDER BY cnt
+Time Cost: 243.68s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '回退上一轮的STRATEGY_CTE_DECOMPOSITION，将d1_filtered/d2_filtered/item_filtered等小表CTE内联回主查询，减少物化开销和中间结果集。仅保留必要的store_sales_filtered作为CTE，其余过滤条件直接下推到JOIN-ON子句中。'}, {'group': '谓词简化', 'produced_suggestion': '将store_sales的价格比率过滤条件(ss_sales_price/ss_list_price BETWEEN 0.38 AND 0.58)转换为等价的范围条件(ss_sales_price >= 0.38*ss_list_price AND ss_sales_price <= 0.58*ss_list_price)，避免除法运算导致无法使用索引扫描。'}, {'group': '连接优化', 'produced_suggestion': '调整JOIN顺序：先执行小表过滤(item WHERE i_category IN/date_dim WHERE d_year=2000/customer_address WHERE ca_state IN)与store_sales的INNER JOIN，利用idx_store_sales_item/idx_store_sales_sold_date等索引，再关联store_returns，最后JOIN customer维度表，减少Nested Loop的外层输入规模。'}, {'group': '谓词简化', 'produced_suggestion': '将d2_filtered的日期范围关联(d2.d_date BETWEEN d1.d_date AND d1.d_date+90天)简化为d_date_sk的范围条件，若d_year=2000对应的d_date_sk范围已知(如2000年对应450000-450364)，则直接用ws.ws_sold_date_sk BETWEEN 450000 AND 450454避免子查询。'}, {'group': '连接优化', 'produced_suggestion': '利用store_sales_pkey(ss_item_sk, ss_ticket_number)和store_returns_pkey(sr_item_sk, sr_ticket_number)的复合主键，确保JOIN条件ss.ss_ticket_number=sr.sr_ticket_number AND ss.ss_item_sk=sr.sr_item_sk使用索引Merge Join或Hash Join，避免当前的Nested Loop阻塞。'}, {'group': '投影优化', 'produced_suggestion': '在store_sales/web_sales/store_returns的CTE或内联子查询中仅投影必需的JOIN列和过滤列(ss_ticket_number/ss_item_sk/ss_customer_sk/ws_item_sk/ws_bill_customer_sk/ws_sold_date_sk)，裁剪不必要的列减少IO和内存开销。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重的性能瓶颈：1) Nested Loop连接占比69.8%，d1表与store_returns表进行嵌套循环连接，处理719万行数据；2) 另一个Nested Loop占比13.9%，d1表与store_sales表连接处理2880万行；3) 多表笛卡尔积式连接导致中间结果集膨胀；4) date_dim表d1和d2之间的日期范围条件(d2.d_date between d1.d_date AND d1.d_date + 90天)形成复杂关联；5) item表的Bitmap Heap Scan占比9.9%。历史案例显示相似SQL通过CTE分解、连接条件下推、过滤条件下推、派生NOT NULL过滤器、聚合下推等规则组合可获得显著优化效果。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将复杂多表连接分解为CTE：先用d1.d_year=2000和d1.d_date_sk过滤date_dim得到有效日期集合，再用d2与d1的日期范围关联(d2.d_date between d1.d_date AND d1.d_date+90天)预先计算有效日期对，避免后续Nested Loop中重复计算日期范围判断"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先连接高选择性维度表（item.i_category IN 3值, household_demographics的hd_income_band_sk BETWEEN 14 AND 20, customer_address.ca_state IN 5值），利用索引idx_item_category、customer_address_pkey、household_demographics_pkey减少中间结果集，再连接事实表store_sales/store_returns/web_sales"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将过滤条件尽早下推到扫描层：1) item表的i_category条件直接应用于Index Scan；2) 将ss_sales_price/ss_list_price BETWEEN 0.38 AND 0.58条件下推到store_sales扫描阶段，利用idx_store_sales_item索引过滤；3) 将hd_buy_potential='0-500'条件下推到household_demographics扫描"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "派生NOT NULL过滤器：从等值连接条件(ss_ticket_number=sr_ticket_number, ss_item_sk=sr_item_sk=ws_item_sk, ss_customer_sk=ws_bill_customer_sk=c_customer_sk等)推导出各连接键NOT NULL条件，提前过滤NULL值行，减少连接时的数据量"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将sr_returned_date_sk=d1.d_date_sk和ws_sold_date_sk=d2.d_date_sk的连接条件与d1.d_year=2000组合，优先利用idx_store_returns_returned_date和idx_web_sales_sold_date索引扫描，避免全表扫描后再过滤"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "评估是否可以将GROUP BY c_customer_sk聚合部分下推：在连接customer表之前先对store_sales按ss_customer_sk预聚合count，减少后续连接的行数（需确保连接条件不影响count正确性）"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "列裁剪：只投影必需列(ss_ticket_number, ss_item_sk, ss_customer_sk, ss_sales_price, ss_list_price从store_sales；sr_ticket_number, sr_item_sk, sr_returned_date_sk从store_returns；ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk从web_sales等)，利用覆盖索引idx_store_sales_cover_q19减少I/O"
+    },
+    {
+      "group": "常量折叠",
+      "produced_suggestion": "预计算常量表达式：将ss_sales_price/ss_list_price BETWEEN 38*0.01 AND 58*0.01简化为BETWEEN 0.38 AND 0.58；将d1.d_date + interval '90' day的计算结果物化到CTE中避免重复计算"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+    "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "FILTER_REDUCE_EXPRESSIONS", "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE", "PROJECT_JOIN_TRANSPOSE", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"],
+    "groups": "子查询优化,连接优化,谓词简化,投影优化,聚合优化",
+    "rule_effect_confidence": {
+        "STRATEGY_CTE_DECOMPOSITION": 0.8,
+        "FILTER_INTO_JOIN": 0.75,
+        "JOIN_CONDITION_PUSH": 0.7,
+        "FILTER_REDUCE_EXPRESSIONS": 0.65,
+        "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.75,
+        "PROJECT_JOIN_TRANSPOSE": 0.7,
+        "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.65
+    },
+    "rule_effect_scores": {
+        "STRATEGY_CTE_DECOMPOSITION": 0.25,
+        "FILTER_INTO_JOIN": 0.2,
+        "JOIN_CONDITION_PUSH": 0.15,
+        "FILTER_REDUCE_EXPRESSIONS": 0.1,
+        "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE": 0.1,
+        "PROJECT_JOIN_TRANSPOSE": 0.1,
+        "AGGREGATE_JOIN_TRANSPOSE_EXTENDED": 0.1
+    }
+}
+✅ 选择了 7 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化,连接优化,谓词简化,投影优化,聚合优化",
+  "applied_rules": [
+    "STRATEGY_CTE_DECOMPOSITION",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "JOIN_DERIVE_IS_NOT_NULL_FILTER_RULE",
+    "PROJECT_JOIN_TRANSPOSE",
+    "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"
+  ],
+  "rewritten_sql": "WITH d1_filtered AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_year = 2000\n    AND d_date_sk IS NOT NULL\n),\nd2_filtered AS (\n  SELECT d2.d_date_sk, d2.d_date\n  FROM date_dim d2\n  INNER JOIN d1_filtered ON d2.d_date BETWEEN d1_filtered.d_date AND (d1_filtered.d_date + INTERVAL '90' day)\n  WHERE d2.d_date_sk IS NOT NULL\n),\nitem_filtered AS (\n  SELECT i_item_sk\n  FROM item\n  WHERE i_category IN ('Jewelry', 'Music', 'Sports')\n    AND i_item_sk IS NOT NULL\n),\ncustomer_address_filtered AS (\n  SELECT ca_address_sk\n  FROM customer_address\n  WHERE ca_state IN ('IA', 'KS', 'MD', 'MO', 'OK')\n    AND ca_address_sk IS NOT NULL\n),\nhousehold_demographics_filtered AS (\n  SELECT hd_demo_sk\n  FROM household_demographics\n  WHERE hd_income_band_sk BETWEEN 14 AND 20\n    AND hd_buy_potential = '0-500'\n    AND hd_demo_sk IS NOT NULL\n),\nstore_sales_filtered AS (\n  SELECT ss_ticket_number, ss_item_sk, ss_customer_sk\n  FROM store_sales\n  WHERE ss_sales_price / ss_list_price BETWEEN 0.38 AND 0.58\n    AND ss_ticket_number IS NOT NULL\n    AND ss_item_sk IS NOT NULL\n    AND ss_customer_sk IS NOT NULL\n),\nstore_returns_filtered AS (\n  SELECT sr_ticket_number, sr_item_sk, sr_returned_date_sk\n  FROM store_returns\n  WHERE sr_ticket_number IS NOT NULL\n    AND sr_item_sk IS NOT NULL\n    AND sr_returned_date_sk IS NOT NULL\n),\nweb_sales_filtered AS (\n  SELECT ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk\n  FROM web_sales\n  WHERE ws_item_sk IS NOT NULL\n    AND ws_bill_customer_sk IS NOT NULL\n    AND ws_sold_date_sk IS NOT NULL\n),\ncustomer_filtered AS (\n  SELECT c_customer_sk, c_first_name, c_last_name, c_current_addr_sk, c_current_hdemo_sk\n  FROM customer\n  WHERE c_customer_sk IS NOT NULL\n    AND c_current_addr_sk IS NOT NULL\n    AND c_current_hdemo_sk IS NOT NULL\n)\nSELECT c.c_customer_sk, c.c_first_name, c.c_last_name, COUNT(*) AS cnt\nFROM store_sales_filtered ss\nINNER JOIN store_returns_filtered sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk\nINNER JOIN item_filtered i ON ss.ss_item_sk = i.i_item_sk\nINNER JOIN d1_filtered d1 ON sr.sr_returned_date_sk = d1.d_date_sk\nINNER JOIN web_sales_filtered ws ON ss.ss_item_sk = ws.ws_item_sk AND ss.ss_customer_sk = ws.ws_bill_customer_sk\nINNER JOIN d2_filtered d2 ON ws.ws_sold_date_sk = d2.d_date_sk\nINNER JOIN customer_filtered c ON ss.ss_customer_sk = c.c_customer_sk\nINNER JOIN customer_address_filtered ca ON c.c_current_addr_sk = ca.ca_address_sk\nINNER JOIN household_demographics_filtered hd ON c.c_current_hdemo_sk = hd.hd_demo_sk\nGROUP BY c.c_customer_sk, c.c_first_name, c.c_last_name\nORDER BY cnt",
+  "semantic_correctness_guarantee": "1. **CTE分解与谓词下推**：将原SQL中各维度表的过滤条件分别提取到8个CTE中（d1_filtered过滤d_year=2000，d2_filtered在d1基础上计算90天日期范围，item_filtered过滤i_category IN 3值，customer_address_filtered过滤ca_state IN 5值，household_demographics_filtered过滤hd_income_band_sk与hd_buy_potential，store_sales_filtered过滤价格比率，store_returns_filtered/web_sales_filtered/customer_filtered仅做列裁剪与NOT NULL过滤）。这些CTE在语义上等价于原SQL的WHERE条件在各表扫描阶段的应用，不改变最终结果集范围。\n\n2. **连接条件与日期范围逻辑**：d2_filtered的CTE通过JOIN d1_filtered实现\"d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '90' day)\"的日期范围约束，与原SQL在WHERE子句中的表达完全等价。主查询中sr.sr_returned_date_sk=d1.d_date_sk与ws.ws_sold_date_sk=d2.d_date_sk的JOIN条件对应原SQL的连接逻辑，结果集不变。\n\n3. **JOIN顺序与等值连接键**：重写SQL保持原SQL所有等值连接条件（ss_ticket_number=sr_ticket_number, ss_item_sk=sr_item_sk=ws_item_sk=i_item_sk, ss_customer_sk=ws_bill_customer_sk=c_customer_sk, c_current_addr_sk=ca_address_sk, c_current_hdemo_sk=hd_demo_sk），仅调整连接顺序为先连接高选择性维度表（item、date_dim、customer_address、household_demographics）再连接事实表。由于所有JOIN为INNER JOIN且基于等值键，连接顺序变化不影响结果集（关系代数的交换律与结合律）。\n\n4. **派生IS NOT NULL过滤器**：为所有等值连接键（ss_ticket_number, ss_item_sk, ss_customer_sk, sr_ticket_number, sr_item_sk, sr_returned_date_sk, ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk, c_customer_sk, c_current_addr_sk, c_current_hdemo_sk, i_item_sk, ca_address_sk, hd_demo_sk, d_date_sk）添加IS NOT NULL过滤。在INNER JOIN语义下，NULL值行本来就会在连接时被自然过滤（NULL=NULL为UNKNOWN，不满足连接条件），显式添加IS NOT NULL不改变结果集，仅提前过滤以优化执行。\n\n5. **常量折叠与列裁剪**：将\"ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 58 * 0.01\"简化为\"BETWEEN 0.38 AND 0.58\"，纯数值计算等价变换。各CTE仅投影后续连接与聚合所需列（如store_sales_filtered仅保留ss_ticket_number/ss_item_sk/ss_customer_sk），投影裁剪不改变JOIN与GROUP BY的结果，仅减少中间数据量。\n\n6. **GROUP BY与聚合函数**：重写SQL的GROUP BY c.c_customer_sk, c.c_first_name, c.c_last_name与原SQL一致，COUNT(*)聚合函数在相同分组键下计数JOIN后的行数，语义完全相同。由于customer表的c_customer_sk为主键，c_first_name与c_last_name在相同c_customer_sk下唯一确定，分组结果与原SQL等价。\n\n7. **ORDER BY子句**：重写SQL保留\"ORDER BY cnt\"，排序逻辑不变，最终输出结果集顺序与原SQL一致。\n\n8. **无易误判风险点**：本查询不涉及OUTER JOIN（无NULL值引入）、HAVING子句、LIMIT、DISTINCT、相关子查询或窗口函数，所有改写均为INNER JOIN场景下的等价变换。CTE物化与连接顺序调整不影响TPC-DS标准语义下的结果集正确性。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过CTE分解、谓词下推、IS NOT NULL过滤器派生和列裁剪等变换，保持了与原始SQL完全相同的JOIN条件、过滤逻辑、分组聚合和排序语义，所有改写均为INNER JOIN场景下的等价变换。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 7->6, Hash/Merge 1->3 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+⚠️ 检测到成本爆炸：重写 cost 增幅 1032.1% (> 1000%)，判定当前重写性能更差，进入下一轮优化。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上一轮采用激进的CTE分解策略导致cost爆炸1032%。当前执行计划显示核心瓶颈是：(1) store_sales全表扫描(91.7%代价)且过滤条件ss_sales_price/ss_list_price无法使用索引；(2) Nested Loop连接导致流水线阻塞(5.6%代价)。需要回退CTE分解，恢复关键过滤条件到主查询，利用已有索引优化连接路径，避免中间结果膨胀。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "回退上一轮的STRATEGY_CTE_DECOMPOSITION，将d1_filtered/d2_filtered/item_filtered等小表CTE内联回主查询，减少物化开销和中间结果集。仅保留必要的store_sales_filtered作为CTE，其余过滤条件直接下推到JOIN-ON子句中。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将store_sales的价格比率过滤条件(ss_sales_price/ss_list_price BETWEEN 0.38 AND 0.58)转换为等价的范围条件(ss_sales_price >= 0.38*ss_list_price AND ss_sales_price <= 0.58*ss_list_price)，避免除法运算导致无法使用索引扫描。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整JOIN顺序：先执行小表过滤(item WHERE i_category IN/date_dim WHERE d_year=2000/customer_address WHERE ca_state IN)与store_sales的INNER JOIN，利用idx_store_sales_item/idx_store_sales_sold_date等索引，再关联store_returns，最后JOIN customer维度表，减少Nested Loop的外层输入规模。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将d2_filtered的日期范围关联(d2.d_date BETWEEN d1.d_date AND d1.d_date+90天)简化为d_date_sk的范围条件，若d_year=2000对应的d_date_sk范围已知(如2000年对应450000-450364)，则直接用ws.ws_sold_date_sk BETWEEN 450000 AND 450454避免子查询。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用store_sales_pkey(ss_item_sk, ss_ticket_number)和store_returns_pkey(sr_item_sk, sr_ticket_number)的复合主键，确保JOIN条件ss.ss_ticket_number=sr.sr_ticket_number AND ss.ss_item_sk=sr.sr_item_sk使用索引Merge Join或Hash Join，避免当前的Nested Loop阻塞。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "在store_sales/web_sales/store_returns的CTE或内联子查询中仅投影必需的JOIN列和过滤列(ss_ticket_number/ss_item_sk/ss_customer_sk/ws_item_sk/ws_bill_customer_sk/ws_sold_date_sk)，裁剪不必要的列减少IO和内存开销。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "applied_rules": ["PROJECT_MERGE", "PROJECT_REMOVE", "PROJECT_FILTER_TRANSPOSE", "FILTER_TABLE_FUNCTION_TRANSPOSE", "PROJECT_FILTER_VALUES_MERGE", "PROJECT_SUB_QUERY_TO_CORRELATE", "PROJECT_CORRELATE_TRANSPOSE", "FILTER_CORRELATE", "AGGREGATE_PROJECT_MERGE", "AGGREGATE_REMOVE", "SORT_REMOVE"],
+  "groups": "投影优化, 常量折叠",
+  "rule_effect_confidence": {
+    "PROJECT_MERGE": 0.75,
+    "PROJECT_REMOVE": 0.80,
+    "PROJECT_FILTER_TRANSPOSE": 0.70,
+    "FILTER_TABLE_FUNCTION_TRANSPOSE": 0.65,
+    "PROJECT_FILTER_VALUES_MERGE": 0.60,
+    "PROJECT_SUB_QUERY_TO_CORRELATE": 0.55,
+    "PROJECT_CORRELATE_TRANSPOSE": 0.50,
+    "FILTER_CORRELATE": 0.45,
+    "AGGREGATE_PROJECT_MERGE": 0.40,
+    "AGGREGATE_REMOVE": 0.35,
+    "SORT_REMOVE": 0.30
+  },
+  "rule_effect_scores": {
+    "PROJECT_MERGE": 0.2,
+    "PROJECT_REMOVE": 0.15,
+    "PROJECT_FILTER_TRANSPOSE": 0.15,
+    "FILTER_TABLE_FUNCTION_TRANSPOSE": 0.1,
+    "PROJECT_FILTER_VALUES_MERGE": 0.1,
+    "PROJECT_SUB_QUERY_TO_CORRELATE": 0.1,
+    "PROJECT_CORRELATE_TRANSPOSE": 0.05,
+    "FILTER_CORRELATE": 0.05,
+    "AGGREGATE_PROJECT_MERGE": 0.05,
+    "AGGREGATE_REMOVE": 0.05,
+    "SORT_REMOVE": 0.05
+  }
+}
+✅ 选择了 11 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "投影优化, 常量折叠",
+  "applied_rules": [
+    "PROJECT_MERGE",
+    "PROJECT_REMOVE",
+    "PROJECT_FILTER_TRANSPOSE",
+    "FILTER_TABLE_FUNCTION_TRANSPOSE",
+    "PROJECT_FILTER_VALUES_MERGE",
+    "PROJECT_SUB_QUERY_TO_CORRELATE",
+    "PROJECT_CORRELATE_TRANSPOSE",
+    "FILTER_CORRELATE",
+    "AGGREGATE_PROJECT_MERGE",
+    "AGGREGATE_REMOVE",
+    "SORT_REMOVE"
+  ],
+  "rewritten_sql": "SELECT c.c_customer_sk, c.c_first_name, c.c_last_name, COUNT(*) AS cnt\nFROM store_sales ss\nINNER JOIN store_returns sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk\nINNER JOIN item i ON ss.ss_item_sk = i.i_item_sk\nINNER JOIN date_dim d1 ON sr.sr_returned_date_sk = d1.d_date_sk\nINNER JOIN web_sales ws ON ss.ss_item_sk = ws.ws_item_sk AND ss.ss_customer_sk = ws.ws_bill_customer_sk\nINNER JOIN date_dim d2 ON ws.ws_sold_date_sk = d2.d_date_sk\nINNER JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk\nINNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\nINNER JOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk\nWHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 0.38 AND 0.58\n  AND i.i_category IN ('Jewelry', 'Music', 'Sports')\n  AND d1.d_year = 2000\n  AND d2.d_date BETWEEN (SELECT MIN(d_date) FROM date_dim WHERE d_year = 2000) \n                    AND (SELECT MAX(d_date) FROM date_dim WHERE d_year = 2000) + INTERVAL '90' day\n  AND ca.ca_state IN ('IA', 'KS', 'MD', 'MO', 'OK')\n  AND hd.hd_income_band_sk BETWEEN 14 AND 20\n  AND hd.hd_buy_potential = '0-500'\nGROUP BY c.c_customer_sk, c.c_first_name, c.c_last_name\nORDER BY cnt",
+  "semantic_correctness_guarantee": "1. **CTE内联（PROJECT_MERGE/PROJECT_REMOVE）**：将所有过滤型CTE（d1_filtered/d2_filtered/item_filtered/customer_address_filtered/household_demographics_filtered/store_sales_filtered/store_returns_filtered/web_sales_filtered/customer_filtered）内联到主查询的JOIN链中，将CTE中的SELECT投影列直接合并到JOIN对应表上，消除冗余的中间物化层。原CTE仅做简单过滤+投影主键/JOIN键，内联后通过WHERE子句与JOIN-ON条件表达相同过滤逻辑，不改变结果集范围。\n\n2. **过滤条件下推（PROJECT_FILTER_TRANSPOSE/FILTER_CORRELATE）**：将原CTE中的过滤条件（如i_category IN/ca_state IN/d_year=2000/hd_income_band_sk BETWEEN/hd_buy_potential等）下推到主查询WHERE子句，利用PostgreSQL查询优化器在JOIN前对各表应用索引扫描（如idx_item_category/idx_date_dim_year_moy/idx_store_sales_item等），减少JOIN输入行数。所有谓词均为原CTE中等价条件的直接迁移，未改变过滤语义。\n\n3. **d2日期范围相关子查询简化（FILTER_CORRELATE）**：原d2_filtered通过INNER JOIN d1_filtered的d_date范围（d_date到d_date+90天）生成d2候选集。重写后将其等价改写为d2.d_date BETWEEN (2000年最小日期) AND (2000年最大日期+90天)的标量子查询，避免JOIN date_dim两次。由于d1.d_year=2000确定了d1.d_date的范围，d2的日期窗口完全由d1.d_year=2000派生，两种表达在TPC-DS Schema下等价（date_dim.d_date与d_year存在函数依赖）。\n\n4. **IS NOT NULL过滤合并（FILTER_REDUCE_EXPRESSIONS）**：原CTE中对所有JOIN键的IS NOT NULL检查（如ss_ticket_number IS NOT NULL/sr_returned_date_sk IS NOT NULL等）在重写后通过INNER JOIN的隐式NOT NULL语义自动保证。PostgreSQL的INNER JOIN会自动过滤JOIN键为NULL的行，无需显式WHERE子句重复声明，结果集完全一致。\n\n5. **聚合与投影保持（AGGREGATE_PROJECT_MERGE/AGGREGATE_REMOVE未实际触发改写）**：GROUP BY c.c_customer_sk, c.c_first_name, c.c_last_name与COUNT(*)聚合逻辑完全保留，未做结构性改变。由于customer表的c_customer_sk为主键，按主键+非键列分组与按主键分组+投影非键列等价（customer表保证每个c_customer_sk对应唯一的c_first_name/c_last_name），聚合结果集与原查询一致。\n\n6. **ORDER BY保持（SORT_REMOVE未触发）**：ORDER BY cnt保持不变，确保输出排序与原查询相同。\n\n7. **JOIN链路径与过滤顺序等价性**：重写前后的JOIN链拓扑结构一致（store_sales → store_returns → item → date_dim(d1) → web_sales → date_dim(d2) → customer → customer_address → household_demographics），所有INNER JOIN条件（ss.ss_ticket_number=sr.sr_ticket_number AND ss.ss_item_sk=sr.sr_item_sk等）与原CTE的JOIN-ON子句完全对应。由于所有JOIN均为INNER JOIN，过滤条件的执行顺序（CTE提前过滤 vs WHERE子句过滤）不影响最终结果集的行与列内容，仅影响中间执行计划（优化器可自由选择过滤时机）。\n\n8. **无相关子查询/HAVING/LIMIT易误判点**：查询不含相关子查询的相关列引用（d2日期范围子查询为标量非相关），无HAVING子句（聚合后无二次过滤），无LIMIT（全量输出），重写未引入可能改变行数或NULL处理的逻辑分支。所有改写均为投影消除、过滤下推与CTE内联的标准等价变换。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": false,
+    "message": "d2日期范围谓词不等价:原SQL要求d2.d_date在d1.d_date与d1.d_date+90天之间,重写SQL改为d2.d_date在2000年全年最小日期与最大日期+90天之间,后者范围可能更宽导致多匹配web_sales行。",
+    "differences": [
+        {
+            "type": "过滤条件语义变化",
+            "description": "原SQL d2.d_date范围由每行d1.d_date动态确定(逐行关联),重写为静态全局范围(2000年最小日期到最大日期+90天),当d1表有多个不同d_date时两者结果集不同。",
+            "location": "WHERE子句中d2.d_date的BETWEEN条件与原FROM子句中d1/d2的JOIN关联"
+        }
+    ]
+}
+```
+❌ 语义不等价: d2日期范围谓词不等价:原SQL要求d2.d_date在d1.d_date与d1.d_date+90天之间,重写SQL改为d2.d_date在2000年全年最小日期与最大日期+90天之间,后者范围可能更宽导致多匹配web_sales行。
+```json
+{
+  "fixed_sql": "SELECT c.c_customer_sk, c.c_first_name, c.c_last_name, COUNT(*) AS cnt FROM store_sales ss INNER JOIN store_returns sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk INNER JOIN item i ON ss.ss_item_sk = i.i_item_sk INNER JOIN date_dim d1 ON sr.sr_returned_date_sk = d1.d_date_sk INNER JOIN web_sales ws ON ss.ss_item_sk = ws.ws_item_sk AND ss.ss_customer_sk = ws.ws_bill_customer_sk INNER JOIN date_dim d2 ON ws.ws_sold_date_sk = d2.d_date_sk AND d2.d_date BETWEEN d1.d_date AND d1.d_date + INTERVAL '90' day INNER JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk WHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 0.38 AND 0.58 AND i.i_category IN ('Jewelry', 'Music', 'Sports') AND d1.d_year = 2000 AND ca.ca_state IN ('IA', 'KS', 'MD', 'MO', 'OK') AND hd.hd_income_band_sk BETWEEN 14 AND 20 AND hd.hd_buy_potential = '0-500' GROUP BY c.c_customer_sk, c.c_first_name, c.c_last_name ORDER BY cnt",
+  "note": "将d2.d_date的静态全局BETWEEN条件移至d2 JOIN条件中，改为逐行关联d1.d_date动态范围，恢复原SQL语义"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已将d2日期范围谓词改为d2.d_date BETWEEN d1.d_date AND d1.d_date+90天,与原SQL的逐行关联语义等价,消除了上轮全局范围问题。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全一致，无结构性变化。重写仅将隐式JOIN改为显式INNER JOIN语法，并添加表别名，未改变优化器选择的执行路径。两者均采用相同的Nested Loop嵌套、索引扫描、位图扫描、Hash Join组合，连接顺序、过滤下推、并行度(Workers Planned=2)完全相同。costs几乎无差异(72534.59 vs 72536.02，仅+0.002%)，行数估计求和相同(52464)。SQL逻辑层面的改进(显式JOIN语法、别名规范化、常量折叠38*0.01→0.38)对执行计划无实质影响。已应用投影优化和常量折叠规则,但结构未再突破,且原计划已高度优化(索引扫描为主、过滤下推充分、并行执行)。继续微调空间极小,可终止。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 811
+   - 规则序列: ['PROJECT_MERGE', 'PROJECT_REMOVE', 'PROJECT_FILTER_TRANSPOSE', 'FILTER_TABLE_FUNCTION_TRANSPOSE', 'PROJECT_FILTER_VALUES_MERGE', 'PROJECT_SUB_QUERY_TO_CORRELATE', 'PROJECT_CORRELATE_TRANSPOSE', 'FILTER_CORRELATE', 'AGGREGATE_PROJECT_MERGE', 'AGGREGATE_REMOVE', 'SORT_REMOVE']
+   - 优化组别: 投影优化, 常量折叠
+   - 估计代价: 原始=72534.59, 重写=72536.02，相对变化: -0.00%
+✅ 成功存储，记录ID: a330cff0-db86-4917-ae15-fd68cafdc964
+
+🎲 UCT Math Update: 11 rules, reward=-0.0000 (cost=-0.0000, rows=+0.0000, depth=+0.0000, oc=72534.5900, rc=72536.0200)
+   结构分细节: rows 52464.0->52464.0 (score=+0.000), depth 14.0->14.0 (score=+0.000)
+✅ UCT Update Complete:
+   → PROJECT_MERGE: P(s,a)=N/A, effect=0.190, conf=0.75, lambda=0.38, reward=-0.000, count=7, avg=+0.014
+   → PROJECT_REMOVE: P(s,a)=N/A, effect=0.143, conf=0.80, lambda=0.40, reward=-0.000, count=44, avg=+0.007
+   → PROJECT_FILTER_TRANSPOSE: P(s,a)=N/A, effect=0.143, conf=0.70, lambda=0.35, reward=-0.000, count=2, avg=+0.002
+   → FILTER_TABLE_FUNCTION_TRANSPOSE: P(s,a)=N/A, effect=0.095, conf=0.65, lambda=0.33, reward=-0.000, count=1, avg=-0.000
+   → PROJECT_FILTER_VALUES_MERGE: P(s,a)=N/A, effect=0.095, conf=0.60, lambda=0.30, reward=-0.000, count=1, avg=-0.000
+   → PROJECT_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=0.095, conf=0.55, lambda=0.28, reward=-0.000, count=1, avg=-0.000
+   → PROJECT_CORRELATE_TRANSPOSE: P(s,a)=N/A, effect=0.048, conf=0.50, lambda=0.25, reward=-0.000, count=1, avg=-0.000
+   → FILTER_CORRELATE: P(s,a)=N/A, effect=0.048, conf=0.45, lambda=0.23, reward=-0.000, count=8, avg=+0.012
+   → AGGREGATE_PROJECT_MERGE: P(s,a)=N/A, effect=0.048, conf=0.40, lambda=0.20, reward=-0.000, count=2, avg=-0.003
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=0.048, conf=0.35, lambda=0.17, reward=-0.000, count=10, avg=-0.024
+   → SORT_REMOVE: P(s,a)=N/A, effect=0.048, conf=0.30, lambda=0.15, reward=-0.000, count=15, avg=+0.011
+
+----------------------------------------
+

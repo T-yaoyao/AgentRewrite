@@ -1,0 +1,167 @@
+Query ID: 66
+==================================================
+
+Original: with inv as (select w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy        ,stdev,mean, case mean when 0 then null else stdev/mean end cov  from(select w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy             ,stddev_samp(inv_quantity_on_hand) stdev,avg(inv_quantity_on_hand) mean       from inventory           ,item           ,warehouse           ,date_dim       where inv_item_sk = i_item_sk         and inv_warehouse_sk = w_warehouse_sk         and inv_date_sk = d_date_sk         and d_year =2000         and i_category IN ('Books', 'Men')         and i_manager_id BETWEEN 81 and 100         and inv_quantity_on_hand between 376 and 576       group by w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy) foo  where case mean when 0 then 0 else stdev/mean end > 1) select inv1.w_warehouse_sk,inv1.i_item_sk,inv1.d_moy,inv1.mean, inv1.cov         ,inv2.w_warehouse_sk,inv2.i_item_sk,inv2.d_moy,inv2.mean, inv2.cov from inv inv1,inv inv2 where inv1.i_item_sk = inv2.i_item_sk   and inv1.w_warehouse_sk =  inv2.w_warehouse_sk   and inv1.d_moy=1   and inv2.d_moy=1+1   and inv1.cov > 1.5 order by inv1.w_warehouse_sk,inv1.i_item_sk,inv1.d_moy,inv1.mean,inv1.cov         ,inv2.d_moy,inv2.mean, inv2.cov ;
+Rewritten: WITH inv AS (
+  SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean,
+         CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END AS cov
+  FROM (
+    SELECT w.w_warehouse_name, w.w_warehouse_sk, i.i_item_sk, d.d_moy,
+           STDDEV_SAMP(inv.inv_quantity_on_hand) AS stdev,
+           AVG(inv.inv_quantity_on_hand) AS mean
+    FROM inventory inv
+    JOIN (
+      SELECT i_item_sk
+      FROM item
+      WHERE i_category IN ('Books', 'Men')
+        AND i_manager_id BETWEEN 81 AND 100
+    ) i ON inv.inv_item_sk = i.i_item_sk
+    JOIN warehouse w ON inv.inv_warehouse_sk = w.w_warehouse_sk
+    JOIN (
+      SELECT d_date_sk, d_moy
+      FROM date_dim
+      WHERE d_year = 2000
+    ) d ON inv.inv_date_sk = d.d_date_sk
+    WHERE inv.inv_quantity_on_hand BETWEEN 376 AND 576
+    GROUP BY w.w_warehouse_name, w.w_warehouse_sk, i.i_item_sk, d.d_moy
+  ) foo
+  WHERE mean <> 0 AND stdev/mean > 1
+)
+SELECT inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,
+       inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov
+FROM inv inv1
+JOIN inv inv2 ON inv1.i_item_sk = inv2.i_item_sk
+                AND inv1.w_warehouse_sk = inv2.w_warehouse_sk
+WHERE inv1.d_moy = 1
+  AND inv2.d_moy = 2
+  AND inv1.cov > 1.5
+ORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,
+         inv2.d_moy, inv2.mean, inv2.cov
+Time Cost: 207.30s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': '将CTE中的子查询结果按d_moy分组后物化，避免重复计算。考虑将inv CTE拆分为两个独立的子查询(d_moy=1和d_moy=2)，减少数据扫描量，因为自连接时只需要特定月份的数据。'}, {'group': '谓词简化', 'produced_suggestion': '将inv1.d_moy=1和inv2.d_moy=2的过滤条件下推到CTE定义中，在GROUP BY之前就过滤掉不需要的月份数据，大幅减少聚合计算量和中间结果集。同时简化WHERE条件中的CASE表达式判断逻辑。'}, {'group': '常量折叠', 'produced_suggestion': "预计算常量表达式：将'1+1'替换为常量2；将CASE mean WHEN 0表达式简化为直接的mean<>0判断配合stdev/mean>1的条件合并。"}, {'group': '连接优化', 'produced_suggestion': '优化多表连接顺序：先执行date_dim和item的过滤(d_year=2000, i_category, i_manager_id)得到小结果集，再与warehouse连接，最后才与大表inventory连接，利用索引inventory_pkey(inv_date_sk, inv_item_sk, inv_warehouse_sk)。'}, {'group': '聚合优化', 'produced_suggestion': '在GROUP BY中添加d_moy的早期过滤，只对d_moy IN (1,2)的数据进行聚合计算，避免对所有月份数据做stddev_samp和avg计算后再过滤。'}, {'group': '投影优化', 'produced_suggestion': '消除CTE中不必要的列投影，只保留最终SELECT和WHERE/JOIN条件中实际使用的列(w_warehouse_sk, i_item_sk, d_moy, mean, cov)，减少中间结果集大小。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示inventory表的全表扫描(Seq Scan)代价占比高达98.1%，是主要性能瓶颈。历史案例表明相似SQL通过CTE分解、谓词下推、连接优化等方式可提升性能。当前SQL存在多处可优化点：(1)CTE inv被自连接使用，可通过物化或分解优化；(2)WHERE子句中的过滤条件可以更早应用；(3)常量表达式(d_moy=1和d_moy=1+1)可预计算；(4)自连接条件inv1.d_moy=1和inv2.d_moy=2是常量，可提前过滤；(5)CASE表达式在CTE和外层WHERE中重复计算。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将CTE中的子查询结果按d_moy分组后物化，避免重复计算。考虑将inv CTE拆分为两个独立的子查询(d_moy=1和d_moy=2)，减少数据扫描量，因为自连接时只需要特定月份的数据。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将inv1.d_moy=1和inv2.d_moy=2的过滤条件下推到CTE定义中，在GROUP BY之前就过滤掉不需要的月份数据，大幅减少聚合计算量和中间结果集。同时简化WHERE条件中的CASE表达式判断逻辑。"
+    },
+    {
+      "group": "常量折叠",
+      "produced_suggestion": "预计算常量表达式：将'1+1'替换为常量2；将CASE mean WHEN 0表达式简化为直接的mean<>0判断配合stdev/mean>1的条件合并。"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "优化多表连接顺序：先执行date_dim和item的过滤(d_year=2000, i_category, i_manager_id)得到小结果集，再与warehouse连接，最后才与大表inventory连接，利用索引inventory_pkey(inv_date_sk, inv_item_sk, inv_warehouse_sk)。"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "在GROUP BY中添加d_moy的早期过滤，只对d_moy IN (1,2)的数据进行聚合计算，避免对所有月份数据做stddev_samp和avg计算后再过滤。"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "消除CTE中不必要的列投影，只保留最终SELECT和WHERE/JOIN条件中实际使用的列(w_warehouse_sk, i_item_sk, d_moy, mean, cov)，减少中间结果集大小。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+    "applied_rules":["FILTER_INTO_JOIN","PROJECT_MERGE"],
+    "groups":"谓词简化，投影优化",
+    "rule_effect_confidence": {
+        "FILTER_INTO_JOIN": 0.92,
+		"PROJECT_MERGE": 0.25
+    },
+    "rule_effect_scores": {
+        "FILTER_INTO_JOIN": 0.92,
+		"PROJECT_MERGE": 0.08
+    }
+}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化，投影优化",
+  "applied_rules": ["FILTER_INTO_JOIN", "PROJECT_MERGE"],
+  "rewritten_sql": "WITH inv AS (\n  SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean,\n         CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END AS cov\n  FROM (\n    SELECT w.w_warehouse_name, w.w_warehouse_sk, i.i_item_sk, d.d_moy,\n           STDDEV_SAMP(inv.inv_quantity_on_hand) AS stdev,\n           AVG(inv.inv_quantity_on_hand) AS mean\n    FROM inventory inv\n    JOIN (\n      SELECT i_item_sk\n      FROM item\n      WHERE i_category IN ('Books', 'Men')\n        AND i_manager_id BETWEEN 81 AND 100\n    ) i ON inv.inv_item_sk = i.i_item_sk\n    JOIN warehouse w ON inv.inv_warehouse_sk = w.w_warehouse_sk\n    JOIN (\n      SELECT d_date_sk, d_moy\n      FROM date_dim\n      WHERE d_year = 2000\n        AND d_moy IN (1, 2)\n    ) d ON inv.inv_date_sk = d.d_date_sk\n    WHERE inv.inv_quantity_on_hand BETWEEN 376 AND 576\n    GROUP BY w.w_warehouse_name, w.w_warehouse_sk, i.i_item_sk, d.d_moy\n  ) foo\n  WHERE mean <> 0 AND stdev/mean > 1\n)\nSELECT inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,\n       inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov\nFROM inv inv1\nJOIN inv inv2 ON inv1.i_item_sk = inv2.i_item_sk\n                AND inv1.w_warehouse_sk = inv2.w_warehouse_sk\nWHERE inv1.d_moy = 1\n  AND inv2.d_moy = 2\n  AND inv1.cov > 1.5\nORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,\n         inv2.d_moy, inv2.mean, inv2.cov",
+  "semantic_correctness_guarantee": "1. **FILTER_INTO_JOIN 应用**：将原 SQL 中四表隐式 JOIN（通过 WHERE 连接）改写为显式 INNER JOIN，并将只依赖单表的过滤条件下推到各表的子查询中。具体：item 表的 i_category 和 i_manager_id 条件下推到 item 子查询；date_dim 表的 d_year=2000 和新增的 d_moy IN (1,2) 条件下推到 date_dim 子查询；warehouse 保持原样；inventory 的 inv_quantity_on_hand 条件保留在主 JOIN 的 WHERE 中。这些下推操作在 INNER JOIN 语义下等价，因为 WHERE 条件对结果集的过滤效果与子查询内过滤后再 JOIN 相同。\n\n2. **d_moy 条件提前过滤**：原 SQL 对所有月份数据进行 GROUP BY 聚合后，在外层 inv1.d_moy=1 和 inv2.d_moy=2 处过滤。重写 SQL 在 date_dim 子查询中直接限定 d_moy IN (1,2)，只对这两个月份的数据做聚合。由于 GROUP BY 包含 d_moy，且最终只使用 d_moy=1 和 d_moy=2 的行，提前过滤不会丢失或增加结果行，与原 SQL 等价。\n\n3. **CASE 表达式简化（常量折叠与谓词简化）**：原 SQL 在 inv CTE 定义的 WHERE 中使用 'CASE mean WHEN 0 THEN 0 ELSE stdev/mean END > 1'。重写为 'mean <> 0 AND stdev/mean > 1'。当 mean=0 时，原 CASE 返回 0，0>1 为 false；重写中 mean<>0 为 false，整体为 false。当 mean<>0 时，原 CASE 返回 stdev/mean，条件等价于 stdev/mean>1；重写中两条件均需满足，结果相同。因此两种写法在所有情况下逻辑等价。\n\n4. **inv2.d_moy=1+1 常量折叠**：原 SQL 使用 'inv2.d_moy=1+1'，重写为 'inv2.d_moy=2'，这是直接的常量计算，语义完全等价。\n\n5. **PROJECT_MERGE（投影合并）**：原 SQL 在 inv CTE 内部嵌套子查询 foo，外层从 foo 中 SELECT 并计算 cov。重写 SQL 将 cov 的计算保留在同一层，但由于 CTE 定义本身就是一层投影，实际未引入额外嵌套。外层主 SELECT 直接引用 inv 的列，无需再投影。这一合并不改变最终输出列集和计算逻辑。\n\n6. **JOIN 顺序与等价性**：原 SQL 使用逗号分隔的四表隐式 CROSS JOIN + WHERE 过滤，重写为显式 INNER JOIN。在有 ON 条件和 WHERE 过滤的情况下，INNER JOIN 与隐式 JOIN + WHERE 在结果集上完全等价。JOIN 顺序的改变（先 item、warehouse、date_dim 再 inventory）不影响结果集内容，只影响执行计划。\n\n7. **主键与 GROUP BY 保证**：inventory 表主键为 (inv_date_sk, inv_item_sk, inv_warehouse_sk)，GROUP BY 包含 w_warehouse_sk (对应 inv_warehouse_sk)、i_item_sk (对应 inv_item_sk)、d_moy (由 d_date_sk 通过 date_dim 确定)。虽然 GROUP BY 未直接包含 inv_date_sk，但 d_moy 与 d_date_sk 在 date_dim 中一对多关系（同一 d_moy 对应多个 d_date_sk），聚合计算 STDDEV_SAMP 和 AVG 是对同一 warehouse、item、moy 下所有 date 的 inv_quantity_on_hand 进行统计，这与原 SQL 的 GROUP BY 逻辑一致。\n\n8. **NULL 处理与 cov 计算**：原 SQL 在 cov 定义中使用 'CASE mean WHEN 0 THEN null ELSE stdev/mean END'。重写 SQL 保留相同逻辑。当 mean=0 时返回 NULL，当 mean<>0 时返回 stdev/mean。由于 WHERE 条件已过滤掉 mean=0 的情况（通过 mean<>0），进入 inv CTE 的所有行 mean 均非 0，cov 计算结果与原 SQL 一致。外层 inv1.cov>1.5 条件在两 SQL 中作用于相同的数据集。\n\n9. **最终 SELECT 与 ORDER BY**：外层主查询从 inv 自连接中 SELECT 指定列并按相同顺序 ORDER BY。由于 inv CTE 的定义在两 SQL 中等价（仅实现方式不同，结果集相同），且 JOIN 条件、WHERE 条件、ORDER BY 子句均未改变，最终输出的结果集在行内容、列顺序、排序顺序上与原 SQL 完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": false,
+    "message": "原 SQL 对所有 d_moy 值聚合后过滤 d_moy IN (1,2)；重写 SQL 在聚合前就限定 d_moy IN (1,2)，导致 STDDEV_SAMP 和 AVG 的计算基数不同，聚合结果会改变。",
+    "differences": [
+        {
+            "type": "aggregation_scope",
+            "description": "原 SQL 对全年数据（所有 d_moy）计算 STDDEV_SAMP 和 AVG，重写 SQL 仅对 d_moy IN (1,2) 的数据计算聚合，统计范围缩小改变了聚合值",
+            "location": "inv CTE 的 GROUP BY 聚合层"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原 SQL 对所有 d_moy 值聚合后过滤 d_moy IN (1,2)；重写 SQL 在聚合前就限定 d_moy IN (1,2)，导致 STDDEV_SAMP 和 AVG 的计算基数不同，聚合结果会改变。
+```json
+{
+  "fixed_sql": "WITH inv AS (\n  SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean,\n         CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END AS cov\n  FROM (\n    SELECT w.w_warehouse_name, w.w_warehouse_sk, i.i_item_sk, d.d_moy,\n           STDDEV_SAMP(inv.inv_quantity_on_hand) AS stdev,\n           AVG(inv.inv_quantity_on_hand) AS mean\n    FROM inventory inv\n    JOIN (\n      SELECT i_item_sk\n      FROM item\n      WHERE i_category IN ('Books', 'Men')\n        AND i_manager_id BETWEEN 81 AND 100\n    ) i ON inv.inv_item_sk = i.i_item_sk\n    JOIN warehouse w ON inv.inv_warehouse_sk = w.w_warehouse_sk\n    JOIN (\n      SELECT d_date_sk, d_moy\n      FROM date_dim\n      WHERE d_year = 2000\n    ) d ON inv.inv_date_sk = d.d_date_sk\n    WHERE inv.inv_quantity_on_hand BETWEEN 376 AND 576\n    GROUP BY w.w_warehouse_name, w.w_warehouse_sk, i.i_item_sk, d.d_moy\n  ) foo\n  WHERE mean <> 0 AND stdev/mean > 1\n)\nSELECT inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,\n       inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov\nFROM inv inv1\nJOIN inv inv2 ON inv1.i_item_sk = inv2.i_item_sk\n                AND inv1.w_warehouse_sk = inv2.w_warehouse_sk\nWHERE inv1.d_moy = 1\n  AND inv2.d_moy = 2\n  AND inv1.cov > 1.5\nORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,\n         inv2.d_moy, inv2.mean, inv2.cov",
+  "note": "移除 date_dim 子查询中的 'd_moy IN (1, 2)' 过滤条件，恢复对全年数据的聚合计算，使聚合范围与原 SQL 一致"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写 SQL 已移除 date_dim 子查询中的 d_moy IN (1,2) 限制，恢复对全年数据聚合，与原始 SQL 的聚合范围一致；其余改写（显式 JOIN、条件下推、CASE 简化）均为等价变换。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划结构完全一致，仅发生微小代价优化（总cost从1582203.43降至1582203.17，降幅0.00016%）。节点类型、扫描方式、连接算法、排序策略、并行度均无变化；行数估计求和从6934116降至6934106（降幅0.00014%），几乎可忽略。重写仅改进WHERE子句中CASE表达式的判断逻辑（从'CASE mean WHEN 0 THEN 0 ELSE stdev/mean END > 1'优化为'mean<>0 AND stdev/mean>1'），以及显式化JOIN语法和子查询别名，属于语义等价的SQL逻辑优化，未触发执行计划层面的结构性改进。由于本轮优化已达收益上限（结构不变+成本微降），继续重写已无明显改进空间。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 1008
+   - 规则序列: ['FILTER_INTO_JOIN', 'PROJECT_MERGE']
+   - 优化组别: 谓词简化，投影优化
+   - 估计代价: 原始=1582203.43, 重写=1582203.17，相对变化: 0.00%
+✅ 成功存储，记录ID: c248b5c4-4903-4cc1-b412-3a9c757b83ab
+
+🎲 UCT Math Update: 2 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1582203.4300, rc=1582203.1700)
+   结构分细节: rows 6934116.0->6934106.0 (score=+0.000), depth 11.0->11.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.920, conf=0.92, lambda=0.46, reward=+0.000, count=152, avg=+0.002
+   → PROJECT_MERGE: P(s,a)=N/A, effect=0.080, conf=0.25, lambda=0.12, reward=+0.000, count=2, avg=+0.022
+
+----------------------------------------
+

@@ -1,0 +1,220 @@
+Query ID: 132
+==================================================
+
+Original: select           cc_call_center_id Call_Center,         cc_name Call_Center_Name,         cc_manager Manager,         sum(cr_net_loss) Returns_Loss from         call_center,         catalog_returns,         date_dim,         customer,         customer_address,         customer_demographics,         household_demographics where         cr_call_center_sk       = cc_call_center_sk and     cr_returned_date_sk     = d_date_sk and     cr_returning_customer_sk= c_customer_sk and     cd_demo_sk              = c_current_cdemo_sk and     hd_demo_sk              = c_current_hdemo_sk and     ca_address_sk           = c_current_addr_sk and     d_year                  = 1999  and     d_moy                   = 3 and     ( (cd_marital_status       = 'M' and cd_education_status     = 'Unknown')         or(cd_marital_status       = 'W' and cd_education_status     = 'Advanced Degree')) and     hd_buy_potential like '>10000%' and     ca_gmt_offset           = -7 group by cc_call_center_id,cc_name,cc_manager,cd_marital_status,cd_education_status order by sum(cr_net_loss) desc;
+Rewritten: select           cc_call_center_id Call_Center,         cc_name Call_Center_Name,         cc_manager Manager,         sum(cr_net_loss) Returns_Loss from         call_center,         catalog_returns,         date_dim,         customer,         customer_address,         customer_demographics,         household_demographics where         cr_call_center_sk       = cc_call_center_sk and     cr_returned_date_sk     = d_date_sk and     cr_returning_customer_sk= c_customer_sk and     cd_demo_sk              = c_current_cdemo_sk and     hd_demo_sk              = c_current_hdemo_sk and     ca_address_sk           = c_current_addr_sk and     d_year                  = 1999  and     d_moy                   = 3 and     ( (cd_marital_status       = 'M' and cd_education_status     = 'Unknown')         or(cd_marital_status       = 'W' and cd_education_status     = 'Advanced Degree')) and     hd_buy_potential like '>10000%' and     ca_gmt_offset           = -7 group by cc_call_center_id,cc_name,cc_manager,cd_marital_status,cd_education_status order by sum(cr_net_loss) desc;
+Time Cost: 551.84s
+Suggestion: [{'group': '连接优化', 'produced_suggestion': '将连接顺序调整为call_center(24行)→catalog_returns→date_dim，避免当前date_dim早期驱动导致的82.3%代价Nested Loop。使用STRAIGHT_JOIN提示或子查询强制优化器先执行call_center与catalog_returns的Hash Join，再通过idx_catalog_returns_returned_date索引与date_dim过滤结果连接，减少循环次数'}, {'group': '子查询优化', 'produced_suggestion': '将customer与customer_demographics、household_demographics、customer_address的连接改为EXISTS半连接形式（WHERE EXISTS (SELECT 1 FROM customer_demographics cd WHERE c_current_cdemo_sk=cd.cd_demo_sk AND ...)），强制优化器在catalog_returns连接前完成customer的高选择性过滤，避免将3个维度表的全量数据传递到主连接路径'}, {'group': '谓词简化', 'produced_suggestion': "将customer_demographics的OR条件(cd_marital_status='M' AND cd_education_status='Unknown') OR (cd_marital_status='W' AND cd_education_status='Advanced Degree')改写为IN谓词或UNION ALL两个独立分支，帮助优化器更精准估算选择性并可能使用索引（若存在复合索引）"}, {'group': '谓词简化', 'produced_suggestion': "对household_demographics的LIKE条件hd_buy_potential LIKE '>10000%'改为等值或范围条件（如hd_buy_potential >= '>10000'），避免当前3.0%代价的全表扫描，若hd_buy_potential为枚举值可改为IN列表"}, {'group': '投影优化', 'produced_suggestion': 'GROUP BY中包含cd_marital_status和cd_education_status但SELECT中未显式投影，检查是否为冗余分组列。若业务不需要按这两列分组，删除它们可减少Hash Aggregate的内存消耗和排序代价'}, {'group': '保护机制', 'produced_suggestion': '写入防护触发：重写 cost 增幅 1560.3% 超过 1000%，输出已回退到原始 SQL。'}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示存在严重性能瓶颈：1) 最大瓶颈是date_dim与catalog_returns的Nested Loop连接(代价占比82.3%)，使用索引扫描但循环次数过多(73049次)；2) date_dim与customer、customer_address的Nested Loop连接也消耗较高(8.7%+1.4%)；3) household_demographics使用全表扫描(3.0%)。当前连接顺序导致date_dim(73049行)作为外表驱动多个大表连接，可通过调整连接顺序、下推过滤条件、优化连接方式来显著降低循环次数和中间结果集大小。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：当前date_dim(73049行)作为驱动表与catalog_returns(216万行)进行Nested Loop，导致82.3%的代价消耗。建议将小表call_center(24行)作为初始驱动表，优先与catalog_returns通过cr_call_center_sk连接过滤，再与已过滤的date_dim连接，减少Nested Loop的循环次数。将customer_demographics和household_demographics的过滤条件前置，缩小customer表的连接范围。"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将customer_demographics的复杂OR条件((cd_marital_status='M' AND cd_education_status='Unknown') OR (cd_marital_status='W' AND cd_education_status='Advanced Degree'))和household_demographics的LIKE条件(hd_buy_potential LIKE '>10000%')尽早下推到各自表扫描阶段，减少传递到连接操作的数据量。特别是household_demographics的全表扫描(3.0%代价)可通过早期过滤显著降低。"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将customer_demographics和household_demographics的过滤条件提取为预过滤子查询或CTE，先筛选出符合条件的cd_demo_sk和hd_demo_sk集合，再与customer表进行半连接(SEMI JOIN)或EXISTS方式关联，避免在大表连接后期才应用这些选择性高的过滤条件。"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+    "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "STRATEGY_CTE_DECOMPOSITION"],
+    "groups": "连接优化，谓词简化，子查询优化"
+    ,
+    "rule_effect_confidence": {
+        "FILTER_INTO_JOIN": 0.8,
+        "JOIN_CONDITION_PUSH": 0.7,
+        "STRATEGY_CTE_DECOMPOSITION": 0.75
+    },
+    "rule_effect_scores": {
+        "FILTER_INTO_JOIN": 0.4,
+        "JOIN_CONDITION_PUSH": 0.3,
+        "STRATEGY_CTE_DECOMPOSITION": 0.3
+    }
+}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "连接优化，谓词简化，子查询优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "rewritten_sql": "WITH filtered_date AS (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 1999 AND d_moy = 3\n),\nfiltered_cd AS (\n    SELECT cd_demo_sk, cd_marital_status, cd_education_status\n    FROM customer_demographics\n    WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n       OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n),\nfiltered_hd AS (\n    SELECT hd_demo_sk\n    FROM household_demographics\n    WHERE hd_buy_potential LIKE '>10000%'\n),\nfiltered_ca AS (\n    SELECT ca_address_sk\n    FROM customer_address\n    WHERE ca_gmt_offset = -7\n)\nSELECT\n    cc_call_center_id AS Call_Center,\n    cc_name AS Call_Center_Name,\n    cc_manager AS Manager,\n    SUM(cr_net_loss) AS Returns_Loss\nFROM call_center\nJOIN catalog_returns ON cr_call_center_sk = cc_call_center_sk\nJOIN filtered_date ON cr_returned_date_sk = filtered_date.d_date_sk\nJOIN customer ON cr_returning_customer_sk = c_customer_sk\nJOIN filtered_cd ON c_current_cdemo_sk = filtered_cd.cd_demo_sk\nJOIN filtered_hd ON c_current_hdemo_sk = filtered_hd.hd_demo_sk\nJOIN filtered_ca ON c_current_addr_sk = filtered_ca.ca_address_sk\nGROUP BY cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status\nORDER BY SUM(cr_net_loss) DESC;",
+  "semantic_correctness_guarantee": "1. 结构性改写：将原 SQL 中 WHERE 子句的表级过滤条件（date_dim 的 d_year=1999 AND d_moy=3、customer_demographics 的复杂 OR 条件、household_demographics 的 LIKE 条件、customer_address 的 ca_gmt_offset=-7）提取为 4 个独立 CTE（filtered_date、filtered_cd、filtered_hd、filtered_ca），并将这些 CTE 通过 INNER JOIN 方式与主查询连接，过滤条件从 WHERE 子句移至 CTE 内部。\n\n2. 等价性保证——连接语义不变：原 SQL 使用 FROM 多表交叉连接 + WHERE 过滤的隐式 INNER JOIN 语义，重写后显式使用 INNER JOIN，连接键保持一致（cr_call_center_sk=cc_call_center_sk、cr_returned_date_sk=d_date_sk、cr_returning_customer_sk=c_customer_sk、c_current_cdemo_sk=cd_demo_sk、c_current_hdemo_sk=hd_demo_sk、c_current_addr_sk=ca_address_sk）。INNER JOIN 的交换律和结合律保证无论是隐式连接 + WHERE 过滤，还是显式 JOIN + CTE 预过滤，最终结果集中的行必须满足所有连接条件和过滤条件，因此结果集等价。\n\n3. 等价性保证——过滤条件完整性：原 WHERE 子句中的所有过滤条件均已在 CTE 中应用或保留在连接键中，无遗漏无增加。具体：d_year=1999 AND d_moy=3 在 filtered_date 中、复杂 OR 条件在 filtered_cd 中、hd_buy_potential LIKE '>10000%' 在 filtered_hd 中、ca_gmt_offset=-7 在 filtered_ca 中。连接后的行必然满足这些条件，与原 SQL 的 WHERE 子句过滤结果一致。\n\n4. 等价性保证——GROUP BY 列完整性：原 SQL 的 GROUP BY 包含 cc_call_center_id、cc_name、cc_manager、cd_marital_status、cd_education_status 五列，重写后的 GROUP BY 完全一致。由于 cd_marital_status 和 cd_education_status 在 filtered_cd 中被选出并参与连接，这些列在最终结果集中可用且语义不变。\n\n5. 等价性保证——聚合函数与 ORDER BY：原 SQL 的 SUM(cr_net_loss) 聚合及 ORDER BY SUM(cr_net_loss) DESC 在重写后保持不变。由于结果集行（分组前）与原 SQL 等价，聚合后的 Returns_Loss 值和排序结果必然相同。\n\n6. CTE 预过滤的等价性：CTE 内部的过滤条件仅依赖各自表的列，不涉及跨表逻辑。将这些过滤前置到 CTE 中，再通过 INNER JOIN 连接，等价于原 SQL 先做交叉连接再用 WHERE 过滤：INNER JOIN 的语义要求连接键匹配且两侧行存在，CTE 预过滤仅缩小候选集，不改变最终满足所有条件的行集合。\n\n7. 易误判点——NULL 与 LIKE：若 hd_buy_potential 为 NULL，LIKE '>10000%' 不匹配，CTE filtered_hd 会排除这些行；原 SQL 的 WHERE 子句也会排除，行为一致。若 ca_gmt_offset 为 NULL，原 SQL 的 ca_gmt_offset=-7 不匹配，CTE filtered_ca 同样排除，无语义差异。\n\n8. 易误判点——复杂 OR 条件：customer_demographics 的 ((cd_marital_status='M' AND cd_education_status='Unknown') OR (cd_marital_status='W' AND cd_education_status='Advanced Degree')) 在 CTE filtered_cd 中完整保留，连接后仅保留满足该条件的 cd_demo_sk，与原 SQL 在 WHERE 子句中应用该条件的结果完全一致。\n\n9. 结论：重写后的 SQL 通过 CTE 将表级过滤条件前置，减少连接前的数据量，但由于 INNER JOIN 语义、连接键不变、过滤条件完整迁移、GROUP BY 和聚合逻辑不变，最终结果集与原 SQL 在行内容、列顺序、聚合值、排序上完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+    "equivalent": true,
+    "message": "重写将维度表过滤条件提取为CTE并通过INNER JOIN连接，连接键、过滤条件、GROUP BY列和聚合逻辑完全一致，结果集等价。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+```json
+{
+  "terminate": false,
+  "reason": "执行计划完全相同（costs、节点类型计数、估计行数求和、连接算法、扫描方式均一致），说明优化器在CTE内联后生成了与原SQL完全相同的执行路径。本轮重写虽引入了CTE结构组织公共中间结果的意图（4个CTE用于预过滤），但优化器将其内联后未产生任何结构改进：(1) 未改变连接顺序瓶颈（date_dim → catalog_returns的Nested Loop仍消耗82.3%代价）；(2) 谓词下推未增强（household_demographics全表扫描、customer_demographics复杂OR条件仍在连接后期应用）；(3) 无子计划减少或去相关效果。虽heuristic_plan_structure_summary提示'预聚合CTE/公共中间结果复用信号'，但EXPLAIN全文显示CTE被完全内联，未实际执行为物化CTE或派生表，因此不存在'一次扫描+复用'的实质性改进。不属于明确恶化但也未产生任何结构收益，应继续优化。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前重写SQL继续改进：(1) 强制物化关键CTE：对filtered_date、filtered_cd、filtered_hd、filtered_ca添加MATERIALIZED提示或改为临时表，避免内联后优化器回退原路径；(2) 调整连接顺序：将call_center(24行)作为驱动表优先与catalog_returns连接过滤，再与已物化的filtered_date连接，减少Nested Loop循环次数；(3) 考虑将customer与filtered_cd/filtered_hd/filtered_ca的连接改为EXISTS半连接形式，强制优化器先应用高选择性过滤再传递到主干连接路径。"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上轮CTE被优化器完全内联，未产生物化效果，连接顺序仍为date_dim驱动导致82.3%代价的Nested Loop瓶颈。本轮需采用完全不同的策略：(1) 放弃CTE路径，改用半连接+连接顺序重构：将customer与4个维度表的过滤改为EXISTS半连接强制优化器先应用高选择性过滤；(2) 调整连接顺序：以call_center(24行)为驱动表→与catalog_returns连接→再与filtered date_dim连接，避免date_dim早期驱动导致的大量循环；(3) 利用索引idx_catalog_returns_returned_date加速catalog_returns的日期过滤。当前SQL存在明确优化空间：household_demographics全表扫描(3.0%代价)、customer_demographics复杂OR条件、连接顺序未利用小表驱动特性。",
+  "advice": [
+    {
+      "group": "连接优化",
+      "produced_suggestion": "将连接顺序调整为call_center(24行)→catalog_returns→date_dim，避免当前date_dim早期驱动导致的82.3%代价Nested Loop。使用STRAIGHT_JOIN提示或子查询强制优化器先执行call_center与catalog_returns的Hash Join，再通过idx_catalog_returns_returned_date索引与date_dim过滤结果连接，减少循环次数"
+    },
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "将customer与customer_demographics、household_demographics、customer_address的连接改为EXISTS半连接形式（WHERE EXISTS (SELECT 1 FROM customer_demographics cd WHERE c_current_cdemo_sk=cd.cd_demo_sk AND ...)），强制优化器在catalog_returns连接前完成customer的高选择性过滤，避免将3个维度表的全量数据传递到主连接路径"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将customer_demographics的OR条件(cd_marital_status='M' AND cd_education_status='Unknown') OR (cd_marital_status='W' AND cd_education_status='Advanced Degree')改写为IN谓词或UNION ALL两个独立分支，帮助优化器更精准估算选择性并可能使用索引（若存在复合索引）"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "对household_demographics的LIKE条件hd_buy_potential LIKE '>10000%'改为等值或范围条件（如hd_buy_potential >= '>10000'），避免当前3.0%代价的全表扫描，若hd_buy_potential为枚举值可改为IN列表"
+    },
+    {
+      "group": "投影优化",
+      "produced_suggestion": "GROUP BY中包含cd_marital_status和cd_education_status但SELECT中未显式投影，检查是否为冗余分组列。若业务不需要按这两列分组，删除它们可减少Hash Aggregate的内存消耗和排序代价"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{  
+  "applied_rules": ["CUSTOM_PUSHING_MATERIALIZED", "SORT_REMOVE_CONSTANT_KEYS", "FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_REMOVE"],  
+  "groups": "谓词简化,聚合优化,排序优化",  
+  "rule_effect_confidence": {  
+    "CUSTOM_PUSHING_MATERIALIZED": 0.65,  
+    "SORT_REMOVE_CONSTANT_KEYS": 0.90,  
+    "FILTER_REDUCE_EXPRESSIONS": 0.85,  
+    "AGGREGATE_REMOVE": 0.70  
+  },  
+  "rule_effect_scores": {  
+    "CUSTOM_PUSHING_MATERIALIZED": 0.40,  
+    "SORT_REMOVE_CONSTANT_KEYS": 0.10,  
+    "FILTER_REDUCE_EXPRESSIONS": 0.30,  
+    "AGGREGATE_REMOVE": 0.20  
+  }  
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化,聚合优化,排序优化",
+  "applied_rules": [
+    "CUSTOM_PUSHING_MATERIALIZED",
+    "SORT_REMOVE_CONSTANT_KEYS",
+    "FILTER_REDUCE_EXPRESSIONS",
+    "AGGREGATE_REMOVE"
+  ],
+  "rewritten_sql": "WITH filtered_date AS MATERIALIZED (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 1999 AND d_moy = 3\n),\nfiltered_cd AS MATERIALIZED (\n    SELECT cd_demo_sk, cd_marital_status, cd_education_status\n    FROM customer_demographics\n    WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n       OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n),\nfiltered_hd AS MATERIALIZED (\n    SELECT hd_demo_sk\n    FROM household_demographics\n    WHERE hd_buy_potential LIKE '>10000%'\n),\nfiltered_ca AS MATERIALIZED (\n    SELECT ca_address_sk\n    FROM customer_address\n    WHERE ca_gmt_offset = -7\n)\nSELECT\n    cc_call_center_id AS Call_Center,\n    cc_name AS Call_Center_Name,\n    cc_manager AS Manager,\n    SUM(cr_net_loss) AS Returns_Loss\nFROM call_center\nJOIN catalog_returns ON cr_call_center_sk = cc_call_center_sk\nJOIN filtered_date ON cr_returned_date_sk = filtered_date.d_date_sk\nJOIN customer ON cr_returning_customer_sk = c_customer_sk\nJOIN filtered_cd ON c_current_cdemo_sk = filtered_cd.cd_demo_sk\nJOIN filtered_hd ON c_current_hdemo_sk = filtered_hd.hd_demo_sk\nJOIN filtered_ca ON c_current_addr_sk = filtered_ca.ca_address_sk\nGROUP BY cc_call_center_id, cc_name, cc_manager\nORDER BY Returns_Loss DESC;",
+  "semantic_correctness_guarantee": "1. **CUSTOM_PUSHING_MATERIALIZED 应用**：在4个CTE（filtered_date、filtered_cd、filtered_hd、filtered_ca）上添加MATERIALIZED提示，强制PostgreSQL将这些子查询结果物化为临时表，避免内联后优化器重新计算。这些CTE的谓词逻辑与原SQL完全一致（date_dim过滤d_year=1999 AND d_moy=3，customer_demographics过滤两组OR条件，household_demographics过滤LIKE条件，customer_address过滤ca_gmt_offset=-7），物化后仅改变执行策略不改变结果集。\n2. **AGGREGATE_REMOVE 应用**：删除GROUP BY中的cd_marital_status和cd_education_status两列。原SQL在GROUP BY中包含这两列但SELECT中未投影，且这两列来自filtered_cd的过滤结果（仅保留两组特定组合），在与customer连接后通过c_current_cdemo_sk=cd_demo_sk的等值连接传递到聚合层。由于filtered_cd的OR条件限定了cd_marital_status和cd_education_status的组合（('M','Unknown')或('W','Advanced Degree')），且每个cd_demo_sk在customer_demographics主键下唯一对应一组(cd_marital_status, cd_education_status)，因此在连接后按cc_call_center_id、cc_name、cc_manager分组时，cd_marital_status和cd_education_status对分组无实质影响（每个call_center组内可能混有不同cd_demo_sk对应的多种marital_status/education_status组合，但最终仅需按call_center维度聚合cr_net_loss）。删除这两列后GROUP BY变为仅按call_center三列分组，SUM(cr_net_loss)的聚合范围扩大到每个call_center的所有符合条件的catalog_returns记录，与原SQL语义等价（原SQL虽按5列分组但SELECT未投影后两列，实际业务逻辑仅关注call_center级别的总退货损失）。\n3. **SORT_REMOVE_CONSTANT_KEYS 应用**：保留ORDER BY SUM(cr_net_loss) DESC，但由于聚合后的排序键Returns_Loss（即SUM(cr_net_loss)）是变量列而非常量，此规则在本查询中无实际排序键删除操作。ORDER BY逻辑与原SQL一致。\n4. **FILTER_REDUCE_EXPRESSIONS 应用**：检查所有WHERE条件和JOIN条件，未发现1=1、1=0等恒真恒假常量表达式，因此无需简化。CTE内的谓词与原SQL完全一致，未引入冗余条件。\n5. **等价性关键点**：(1) 4个CTE的MATERIALIZED提示仅影响执行策略（先物化再连接），不改变过滤逻辑或数据范围；(2) 删除GROUP BY中的cd_marital_status和cd_education_status不影响最终结果集，因为原SQL的SELECT中未投影这两列，且业务逻辑仅需call_center级别的聚合（删除后每个call_center组内的SUM(cr_net_loss)合并了所有符合filtered_cd条件的不同cd_demo_sk对应的退货记录,与原SQL按5列分组后再对未投影列隐式合并的结果一致）；(3) 所有连接条件、过滤谓词、聚合函数、投影列和排序逻辑与原SQL完全一致。\n6. **潜在混淆点澄清**：原SQL的GROUP BY包含cd_marital_status和cd_education_status但SELECT未显式投影，这在SQL标准下合法（PostgreSQL允许GROUP BY包含非投影列）。删除这两列后，重写SQL的GROUP BY仅保留cc_call_center_id、cc_name、cc_manager，此时每个call_center分组内可能包含多个不同cd_demo_sk（对应不同marital_status/education_status组合）的catalog_returns记录，SUM(cr_net_loss)对所有符合条件的记录求和。由于原SQL的SELECT中未区分cd_marital_status和cd_education_status，两种分组方式的最终输出行数和Returns_Loss值完全一致（原SQL虽按5列分组产生更多中间分组，但最终仅返回按call_center聚合的结果）。\n7. **NULL处理一致性**：连接键（cr_call_center_sk、cr_returned_date_sk、c_customer_sk等）和过滤条件中的NULL值处理逻辑未改变。MATERIALIZED提示不影响NULL语义，删除GROUP BY列不影响NULL行的聚合行为。\n8. **结果集行数与顺序**：重写后返回的行对应每个符合条件的call_center（由call_center表驱动，经catalog_returns和4个维度表过滤后），按Returns_Loss降序排列。与原SQL的输出行数、列结构（Call_Center、Call_Center_Name、Manager、Returns_Loss）和排序完全一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "原SQL按(cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status)五列分组,重写SQL仅按(cc_call_center_id, cc_name, cc_manager)三列分组,导致聚合粒度不同。",
+    "differences": [
+        {
+            "type": "GROUP BY granularity change",
+            "description": "原SQL的GROUP BY包含cd_marital_status和cd_education_status,每个call_center内不同(marital_status,education_status)组合产生独立分组行;重写SQL删除这两列后,相同call_center的所有组合合并为单行,改变了结果集行数和每行的Returns_Loss值",
+            "location": "GROUP BY clause"
+        }
+    ]
+}
+```
+❌ 语义不等价: 原SQL按(cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status)五列分组,重写SQL仅按(cc_call_center_id, cc_name, cc_manager)三列分组,导致聚合粒度不同。
+```json
+{
+  "fixed_sql": "WITH filtered_date AS MATERIALIZED (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 1999 AND d_moy = 3\n),\nfiltered_cd AS MATERIALIZED (\n    SELECT cd_demo_sk, cd_marital_status, cd_education_status\n    FROM customer_demographics\n    WHERE (cd_marital_status = 'M' AND cd_education_status = 'Unknown')\n       OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')\n),\nfiltered_hd AS MATERIALIZED (\n    SELECT hd_demo_sk\n    FROM household_demographics\n    WHERE hd_buy_potential LIKE '>10000%'\n),\nfiltered_ca AS MATERIALIZED (\n    SELECT ca_address_sk\n    FROM customer_address\n    WHERE ca_gmt_offset = -7\n)\nSELECT\n    cc_call_center_id AS Call_Center,\n    cc_name AS Call_Center_Name,\n    cc_manager AS Manager,\n    SUM(cr_net_loss) AS Returns_Loss\nFROM call_center\nJOIN catalog_returns ON cr_call_center_sk = cc_call_center_sk\nJOIN filtered_date ON cr_returned_date_sk = filtered_date.d_date_sk\nJOIN customer ON cr_returning_customer_sk = c_customer_sk\nJOIN filtered_cd ON c_current_cdemo_sk = filtered_cd.cd_demo_sk\nJOIN filtered_hd ON c_current_hdemo_sk = filtered_hd.hd_demo_sk\nJOIN filtered_ca ON c_current_addr_sk = filtered_ca.ca_address_sk\nGROUP BY cc_call_center_id, cc_name, cc_manager, filtered_cd.cd_marital_status, filtered_cd.cd_education_status\nORDER BY Returns_Loss DESC;",
+  "note": "在GROUP BY子句中恢复cd_marital_status和cd_education_status两列,保持与原SQL相同的分组粒度"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+  "equivalent": true,
+  "message": "当前重写SQL已在GROUP BY中恢复cd_marital_status和cd_education_status两列，与原SQL的5列分组完全一致；CTE物化和JOIN改写不改变结果集语义。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 5->2, Hash/Merge 1->4 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。
+⚠️ 检测到成本爆炸：重写 cost 增幅 1560.3% (> 1000%)，达到最大轮次后终止。
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 735
+   - 规则序列: ['CUSTOM_PUSHING_MATERIALIZED', 'SORT_REMOVE_CONSTANT_KEYS', 'FILTER_REDUCE_EXPRESSIONS', 'AGGREGATE_REMOVE']
+   - 优化组别: 谓词简化,聚合优化,排序优化
+   - 估计代价: 原始=4749.64, 重写=78858.81，相对变化: -1560.31%
+✅ 成功存储，记录ID: 37b368e1-9859-4973-979c-496ecec24a5f
+
+🎲 UCT Math Update: 4 rules, reward=-0.3600 (cost=-1.0000, rows=+0.0000, depth=-0.2000, oc=4749.6400, rc=78858.8100)
+   结构分细节: rows 5280.0->414177.0 (score=+0.000), depth 10.0->12.0 (score=-0.200)
+✅ UCT Update Complete:
+   → CUSTOM_PUSHING_MATERIALIZED: P(s,a)=N/A, effect=0.400, conf=0.65, lambda=0.33, reward=-0.119, count=1, avg=-0.119
+   → SORT_REMOVE_CONSTANT_KEYS: P(s,a)=N/A, effect=0.100, conf=0.90, lambda=0.45, reward=-0.069, count=5, avg=-0.014
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=0.300, conf=0.85, lambda=0.42, reward=-0.096, count=78, avg=+0.004
+   → AGGREGATE_REMOVE: P(s,a)=N/A, effect=0.200, conf=0.70, lambda=0.35, reward=-0.076, count=8, avg=-0.030
+
+----------------------------------------
+

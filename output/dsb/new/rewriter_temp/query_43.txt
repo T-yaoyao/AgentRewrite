@@ -1,0 +1,235 @@
+Query ID: 43
+==================================================
+
+Original: select  i_item_id,         s_state, grouping(s_state) g_state,         avg(ss_quantity) agg1,         avg(ss_list_price) agg2,         avg(ss_coupon_amt) agg3,         avg(ss_sales_price) agg4 from store_sales, customer_demographics, date_dim, store, item where ss_sold_date_sk = d_date_sk and       ss_item_sk = i_item_sk and       ss_store_sk = s_store_sk and       ss_cdemo_sk = cd_demo_sk and       cd_gender = 'M' and       cd_marital_status = 'S' and       cd_education_status = 'College' and       d_year = 2002 and       s_state = 'IL' and      i_category  = 'Jewelry'  group by rollup (i_item_id, s_state)  order by i_item_id          ,s_state  limit 100;
+Rewritten: SELECT
+  i_item_id,
+  s_state,
+  GROUPING(s_state) AS g_state,
+  AVG(ss_quantity) AS agg1,
+  AVG(ss_list_price) AS agg2,
+  AVG(ss_coupon_amt) AS agg3,
+  AVG(ss_sales_price) AS agg4
+FROM
+  store_sales
+  INNER JOIN customer_demographics ON ss_cdemo_sk = customer_demographics.cd_demo_sk
+  INNER JOIN date_dim ON ss_sold_date_sk = date_dim.d_date_sk
+  INNER JOIN store ON ss_store_sk = store.s_store_sk
+  INNER JOIN item ON ss_item_sk = item.i_item_sk
+WHERE
+  customer_demographics.cd_gender = 'M'
+  AND customer_demographics.cd_marital_status = 'S'
+  AND customer_demographics.cd_education_status = 'College'
+  AND date_dim.d_year = 2002
+  AND store.s_state = 'IL'
+  AND item.i_category = 'Jewelry'
+GROUP BY ROLLUP(i_item_id, s_state)
+ORDER BY i_item_id, s_state
+LIMIT 100;
+Time Cost: 265.12s
+Suggestion: [{'group': '子查询优化', 'produced_suggestion': "移除所有派生表(cd/d/s/i)，改用直接INNER JOIN+WHERE子句：将WHERE条件(cd_gender='M' AND cd_marital_status='S' AND cd_education_status='College', d_year=2002, s_state='IL', i_category='Jewelry')直接置于主查询WHERE中，消除派生表嵌套层级，让优化器准确估算选择性并传递谓词至索引扫描(如date_dim的idx_date_dim_year_moy)"}, {'group': '连接优化', 'produced_suggestion': "调整连接顺序为维度表先行：先连接高选择性小表(store WHERE s_state='IL' → customer_demographics WHERE cd_gender='M'... → item WHERE i_category='Jewelry')，再连接date_dim(利用d_year=2002索引过滤至365行左右)，最后连接事实表store_sales，避免当前date_dim(73049行)作为外表驱动Nested Loop导致的笛卡尔积膨胀(cost=166406.26)"}, {'group': '谓词简化', 'produced_suggestion': '将date_dim的d_year=2002条件显式标记为高选择性谓词，配合idx_date_dim_year_moy索引(覆盖d_year, d_moy)，确保优化器选择Index Scan而非Seq Scan；同时保留store_sales的ss_sold_date_sk连接条件在WHERE中(ss_sold_date_sk=d_date_sk AND d_year=2002)，触发idx_store_sales_date_store复合索引的index-only scan'}, {'group': '连接优化', 'produced_suggestion': "针对store_sales与date_dim的连接，利用idx_store_sales_date_store(ss_sold_date_sk, ss_store_sk)复合索引：先通过s_state='IL'过滤store表(约102行)，再将ss_store_sk与ss_sold_date_sk组合作为索引查找键，配合date_dim的d_year=2002索引过滤，减少store_sales参与连接的行数(当前sum_plan_rows=1871需降至<1000)"}]
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "执行计划显示95.9%的代价集中在Nested Loop连接(date_dim与store)上，总代价达117,970。当前查询存在多个优化机会：1) date_dim过滤后仍有73049行参与连接，而store仅102行，且store有单一过滤条件s_state='IL'，应优先过滤减少连接基数；2) 五表连接缺乏显式连接顺序优化，应将高选择性维度表(customer_demographics三个等值条件、store单一状态、date_dim单一年份、item单一类别)优先过滤并与大事实表store_sales连接；3) 相似历史案例显示FILTER_INTO_JOIN、JOIN_PUSH_TRANSITIVE_PREDICATES等规则在相同SQL指纹上命中5次并有效，可借鉴；4) store_sales有2880万行，需通过谓词下推和连接顺序调整最大化早期过滤效果。",
+  "advice": [
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将维度表的高选择性过滤条件(cd_gender='M' AND cd_marital_status='S' AND cd_education_status='College', d_year=2002, s_state='IL', i_category='Jewelry')显式下推到对应表扫描层，通过FILTER_INTO_JOIN规则确保在连接前完成过滤，减少参与连接的行数"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序：优先让小维度表(store过滤后约1-2行, date_dim过滤2002年约365行, item过滤Jewelry类别约数百行, customer_demographics过滤后约数千行)先连接形成小结果集，最后再与store_sales大表连接。利用JOIN_PUSH_TRANSITIVE_PREDICATES传递等值连接条件，使store_sales能利用idx_store_sales_sold_date、idx_store_sales_cdemo、idx_store_sales_store等复合索引"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "考虑将高选择性维度表转换为半连接(SEMI JOIN)过滤store_sales，应用SEMI_JOIN_FILTER_TRANSPOSE规则将过滤操作前置。例如先通过date_dim(d_year=2002)、store(s_state='IL')构建半连接过滤，再执行完整连接，减少Nested Loop的外表行数"
+    },
+    {
+      "group": "聚合优化",
+      "produced_suggestion": "应用AGGREGATE_FILTER_TRANSPOSE规则，将过滤条件尽可能移到聚合操作之前。当前所有WHERE条件均可在GROUP BY ROLLUP前完成过滤，确保聚合仅处理满足条件的最小数据集，减少聚合计算代价"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "利用JOIN_CONDITION_PUSH规则，将等值连接条件(ss_sold_date_sk=d_date_sk, ss_store_sk=s_store_sk, ss_cdemo_sk=cd_demo_sk, ss_item_sk=i_item_sk)转换为对store_sales的索引查找条件。结合已有索引idx_store_sales_sold_date、idx_store_sales_store、idx_store_sales_cdemo、idx_store_sales_item，将Nested Loop转换为Index Nested Loop或Hash Join"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+    "applied_rules": ["FILTER_INTO_JOIN", "JOIN_CONDITION_PUSH", "AGGREGATE_FILTER_TRANSPOSE", "JOIN_PUSH_TRANSITIVE_PREDICATES"],
+    "groups": "谓词简化,连接优化,聚合优化",
+    "rule_effect_confidence": {
+        "FILTER_INTO_JOIN": 0.95,
+        "JOIN_CONDITION_PUSH": 0.85,
+        "AGGREGATE_FILTER_TRANSPOSE": 0.90,
+        "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.85
+    },
+    "rule_effect_scores": {
+        "FILTER_INTO_JOIN": 0.25,
+        "JOIN_CONDITION_PUSH": 0.25,
+        "AGGREGATE_FILTER_TRANSPOSE": 0.25,
+        "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.25
+    }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "谓词简化,连接优化,聚合优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "AGGREGATE_FILTER_TRANSPOSE",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES"
+  ],
+  "rewritten_sql": "SELECT\n  i_item_id,\n  s_state,\n  GROUPING(s_state) AS g_state,\n  AVG(ss_quantity) AS agg1,\n  AVG(ss_list_price) AS agg2,\n  AVG(ss_coupon_amt) AS agg3,\n  AVG(ss_sales_price) AS agg4\nFROM\n  store_sales\n  INNER JOIN (\n    SELECT cd_demo_sk\n    FROM customer_demographics\n    WHERE cd_gender = 'M'\n      AND cd_marital_status = 'S'\n      AND cd_education_status = 'College'\n  ) AS cd ON ss_cdemo_sk = cd.cd_demo_sk\n  INNER JOIN (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 2002\n  ) AS d ON ss_sold_date_sk = d.d_date_sk\n  INNER JOIN (\n    SELECT s_store_sk, s_state\n    FROM store\n    WHERE s_state = 'IL'\n  ) AS s ON ss_store_sk = s.s_store_sk\n  INNER JOIN (\n    SELECT i_item_sk, i_item_id\n    FROM item\n    WHERE i_category = 'Jewelry'\n  ) AS i ON ss_item_sk = i.i_item_sk\nGROUP BY ROLLUP(i_item_id, s_state)\nORDER BY i_item_id, s_state\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **FILTER_INTO_JOIN规则应用**：将原始SQL中WHERE子句的5个维度表过滤条件(cd_gender='M' AND cd_marital_status='S' AND cd_education_status='College', d_year=2002, s_state='IL', i_category='Jewelry')分别推入对应维度表的派生子查询中。每个子查询在JOIN前完成过滤，减少参与连接的行数。由于这些条件原本就作用于各自的维度表且与连接键无关，提前过滤不改变最终结果集。\n\n2. **JOIN_CONDITION_PUSH规则应用**：等值连接条件(ss_sold_date_sk=d_date_sk, ss_item_sk=i_item_sk, ss_store_sk=s_store_sk, ss_cdemo_sk=cd_demo_sk)保持在各自JOIN的ON子句中。由于各维度表已通过子查询预过滤，连接条件实际上隐含了传递性约束(例如ss_sold_date_sk必然对应d_year=2002的日期键)，使得store_sales可利用idx_store_sales_sold_date、idx_store_sales_cdemo、idx_store_sales_store等索引进行高效查找。\n\n3. **AGGREGATE_FILTER_TRANSPOSE规则应用**：原始SQL的WHERE过滤条件全部在GROUP BY ROLLUP之前执行(通过子查询预过滤实现)。重写后聚合操作仅处理已过滤的store_sales行(满足所有连接条件和维度表约束)，与原SQL的「先多表连接再过滤再聚合」语义等价，但减少了聚合输入数据量。\n\n4. **JOIN_PUSH_TRANSITIVE_PREDICATES规则应用**：利用等值连接的传递性，虽未显式添加冗余WHERE条件(如ss_sold_date_sk对应d_year=2002的具体date_sk值)，但通过INNER JOIN语义保证：只有满足所有维度表过滤条件的store_sales行才会被保留。例如ss_sold_date_sk=d.d_date_sk且d.d_date_sk来自d_year=2002的子查询，等价于原SQL中ss_sold_date_sk连接到满足d_year=2002的date_dim行。\n\n5. **SELECT子句与聚合等价性**：重写后SELECT列表(i_item_id, s_state, GROUPING(s_state), AVG聚合函数)与原SQL完全一致。GROUPING函数作用于同一分组列s_state，GROUP BY ROLLUP(i_item_id, s_state)的分组层次不变，因此生成的汇总行(包括NULL补位的超聚合行)与原SQL一致。\n\n6. **ORDER BY与LIMIT等价性**：重写后ORDER BY i_item_id, s_state与原SQL相同，作用于聚合后的结果集。LIMIT 100在相同排序下返回相同的前100行。由于聚合前的过滤操作不改变聚合结果的分组键(i_item_id, s_state)和度量值(AVG计算基于相同的store_sales行)，最终结果集顺序和内容与原SQL等价。\n\n7. **INNER JOIN语义保证**：所有JOIN均为INNER JOIN，与原SQL的隐式内连接语义一致。重写后只有同时满足所有连接条件和过滤条件的store_sales行才会进入聚合阶段，这与原SQL「多表笛卡尔积→WHERE过滤→聚合」的结果完全等价。不存在LEFT/RIGHT JOIN引入的NULL行或多余行，不改变结果集的行数和内容。\n\n8. **NULL值处理**：原SQL的等值连接(如ss_sold_date_sk=d_date_sk)在标准SQL语义下会过滤掉任一侧为NULL的行。重写后的INNER JOIN保持相同语义，不会引入或丢失NULL相关的行。维度表过滤条件(如cd_gender='M')也不匹配NULL值，因此NULL处理逻辑与原SQL一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+  "equivalent": true,
+  "message": "重写SQL通过子查询将维度表过滤条件下推，将隐式内连接改写为显式INNER JOIN，聚合、分组、排序、限制语义均与原SQL完全一致。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": false,
+  "reason": "执行计划对比显示：1)Workers Planned从2降至1，并行度下降50%；2)date_dim访问路径从Index Scan(cost=2981.0)退化为Seq Scan(cost=1961.12)，虽单看cost更低，但丢失索引访问路径；3)index_scan从4降至3，bitmap_scan保持0，结构上索引利用减少；4)sum_plan_rows从1579增至1871(+18.5%)，虽未达灾难性膨胀，但与'减少参与连接行数'的优化目标相悖；5)总cost从123067.15增至170623.27(+38.6%)，虽cost为弱信号，但结合并行度下降、索引减少、行数增加等多项结构性退化信号，共同指向本轮重写未达改进效果。本轮应用了FILTER_INTO_JOIN等4条规则，但派生表写法未能触发优化器更优的连接顺序或索引选择策略，反而导致date_dim从索引扫描退化为全表扫描，且并行度下降抵消了部分收益。",
+  "no_further_optimization": false,
+  "next_step_advice": "基于当前rewritten_sql继续优化：1)移除派生表嵌套，改用CTE或直接WHERE子句，避免优化器对派生表估算偏差导致索引丢失；2)显式使用STRAIGHT_JOIN或JOIN hint强制维度表先连接顺序(store->date_dim->item->customer_demographics->store_sales)，确保小表驱动；3)在store_sales连接前增加显式索引提示(USE INDEX/FORCE INDEX)，保留idx_store_sales_date_store等复合索引访问路径；4)考虑将d_year=2002等高选择性条件保留在主查询WHERE中而非派生表内，让优化器更准确传递谓词；5)验证并行度配置，尝试通过/*+ PARALLEL(store_sales 2) */等hint恢复并行扫描。"
+}
+```
+ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 开始初始优化可行性检查...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+```json
+{
+  "can_optimize": true,
+  "reason": "上轮派生表嵌套导致date_dim从Index Scan退化为Seq Scan(cost=1961.12)，并触发高代价Nested Loop(cost=166406.26，占比97.5%)。当前SQL仍保留派生表结构，需移除派生表改用直接JOIN+WHERE条件，让优化器正确传递谓词(d_year=2002)至索引访问路径(idx_date_dim_year_moy或idx_date_dim_sk)，同时调整连接顺序为小表驱动(store/item/customer_demographics→date_dim→store_sales)以避免date_dim(73049行)×store(102行)的笛卡尔积式Nested Loop。索引信息显示store_sales存在idx_store_sales_date_store等复合索引，扁平化结构后可触发索引访问并恢复并行度。",
+  "advice": [
+    {
+      "group": "子查询优化",
+      "produced_suggestion": "移除所有派生表(cd/d/s/i)，改用直接INNER JOIN+WHERE子句：将WHERE条件(cd_gender='M' AND cd_marital_status='S' AND cd_education_status='College', d_year=2002, s_state='IL', i_category='Jewelry')直接置于主查询WHERE中，消除派生表嵌套层级，让优化器准确估算选择性并传递谓词至索引扫描(如date_dim的idx_date_dim_year_moy)"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "调整连接顺序为维度表先行：先连接高选择性小表(store WHERE s_state='IL' → customer_demographics WHERE cd_gender='M'... → item WHERE i_category='Jewelry')，再连接date_dim(利用d_year=2002索引过滤至365行左右)，最后连接事实表store_sales，避免当前date_dim(73049行)作为外表驱动Nested Loop导致的笛卡尔积膨胀(cost=166406.26)"
+    },
+    {
+      "group": "谓词简化",
+      "produced_suggestion": "将date_dim的d_year=2002条件显式标记为高选择性谓词，配合idx_date_dim_year_moy索引(覆盖d_year, d_moy)，确保优化器选择Index Scan而非Seq Scan；同时保留store_sales的ss_sold_date_sk连接条件在WHERE中(ss_sold_date_sk=d_date_sk AND d_year=2002)，触发idx_store_sales_date_store复合索引的index-only scan"
+    },
+    {
+      "group": "连接优化",
+      "produced_suggestion": "针对store_sales与date_dim的连接，利用idx_store_sales_date_store(ss_sold_date_sk, ss_store_sk)复合索引：先通过s_state='IL'过滤store表(约102行)，再将ss_store_sk与ss_sold_date_sk组合作为索引查找键，配合date_dim的d_year=2002索引过滤，减少store_sales参与连接的行数(当前sum_plan_rows=1871需降至<1000)"
+    }
+  ]
+}
+```
+✅ SQL 可以优化，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 100 rules
+   → PROJECT_SUB_QUERY_TO_CORRELATE: UCT=1.100
+   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "AGGREGATE_FILTER_TRANSPOSE",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES"
+  ],
+  "groups": "子查询优化",
+  "rule_effect_confidence": {
+    "AGGREGATE_FILTER_TRANSPOSE": 0.3,
+    "FILTER_INTO_JOIN": 0.2,
+    "JOIN_CONDITION_PUSH": 0.4,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.3
+  },
+  "rule_effect_scores": {
+    "AGGREGATE_FILTER_TRANSPOSE": 0.35,
+    "FILTER_INTO_JOIN": 0.2,
+    "JOIN_CONDITION_PUSH": 0.7,
+    "JOIN_PUSH_TRANSITIVE_PREDICATES": 0.4
+  }
+}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+```json
+{
+  "groups": "子查询优化",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "AGGREGATE_FILTER_TRANSPOSE",
+    "JOIN_PUSH_TRANSITIVE_PREDICATES"
+  ],
+  "rewritten_sql": "SELECT\n  i_item_id,\n  s_state,\n  GROUPING(s_state) AS g_state,\n  AVG(ss_quantity) AS agg1,\n  AVG(ss_list_price) AS agg2,\n  AVG(ss_coupon_amt) AS agg3,\n  AVG(ss_sales_price) AS agg4\nFROM\n  store_sales\n  INNER JOIN customer_demographics ON ss_cdemo_sk = customer_demographics.cd_demo_sk\n  INNER JOIN date_dim ON ss_sold_date_sk = date_dim.d_date_sk\n  INNER JOIN store ON ss_store_sk = store.s_store_sk\n  INNER JOIN item ON ss_item_sk = item.i_item_sk\nWHERE\n  customer_demographics.cd_gender = 'M'\n  AND customer_demographics.cd_marital_status = 'S'\n  AND customer_demographics.cd_education_status = 'College'\n  AND date_dim.d_year = 2002\n  AND store.s_state = 'IL'\n  AND item.i_category = 'Jewelry'\nGROUP BY ROLLUP(i_item_id, s_state)\nORDER BY i_item_id, s_state\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. **派生表展开为直接JOIN + WHERE结构**：原SQL在FROM子句中使用4个派生表(cd/d/s/i)封装各自的过滤条件，本次重写将所有派生表的SELECT * FROM table WHERE condition模式展开为直接INNER JOIN table ON join_key，并将WHERE条件(cd_gender='M' AND cd_marital_status='S' AND cd_education_status='College', d_year=2002, s_state='IL', i_category='Jewelry')统一移至主查询WHERE子句。由于原始派生表中无GROUP BY/聚合/DISTINCT，每个派生表仅做过滤投影，故展开后与原SQL在每张表上筛选出的行集完全等价。\n\n2. **JOIN条件保持等价**：原SQL通过ON ss_cdemo_sk = cd.cd_demo_sk连接派生表cd，重写后改为ON ss_cdemo_sk = customer_demographics.cd_demo_sk，连接键与作用域完全一致；同理date_dim、store、item的连接键(ss_sold_date_sk=d_date_sk, ss_store_sk=s_store_sk, ss_item_sk=i_item_sk)在重写后保持不变，仅将派生表别名替换为原表名，JOIN语义未改变。\n\n3. **过滤条件传递性与提前过滤**：应用JOIN_PUSH_TRANSITIVE_PREDICATES规则时，虽原SQL中date_dim.d_year=2002等条件在派生表内，但INNER JOIN语义下这些条件本质上可视为WHERE子句的一部分；重写后将所有条件显式放入WHERE，利用传递性(如ss_sold_date_sk=d_date_sk AND d_year=2002可推导出store_sales参与连接的行必满足对应d_date_sk指向2002年的日期)，让优化器能更准确地将谓词下推至索引扫描(如idx_date_dim_year_moy、idx_store_sales_date_store)。由于INNER JOIN的交换律与结合律，以及WHERE条件可任意顺序应用于笛卡尔积后的结果集，本次重写不改变最终连接结果的行集与列值。\n\n4. **聚合作用域与GROUP BY ROLLUP保持不变**：原SQL在派生表连接后对(i_item_id, s_state)执行GROUP BY ROLLUP并计算AVG聚合，重写后聚合输入为WHERE过滤+INNER JOIN后的store_sales行集，与原SQL中派生表过滤后再连接的行集完全相同(仅JOIN顺序可能被优化器调整，但INNER JOIN结果不受顺序影响)。ROLLUP(i_item_id, s_state)生成的分组层级(包含单列分组、总计行)与GROUPING(s_state)的语义在重写前后保持一致，AVG(ss_quantity/ss_list_price/ss_coupon_amt/ss_sales_price)计算的输入行集未改变。\n\n5. **ORDER BY与LIMIT语义等价性**：原SQL按(i_item_id, s_state)排序后取前100行，重写后排序键与LIMIT子句完全相同，由于聚合结果行集未变(上述第4点保证)，故排序后截取的100行与原SQL一致。需注意ROLLUP生成的NULL值行(如总计行的s_state为NULL)在ORDER BY中的排序行为由数据库默认NULL排序规则决定(通常NULLS LAST)，重写前后该规则未改变。\n\n6. **索引利用与优化器自由度提升**：移除派生表后，优化器可直接访问原表统计信息与索引(如idx_date_dim_year_moy覆盖d_year=2002、idx_store_state覆盖s_state='IL'、idx_item_category覆盖i_category='Jewelry')，避免派生表嵌套导致的基数估算偏差。WHERE子句中显式列出所有条件(而非隐藏在派生表内)，让优化器能利用JOIN_CONDITION_PUSH与FILTER_INTO_JOIN规则自行决定是否将条件下推至索引扫描或调整连接顺序(如先扫描高选择性的store WHERE s_state='IL'再连接date_dim WHERE d_year=2002)，从而恢复索引访问路径并减少中间结果行数。\n\n7. **易误判点说明**：本次重写未改变INNER JOIN类型(未涉及LEFT/RIGHT JOIN的NULL生成行)，未引入DISTINCT/UNION(不影响重复行语义)，未修改聚合函数或HAVING条件(原SQL无HAVING)，未改变相关子查询逻辑(原SQL无相关子查询)。派生表展开后WHERE条件的执行时机(是否在JOIN前过滤)由优化器决定，但INNER JOIN + WHERE的交换律保证无论优化器选择何种物理计划(Hash Join/Nested Loop/先过滤后连接/先连接后过滤)，最终结果集均与原SQL等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+  "equivalent": true,
+  "message": "重写将派生表展开为直接INNER JOIN + WHERE结构，JOIN连接键、过滤条件、GROUP BY ROLLUP、聚合函数、ORDER BY与LIMIT完全保持一致；INNER JOIN语义下派生表内外的过滤条件等价，最终结果集相同。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划完全相同，cost相同(123067.15)，结构信号无任何变化：节点类型计数一致(Index Scan=4, Nested Loop=4, Seq Scan=1)，行数估计求和均为1579.0，连接顺序、扫描方式、并行度(Workers Planned=2)、过滤下推均无差异。本轮重写仅将隐式JOIN改写为显式INNER JOIN语法，未触发优化器改变执行计划。原SQL已基于索引驱动(idx_date_dim_sk过滤d_year=2002至152行, idx_store_sales_date_store复合索引连接store_sales, idx_item_sk/idx_customer_demographics_sk逐层过滤)，连接顺序合理(维度表date_dim→store→store_sales→item→customer_demographics)，过滤条件已下推至Index Cond/Filter层，并行执行未出现问题。当前执行计划已无明显结构瓶颈，继续重写不太可能产生实质性改进。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 491
+   - 规则序列: ['FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH', 'AGGREGATE_FILTER_TRANSPOSE', 'JOIN_PUSH_TRANSITIVE_PREDICATES']
+   - 优化组别: 子查询优化
+   - 估计代价: 原始=123067.15, 重写=123067.15，相对变化: 0.00%
+✅ 成功存储，记录ID: 24151efd-9b31-4825-be3b-9cc9d94e3cdd
+
+🎲 UCT Math Update: 4 rules, reward=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=123067.1500, rc=123067.1500)
+   结构分细节: rows 1579.0->1579.0 (score=+0.000), depth 10.0->10.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=0.121, conf=0.20, lambda=0.10, reward=+0.000, count=139, avg=+0.002
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=0.424, conf=0.40, lambda=0.20, reward=+0.000, count=127, avg=+0.001
+   → AGGREGATE_FILTER_TRANSPOSE: P(s,a)=N/A, effect=0.212, conf=0.30, lambda=0.15, reward=+0.000, count=26, avg=+0.020
+   → JOIN_PUSH_TRANSITIVE_PREDICATES: P(s,a)=N/A, effect=0.242, conf=0.30, lambda=0.15, reward=+0.000, count=39, avg=+0.009
+
+----------------------------------------
+
