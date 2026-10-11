@@ -1,0 +1,113 @@
+Query ID: 136
+==================================================
+
+Original: select     sum(ws_ext_discount_amt)  as "Excess Discount Amount" from     web_sales    ,item    ,date_dim where (i_manufact_id BETWEEN 394 and 593 or i_category IN ('Books', 'Home', 'Sports')) and i_item_sk = ws_item_sk and d_date between '2002-02-11' and         cast('2002-02-11' as date) + interval '90' day and d_date_sk = ws_sold_date_sk and ws_wholesale_cost BETWEEN 68 AND 88 and ws_ext_discount_amt      > (          SELECT             1.3 * avg(ws_ext_discount_amt)          FROM             web_sales            ,date_dim          WHERE               ws_item_sk = i_item_sk           and d_date between '2002-02-11' and                              cast('2002-02-11' as date) + interval '90' day           and d_date_sk = ws_sold_date_sk           and ws_wholesale_cost BETWEEN 68 AND 88           and ws_sales_price / ws_list_price BETWEEN 85 * 0.01 AND 100 * 0.01   ) order by sum(ws_ext_discount_amt) limit 100;
+Rewritten: WITH avg_discount AS (
+  SELECT 
+    ws_item_sk,
+    1.3 * avg(ws_ext_discount_amt) AS threshold
+  FROM 
+    web_sales
+    JOIN date_dim ON d_date_sk = ws_sold_date_sk
+  WHERE 
+    d_date BETWEEN '2002-02-11' AND cast('2002-02-11' AS date) + interval '90' day
+    AND ws_wholesale_cost BETWEEN 68 AND 88
+  GROUP BY ws_item_sk
+)
+SELECT 
+  sum(ws.ws_ext_discount_amt) AS "Excess Discount Amount"
+FROM 
+  web_sales ws
+  JOIN item i ON i.i_item_sk = ws.ws_item_sk
+  JOIN date_dim d ON d.d_date_sk = ws.ws_sold_date_sk
+  JOIN avg_discount ad ON ad.ws_item_sk = ws.ws_item_sk
+WHERE 
+  (i.i_manufact_id BETWEEN 394 AND 593 OR i.i_category IN ('Books', 'Home', 'Sports'))
+  AND d.d_date BETWEEN '2002-02-11' AND cast('2002-02-11' AS date) + interval '90' day
+  AND ws.ws_wholesale_cost BETWEEN 68 AND 88
+  AND ws.ws_ext_discount_amt > ad.threshold
+  AND ws.ws_sales_price / ws.ws_list_price BETWEEN 0.85 AND 1.00
+ORDER BY sum(ws.ws_ext_discount_amt)
+LIMIT 100;
+Time Cost: 164.96s
+Suggestion: []
+🔍 准备重写上下文（跳过规则组决策）...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 已跳过规则组筛选，直接进入全量规则选择
+🔧 开始基于全量规则直接重写 SQL...
+```json
+{
+  "groups": "子查询去相关化与谓词下推",
+  "applied_rules": [
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH"
+  ],
+  "rewritten_sql": "WITH avg_discount AS (\n  SELECT \n    ws_item_sk,\n    1.3 * avg(ws_ext_discount_amt) AS threshold\n  FROM \n    web_sales\n    JOIN date_dim ON d_date_sk = ws_sold_date_sk\n  WHERE \n    d_date BETWEEN '2002-02-11' AND cast('2002-02-11' AS date) + interval '90' day\n    AND ws_wholesale_cost BETWEEN 68 AND 88\n    AND ws_sales_price / ws_list_price BETWEEN 0.85 AND 1.00\n  GROUP BY ws_item_sk\n)\nSELECT \n  sum(ws.ws_ext_discount_amt) AS \"Excess Discount Amount\"\nFROM \n  web_sales ws\n  JOIN item i ON i.i_item_sk = ws.ws_item_sk\n  JOIN date_dim d ON d.d_date_sk = ws.ws_sold_date_sk\n  JOIN avg_discount ad ON ad.ws_item_sk = ws.ws_item_sk\nWHERE \n  (i.i_manufact_id BETWEEN 394 AND 593 OR i.i_category IN ('Books', 'Home', 'Sports'))\n  AND d.d_date BETWEEN '2002-02-11' AND cast('2002-02-11' AS date) + interval '90' day\n  AND ws.ws_wholesale_cost BETWEEN 68 AND 88\n  AND ws.ws_ext_discount_amt > ad.threshold\nORDER BY sum(ws.ws_ext_discount_amt)\nLIMIT 100;",
+  "semantic_correctness_guarantee": "1. 将原始SQL中的相关子查询(子查询引用外层item表的i_item_sk)改写为CTE + JOIN形式:CTE按ws_item_sk分组计算平均折扣阈值,主查询通过JOIN avg_discount表获取对应阈值,等价于原相关子查询对每个i_item_sk计算的结果。\n2. 子查询中的date_dim过滤条件(d_date范围和JOIN条件)与主查询完全相同,CTE预先完成date_dim JOIN和过滤,主查询再次JOIN date_dim并应用相同过滤条件,确保仅选取满足时间范围的记录,与原SQL双重date_dim过滤语义一致。\n3. 子查询中ws_wholesale_cost BETWEEN 68 AND 88与ws_sales_price/ws_list_price BETWEEN 0.85 AND 1.00两个过滤条件在CTE中预先应用,主查询额外保留ws_wholesale_cost BETWEEN 68 AND 88(因主查询原本就有该条件),确保参与阈值比较的ws_ext_discount_amt来自相同过滤范围的记录。\n4. 主查询中ws.ws_ext_discount_amt > ad.threshold等价于原SQL的ws_ext_discount_amt > (SELECT 1.3*avg(...)),因ad.threshold已在CTE中按ws_item_sk分组计算,JOIN后每行web_sales记录对应其item的阈值。\n5. item表过滤条件(i_manufact_id或i_category)仅在主查询中应用,与原SQL位置一致,不影响子查询计算的阈值(原子查询通过i_item_sk关联但不直接过滤item表)。\n6. 聚合函数sum(ws_ext_discount_amt)、ORDER BY和LIMIT 100在主查询外层保持不变,确保最终结果集的排序和行数与原SQL完全一致。\n7. NULL处理:若某ws_item_sk在CTE中无满足条件的记录则无对应阈值,JOIN avg_discount时该item的web_sales记录被过滤(内连接语义),与原相关子查询返回NULL导致比较失败的效果等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+```json
+{
+    "equivalent": false,
+    "message": "重写SQL在CTE中对子查询过滤条件的处理与原始SQL不等价,导致阈值计算范围不同。",
+    "differences": [
+        {
+            "type": "filter_scope",
+            "description": "原始SQL子查询中未过滤ws_sales_price/ws_list_price条件(该条件仅在子查询WHERE中出现),而重写SQL的CTE对avg_discount计算时应用了该条件,导致阈值threshold基于更小的数据集计算",
+            "location": "avg_discount CTE的WHERE子句"
+        },
+        {
+            "type": "correlation_semantics",
+            "description": "原始SQL相关子查询对外层每个满足item条件的i_item_sk计算阈值,而重写SQL的CTE对所有ws_item_sk预计算阈值(包括不满足item过滤条件的item),两者计算阈值的item范围不同",
+            "location": "CTE与主查询的JOIN逻辑"
+        }
+    ]
+}
+```
+❌ 语义不等价: 重写SQL在CTE中对子查询过滤条件的处理与原始SQL不等价,导致阈值计算范围不同。
+```json
+{
+  "fixed_sql": "WITH avg_discount AS (\n  SELECT \n    ws_item_sk,\n    1.3 * avg(ws_ext_discount_amt) AS threshold\n  FROM \n    web_sales\n    JOIN date_dim ON d_date_sk = ws_sold_date_sk\n  WHERE \n    d_date BETWEEN '2002-02-11' AND cast('2002-02-11' AS date) + interval '90' day\n    AND ws_wholesale_cost BETWEEN 68 AND 88\n  GROUP BY ws_item_sk\n)\nSELECT \n  sum(ws.ws_ext_discount_amt) AS \"Excess Discount Amount\"\nFROM \n  web_sales ws\n  JOIN item i ON i.i_item_sk = ws.ws_item_sk\n  JOIN date_dim d ON d.d_date_sk = ws.ws_sold_date_sk\n  JOIN avg_discount ad ON ad.ws_item_sk = ws.ws_item_sk\nWHERE \n  (i.i_manufact_id BETWEEN 394 AND 593 OR i.i_category IN ('Books', 'Home', 'Sports'))\n  AND d.d_date BETWEEN '2002-02-11' AND cast('2002-02-11' AS date) + interval '90' day\n  AND ws.ws_wholesale_cost BETWEEN 68 AND 88\n  AND ws.ws_ext_discount_amt > ad.threshold\n  AND ws.ws_sales_price / ws.ws_list_price BETWEEN 0.85 AND 1.00\nORDER BY sum(ws.ws_ext_discount_amt)\nLIMIT 100;",
+  "note": "从CTE的WHERE中移除ws_sales_price/ws_list_price条件,将其添加到主查询WHERE中,使阈值计算基于完整数据集而过滤仅在最终结果应用"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+    "equivalent": true,
+    "message": "当前重写SQL已将ws_sales_price/ws_list_price过滤条件从CTE移除,仅保留在主查询中,与原始SQL子查询语义一致;CTE按ws_item_sk分组计算阈值的范围现与原子查询相同,主查询通过JOIN获取阈值并过滤,等价于原相关子查询。",
+    "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 95794.0 -> 5591.0 (重写侧约为原的 5.8365%) | 强信号: 行数估计求和大幅下降，重写侧约为原的 5.8365% (<= 10%) | 检测到子计划/初始化计划减少: 1->0，说明重写可能消除了重复执行或去相关。 | 重写SQL显式引入CTE组织公共中间结果，说明存在一次性计算后复用的意图。 | 检测到预聚合CTE/子查询（含 SUM/AVG/MIN/MAX/COUNT），这通常用于先压缩中间结果再参与 JOIN，可视为公共中间结果复用的强信号。
+✅ 行数估计求和大幅下降至原的 5.8365%，直接判定优化成功，终止并保留重写 SQL
+ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 605
+   - 规则序列: ['FILTER_SUB_QUERY_TO_CORRELATE', 'FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH']
+   - 优化组别: 子查询去相关化与谓词下推
+   - 估计代价: 原始=37259.16, 重写=51465.42，相对变化: -38.13%
+✅ 成功存储，记录ID: 690aa282-4187-4d97-ad7a-2b85a9931625
+
+🎲 UCT Math Update: 3 rules, reward=+0.1498 (cost=-0.3813, rows=+0.9416, depth=-0.3750, oc=37259.1600, rc=51465.4200)
+   结构分细节: rows 95794.0->5591.0 (score=+0.942), depth 8.0->11.0 (score=-0.375)
+✅ UCT Update Complete:
+   → FILTER_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, effect=N/A, conf=N/A, lambda=0.00, reward=+0.055, count=26, avg=+0.026
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=N/A, conf=N/A, lambda=0.00, reward=+0.050, count=240, avg=+0.002
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=N/A, conf=N/A, lambda=0.00, reward=+0.045, count=207, avg=-0.001
+
+----------------------------------------
+

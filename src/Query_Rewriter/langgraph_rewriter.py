@@ -1503,8 +1503,8 @@ class LangGraphQueryRewriter:
                     )
                 elif cost_regress:
                     print(
-                        f"ℹ️  估计代价上升 {ratio:.1f}%（> {self.COST_ROLLBACK_PCT}%），"
-                        "但已取消回退逻辑，保留当前重写 SQL 作为最终输出。"
+                        f"ℹ️  估计代价上升 {ratio:.1f}%（> {self.COST_ROLLBACK_PCT}%）。"
+                        "最终输出取各轮中估计代价最低者，本轮不会盖过更低代价的候选。"
                     )
                 if rw != init_sql:
                     if is_uncertain:
@@ -1584,15 +1584,33 @@ class LangGraphQueryRewriter:
                 "rewrite_suggestion": [],
                 "agent_trace": state.get("agent_trace", []),
             }
-        final_sql = _state_sql(state.get("rewritten_sql") or state["initial_sql"])
-        if state.get("current_rewrite_result"):
-            final_sql = _state_sql(state["current_rewrite_result"].get("rewritten_sql", final_sql))
-        rc = state.get("final_rewritten_costs", oc)
-        rate = round(((oc - rc) / oc * 100) if oc > 0 else 0.0, 2)
-        sel = state.get("selected_rules") or {}
-        rules = sel.get("applied_rules")
-        if not rules:
+        init_sql = _state_sql(state["initial_sql"])
+        best_sql = state.get("best_sql")
+        best_cost = state.get("best_cost")
+        best_rules = state.get("best_rules")
+        # 各轮里估计代价最低的改写；不低于原 SQL 时输出原 SQL。
+        if (
+            best_sql
+            and isinstance(best_cost, (int, float))
+            and isinstance(oc, (int, float))
+            and oc > 0
+            and float(best_cost) < float(oc)
+        ):
+            final_sql = _state_sql(best_sql)
+            rc = float(best_cost)
+            rules = best_rules or None
+            print(
+                f"✅ 最终输出估计代价最低的一轮: {rc:.4f} < 原始 {float(oc):.4f}"
+            )
+        else:
+            final_sql = init_sql
+            rc = float(oc) if isinstance(oc, (int, float)) else 0.0
             rules = None
+            if best_sql and isinstance(best_cost, (int, float)) and isinstance(oc, (int, float)):
+                print(
+                    f"ℹ️ 各轮估计代价都不低于原始查询 ({float(best_cost):.4f} >= {float(oc):.4f})，输出原 SQL"
+                )
+        rate = round(((oc - rc) / oc * 100) if oc > 0 else 0.0, 2)
         return {
             "tpch": [
                 {

@@ -707,14 +707,66 @@ def get_all_rules() -> dict:
 
 RULE_EXAMPLES_MAX_PER_RULE = 1
 _RULE_EXAMPLE_FINGERPRINT_GENERATOR = SQLFingerprintGenerator()
+_TABLE_FROM_JOIN_RE = re.compile(
+    r"(?is)\b(?:FROM|JOIN|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|"
+    r"CROSS\s+JOIN|STRAIGHT_JOIN|UPDATE|INTO)\s+"
+    r"(?:ONLY\s+)?"
+    r"(?:(\w+)\s*\.\s*)?(\w+)"
+)
+_TABLE_NAME_SKIP = {
+    "select", "where", "group", "order", "having", "limit", "offset",
+    "union", "except", "intersect", "on", "using", "lateral", "unnest",
+    "values", "case", "when", "set", "dual", "generate_series",
+}
+
+
+def _tables_in_appearance_order(sql: str) -> List[str]:
+    """Return unique base table names in first-appearance order from FROM/JOIN/UPDATE/INTO."""
+    text = str(sql or "")
+    if not text.strip():
+        return []
+    text = re.sub(r"--[^\n]*", " ", text)
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    text = re.sub(r"'(?:''|[^'])*'", " ", text)
+    seen = set()
+    ordered: List[str] = []
+    for match in _TABLE_FROM_JOIN_RE.finditer(text):
+        name = match.group(2)
+        if not name:
+            continue
+        base = name.lower()
+        if base in _TABLE_NAME_SKIP or base in seen:
+            continue
+        seen.add(base)
+        ordered.append(base)
+    return ordered
+
+
+def _anonymize_tables_by_appearance(sql: str) -> str:
+    """Replace base table names with t1..tn by appearance order, using placeholders to avoid collisions."""
+    tables = _tables_in_appearance_order(sql)
+    if not tables:
+        return sql
+    index_of = {name: idx for idx, name in enumerate(tables, start=1)}
+    result = sql
+    for name in sorted(tables, key=len, reverse=True):
+        result = re.sub(
+            rf"(?i)(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])",
+            f"__PASR_TBL_{index_of[name]}__",
+            result,
+        )
+    for idx in range(1, len(tables) + 1):
+        result = result.replace(f"__PASR_TBL_{idx}__", f"t{idx}")
+    return result
 
 
 def _sql_fingerprint(sql_text: str) -> str:
-    """Return a normalized SQL fingerprint for rule-example similarity."""
+    """Return a table-anonymized SQL fingerprint for rule-example similarity."""
     if not isinstance(sql_text, str) or not sql_text.strip():
         return ""
     try:
-        return _RULE_EXAMPLE_FINGERPRINT_GENERATOR.get_template(sql_text) or sql_text
+        anonymized = _anonymize_tables_by_appearance(sql_text)
+        return _RULE_EXAMPLE_FINGERPRINT_GENERATOR.get_template(anonymized) or anonymized
     except Exception:
         return sql_text
 
@@ -739,7 +791,7 @@ def _cosine_similarity(left: Counter, right: Counter) -> float:
 
 
 def _rule_example_similarity(current_sql: str, example_query: str) -> Dict[str, Any]:
-    """Compare current SQL with an example original SQL using fingerprint cosine similarity."""
+    """Compare current SQL with an example original SQL using anonymized fingerprint cosine similarity."""
     current_fp = _sql_fingerprint(current_sql)
     example_fp = _sql_fingerprint(example_query)
     score = _cosine_similarity(_fingerprint_tokens(current_fp), _fingerprint_tokens(example_fp))
@@ -759,8 +811,9 @@ def get_rule_examples(
     按规则 ID 拉取最相关示例。
 
     - 若某个 rule_id 只有 1 条示例：直接选择。
-    - 若某个 rule_id 有多条示例且提供 current_sql：比较 current_sql 与 example.original_query
-      的 SQL 指纹余弦相似度，选择 Top-1（或 max_per_rule 指定的 Top-K）。
+    - 若某个 rule_id 有多条示例且提供 current_sql：将表名按出现顺序规范为 t1..tn 后，
+      比较 current_sql 与 example.original_query 的 SQL 指纹余弦相似度，选择 Top-1
+      （或 max_per_rule 指定的 Top-K）。
     - 若未提供 current_sql：退化为文件顺序 Top-K，保持旧调用兼容。
     """
     rule_kb = load_rule_knowledge_base()

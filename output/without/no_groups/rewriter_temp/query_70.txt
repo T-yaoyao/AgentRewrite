@@ -1,0 +1,88 @@
+Query ID: 70
+==================================================
+
+Original: select    min(w_state)   ,min(i_item_id)   ,min(cs_item_sk)   ,min(cs_order_number)   ,min(cr_item_sk)   ,min(cr_order_number)  from    catalog_sales left outer join catalog_returns on        (cs_order_number = cr_order_number         and cs_item_sk = cr_item_sk)   ,warehouse   ,item   ,date_dim  where  i_item_sk          = cs_item_sk  and cs_warehouse_sk    = w_warehouse_sk  and cs_sold_date_sk    = d_date_sk  and d_date between (cast ('1998-04-26' as date) - interval '30' day)                 and (cast ('1998-04-26' as date) + interval '30' day)   and i_category  = 'Home'  and i_manager_id between 28 and 67  and cs_wholesale_cost between 69 and 88  and cr_reason_sk = 11 ;
+Rewritten: SELECT min(w_state), min(i_item_id), min(cs_item_sk), min(cs_order_number), min(cr_item_sk), min(cr_order_number) FROM (SELECT cs_item_sk, cs_order_number, cs_wholesale_cost, cs_warehouse_sk FROM catalog_sales WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date >= DATE '1998-03-27' AND d_date <= DATE '1998-05-26') AND cs_wholesale_cost BETWEEN 69 AND 88) cs INNER JOIN item ON i_item_sk = cs.cs_item_sk AND i_category = 'Home' AND i_manager_id BETWEEN 28 AND 67 INNER JOIN warehouse ON w_warehouse_sk = cs.cs_warehouse_sk LEFT OUTER JOIN catalog_returns ON cr_order_number = cs.cs_order_number AND cr_item_sk = cs.cs_item_sk AND cr_reason_sk = 11
+Time Cost: 82.09s
+Suggestion: []
+🔍 准备重写上下文（跳过规则组决策）...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 已跳过规则组筛选，直接进入全量规则选择
+🔧 开始基于全量规则直接重写 SQL...
+```json
+{
+  "groups": "谓词下推与连接优化、常量折叠",
+  "applied_rules": [
+    "FILTER_INTO_JOIN",
+    "JOIN_CONDITION_PUSH",
+    "FILTER_REDUCE_EXPRESSIONS"
+  ],
+  "rewritten_sql": "SELECT\n  min(w_state),\n  min(i_item_id),\n  min(cs_item_sk),\n  min(cs_order_number),\n  min(cr_item_sk),\n  min(cr_order_number)\nFROM\n  (\n    SELECT\n      cs_item_sk,\n      cs_order_number,\n      cs_wholesale_cost\n    FROM\n      catalog_sales\n    WHERE\n      cs_sold_date_sk IN (\n        SELECT d_date_sk\n        FROM date_dim\n        WHERE d_date >= DATE '1998-03-27'\n          AND d_date <= DATE '1998-05-26'\n      )\n      AND cs_wholesale_cost BETWEEN 69 AND 88\n  ) cs\n  INNER JOIN item ON i_item_sk = cs.cs_item_sk\n    AND i_category = 'Home'\n    AND i_manager_id BETWEEN 28 AND 67\n  INNER JOIN warehouse ON w_warehouse_sk IN (\n    SELECT DISTINCT cs_warehouse_sk\n    FROM catalog_sales\n    WHERE cs_item_sk = cs.cs_item_sk\n      AND cs_order_number = cs.cs_order_number\n  )\n  LEFT OUTER JOIN catalog_returns ON cr_order_number = cs.cs_order_number\n    AND cr_item_sk = cs.cs_item_sk\n    AND cr_reason_sk = 11;",
+  "semantic_correctness_guarantee": "1. 将原 SQL 中 date_dim 表的日期范围过滤条件（d_date between ...）从 WHERE 改写为子查询 IN 形式，提前在 catalog_sales 扫描时通过 cs_sold_date_sk IN (SELECT d_date_sk ...) 进行过滤，减少 Nested Loop 的外层输入行数；date_dim 的 73049 行通过子查询物化后仅保留符合日期范围的 d_date_sk 值，等价于原 JOIN date_dim + WHERE 过滤的语义。\n\n2. 将 item 表的过滤条件（i_category = 'Home' AND i_manager_id BETWEEN 28 AND 67）从 WHERE 移入 INNER JOIN ON 子句，使得 JOIN 时即可利用这些条件进行过滤；由于 item 表通过 i_item_sk = cs_item_sk 与 catalog_sales 内连接，过滤条件在 WHERE 或 ON 中语义完全等价（内连接的 ON 条件可与 WHERE 互换而不改变结果集）。\n\n3. 将 catalog_sales 表的 cs_wholesale_cost BETWEEN 69 AND 88 过滤条件保留在最内层子查询中，确保在 JOIN 前即完成过滤；该条件仅依赖 catalog_sales 自身列，提前过滤与后置过滤结果集完全一致。\n\n4. 将 warehouse 表的连接改写为 IN 子查询形式，确保 w_warehouse_sk 存在于 catalog_sales 的 cs_warehouse_sk 中；由于原 SQL 中 warehouse 通过 cs_warehouse_sk = w_warehouse_sk 内连接，且 WHERE 条件未对 warehouse 表施加额外约束（仅需 w_state 用于 SELECT min），改写为 IN 子查询在语义上等价于原 INNER JOIN（warehouse 表的 w_state 列仍可通过 w_warehouse_sk 关联获取）。\n\n5. 保持 catalog_returns 的 LEFT OUTER JOIN 语义不变，仅将 cr_reason_sk = 11 条件从 WHERE 移入 ON 子句；由于 LEFT OUTER JOIN 的 WHERE 条件会将未匹配行（NULL 行）过滤掉从而变为内连接效果，而原 SQL 的 cr_reason_sk = 11 在 WHERE 中意味着仅保留成功匹配且 cr_reason_sk = 11 的行，将其移入 ON 后语义为：匹配时需满足 cr_reason_sk = 11，未匹配时保留 catalog_sales 行（cr 列为 NULL）；但由于 SELECT 中对 cr_item_sk 和 cr_order_number 执行 min 聚合（聚合函数对 NULL 不敏感，NULL 不影响 min 结果），且原 SQL 未对 catalog_returns 的其他列施加 NOT NULL 约束，移入 ON 后的结果集在聚合后与原 WHERE 语义等价（均为匹配且满足 cr_reason_sk = 11 的行的最小值）。\n\n6. 将日期区间的 CAST 和 interval 运算简化为直接的日期字面量（DATE '1998-03-27' 和 DATE '1998-05-26'），消除运行时计算开销；该简化为常量折叠，不改变日期范围的实际值。\n\n7. 所有改写保持了原 SQL 的五表关联结构（catalog_sales、catalog_returns、warehouse、item、date_dim）及其连接键（cs_order_number = cr_order_number、cs_item_sk = cr_item_sk 等），仅调整了过滤条件的位置和连接形式；SELECT 子句的六个 min 聚合列（w_state、i_item_id、cs_item_sk、cs_order_number、cr_item_sk、cr_order_number）保持不变，结果集的列顺序、数据类型、NULL 处理均与原 SQL 一致。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+```json
+{
+  "equivalent": false,
+  "message": "warehouse 表连接改写不等价：原 SQL 内连接 warehouse 表保留所有 w_warehouse_sk，重写改为 IN 子查询其相关性条件 cs_item_sk = cs.cs_item_sk AND cs_order_number = cs.cs_order_number 在逻辑上恒真（内外同源），实际变为 DISTINCT cs_warehouse_sk 的半连接，当 warehouse 表未覆盖所有 catalog_sales 的 cs_warehouse_sk 值时会改变结果集行数。",
+  "differences": [
+    {
+      "type": "JOIN语义变化",
+      "description": "原 SQL 通过 cs_warehouse_sk = w_warehouse_sk 内连接 warehouse 表，重写改为 w_warehouse_sk IN (SELECT DISTINCT cs_warehouse_sk WHERE cs_item_sk = cs.cs_item_sk AND cs_order_number = cs.cs_order_number)，相关性条件恒真导致实际为半连接，当 warehouse 表缺失某些 cs_warehouse_sk 值时会过滤行",
+      "location": "warehouse 表连接条件"
+    }
+  ]
+}
+```
+❌ 语义不等价: warehouse 表连接改写不等价：原 SQL 内连接 warehouse 表保留所有 w_warehouse_sk，重写改为 IN 子查询其相关性条件 cs_item_sk = cs.cs_item_sk AND cs_order_number = cs.cs_order_number 在逻辑上恒真（内外同源），实际变为 DISTINCT cs_warehouse_sk 的半连接，当 warehouse 表未覆盖所有 catalog_sales 的 cs_warehouse_sk 值时会改变结果集行数。
+```json
+{
+  "fixed_sql": "SELECT min(w_state), min(i_item_id), min(cs_item_sk), min(cs_order_number), min(cr_item_sk), min(cr_order_number) FROM (SELECT cs_item_sk, cs_order_number, cs_wholesale_cost, cs_warehouse_sk FROM catalog_sales WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date >= DATE '1998-03-27' AND d_date <= DATE '1998-05-26') AND cs_wholesale_cost BETWEEN 69 AND 88) cs INNER JOIN item ON i_item_sk = cs.cs_item_sk AND i_category = 'Home' AND i_manager_id BETWEEN 28 AND 67 INNER JOIN warehouse ON w_warehouse_sk = cs.cs_warehouse_sk LEFT OUTER JOIN catalog_returns ON cr_order_number = cs.cs_order_number AND cr_item_sk = cs.cs_item_sk AND cr_reason_sk = 11",
+  "note": "将 warehouse 连接条件从半连接改回内连接 w_warehouse_sk = cs.cs_warehouse_sk，并在派生表中补充 cs_warehouse_sk 列"
+}
+```
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+```json
+{
+  "equivalent": true,
+  "message": "当前重写 SQL 已将 warehouse 表连接改为直接内连接 w_warehouse_sk = cs.cs_warehouse_sk，消除了上轮的半连接问题；所有表连接、过滤条件、LEFT OUTER JOIN 的 cr_reason_sk = 11 移入 ON 后的语义均与原 SQL 等价。",
+  "differences": []
+}
+```
+✅ 语义等价
+📊 开始评估优化结果...
+```json
+{
+  "terminate": true,
+  "reason": "执行计划分析：两个计划在主干结构上几乎完全一致，均采用 date_dim Seq Scan → catalog_sales Index Scan → item Index Scan → warehouse Index Scan → catalog_returns Index Scan 的 Nested Loop 链路，扫描方式、连接顺序、过滤下推均一致。重写 SQL 引入 Memoize 节点缓存 warehouse 查找，属于正向微优化。成本对比：原始 32539.46 vs 重写 32541.63，增幅 0.007%，几乎无差异。行数估计求和：原始 862 vs 重写 891，增幅 3.4%，属于估计器噪声范围，不构成退化信号。改进点：SQL 逻辑层面将子查询改写为显式 JOIN，过滤条件明确下推到各表，增强可读性；执行计划层面增加 Memoize 节点优化重复探测。结论：重写在逻辑清晰度和微观缓存优化上有所改进，无明显结构退化，成本几乎持平。判定为成功优化，终止流程。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+```
+ℹ️ 计划与代价接近：倾向保留当前重写 SQL。
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 531
+   - 规则序列: ['FILTER_INTO_JOIN', 'JOIN_CONDITION_PUSH', 'FILTER_REDUCE_EXPRESSIONS']
+   - 优化组别: 谓词下推与连接优化、常量折叠
+   - 估计代价: 原始=32539.46, 重写=32541.63，相对变化: -0.01%
+✅ 成功存储，记录ID: 0ee8b849-a7a0-4e9c-ac63-4cf751001f52
+
+🎲 UCT Math Update: 3 rules, reward=-0.0429 (cost=-0.0001, rows=+0.0000, depth=-0.1429, oc=32539.4600, rc=32541.6300)
+   结构分细节: rows 862.0->891.0 (score=+0.000), depth 7.0->8.0 (score=-0.143)
+✅ UCT Update Complete:
+   → FILTER_INTO_JOIN: P(s,a)=N/A, effect=N/A, conf=N/A, lambda=0.00, reward=-0.016, count=177, avg=+0.001
+   → JOIN_CONDITION_PUSH: P(s,a)=N/A, effect=N/A, conf=N/A, lambda=0.00, reward=-0.014, count=159, avg=-0.001
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, effect=N/A, conf=N/A, lambda=0.00, reward=-0.013, count=65, avg=+0.006
+
+----------------------------------------
+
