@@ -1,6 +1,6 @@
 """
 LangGraph 编排的查询重写管线：
-initial_check → rule_selection → rewrite → syntax_check → semantic_check → evaluation
+initial_check（PlanAnalyzer）→ rule_selection → rewrite → syntax_check → semantic_check → evaluation
 →（有条件）uct_learning → END。UCT 学习更新使用纯数学公式（基于代价降低率）。
 """
 from __future__ import annotations
@@ -87,7 +87,6 @@ class RewriteState(TypedDict, total=False):
     best_cost: Optional[float]
     best_sql: Optional[str]
     best_rules: Optional[List]
-    best_groups: str
 
     previous_feedback: Optional[Dict]
 
@@ -118,6 +117,72 @@ def _state_sql(sql: Any) -> str:
     return _normalize_sql_text(sql)
 
 
+def _sql_identity(sql: Any) -> str:
+    """比较两条 SQL 是否为同一文本，忽略空白和末尾分号。"""
+    return re.sub(r"\s+", " ", _state_sql(sql)).strip().rstrip(";").strip()
+
+
+def align_step_sqls(
+    applied_rules: List[str],
+    rewritten_sql: str,
+    raw_steps: Any,
+) -> Optional[List[str]]:
+    """逐步 SQL 必须与规则序列等长，且最后一项就是最终重写。"""
+    if not applied_rules:
+        return []
+    if not isinstance(raw_steps, list) or len(raw_steps) != len(applied_rules):
+        return None
+    steps: List[str] = []
+    for item in raw_steps:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        steps.append(_state_sql(item))
+    if _sql_identity(steps[-1]) != _sql_identity(rewritten_sql):
+        return None
+    steps[-1] = _state_sql(rewritten_sql)
+    return steps
+
+
+def marginal_cost_rewards(costs: List[float]) -> Optional[List[float]]:
+    """r_i = clip((C_{i-1} - C_i) / C_0, -1, 1)。C_0 是本轮规则作用前的代价。"""
+    if len(costs) < 2 or costs[0] <= 0:
+        return None
+    rewards: List[float] = []
+    for prev, cur in zip(costs, costs[1:]):
+        raw = (float(prev) - float(cur)) / float(costs[0])
+        rewards.append(float(max(-1.0, min(1.0, raw))))
+    return rewards
+
+
+def equal_cost_rewards(original_cost: float, rewritten_cost: float, n: int) -> Optional[List[float]]:
+    """逐步代价不可用时，把序列代价收益均分给 n 条规则。"""
+    if n <= 0 or original_cost <= 0:
+        return None
+    total = (float(original_cost) - float(rewritten_cost)) / float(original_cost)
+    share = float(max(-1.0, min(1.0, total)) / n)
+    return [share] * n
+
+
+def _bind_step_chain(rr: Dict[str, Any], final_sql: str) -> None:
+    """保留已有逐步 SQL，并把最后一步改成实际留下的 SQL。"""
+    final_sql = _state_sql(final_sql)
+    rr["rewritten_sql"] = final_sql
+    steps = rr.get("step_sqls")
+    if isinstance(steps, list) and steps and all(isinstance(s, str) and s.strip() for s in steps):
+        bound = [_state_sql(s) for s in steps]
+        bound[-1] = final_sql
+        rr["step_sqls"] = bound
+    else:
+        rr["step_sqls"] = None
+
+
+def _rollback_unfixed_rewrite(rr: Dict[str, Any], original_sql: str) -> None:
+    """语法或语义修不好时退回原始 SQL，并禁止本轮写入 LinUCB。"""
+    rr["rewritten_sql"] = _state_sql(original_sql)
+    rr["step_sqls"] = None
+    rr["skip_linucb"] = True
+
+
 class LangGraphQueryRewriter:
     MIN_SIMILARITY = 0.80
     HIGH_SIMILARITY = 0.90
@@ -128,16 +193,12 @@ class LangGraphQueryRewriter:
     COST_ROLLBACK_PCT = 50.0
     # If estimated cost drops by more than this fraction vs original, skip LLM evaluation and exit.
     EARLY_TERMINATE_COST_REDUCTION_RATIO = 0.40
-    EFFECT_SCORE_LAMBDA_BASE = 0.5
     # Reward fusion: combine optimizer cost signal with plan-structure signal.
-    REWARD_COST_WEIGHT = 0.30
-    REWARD_ROWS_WEIGHT = 0.40
-    REWARD_DEPTH_WEIGHT = 0.30
+    REWARD_COST_WEIGHT = 0.60
+    REWARD_ROWS_WEIGHT = 0.20
+    REWARD_DEPTH_WEIGHT = 0.20
     # Keep rewrite when cost/plan are near-equivalent to avoid over-rollback.
     NEAR_EQUAL_COST_PCT = 0.10
-    # Treat rewrite as strong degradation when estimated cost explodes beyond this percentage.
-    COST_EXPLOSION_PCT = 1000.0
-
     def __init__(
         self,
         message_queue: MessageQueue,
@@ -423,12 +484,12 @@ class LangGraphQueryRewriter:
         r_exp: Any,
         oc: float,
         rc: float,
+        rule_step_rewards: List[float],
     ) -> Dict[str, Any]:
         return {
             "applied_rules": applied,
             "chosen_rule_prior": sel.get("chosen_rule_prior") or [],
-            "rule_effect_scores": sel.get("rule_effect_scores") or {},
-            "rule_effect_confidence": sel.get("rule_effect_confidence") or {},
+            "rule_step_rewards": list(rule_step_rewards),
             "context_vector": sel.get("_context_vector"),
             "original_cost": oc,
             "rewritten_cost": rc,
@@ -483,6 +544,23 @@ class LangGraphQueryRewriter:
             sum_rows += float(child_m["sum_rows"])
             max_depth = max(max_depth, float(child_m["max_depth"]))
         return {"sum_rows": sum_rows, "max_depth": max_depth}
+
+    def _plan_analyzer_report(self, explain_payload: Any) -> str:
+        """PlanAnalyzer text for every node. Raw EXPLAIN is not included."""
+        from src.Rewrite_Middleware.plan_analyzer import PlanAnalyzer
+
+        if explain_payload is None:
+            return "计划分析失败：没有执行计划。"
+        if isinstance(explain_payload, str):
+            text = explain_payload
+        else:
+            text = json.dumps(explain_payload, ensure_ascii=False)
+        try:
+            db_name = self.dbms.db_name if hasattr(self.dbms, "db_name") else None
+            analyzer = PlanAnalyzer(explain_json_str=text, db_name=db_name)
+            return analyzer.format_all_nodes_report()
+        except Exception as e:
+            return f"计划分析失败：{e}"
 
     @classmethod
     def _compute_structure_reward(cls, original_explain: Any, rewritten_explain: Any) -> Dict[str, float]:
@@ -548,6 +626,65 @@ class LangGraphQueryRewriter:
             "r_depth": float(r_depth),
         }
 
+    def _paper_sequence_reward(self, oc: float, rc: float, original_explain: Any, rewritten_explain: Any) -> float:
+        """融合收益 R = 0.6 R_cost + 0.2 R_rows + 0.2 R_depth，三项均为对称 clip。"""
+        cost_reward = self.bandit.compute_sequence_reward(oc, rc)
+        detail = self._compute_structure_reward(original_explain, rewritten_explain)
+        o_rows = float(detail.get("o_rows", 0.0))
+        r_rows = float(detail.get("r_rows", 0.0))
+        o_depth = float(detail.get("o_depth", 0.0))
+        r_depth = float(detail.get("r_depth", 0.0))
+        if o_rows > 0:
+            rows_reward = max(-1.0, min(1.0, (o_rows - r_rows) / o_rows))
+        else:
+            rows_reward = 0.0
+        if o_depth > 0:
+            depth_reward = max(-1.0, min(1.0, (o_depth - r_depth) / o_depth))
+        else:
+            depth_reward = 0.0
+        reward = (
+            self.REWARD_COST_WEIGHT * cost_reward
+            + self.REWARD_ROWS_WEIGHT * rows_reward
+            + self.REWARD_DEPTH_WEIGHT * depth_reward
+        )
+        return float(max(-1.0, min(1.0, reward)))
+
+    def _store_positive_memory(
+        self,
+        original_sql: str,
+        rewritten_sql: str,
+        rule_sequence: List[str],
+        original_cost: float,
+        rewritten_cost: float,
+        original_explain: Any,
+        rewritten_explain: Any,
+    ) -> None:
+        """仅当论文融合收益 R>0 时写入案例向量库。"""
+        if not self.global_memory:
+            return
+        reward = self._paper_sequence_reward(
+            original_cost, rewritten_cost, original_explain, rewritten_explain
+        )
+        if reward <= 0.0:
+            print(f"ℹ️ 记忆跳过：论文收益 R={reward:+.4f}，仅记录 R>0 的案例")
+            return
+        detail = self._compute_structure_reward(original_explain, rewritten_explain)
+        try:
+            self.global_memory.store_successful_optimization(
+                original_sql=original_sql,
+                rewritten_sql=rewritten_sql,
+                rule_sequence=rule_sequence,
+                original_cost=original_cost,
+                rewritten_cost=rewritten_cost,
+                metadata={
+                    "rows_score": float(detail.get("rows_score", 0.0)),
+                    "depth_score": float(detail.get("depth_score", 0.0)),
+                    "paper_reward": reward,
+                },
+            )
+        except Exception as ex:
+            print(f"⚠️ 知识库存储失败: {ex}")
+
     def _should_write_uct_sample(
         self,
         oc: float,
@@ -564,54 +701,56 @@ class LangGraphQueryRewriter:
         rdepth = float(depth_score)
         return not (rcost < 0.0 and rrows < 0.0 and rdepth < 0.0)
 
-    @staticmethod
-    def _fallback_position_weights(applied: List[str], position_decay: float = 0.90) -> Dict[str, float]:
-        if not applied:
-            return {}
-        if position_decay <= 0:
-            position_decay = 1.0
-        ws = np.array([position_decay ** i for i in range(len(applied))], dtype=np.float64)
-        s = float(ws.sum()) if float(ws.sum()) > 0 else 1.0
-        return {rid: float(ws[i] / s) for i, rid in enumerate(applied)}
+    def _explain_has_cost(self, explain_result: Any) -> bool:
+        if isinstance(explain_result, str):
+            if re.search(r"执行计划总代价:\s*([0-9,]+\.?[0-9]*)", explain_result):
+                return True
+            try:
+                explain_result = json.loads(explain_result)
+            except json.JSONDecodeError:
+                return False
+        if isinstance(explain_result, dict):
+            if "total_cost" in explain_result:
+                return True
+            plan = explain_result.get("Plan")
+            return isinstance(plan, dict) and "Total Cost" in plan
+        if isinstance(explain_result, list) and explain_result:
+            plan = explain_result[0].get("Plan") if isinstance(explain_result[0], dict) else None
+            return isinstance(plan, dict) and "Total Cost" in plan
+        return False
 
-    def _mix_llm_effect_with_confidence_gate(
+    async def _measure_step_cost_rewards(
         self,
-        applied: List[str],
-        effect_scores: Dict[str, float],
-        effect_confidence: Dict[str, float],
-    ) -> Dict[str, float]:
-        """
-        Mixed weight per rule:
-            w_i = lambda_i * w_i_llm + (1-lambda_i) * w_i_fallback
-            lambda_i = lambda_base * confidence_i
-        """
-        if not applied:
-            return {}
-        fallback = self._fallback_position_weights(applied, position_decay=0.90)
-        if not effect_scores:
-            return fallback
+        base_sql: str,
+        step_sqls: List[str],
+        known_explains: Dict[str, Any],
+    ) -> Optional[List[float]]:
+        """对规则作用前的 SQL 和每一步 SQL 取 EXPLAIN，得到逐步代价差。"""
+        chain = [_state_sql(base_sql)] + [_state_sql(sql) for sql in step_sqls]
+        explains: List[Any] = [None] * len(chain)
+        pending: List[int] = []
+        for i, sql in enumerate(chain):
+            cached = known_explains.get(_sql_identity(sql))
+            if cached is not None:
+                explains[i] = cached
+            else:
+                pending.append(i)
 
-        llm = {}
-        llm_sum = 0.0
-        for rid in applied:
-            v = float(max(0.0, effect_scores.get(rid, 0.0)))
-            llm[rid] = v
-            llm_sum += v
-        if llm_sum <= 0:
-            return fallback
-        llm = {rid: (llm[rid] / llm_sum) for rid in applied}
+        if pending:
+            async def _one(sql: str):
+                async with self.db_semaphore:
+                    return await DBMS_RAW_EXPLAIN_JSON_Tool(self.dbms, sql)
 
-        mixed = {}
-        for rid in applied:
-            conf = float(effect_confidence.get(rid, 0.5))
-            conf = max(0.0, min(1.0, conf))
-            lambda_i = self.EFFECT_SCORE_LAMBDA_BASE * conf
-            mixed[rid] = lambda_i * llm[rid] + (1.0 - lambda_i) * fallback[rid]
+            fetched = await asyncio.gather(*[_one(chain[i]) for i in pending])
+            for i, exp in zip(pending, fetched):
+                explains[i] = exp
 
-        total = sum(mixed.values())
-        if total <= 0:
-            return fallback
-        return {rid: (mixed[rid] / total) for rid in applied}
+        costs: List[float] = []
+        for exp in explains:
+            if not self._explain_has_cost(exp):
+                return None
+            costs.append(self._extract_cost_from_explain(exp))
+        return marginal_cost_rewards(costs)
 
     def _is_near_equivalent_plan_and_cost(
         self,
@@ -651,12 +790,9 @@ class LangGraphQueryRewriter:
         uct_info = dict(uct_info)
         if not uct_info.get("context_vector"):
             expl = state.get("initial_explain_info") or ""
-            adv_groups: List[str] = []
-            for a in state.get("optimization_advice") or []:
-                g = a.get("group")
-                if g:
-                    adv_groups.append(g)
-            ctx = self.bandit.extract_context(initial_sql, expl, adv_groups, state.get("data_statistics"))
+            ctx = self.bandit.extract_context(
+                initial_sql, expl, state.get("data_statistics")
+            )
             uct_info["context_vector"] = ctx.tolist()
         try:
             context = np.array(uct_info["context_vector"], dtype=np.float32)
@@ -672,25 +808,10 @@ class LangGraphQueryRewriter:
                 pr = item.get("prior")
                 if rid and isinstance(pr, (int, float)):
                     chosen_prior_map[str(rid)] = float(pr)
-            raw_effect_scores = uct_info.get("rule_effect_scores") or {}
-            effect_scores: Dict[str, float] = {}
-            if isinstance(raw_effect_scores, dict):
-                for rid in applied:
-                    v = raw_effect_scores.get(rid)
-                    if isinstance(v, (int, float)) and float(v) > 0:
-                        effect_scores[rid] = float(v)
-            raw_effect_conf = uct_info.get("rule_effect_confidence") or {}
-            effect_conf: Dict[str, float] = {}
-            if isinstance(raw_effect_conf, dict):
-                for rid in applied:
-                    v = raw_effect_conf.get(rid)
-                    if isinstance(v, (int, float)):
-                        effect_conf[rid] = float(max(0.0, min(1.0, float(v))))
-            mixed_weights = self._mix_llm_effect_with_confidence_gate(
-                applied,
-                effect_scores,
-                effect_conf,
-            )
+            step_rewards = uct_info.get("rule_step_rewards") or []
+            if not isinstance(step_rewards, list) or len(step_rewards) != len(applied):
+                print("ℹ️ 缺少逐步代价奖励，跳过 LinUCB 更新")
+                return
             cost_reward = self.bandit.compute_sequence_reward(oc, rc)
             struct_detail = self._compute_structure_reward(
                 uct_info.get("original_explain"),
@@ -698,15 +819,9 @@ class LangGraphQueryRewriter:
             )
             rows_score = float(struct_detail.get("rows_score", 0.0))
             depth_score = float(struct_detail.get("depth_score", 0.0))
-            sequence_reward = (
-                self.REWARD_COST_WEIGHT * cost_reward
-                + self.REWARD_ROWS_WEIGHT * rows_score
-                + self.REWARD_DEPTH_WEIGHT * depth_score
-            )
-            sequence_reward = float(max(-1.0, min(1.0, sequence_reward)))
             print(
                 f"\n🎲 UCT Math Update: {len(applied)} rules, "
-                f"reward={sequence_reward:+.4f} "
+                f"step_sum={sum(float(r) for r in step_rewards):+.4f} "
                 f"(cost={cost_reward:+.4f}, rows={rows_score:+.4f}, depth={depth_score:+.4f}, "
                 f"oc={oc:.4f}, rc={rc:.4f})"
             )
@@ -717,11 +832,10 @@ class LangGraphQueryRewriter:
                 f"depth {struct_detail.get('o_depth', 0.0):.1f}->{struct_detail.get('r_depth', 0.0):.1f} "
                 f"(score={struct_detail.get('depth_score', 0.0):+.3f})"
             )
-            rule_rewards = self.bandit.update_with_sequence_reward(
+            rule_rewards = self.bandit.update_with_rule_rewards(
                 applied,
                 context,
-                sequence_reward,
-                rule_weights=mixed_weights,
+                [float(r) for r in step_rewards],
             )
             print("✅ UCT Update Complete:")
             for rule_id, reward in rule_rewards.items():
@@ -732,24 +846,9 @@ class LangGraphQueryRewriter:
                         if rule_id in chosen_prior_map
                         else "N/A"
                     )
-                    effect_str = (
-                        f"{effect_scores.get(rule_id, 0.0):.3f}"
-                        if effect_scores
-                        else "N/A"
-                    )
-                    conf_str = (
-                        f"{effect_conf.get(rule_id, 0.5):.2f}"
-                        if effect_conf
-                        else "N/A"
-                    )
-                    gate_lambda = (
-                        self.EFFECT_SCORE_LAMBDA_BASE * float(effect_conf.get(rule_id, 0.5))
-                        if effect_conf
-                        else 0.0
-                    )
                     print(
-                        f"   → {rule_id}: P(s,a)={prior_str}, effect={effect_str}, conf={conf_str}, "
-                        f"lambda={gate_lambda:.2f}, reward={reward:+.3f}, "
+                        f"   → {rule_id}: P(s,a)={prior_str}, "
+                        f"reward={reward:+.3f}, "
                         f"count={stats['count']}, avg={stats['avg_reward']:+.3f}"
                     )
         except Exception as be:
@@ -760,7 +859,7 @@ class LangGraphQueryRewriter:
         return {}
 
     async def _initial_check_node(self, state: RewriteState) -> Dict[str, Any]:
-        print("🔍 开始初始优化可行性检查...")
+        print("🔍 PlanAnalyzer 分析当前 SQL...")
         trace = list(state.get("agent_trace") or [])
         few_shot: List = []
         retrieved_id = None
@@ -783,43 +882,28 @@ class LangGraphQueryRewriter:
             async with self.db_semaphore:
                 explain_info = await DBMS_EXPLAIN_Tool(self.dbms, base_sql)
             base_cost = self._extract_cost_from_explain(explain_info)
-            stats = _stats_str(state["data_statistics"])
-            idx = state.get("index_info") or self.index_info
-            async with self.llm_semaphore:
-                check = await self.decision_agent.initial_optimization_check(
-                    base_sql,
-                    stats,
-                    explain_info,
-                    few_shot,
-                    index_info=idx,
-                    previous_feedback=state.get("previous_feedback"),
-                )
-            trace.append({"node": "initial_check", "output": check})
-            can = check.get("can_optimize", False)
-            advice = check.get("advice", [])
-            if can:
-                print("✅ SQL 可以优化，进入规则选择")
-            else:
-                print("❌ SQL 无需优化，终止流程")
+            explain_text = (
+                json.dumps(explain_info, ensure_ascii=False)
+                if not isinstance(explain_info, str)
+                else explain_info
+            )
+            trace.append({"node": "initial_check", "output": {"plan_analyzer": True}})
+            print("✅ 计划分析完成，进入规则选择")
             return {
-                "can_optimize": can,
-                "optimization_advice": advice,
-                "initial_optimization_reason": check.get("reason", "") or "",
-                "initial_explain_info": (
-                    json.dumps(explain_info, ensure_ascii=False)
-                    if not isinstance(explain_info, str)
-                    else explain_info
-                ),
+                "can_optimize": True,
+                "optimization_advice": [],
+                "initial_optimization_reason": "",
+                "initial_explain_info": explain_text,
                 "original_cost": state.get("original_cost", base_cost) if state.get("original_cost") else base_cost,
                 "current_cost": base_cost,
                 "final_original_costs": state.get("final_original_costs", base_cost) if state.get("final_original_costs") else base_cost,
                 "few_shot_examples": few_shot,
                 "retrieved_record_id": retrieved_id,
                 "agent_trace": trace,
-                "should_terminate": not can,
+                "should_terminate": False,
                 "current_sql": base_sql,
                 "rewritten_sql": base_sql,
-                "final_rewritten_costs": base_cost if not can else state.get("final_rewritten_costs", 0.0),
+                "final_rewritten_costs": state.get("final_rewritten_costs", 0.0),
             }
         except Exception as e:
             print(f"初始检查失败: {e}")
@@ -846,11 +930,6 @@ class LangGraphQueryRewriter:
         trace = list(state.get("agent_trace") or [])
         try:
             base_sql = _state_sql(state.get("current_sql") or state["initial_sql"])
-            groups: List[str] = []
-            for a in state.get("optimization_advice") or []:
-                g = a.get("group")
-                if g:
-                    groups.append(g)
             lib = get_all_rules()
             stats = _stats_str(state["data_statistics"])
             idx = state.get("index_info") or self.index_info
@@ -865,7 +944,7 @@ class LangGraphQueryRewriter:
                 )
             
             # ====== Bandit scoring (single-pass generation + bandit sorting) ======
-            context = self.bandit.extract_context(base_sql, explain_info, groups, state.get("data_statistics"))
+            context = self.bandit.extract_context(base_sql, explain_info, state.get("data_statistics"))
             scored_rules = self.bandit.score_rules(lib, context)
             
             # Build UCT-scored rule library for LLM
@@ -883,8 +962,7 @@ class LangGraphQueryRewriter:
             async with self.llm_semaphore:
                 seq = await self.reasoning_agent.select_rule_sequence(
                     base_sql,
-                    state["optimization_advice"],
-                    uct_scored_lib,  # Pass UCT-scored library
+                    uct_scored_lib,
                     stats,
                     explain_info,
                     rnd,
@@ -911,21 +989,25 @@ class LangGraphQueryRewriter:
         trace = list(state.get("agent_trace") or [])
         try:
             base_sql = _state_sql(state.get("current_sql") or state["initial_sql"])
-            sel = state.get("selected_rules") or {"applied_rules": [], "groups": ""}
+            sel = state.get("selected_rules") or {"applied_rules": []}
             stats = _stats_str(state["data_statistics"])
             idx = state.get("index_info") or self.index_info
             async with self.llm_semaphore:
                 rr = await self.rewrite_agent.rewrite_with_rule_sequence(
                     base_sql,
                     sel,
-                    json.dumps(state.get("optimization_advice") or [], ensure_ascii=False),
-                    stats,
+                    state.get("initial_explain_info") or "",
                     schema_content=state.get("schema_content") or "",
-                    index_info=idx,
                     previous_feedback=state.get("previous_feedback"),
                 )
             rr = dict(rr or {})
             rr["rewritten_sql"] = _state_sql(rr.get("rewritten_sql", base_sql))
+            rr["rewrite_base_sql"] = base_sql
+            rr["step_sqls"] = align_step_sqls(
+                sel.get("applied_rules") or rr.get("applied_rules") or [],
+                rr["rewritten_sql"],
+                rr.get("step_sqls"),
+            )
             trace.append({"node": "rewrite", "output": dict(rr)})
             if rr.get("parse_error") and rr.get("rewritten_sql") == base_sql:
                 async with self.llm_semaphore:
@@ -938,6 +1020,7 @@ class LangGraphQueryRewriter:
                     )
                 if fixed:
                     rr["rewritten_sql"] = _state_sql(fixed)
+                    rr["step_sqls"] = None
                     rr.pop("parse_error", None)
             raw_g = rr.get("semantic_correctness_guarantee")
             raw_s = rr.get("semantic_check")
@@ -970,6 +1053,7 @@ class LangGraphQueryRewriter:
             ok = sc.get("flag", sc.get("valid", True))
             if ok:
                 print("✅ 语法检查通过")
+                _bind_step_chain(rr, sql)
                 trace.append({"node": "syntax_check", "output": {"valid": True}})
                 return {"current_rewrite_result": rr, "agent_trace": trace}
             cur = sql
@@ -991,15 +1075,16 @@ class LangGraphQueryRewriter:
                         or cur
                     )
                 if cur and (await DBMS_Syntax_Tool(self.dbms, cur)).get("flag", True):
-                    rr["rewritten_sql"] = cur
+                    _bind_step_chain(rr, cur)
                     trace.append({"node": "syntax_check", "output": {"valid": True, "attempts": attempt + 1}})
                     return {"current_rewrite_result": rr, "agent_trace": trace}
-            rr["rewritten_sql"] = _state_sql(state["initial_sql"])
-            trace.append({"node": "syntax_check", "output": {"valid": False, "rolled_back": True}})
+            print("ℹ️ 语法修复失败，退回原始 SQL，不记 LinUCB")
+            _rollback_unfixed_rewrite(rr, state["initial_sql"])
+            trace.append({"node": "syntax_check", "output": {"valid": False, "rolled_back": True, "skip_linucb": True}})
             return {"current_rewrite_result": rr, "agent_trace": trace}
         except Exception as e:
             print(f"语法检查异常: {e}")
-            rr["rewritten_sql"] = _state_sql(state["initial_sql"])
+            _rollback_unfixed_rewrite(rr, state["initial_sql"])
             return {
                 "current_rewrite_result": rr,
                 "agent_trace": trace + [{"node": "syntax_check", "error": str(e)}],
@@ -1009,6 +1094,15 @@ class LangGraphQueryRewriter:
         print("🧠 开始语义等价检查...")
         trace = list(state.get("agent_trace") or [])
         rr = dict(state.get("current_rewrite_result") or {})
+        if rr.get("skip_linucb"):
+            print("ℹ️ 语法修复已退回原始 SQL，不再做语义修复")
+            return {
+                "current_rewrite_result": rr,
+                "semantic_equivalent": False,
+                "semantic_equivalence_message": "语法修复失败，已退回原始 SQL",
+                "semantic_equivalence_differences": [],
+                "agent_trace": trace,
+            }
         base_sql = _state_sql(state.get("current_sql") or state["initial_sql"])
         cur = _state_sql(rr.get("rewritten_sql", base_sql))
         rr["rewritten_sql"] = cur
@@ -1079,7 +1173,7 @@ class LangGraphQueryRewriter:
             trace.append({"node": "semantic_check", "output": tool_out})
 
             if status == "equivalent":
-                rr["rewritten_sql"] = _state_sql(cur)
+                _bind_step_chain(rr, cur)
                 print("✅ 确定性等价验证通过")
                 return {
                     "current_rewrite_result": rr,
@@ -1120,12 +1214,52 @@ class LangGraphQueryRewriter:
             if not fixed_sql:
                 break
             cur = fixed_sql
+        else:
+            # The loop repairs after each failed check, so the last repair has not been checked.
+            try:
+                raw_eq = await Equivalence_Check_Tool(
+                    state["initial_sql"],
+                    cur,
+                    state.get("schema_file", self.schema_file),
+                    timeout=10,
+                    verbose=False,
+                )
+            except Exception as ex:
+                raw_eq = f"UNKNOWN_EXCEPTION: {ex}"
+            parsed_eq = self._parse_equivalence_tool_result(raw_eq)
+            if parsed_eq["status"] == "equivalent":
+                _bind_step_chain(rr, cur)
+                print("✅ 确定性等价验证通过")
+                return {
+                    "current_rewrite_result": rr,
+                    "semantic_equivalent": True,
+                    "semantic_equivalence_message": parsed_eq["reason"],
+                    "semantic_equivalence_differences": [],
+                    "agent_trace": trace,
+                }
+            if parsed_eq["status"] == "unknown":
+                deterministic_unknown = True
+                print(f"ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: {parsed_eq['reason']}")
+            else:
+                last_chk = {
+                    "equivalent": False,
+                    "message": parsed_eq["reason"],
+                    "differences": [
+                        {
+                            "type": "确定性等价验证失败",
+                            "description": parsed_eq["reason"],
+                            "location": "Equivalence_Check_Tool",
+                        }
+                    ],
+                }
 
         if not deterministic_unknown:
-            rr["rewritten_sql"] = _state_sql(state["initial_sql"])
+            print("ℹ️ 语义修复失败，退回原始 SQL，不记 LinUCB")
+            _rollback_unfixed_rewrite(rr, state["initial_sql"])
             rollback_out = {
                 "equivalent": False,
                 "rolled_back": True,
+                "skip_linucb": True,
                 "checker": "Equivalence_Check_Tool",
             }
             trace.append({"node": "semantic_check", "output": rollback_out})
@@ -1154,7 +1288,7 @@ class LangGraphQueryRewriter:
             last_chk = chk
             trace.append({"node": "semantic_check", "output": chk})
             if chk.get("equivalent"):
-                rr["rewritten_sql"] = _state_sql(cur)
+                _bind_step_chain(rr, cur)
                 print("✅ 语义等价")
                 return {
                     "current_rewrite_result": rr,
@@ -1180,9 +1314,36 @@ class LangGraphQueryRewriter:
             if not fixed_sql:
                 break
             cur = fixed_sql
+        else:
+            async with self.llm_semaphore:
+                chk = await self.semantic_check_agent.check_equivalence(
+                    state["initial_sql"],
+                    cur,
+                    rules,
+                    semantic_correctness_guarantee=rewriter_guarantee,
+                    schema_content=schema,
+                    index_info=idx,
+                    semantic_check_attempt=self.MAX_SEMANTIC_FIX,
+                    last_rejected_rewritten_sql=last_rejected,
+                    last_rejection_message=last_reject_msg,
+                    last_rejection_differences=last_reject_diffs,
+                )
+            last_chk = chk
+            trace.append({"node": "semantic_check", "output": chk})
+            if chk.get("equivalent"):
+                _bind_step_chain(rr, cur)
+                print("✅ 语义等价")
+                return {
+                    "current_rewrite_result": rr,
+                    "semantic_equivalent": True,
+                    "semantic_equivalence_message": chk.get("message", "") or "",
+                    "semantic_equivalence_differences": chk.get("differences") or [],
+                    "agent_trace": trace,
+                }
 
-        rr["rewritten_sql"] = _state_sql(state["initial_sql"])
-        rollback_out = {"equivalent": False, "rolled_back": True}
+        print("ℹ️ 语义修复失败，退回原始 SQL，不记 LinUCB")
+        _rollback_unfixed_rewrite(rr, state["initial_sql"])
+        rollback_out = {"equivalent": False, "rolled_back": True, "skip_linucb": True}
         trace.append({"node": "semantic_check", "output": rollback_out})
         return {
             "current_rewrite_result": rr,
@@ -1203,7 +1364,6 @@ class LangGraphQueryRewriter:
         rw = _state_sql(rr.get("rewritten_sql", init_sql))
         rr["rewritten_sql"] = rw
         sel = state.get("selected_rules") or {}
-        groups = sel.get("groups", "")
         applied = sel.get("applied_rules", [])
 
         try:
@@ -1222,102 +1382,11 @@ class LangGraphQueryRewriter:
             except (json.JSONDecodeError, TypeError):
                 o_parsed, r_parsed = o_exp, r_exp
             plan_struct = compare_explain_plan_structures(o_parsed, r_parsed)
-            reuse_signal = self._analyze_reuse_positive_signals(
-                init_sql,
-                rw,
-                o_parsed,
-                r_parsed,
-            )
-            if reuse_signal.get("positive"):
-                plan_struct["reuse_positive"] = True
-                plan_struct["reuse_signal"] = reuse_signal
-                plan_struct["reasons"] = list(plan_struct.get("reasons") or []) + list(
-                    reuse_signal.get("reasons") or []
-                )
-            preserve_despite_higher_cost = bool(
-                plan_struct.get("preserve_despite_higher_cost")
-            )
-            if reuse_signal.get("positive"):
-                preserve_despite_higher_cost = True
-                plan_struct["preserve_despite_higher_cost"] = True
-            rows_drastically_reduced = bool(
-                plan_struct.get("rows_drastically_reduced")
-            )
             if plan_struct.get("ok") and plan_struct.get("reasons"):
                 print("📐 计划结构: " + " | ".join(plan_struct["reasons"]))
 
             cost_reduction_ratio = (oc - rc) / oc if oc > 0 else 0.0
-            cost_increase_pct = ((rc - oc) / oc * 100.0) if oc > 0 else 0.0
-            cost_exploded = bool(
-                rw != init_sql
-                and oc > 0
-                and cost_increase_pct > self.COST_EXPLOSION_PCT
-            )
-            if cost_exploded:
-                if rnd < self.MAX_ITERATION_LOOP:
-                    print(
-                        f"⚠️ 检测到成本爆炸：重写 cost 增幅 {cost_increase_pct:.1f}% "
-                        f"(> {self.COST_EXPLOSION_PCT:.0f}%)，判定当前重写性能更差，进入下一轮优化。"
-                    )
-                    ev = {
-                        "terminate": False,
-                        "reason": (
-                            f"重写 SQL 的估计 cost 增幅达到 {cost_increase_pct:.1f}%（超过 {self.COST_EXPLOSION_PCT:.0f}% 阈值），"
-                            "按强负规则判定当前重写性能更差，需要继续优化。"
-                        ),
-                        "no_further_optimization": False,
-                        "next_step_advice": (
-                            "下一轮请回退激进改写，优先恢复关键过滤与连接路径，"
-                            "避免引入导致中间结果爆炸的 CTE/JOIN 结构。"
-                        ),
-                    }
-                else:
-                    print(
-                        f"⚠️ 检测到成本爆炸：重写 cost 增幅 {cost_increase_pct:.1f}% "
-                        f"(> {self.COST_EXPLOSION_PCT:.0f}%)，达到最大轮次后终止。"
-                    )
-                    ev = {
-                        "terminate": True,
-                        "reason": (
-                            f"重写 SQL 的估计 cost 增幅达到 {cost_increase_pct:.1f}%（超过 {self.COST_EXPLOSION_PCT:.0f}% 阈值），"
-                            "判定当前重写性能显著更差；已达到最大轮次，终止优化。"
-                        ),
-                        "no_further_optimization": True,
-                        "next_step_advice": "无需下一步优化。",
-                    }
-                trace.append(
-                    {
-                        "node": "evaluation",
-                        "output": ev,
-                        "skipped_llm": True,
-                        "plan_structure_analysis": plan_struct,
-                    }
-                )
-            elif rows_drastically_reduced and rw != init_sql:
-                row_ratio = plan_struct.get("rows_ratio")
-                row_pct = (float(row_ratio) * 100.0) if isinstance(row_ratio, (int, float)) else 0.0
-                print(
-                    f"✅ 行数估计求和大幅下降至原的 {row_pct:.4f}%，"
-                    "直接判定优化成功，终止并保留重写 SQL"
-                )
-                ev = {
-                    "terminate": True,
-                    "reason": (
-                        f"行数估计求和（Plan Rows累加）大幅下降，重写侧约为原的 {row_pct:.4f}%，"
-                        "按强规则直接判定为优化成功：终止多轮优化并保留本轮重写 SQL。"
-                    ),
-                    "no_further_optimization": True,
-                    "next_step_advice": "无需下一步优化。",
-                }
-                trace.append(
-                    {
-                        "node": "evaluation",
-                        "output": ev,
-                        "skipped_llm": True,
-                        "plan_structure_analysis": plan_struct,
-                    }
-                )
-            elif (
+            if (
                 oc > 0
                 and rw != init_sql
                 and rc < oc
@@ -1346,15 +1415,20 @@ class LangGraphQueryRewriter:
                     }
                 )
             else:
+                struct_for_prompt = self._compute_structure_reward(o_exp, r_exp)
+                rows_depth_comparison = (
+                    f"rows {struct_for_prompt.get('o_rows', 0.0):.1f}"
+                    f"->{struct_for_prompt.get('r_rows', 0.0):.1f}, "
+                    f"depth {struct_for_prompt.get('o_depth', 0.0):.1f}"
+                    f"->{struct_for_prompt.get('r_depth', 0.0):.1f}"
+                )
                 info = {
                     "original_costs": oc,
                     "rewritten_costs": rc,
-                    "original_explain_plan_json": o_exp,
-                    "rewritten_explain_plan_json": r_exp,
-                    "plan_structure_analysis": plan_struct,
-                    "groups": groups,
+                    "original_plan_analysis": self._plan_analyzer_report(o_exp),
+                    "rewritten_plan_analysis": self._plan_analyzer_report(r_exp),
+                    "rows_depth_comparison": rows_depth_comparison,
                     "applied_rules": applied,
-                    "optimization_advice": state.get("optimization_advice") or [],
                     "original_sql": init_sql,
                     "rewritten_sql": rw,
                     "reason": (state.get("previous_feedback") or {}).get("reason", ""),
@@ -1380,59 +1454,65 @@ class LangGraphQueryRewriter:
                 "uncertain",
             )
             is_uncertain = any(marker in eval_reason for marker in uncertain_markers)
-            is_near_equivalent = self._is_near_equivalent_plan_and_cost(plan_struct, oc, rc)
-            if is_near_equivalent:
-                print("ℹ️ 计划与代价接近：倾向保留当前重写 SQL。")
-            reuse_positive = bool(plan_struct.get("reuse_positive"))
-            if reuse_positive:
-                print("ℹ️ 检测到去相关/消除重复执行/公共结果复用：倾向保留当前重写 SQL。")
-
-            structural_improved = bool(plan_struct.get("structural_improvement"))
-            improved_now = bool(
-                rw != init_sql and (
-                    rc < oc
-                    or structural_improved
-                    or preserve_despite_higher_cost
-                    or reuse_positive
-                )
-            )
-            not_improved_or_degraded = not improved_now
-            if not_improved_or_degraded and not no_further_optimization and rnd < self.MAX_ITERATION_LOOP:
-                terminate = False
-                ev["terminate"] = False
-                if not next_step_advice:
-                    reasons = plan_struct.get("reasons") if isinstance(plan_struct, dict) else []
-                    reasons_text = "；".join(reasons[:3]) if reasons else ""
-                    next_step_advice = (
-                        "下一轮请优先修复导致未改进/恶化的关键结构："
-                        "尽量恢复或增强索引访问路径，减少大范围扫描/高开销算子，"
-                        "并针对相关子查询与JOIN顺序做更保守改写。"
-                        + (f" 参考当前结构线索：{reasons_text}" if reasons_text else "")
-                    )
-                ev["next_step_advice"] = next_step_advice
-                print("ℹ️ 本轮未改进/恶化：不终止，进入下一轮重写。")
-
-            # Explicitly carry the cost-explosion signal forward for next-round agents.
-            if cost_exploded:
-                ev["cost_explosion"] = True
-                ev["cost_increase_pct"] = round(cost_increase_pct, 2)
-                ev["cost_explosion_threshold_pct"] = self.COST_EXPLOSION_PCT
-
-            # 仅当「明确下一轮有望降低执行时间」时才续轮：未保留本轮重写时不允许进入下一轮
             if not terminate:
                 print("ℹ️ 评估建议继续下一轮优化（terminate=false）")
+
+            rule_step_rewards: Optional[List[float]] = None
+            step_sqls = rr.get("step_sqls")
+            will_record = terminate or (rnd + 1 > self.MAX_ITERATION_LOOP)
+            can_attribute = (
+                will_record
+                and not rr.get("skip_linucb")
+                and not is_uncertain
+                and bool(applied)
+                and rw != init_sql
+                and isinstance(step_sqls, list)
+                and len(step_sqls) == len(applied)
+            )
+            if can_attribute:
+                base_sql = _state_sql(
+                    rr.get("rewrite_base_sql") or state.get("current_sql") or init_sql
+                )
+                known_explains = {
+                    _sql_identity(init_sql): o_exp,
+                    _sql_identity(rw): r_exp,
+                }
+                rule_step_rewards = await self._measure_step_cost_rewards(
+                    base_sql,
+                    step_sqls,
+                    known_explains,
+                )
+                if not rule_step_rewards or len(rule_step_rewards) != len(applied):
+                    rule_step_rewards = equal_cost_rewards(oc, rc, len(applied))
+                    if rule_step_rewards:
+                        print(
+                            "ℹ️ 逐步 EXPLAIN 代价不可用，LinUCB 改为均分 "
+                            f"{rule_step_rewards[0]:+.4f} × {len(applied)}"
+                        )
+                    else:
+                        print("ℹ️ 逐步 EXPLAIN 代价不可用，且总代价无法均分，跳过 LinUCB 更新")
+            elif will_record and rr.get("skip_linucb"):
+                print("ℹ️ 语法或语义修复失败，跳过 LinUCB 更新")
+            elif will_record and applied and rw != init_sql and not is_uncertain:
+                rule_step_rewards = equal_cost_rewards(oc, rc, len(applied))
+                if rule_step_rewards:
+                    print(
+                        "ℹ️ 逐步 SQL 与规则序列不一致，LinUCB 改为均分 "
+                        f"{rule_step_rewards[0]:+.4f} × {len(applied)}"
+                    )
+                else:
+                    print("ℹ️ 逐步 SQL 与规则序列不一致，且总代价无法均分，跳过 LinUCB 更新")
 
             best_cost = state.get("best_cost")
             best_sql = state.get("best_sql")
             if best_sql:
                 best_sql = _state_sql(best_sql)
             best_rules = state.get("best_rules")
-            best_groups = state.get("best_groups", "")
             if (
                 rw != init_sql
                 and rc < (best_cost if best_cost is not None else float("inf"))
             ):
-                best_cost, best_sql, best_rules, best_groups = rc, rw, applied, groups
+                best_cost, best_sql, best_rules = rc, rw, applied
 
             out: Dict[str, Any] = {
                 "final_original_costs": oc,
@@ -1441,7 +1521,6 @@ class LangGraphQueryRewriter:
                 "best_cost": best_cost,
                 "best_sql": best_sql,
                 "best_rules": best_rules,
-                "best_groups": best_groups,
                 "evaluation_reason": ev.get("reason", "") or "",
                 "evaluation_terminate": terminate,
                 "evaluation_no_further_optimization": no_further_optimization,
@@ -1453,26 +1532,18 @@ class LangGraphQueryRewriter:
             if terminate:
                 out["should_terminate"] = True
                 if rw != init_sql:
-                    # 本轮保留了重写 SQL：写入全局记忆（不要求估计代价下降）
                     if is_uncertain:
                         print("ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库与 UCT 更新。")
-                    elif self.global_memory:
-                        try:
-                            struct_detail_for_store = self._compute_structure_reward(o_exp, r_exp)
-                            self.global_memory.store_successful_optimization(
-                                original_sql=init_sql,
-                                rewritten_sql=out["rewritten_sql"],
-                                rule_sequence=applied,
-                                groups=groups,
-                                original_cost=oc,
-                                rewritten_cost=rc,
-                                metadata={
-                                    "rows_score": float(struct_detail_for_store.get("rows_score", 0.0)),
-                                    "depth_score": float(struct_detail_for_store.get("depth_score", 0.0)),
-                                },
-                            )
-                        except Exception as ex:
-                            print(f"⚠️ 知识库存储失败: {ex}")
+                    else:
+                        self._store_positive_memory(
+                            original_sql=init_sql,
+                            rewritten_sql=out["rewritten_sql"],
+                            rule_sequence=applied,
+                            original_cost=oc,
+                            rewritten_cost=rc,
+                            original_explain=o_exp,
+                            rewritten_explain=r_exp,
+                        )
                     if not is_uncertain:
                         struct_detail_for_gate = self._compute_structure_reward(o_exp, r_exp)
                         should_write = self._should_write_uct_sample(
@@ -1481,9 +1552,17 @@ class LangGraphQueryRewriter:
                             rows_score=float(struct_detail_for_gate.get("rows_score", 0.0)),
                             depth_score=float(struct_detail_for_gate.get("depth_score", 0.0)),
                         )
-                        if applied and should_write:
+                        if applied and should_write and rule_step_rewards:
                             out["_uct_update_info"] = self._uct_update_payload(
-                                sel, applied, init_sql, rw, o_exp, r_exp, oc, rc
+                                sel,
+                                applied,
+                                init_sql,
+                                rw,
+                                o_exp,
+                                r_exp,
+                                oc,
+                                rc,
+                                rule_step_rewards,
                             )
                 out["rewritten_sql"] = _state_sql(out.get("rewritten_sql", rw))
                 cr = dict(out.get("current_rewrite_result") or rr)
@@ -1495,37 +1574,24 @@ class LangGraphQueryRewriter:
             if nxt > self.MAX_ITERATION_LOOP:
                 out["should_terminate"] = True
                 ratio = ((rc - oc) / oc * 100) if oc > 0 else 0.0
-                cost_regress = ratio > self.COST_ROLLBACK_PCT
-                if cost_regress and preserve_despite_higher_cost:
-                    print(
-                        f"ℹ️  估计代价上升 {ratio:.1f}%（> {self.COST_ROLLBACK_PCT}%），"
-                        "计划结构分析建议保留当前重写，不回退。"
-                    )
-                elif cost_regress:
+                if ratio > self.COST_ROLLBACK_PCT:
                     print(
                         f"ℹ️  估计代价上升 {ratio:.1f}%（> {self.COST_ROLLBACK_PCT}%）。"
-                        "最终输出取各轮中估计代价最低者，本轮不会盖过更低代价的候选。"
+                        "已到最大轮数，最终输出以 Decision 是否保留为准。"
                     )
                 if rw != init_sql:
                     if is_uncertain:
                         print("ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库与 UCT 更新。")
-                    elif self.global_memory:
-                        try:
-                            struct_detail_for_store = self._compute_structure_reward(o_exp, r_exp)
-                            self.global_memory.store_successful_optimization(
-                                original_sql=init_sql,
-                                rewritten_sql=rw,
-                                rule_sequence=applied,
-                                groups=groups,
-                                original_cost=oc,
-                                rewritten_cost=rc,
-                                metadata={
-                                    "rows_score": float(struct_detail_for_store.get("rows_score", 0.0)),
-                                    "depth_score": float(struct_detail_for_store.get("depth_score", 0.0)),
-                                },
-                            )
-                        except Exception as ex:
-                            print(f"⚠️ 知识库存储失败: {ex}")
+                    else:
+                        self._store_positive_memory(
+                            original_sql=init_sql,
+                            rewritten_sql=rw,
+                            rule_sequence=applied,
+                            original_cost=oc,
+                            rewritten_cost=rc,
+                            original_explain=o_exp,
+                            rewritten_explain=r_exp,
+                        )
                     if not is_uncertain:
                         struct_detail_for_gate = self._compute_structure_reward(o_exp, r_exp)
                         should_write = self._should_write_uct_sample(
@@ -1534,9 +1600,17 @@ class LangGraphQueryRewriter:
                             rows_score=float(struct_detail_for_gate.get("rows_score", 0.0)),
                             depth_score=float(struct_detail_for_gate.get("depth_score", 0.0)),
                         )
-                        if applied and should_write:
+                        if applied and should_write and rule_step_rewards:
                             out["_uct_update_info"] = self._uct_update_payload(
-                                sel, applied, init_sql, rw, o_exp, r_exp, oc, rc
+                                sel,
+                                applied,
+                                init_sql,
+                                rw,
+                                o_exp,
+                                r_exp,
+                                oc,
+                                rc,
+                                rule_step_rewards,
                             )
                 out["rewritten_sql"] = _state_sql(out.get("rewritten_sql", rw))
                 cr = dict(out.get("current_rewrite_result") or rr)
@@ -1550,10 +1624,7 @@ class LangGraphQueryRewriter:
                 "reason": ev.get("reason", ""),
                 "problematic_rules": applied,
                 "next_step_advice": next_step_advice,
-                "status": "not_improved_or_degraded" if not_improved_or_degraded else "improved_but_continue",
-                "cost_explosion": bool(ev.get("cost_explosion", False)),
-                "cost_increase_pct": ev.get("cost_increase_pct"),
-                "cost_explosion_threshold_pct": ev.get("cost_explosion_threshold_pct"),
+                "status": "agent_continue",
                 "original_cost": oc,
                 "rewritten_cost": rc,
             }
@@ -1585,31 +1656,22 @@ class LangGraphQueryRewriter:
                 "agent_trace": state.get("agent_trace", []),
             }
         init_sql = _state_sql(state["initial_sql"])
-        best_sql = state.get("best_sql")
-        best_cost = state.get("best_cost")
-        best_rules = state.get("best_rules")
-        # 各轮里估计代价最低的改写；不低于原 SQL 时输出原 SQL。
-        if (
-            best_sql
-            and isinstance(best_cost, (int, float))
-            and isinstance(oc, (int, float))
-            and oc > 0
-            and float(best_cost) < float(oc)
-        ):
-            final_sql = _state_sql(best_sql)
-            rc = float(best_cost)
-            rules = best_rules or None
+        kept_sql = _state_sql(state.get("rewritten_sql") or "")
+        agent_kept = bool(state.get("evaluation_terminate")) and bool(kept_sql) and kept_sql != init_sql
+        if agent_kept:
+            final_sql = kept_sql
+            rc_raw = state.get("final_rewritten_costs", oc)
+            rc = float(rc_raw) if isinstance(rc_raw, (int, float)) else 0.0
+            sel = state.get("selected_rules") or {}
+            rules = sel.get("applied_rules") or None
             print(
-                f"✅ 最终输出估计代价最低的一轮: {rc:.4f} < 原始 {float(oc):.4f}"
+                f"✅ Decision 保留本轮重写，输出该 SQL，估计代价 {rc:.4f}"
             )
         else:
             final_sql = init_sql
             rc = float(oc) if isinstance(oc, (int, float)) else 0.0
             rules = None
-            if best_sql and isinstance(best_cost, (int, float)) and isinstance(oc, (int, float)):
-                print(
-                    f"ℹ️ 各轮估计代价都不低于原始查询 ({float(best_cost):.4f} >= {float(oc):.4f})，输出原 SQL"
-                )
+            print("ℹ️ Decision 未保留重写，输出原 SQL")
         rate = round(((oc - rc) / oc * 100) if oc > 0 else 0.0, 2)
         return {
             "tpch": [
@@ -1664,7 +1726,6 @@ class LangGraphQueryRewriter:
             "best_cost": None,
             "best_sql": None,
             "best_rules": None,
-            "best_groups": "",
             "previous_feedback": None,
             "few_shot_examples": [],
             "retrieved_record_id": None,

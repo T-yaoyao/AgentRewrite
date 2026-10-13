@@ -27,9 +27,9 @@ import argparse
 # ============================================================================
 # IMPORTANT: Database Restart Warning
 # ============================================================================
-# This evaluation script uses `systemctl restart postgresql` (or similar) to 
-# restart the PostgreSQL database between query executions to ensure fair 
-# comparison by clearing database caches.
+# This evaluation script restarts the running PostgreSQL postmaster with its
+# own pg_ctl (falling back to systemctl) between original and rewritten SQL,
+# so shared buffers are cleared before the rewritten query is timed.
 #
 # If you don't have permission to restart PostgreSQL (e.g., shared database, 
 # cloud database, or restricted environment), use the --no_restart flag:
@@ -76,13 +76,14 @@ class Evaluation():
         Normalize SQL for semantic-equality-like text comparison in metrics:
         - Replace literal \\n and real newlines with spaces
         - Remove all whitespace
+        - Compare case-insensitively
         """
         if sql_text is None:
             return ""
         s = str(sql_text)
         s = s.replace("\\n", " ").replace("\n", " ")
         s = re.sub(r"\s+", "", s)
-        return s
+        return s.lower()
 
     @staticmethod
     def _coerce_sql_text(sql_value):
@@ -170,6 +171,7 @@ class Evaluation():
             'port': db_port
         }
         print("Connecting to database... DB_NAME: {}, DB_USER: {}, DB_HOST: {}, DB_PORT: {}".format(db_name, db_user, db_host, db_port))
+        restarted_for_shm = False
         for attempt in range(retries):
             try:
                 conn = psycopg2.connect(**conn_params)
@@ -177,6 +179,10 @@ class Evaluation():
                 return conn
             except psycopg2.Error as e:
                 print(f"Database connection failed (attempt {attempt+1}/{retries}): {e}")
+                if (not restarted_for_shm) and "shared memory segment" in str(e):
+                    restarted_for_shm = True
+                    self.restart_postgresql()
+                    continue
                 if attempt < retries - 1:
                     time.sleep(wait_time)  
                 else:
@@ -200,42 +206,30 @@ class Evaluation():
         return obj
     
     def restart_postgresql(self):
-        """
-        Restart PostgreSQL to clear database caches.
-        
-        This function requires appropriate system permissions:
-        - On Linux: sudo systemctl restart postgresql
-        - On macOS: brew services restart postgresql
-        - On Windows: net stop postgresql && net start postgresql
-        
-        If you don't have restart permissions, use --no_restart flag.
-        """
+        """Restart the local PostgreSQL 18 instance so shared buffers are cleared."""
         if self.no_restart:
             print("⚠️  Database restart skipped (--no_restart mode)")
             return
-            
-        print("🔄 Restarting PostgreSQL to clear caches...")
-        # Try different restart commands based on the system
-        commands = [
-            ["systemctl", "restart", "postgresql"],      # Linux with systemd
-            ["service", "postgresql", "restart"],         # Linux with init.d
-            ["brew", "services", "restart", "postgresql"], # macOS with Homebrew
+
+        cmd = [
+            "su", "postgres", "-c",
+            "/pg/PG18.3/bin/pg_ctl -D /pg/PG18.3/data restart",
         ]
-        
-        for cmd in commands:
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                if result.returncode == 0:
-                    print(f"✅ PostgreSQL restarted successfully using: {' '.join(cmd)}")
-                    time.sleep(3)  # wait for PostgreSQL to be fully up
-                    return
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                continue
-        
-        print("⚠️  Warning: Could not restart PostgreSQL. Consider using --no_restart mode.")
-        print("   Manual restart commands:")
-        print("   - Linux: sudo systemctl restart postgresql")
-        print("   - macOS: brew services restart postgresql")
+        print("🔄 Restarting PostgreSQL to clear caches...")
+        print(f"   {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, timeout=180)
+        except subprocess.TimeoutExpired:
+            print("⚠️  Warning: pg_ctl restart timed out.")
+            return
+        except FileNotFoundError:
+            print("⚠️  Warning: su or pg_ctl was not found.")
+            return
+        if result.returncode == 0:
+            print("✅ PostgreSQL restarted successfully")
+            time.sleep(3)
+            return
+        print("⚠️  Warning: Could not restart PostgreSQL.")
 
     def execute_query(self, conn, cursor, query, timeout,return_flag=False):
         try:
@@ -392,6 +386,15 @@ class Evaluation():
         else:
             print("Original Query Execution Failed")
 
+        # Smart shutdown waits until this session disconnects.
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
         self.restart_postgresql()
         if conn is None:
             return None, None, None, None, None, None 

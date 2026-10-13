@@ -41,7 +41,6 @@ class GlobalMemoryManager:
         original_sql: str,
         rewritten_sql: str,
         rule_sequence: List[str],
-        groups: str,
         original_cost: float,
         rewritten_cost: float,
         metadata: Optional[Dict] = None
@@ -54,7 +53,6 @@ class GlobalMemoryManager:
             original_sql: Original SQL
             rewritten_sql: Rewritten SQL
             rule_sequence: Applied rules
-            groups: Optimization groups
             original_cost: Original cost
             rewritten_cost: Rewritten cost
             metadata: Additional metadata
@@ -66,7 +64,6 @@ class GlobalMemoryManager:
             original_sql=original_sql,
             rewritten_sql=rewritten_sql,
             rule_sequence=rule_sequence,
-            groups=groups,
             original_cost=original_cost,
             rewritten_cost=rewritten_cost,
             metadata=metadata

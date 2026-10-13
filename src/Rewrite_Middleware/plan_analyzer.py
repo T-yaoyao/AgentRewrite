@@ -532,6 +532,44 @@ class PlanAnalyzer:
         
         return "\n".join(lines)
 
+    def format_all_nodes_report(self) -> str:
+        """List every plan node. Used by evaluation so the raw EXPLAIN is not sent."""
+        if not self.plan_root:
+            return "无法生成报告：执行计划解析失败"
+
+        if self.has_limit:
+            denominator_full = (
+                max(self.limit_child_cost, self.max_tree_cost)
+                if self.limit_child_cost > 0
+                else self.max_tree_cost
+            )
+        else:
+            denominator_full = max(self.root_total_cost, self.max_tree_cost)
+
+        all_nodes = self._calculate_metrics(self.plan_root)
+        lines = [f"执行计划总代价: {self.root_total_cost:,.2f}"]
+        if self.has_limit:
+            lines.append(f"模式检测: 包含 LIMIT（使用子节点代价作为基准: {self.limit_child_cost:,.2f}）")
+        else:
+            lines.append("模式检测: 全量执行")
+        lines.append(f"\n全部节点 ({len(all_nodes)}):\n")
+        for i, node in enumerate(all_nodes, 1):
+            if denominator_full > 0:
+                pct_str = f"{(node['self_cost'] / denominator_full) * 100:.1f}%"
+            else:
+                pct_str = "0.0%"
+            lines.append(f"{i}. 【{node['node_type']}】")
+            lines.append(f"   - 对象表名: {node['entity']}")
+            lines.append(f"   - 代价占比: {pct_str} (基准: {denominator_full:,.0f})")
+            lines.append(f"   - 自身消耗: {node['self_cost']:,.2f}")
+            lines.append(f"   - 累积消耗: {node['total_cost']:,.2f}")
+            if node["is_blocker"]:
+                lines.append("   - 🛑 瓶颈类型: 流水线阻塞 (Pipeline Blocker)")
+            if node["context"]:
+                lines.append(f"   - 关键信息: {node['context']}")
+            lines.append("")
+        return "\n".join(lines)
+
 # ==========================================
 # 使用示例
 # ==========================================

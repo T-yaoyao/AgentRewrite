@@ -13,14 +13,13 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 from pathlib import Path
 
 # Context layout:
-# SQL fingerprint hash + plan bottleneck operators + advice groups + anonymized table row-count stats
+# SQL fingerprint hash + plan bottleneck operators + anonymized table row-count stats
 FINGERPRINT_HASH_DIM = 32
 PLAN_BOTTLENECK_DIM = 24
-ADVICE_DIM = 8
 TABLE_ROW_BUCKET_DIM = 12
 TABLE_ROW_AGG_DIM = 4
 TABLE_STATS_DIM = TABLE_ROW_BUCKET_DIM + TABLE_ROW_AGG_DIM
-DEFAULT_CONTEXT_DIM = FINGERPRINT_HASH_DIM + PLAN_BOTTLENECK_DIM + ADVICE_DIM + TABLE_STATS_DIM
+DEFAULT_CONTEXT_DIM = FINGERPRINT_HASH_DIM + PLAN_BOTTLENECK_DIM + TABLE_STATS_DIM
 
 # Plan report: operator name inside full-width brackets 【…】
 _BRACKET_OP_RE = re.compile(r"【([^】]+)】")
@@ -384,17 +383,15 @@ class RuleBandit:
         self,
         sql: str,
         explain_info: str,
-        advice_groups: List[str],
         data_statistics: Any = None,
     ) -> np.ndarray:
         """
         Extract context feature vector from SQL fingerprint, plan bottlenecks,
-        advice groups, and anonymized participating table row-count statistics.
+        and anonymized participating table row-count statistics.
 
-        Features (DEFAULT_CONTEXT_DIM = 80):
+        Features (DEFAULT_CONTEXT_DIM = 72):
         - 32 dims: SHA256 bytes of SQLFingerprintGenerator template (project SQL fingerprint)
         - 24 dims: 【】中的算子名（稳定哈希分桶），邻近有代价占比则按占比加权
-        - 8 dims: advice group indicators
         - 16 dims: participating table row-count stats. Real table names are
           anonymized by SQL appearance order as t1..tn before hashing.
 
@@ -403,24 +400,8 @@ class RuleBandit:
         """
         fp = self._fingerprint_hash_features(sql)
         plan = self._plan_bottleneck_features(explain_info)
-
-        all_groups = [
-            "子查询优化",
-            "连接优化",
-            "谓词简化",
-            "常量折叠",
-            "聚合优化",
-            "投影优化",
-            "排序优化",
-            "集合优化",
-        ]
-        advice = np.array(
-            [1.0 if g in advice_groups else 0.0 for g in all_groups],
-            dtype=np.float32,
-        )
-
         table_stats = self._table_row_count_features(sql, data_statistics)
-        features = np.concatenate([fp, plan, advice, table_stats], axis=0)
+        features = np.concatenate([fp, plan, table_stats], axis=0)
         if features.shape[0] != self.context_dim:
             raise ValueError(
                 f"Context length {features.shape[0]} != context_dim {self.context_dim}"
@@ -493,13 +474,17 @@ class RuleBandit:
         Returns:
             List of (group, rule_id, ucb_score, description) sorted by score descending
         """
-        scored_rules = []
+        # The same rule_id can sit in several categories. LinUCB state is per id,
+        # so keep one entry and prefer the longer description.
+        best: Dict[str, Tuple[str, str, float, str]] = {}
         for group, rules in rule_library.items():
             for rule_id, rule_desc in rules.items():
+                desc = rule_desc if isinstance(rule_desc, str) else str(rule_desc)
                 score = self.calculate_ucb_score(rule_id, context)
-                scored_rules.append((group, rule_id, score, rule_desc))
-        
-        # Sort by UCB score descending
+                prev = best.get(rule_id)
+                if prev is None or len(desc) > len(prev[3]):
+                    best[rule_id] = (group, rule_id, score, desc)
+        scored_rules = list(best.values())
         scored_rules.sort(key=lambda x: x[2], reverse=True)
         return scored_rules
     
@@ -546,38 +531,38 @@ class RuleBandit:
         raw = (original_cost - rewritten_cost) / original_cost
         return float(max(-1.0, min(1.0, raw)))
 
+    def update_with_rule_rewards(
+        self,
+        rule_sequence: List[str],
+        context: np.ndarray,
+        rule_rewards: List[float],
+    ) -> Dict[str, float]:
+        """Write one measured reward per applied rule. Negative rewards are kept."""
+        if not rule_sequence or len(rule_sequence) != len(rule_rewards):
+            return {}
+
+        allocated: Dict[str, float] = {}
+        for rule_id, reward in zip(rule_sequence, rule_rewards):
+            reward_i = float(max(-1.0, min(1.0, float(reward))))
+            self.update(rule_id, context, reward_i)
+            allocated[rule_id] = allocated.get(rule_id, 0.0) + reward_i
+        return allocated
+
     def update_with_sequence_reward(
         self,
         rule_sequence: List[str],
         context: np.ndarray,
         sequence_reward: float,
         rule_weights: Optional[Dict[str, float]] = None,
-        position_decay: float = 0.90,
     ) -> Dict[str, float]:
         """
-        Update statistics from sequence-level reward without any LLM.
+        Split the query-level reward by w_i = e_i c_i / sum_j e_j c_j.
 
-        The full sequence gets a scalar reward from cost reduction.
-        Reward distribution strategy:
-        1) If rule_weights provided, use normalized positive weights for matching rules.
-        2) Otherwise, use geometric position weights:
-           w_i = position_decay ** i
-           r_i = sequence_reward * w_i / sum_j w_j
-
-        Args:
-            rule_sequence: Ordered applied rule IDs.
-            context: Context vector used for LinUCB update.
-            sequence_reward: Sequence-level reward in [-1, 1].
-            rule_weights: Optional per-rule positive weights from LLM effect scores.
-            position_decay: Later rules get smaller weights when < 1.
-
-        Returns:
-            Dict[rule_id, allocated_reward]
+        Caller passes already-normalized weights. If they are missing or sum to 0,
+        selected rules share the reward equally.
         """
         if not rule_sequence:
             return {}
-        if position_decay <= 0:
-            position_decay = 1.0
 
         n = len(rule_sequence)
         if isinstance(rule_weights, dict) and rule_weights:
@@ -588,9 +573,9 @@ class RuleBandit:
             if float(raw.sum()) > 0:
                 weights = raw
             else:
-                weights = np.array([position_decay ** i for i in range(n)], dtype=np.float64)
+                weights = np.ones(n, dtype=np.float64)
         else:
-            weights = np.array([position_decay ** i for i in range(n)], dtype=np.float64)
+            weights = np.ones(n, dtype=np.float64)
         weight_sum = float(weights.sum()) if float(weights.sum()) > 0 else 1.0
 
         allocated: Dict[str, float] = {}

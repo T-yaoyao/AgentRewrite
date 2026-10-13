@@ -25,6 +25,54 @@ def _is_response_format_rejection(exc: BaseException) -> bool:
     return "response_format" in msg or "json_schema" in msg
 
 
+class FatalAPIError(BaseException):
+    """Account, billing, or key failure. Subclasses BaseException so per-query handlers cannot continue."""
+
+
+_FATAL_API_MARKERS = (
+    "insufficient balance",
+    "insufficient_quota",
+    "exceeded your current quota",
+    "quota exceeded",
+    "payment required",
+    "account disabled",
+    "account suspended",
+    "account deactivated",
+    "api key has been disabled",
+    "invalid api key",
+    "invalid_api_key",
+    "incorrect api key",
+    "余额不足",
+    "余额已用尽",
+    "欠费",
+    "无可用资源",
+    "额度不足",
+    "已停用",
+    "被停用",
+    "已冻结",
+    "账号异常",
+    "账户异常",
+    "1113",
+)
+
+
+def _fatal_api_reason(exc: BaseException) -> str | None:
+    """Return the provider error text when the account cannot continue, else None."""
+    status = getattr(exc, "status_code", None)
+    parts = [str(exc)]
+    response = getattr(exc, "response", None)
+    text = getattr(response, "text", None) if response is not None else None
+    if text:
+        parts.append(str(text))
+    body = "\n".join(part for part in parts if part)
+    lowered = body.lower()
+    if status in (401, 402, 403):
+        return body.strip() or f"HTTP {status}"
+    if any(marker.lower() in lowered for marker in _FATAL_API_MARKERS):
+        return body.strip()
+    return None
+
+
 
 class GPT:
     """
@@ -36,6 +84,10 @@ class GPT:
     _global_input_tokens = 0
     _global_output_tokens = 0
     _global_cost_rmb = 0.0
+    _global_cache_hit_tokens = 0
+    _global_cache_miss_tokens = 0
+    _global_cache_prompt_tokens = 0
+    _global_billed_output_tokens = 0
 
     def __init__(
         self,
@@ -79,6 +131,20 @@ class GPT:
             base_url=self.base_url
         )
 
+    def _abort_if_fatal_api(self, exc: BaseException) -> None:
+        """Stop the process when the provider rejects the call for billing or account status."""
+        reason = _fatal_api_reason(exc)
+        if reason is None:
+            return
+        message = (
+            "API 调用失败，已终止运行。\n"
+            f"模型: {self.model}\n"
+            f"接口: {self.base_url}\n"
+            f"原因: {reason}"
+        )
+        print(message, file=sys.stderr, flush=True)
+        raise FatalAPIError(message) from exc
+
     def _count_tokens(self, text: str) -> int:
         """
         Rough token count using a generic tokenizer.
@@ -93,44 +159,231 @@ class GPT:
             # Fallback heuristic: 1 token ≈ 2 characters
             return max(1, len(text) // 2)
 
-    def _estimate_cost_rmb(self, input_tokens: int, output_tokens: int) -> float:
+    def _rmb_prices_per_token(self):
         """
-        Estimate RMB cost based on model pricing.
+        RMB per token: (cached input, uncached input, output).
 
-        For deepseek-v3.2 (from screenshot):
-            - Input:  0.002 RMB / 1K tokens
-            - Output: 0.003 RMB / 1K tokens
-
-        For other models, we currently return 0 (can be extended later).
+        DeepSeek-V4-Pro uses the off-peak column: 0.15 / 4.5 / 13.5 yuan per million.
+        GLM-5.3 uses 2 / 8 / 28 yuan per million.
         """
-        model_lower = self.model.lower()
-        if "deepseek-v3.2" in model_lower or ("deepseek" in model_lower and "v3" in model_lower):
-            in_price = 0.002  # RMB per 1K tokens
-            out_price = 0.003
-        else:
-            # Unknown pricing → don't charge
-            in_price = 0.0
-            out_price = 0.0
+        name = (self.model or "").lower()
+        if "deepseek-v4-pro" in name:
+            return (0.15 / 1_000_000, 4.5 / 1_000_000, 13.5 / 1_000_000)
+        if "glm-5.3" in name:
+            return (2.0 / 1_000_000, 8.0 / 1_000_000, 28.0 / 1_000_000)
+        return None
 
-        return (input_tokens / 1000.0) * in_price + (output_tokens / 1000.0) * out_price
+    def _bill_rmb(self, cache_hit_tokens: int, uncached_input_tokens: int, output_tokens: int) -> float:
+        prices = self._rmb_prices_per_token()
+        if prices is None:
+            return 0.0
+        hit_price, miss_price, output_price = prices
+        return (
+            cache_hit_tokens * hit_price
+            + uncached_input_tokens * miss_price
+            + output_tokens * output_price
+        )
 
     def _update_usage(self, prompt: str, response: str):
-        """
-        Update per-instance and global token/cost statistics.
-        """
+        """Keep a local token count. Money is billed from provider usage, not this estimate."""
         in_tokens = self._count_tokens(prompt)
         out_tokens = self._count_tokens(response)
-        cost = self._estimate_cost_rmb(in_tokens, out_tokens)
-
-        # Update instance-level stats
         self.input_tokens += in_tokens
         self.output_tokens += out_tokens
-        self.cost_rmb += cost
-
-        # Update global stats
         GPT._global_input_tokens += in_tokens
         GPT._global_output_tokens += out_tokens
+
+    def _wants_prompt_cache(self) -> bool:
+        return "claude" in (self.model or "").lower()
+
+    @staticmethod
+    def _is_cache_control_rejection(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return any(
+            token in msg
+            for token in (
+                "cache_control",
+                "cache control",
+                "prompt caching",
+                "expected a string",
+                "must be a string",
+            )
+        )
+
+    @staticmethod
+    def _has_cache_control(messages: list) -> bool:
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("cache_control"):
+                    return True
+        return False
+
+    @staticmethod
+    def _strip_cache_control(messages: list) -> list:
+        stripped = []
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                text = "\n".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict)
+                )
+                stripped.append({"role": message.get("role"), "content": text})
+            else:
+                stripped.append(message)
+        return stripped
+
+    def _compose_messages(self, prompt: str, system_message: str | None) -> list:
+        """Stable system prefix first, query-specific user text second."""
+        messages = []
+        if system_message:
+            if self._wants_prompt_cache():
+                messages.append({
+                    "role": "system",
+                    "content": [{
+                        "type": "text",
+                        "text": system_message,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
+                })
+            else:
+                messages.append({"role": "system", "content": system_message})
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    @staticmethod
+    def _cache_counts_from_usage(usage):
+        """Return (cache_hit, uncached_input, output) from a provider usage object, or None."""
+        if usage is None:
+            return None
+        if isinstance(usage, dict):
+            data = usage
+        else:
+            data = {}
+            for key in (
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+                "prompt_tokens_details",
+            ):
+                if hasattr(usage, key):
+                    data[key] = getattr(usage, key)
+            model_dump = getattr(usage, "model_dump", None)
+            if callable(model_dump):
+                dumped = model_dump()
+                if isinstance(dumped, dict):
+                    data.update(dumped)
+
+        output = data.get("completion_tokens")
+        output_n = int(output or 0)
+        hit = data.get("prompt_cache_hit_tokens")
+        miss = data.get("prompt_cache_miss_tokens")
+        if hit is not None or miss is not None:
+            return int(hit or 0), int(miss or 0), output_n
+
+        details = data.get("prompt_tokens_details")
+        cached = None
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
+        elif details is not None and hasattr(details, "cached_tokens"):
+            cached = getattr(details, "cached_tokens")
+        prompt = data.get("prompt_tokens")
+        if cached is None or prompt is None:
+            if output_n <= 0:
+                return None
+            return 0, 0, output_n
+        hit_n = int(cached or 0)
+        miss_n = max(0, int(prompt or 0) - hit_n)
+        return hit_n, miss_n, output_n
+
+    def _note_chunk_usage(self, chunk) -> None:
+        usage = getattr(chunk, "usage", None)
+        counts = self._cache_counts_from_usage(usage)
+        if counts is None:
+            return
+        hit, miss, output = counts
+        if hit <= 0 and miss <= 0 and output <= 0:
+            return
+        GPT._global_cache_hit_tokens += hit
+        GPT._global_cache_miss_tokens += miss
+        GPT._global_cache_prompt_tokens += hit + miss
+        GPT._global_billed_output_tokens += output
+        cost = self._bill_rmb(hit, miss, output)
+        self.cost_rmb += cost
         GPT._global_cost_rmb += cost
+
+    def _create_sync(self, messages, extra_params, response_format=None):
+        def once(msgs, include_usage=True):
+            kwargs = {
+                "model": self.model,
+                "messages": msgs,
+                "stream": True,
+                **extra_params,
+            }
+            if include_usage:
+                kwargs["stream_options"] = {"include_usage": True}
+            if self.thinking_type != "enabled":
+                kwargs["temperature"] = 0.0
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            try:
+                return self.client.chat.completions.create(**kwargs)
+            except BadRequestError as exc:
+                self._abort_if_fatal_api(exc)
+                if include_usage and "stream_options" in str(exc).lower():
+                    return once(msgs, include_usage=False)
+                raise
+            except Exception as exc:
+                self._abort_if_fatal_api(exc)
+                raise
+
+        try:
+            return once(messages)
+        except BadRequestError as exc:
+            self._abort_if_fatal_api(exc)
+            if self._has_cache_control(messages) and self._is_cache_control_rejection(exc):
+                print("ℹ️ 网关不接受 cache_control，改为普通 system 文本后重试。")
+                return once(self._strip_cache_control(messages))
+            raise
+
+    async def _create_async(self, messages, extra_params, response_format=None):
+        async def once(msgs, include_usage=True):
+            kwargs = {
+                "model": self.model,
+                "messages": msgs,
+                "stream": True,
+                **extra_params,
+            }
+            if include_usage:
+                kwargs["stream_options"] = {"include_usage": True}
+            if self.thinking_type != "enabled":
+                kwargs["temperature"] = 0.0
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            try:
+                return await self.async_client.chat.completions.create(**kwargs)
+            except BadRequestError as exc:
+                self._abort_if_fatal_api(exc)
+                if include_usage and "stream_options" in str(exc).lower():
+                    return await once(msgs, include_usage=False)
+                raise
+            except Exception as exc:
+                self._abort_if_fatal_api(exc)
+                raise
+
+        try:
+            return await once(messages)
+        except BadRequestError as exc:
+            self._abort_if_fatal_api(exc)
+            if self._has_cache_control(messages) and self._is_cache_control_rejection(exc):
+                print("ℹ️ 网关不接受 cache_control，改为普通 system 文本后重试。")
+                return await once(self._strip_cache_control(messages))
+            raise
 
     @classmethod
     def get_global_usage(cls):
@@ -139,10 +392,17 @@ class GPT:
         Returns:
             dict: {input_tokens, output_tokens, total_cost_rmb}
         """
+        prompt_tokens = cls._global_cache_prompt_tokens
+        hit_tokens = cls._global_cache_hit_tokens
         return {
             "input_tokens": cls._global_input_tokens,
             "output_tokens": cls._global_output_tokens,
             "total_cost_rmb": cls._global_cost_rmb,
+            "cache_hit_tokens": hit_tokens,
+            "uncached_input_tokens": cls._global_cache_miss_tokens,
+            "billed_output_tokens": cls._global_billed_output_tokens,
+            "cache_prompt_tokens": prompt_tokens,
+            "cache_hit_rate": (hit_tokens / prompt_tokens) if prompt_tokens > 0 else None,
         }
 
     def get_LLM_response(self, prompt, system_message=None, json_format=False, json_schema=None) -> str:
@@ -159,11 +419,8 @@ class GPT:
         Returns:
             str: The complete response from GPT
         """
-        # Prepare messages array
-        messages = []
-        if system_message:
-            messages.append({"role": "system", "content": system_message})
-        messages.append({"role": "user", "content": prompt})
+        messages = self._compose_messages(prompt, system_message)
+        counted_prompt = f"{system_message}\n{prompt}" if system_message else prompt
 
         # Prepare extra parameters for DeepSeek/OpenAI-compatible thinking controls
         extra_params = {}
@@ -171,9 +428,20 @@ class GPT:
             extra_params["extra_body"] = {"thinking": {"type": self.thinking_type}}
         elif self.is_deepseek_thinking:
             extra_params["extra_body"] = {"enable_thinking": True}
-        if self.reasoning_effort in {"high", "max"}:
+        if self.reasoning_effort in {"low", "high", "max"}:
             extra_params["reasoning_effort"] = self.reasoning_effort
 
+        try:
+            return self._complete_response(
+                messages, counted_prompt, extra_params, json_format, json_schema
+            )
+        except FatalAPIError:
+            raise
+        except Exception as exc:
+            self._abort_if_fatal_api(exc)
+            raise
+
+    def _complete_response(self, messages, counted_prompt, extra_params, json_format, json_schema) -> str:
         if json_format:
             # Request JSON formatted response (prefer strict schema when provided)
             response_format = {"type": "json_object"}
@@ -197,15 +465,13 @@ class GPT:
                         },
                     }
             try:
-                completion = self.client.chat.completions.create(
-                    temperature=0.0,
-                    model=self.model,
+                completion = self._create_sync(
+                    messages,
+                    extra_params,
                     response_format=response_format,
-                    messages=messages,
-                    stream=True,
-                    **extra_params
                 )
             except BadRequestError as exc:
+                self._abort_if_fatal_api(exc)
                 # Many OpenAI-compatible gateways support json_object but not json_schema;
                 # prompt already constrains shape, so fall back to plain JSON object mode.
                 if (
@@ -214,35 +480,27 @@ class GPT:
                     and response_format.get("type") == "json_schema"
                     and _is_response_format_rejection(exc)
                 ):
-                    completion = self.client.chat.completions.create(
-                        temperature=0.0,
-                        model=self.model,
+                    completion = self._create_sync(
+                        messages,
+                        extra_params,
                         response_format={"type": "json_object"},
-                        messages=messages,
-                        stream=True,
-                        **extra_params
                     )
                 elif not (isinstance(json_schema, dict) and json_schema):
-                    completion = self.client.chat.completions.create(
-                        temperature=0.0,
-                        model=self.model,
+                    completion = self._create_sync(
+                        messages,
+                        extra_params,
                         response_format={"type": "json_object"},
-                        messages=messages,
-                        stream=True,
-                        **extra_params
                     )
                 else:
                     raise
-            except Exception:
+            except Exception as exc:
+                self._abort_if_fatal_api(exc)
                 if isinstance(json_schema, dict) and json_schema:
                     raise
-                completion = self.client.chat.completions.create(
-                    temperature=0.0,
-                    model=self.model,
+                completion = self._create_sync(
+                    messages,
+                    extra_params,
                     response_format={"type": "json_object"},
-                    messages=messages,
-                    stream=True,
-                    **extra_params
                 )
 
             if self.is_deepseek_thinking:
@@ -250,6 +508,7 @@ class GPT:
             else:
                 full_response = ""
                 for chunk in completion:
+                    self._note_chunk_usage(chunk)
                     if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
                         chunk_text = chunk.choices[0].delta.content
                         print(chunk_text, end="", flush=True)
@@ -257,18 +516,12 @@ class GPT:
                 print()
 
             # Update cost statistics
-            self._update_usage(prompt, full_response)
+            self._update_usage(counted_prompt, full_response)
             return full_response
 
         else:
             # Request regular text response
-            completion = self.client.chat.completions.create(
-                temperature=0.0,
-                model=self.model,
-                messages=messages,
-                stream=True,
-                **extra_params
-            )
+            completion = self._create_sync(messages, extra_params)
 
             if self.is_deepseek_thinking:
                 full_response = self._process_deepseek_streaming_response(completion)
@@ -276,6 +529,7 @@ class GPT:
                 # Process streaming response
                 full_response = ""
                 for chunk in completion:
+                    self._note_chunk_usage(chunk)
                     if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
                         chunk_text = chunk.choices[0].delta.content
                         print(chunk_text, end="", flush=True)
@@ -283,7 +537,7 @@ class GPT:
                 print()  # New line after response
 
             # Update cost statistics
-            self._update_usage(prompt, full_response)
+            self._update_usage(counted_prompt, full_response)
             return full_response
     
     async def get_LLM_response_async(self, prompt, system_message=None, json_format=False, json_schema=None) -> str:
@@ -300,11 +554,8 @@ class GPT:
             Returns:
                 str: The complete response from GPT
             """
-            # Prepare messages array
-            messages = []
-            if system_message:
-                messages.append({"role": "system", "content": system_message})
-            messages.append({"role": "user", "content": prompt})
+            messages = self._compose_messages(prompt, system_message)
+            counted_prompt = f"{system_message}\n{prompt}" if system_message else prompt
 
             # Prepare extra parameters for DeepSeek/OpenAI-compatible thinking controls
             extra_params = {}
@@ -312,9 +563,20 @@ class GPT:
                 extra_params["extra_body"] = {"thinking": {"type": self.thinking_type}}
             elif self.is_deepseek_thinking:
                 extra_params["extra_body"] = {"enable_thinking": True}
-            if self.reasoning_effort in {"high", "max"}:
+            if self.reasoning_effort in {"low", "high", "max"}:
                 extra_params["reasoning_effort"] = self.reasoning_effort
 
+            try:
+                return await self._complete_response_async(
+                    messages, counted_prompt, extra_params, json_format, json_schema
+                )
+            except FatalAPIError:
+                raise
+            except Exception as exc:
+                self._abort_if_fatal_api(exc)
+                raise
+
+    async def _complete_response_async(self, messages, counted_prompt, extra_params, json_format, json_schema) -> str:
             if json_format:
                 # Request JSON formatted response (prefer strict schema when provided)
                 response_format = {"type": "json_object"}
@@ -338,50 +600,40 @@ class GPT:
                             },
                         }
                 try:
-                    completion = await self.async_client.chat.completions.create(
-                        temperature=0.0,
-                        model=self.model,
+                    completion = await self._create_async(
+                        messages,
+                        extra_params,
                         response_format=response_format,
-                        messages=messages,
-                        stream=True,
-                        **extra_params
                     )
                 except BadRequestError as exc:
+                    self._abort_if_fatal_api(exc)
                     if (
                         isinstance(json_schema, dict)
                         and json_schema
                         and response_format.get("type") == "json_schema"
                         and _is_response_format_rejection(exc)
                     ):
-                        completion = await self.async_client.chat.completions.create(
-                            temperature=0.0,
-                            model=self.model,
+                        completion = await self._create_async(
+                            messages,
+                            extra_params,
                             response_format={"type": "json_object"},
-                            messages=messages,
-                            stream=True,
-                            **extra_params
                         )
                     elif not (isinstance(json_schema, dict) and json_schema):
-                        completion = await self.async_client.chat.completions.create(
-                            temperature=0.0,
-                            model=self.model,
+                        completion = await self._create_async(
+                            messages,
+                            extra_params,
                             response_format={"type": "json_object"},
-                            messages=messages,
-                            stream=True,
-                            **extra_params
                         )
                     else:
                         raise
-                except Exception:
+                except Exception as exc:
+                    self._abort_if_fatal_api(exc)
                     if isinstance(json_schema, dict) and json_schema:
                         raise
-                    completion = await self.async_client.chat.completions.create(
-                        temperature=0.0,
-                        model=self.model,
+                    completion = await self._create_async(
+                        messages,
+                        extra_params,
                         response_format={"type": "json_object"},
-                        messages=messages,
-                        stream=True,
-                        **extra_params
                     )
 
                 if self.is_deepseek_thinking:
@@ -389,6 +641,7 @@ class GPT:
                 else:
                     full_response = ""
                     async for chunk in completion:
+                        self._note_chunk_usage(chunk)
                         if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
                             chunk_text = chunk.choices[0].delta.content
                             print(chunk_text, end="", flush=True)
@@ -396,17 +649,11 @@ class GPT:
                     print()
 
                 # Update cost statistics
-                self._update_usage(prompt, full_response)
+                self._update_usage(counted_prompt, full_response)
                 return full_response
             else:
                 # Request regular text response
-                completion = await self.async_client.chat.completions.create(
-                    temperature=0.0,
-                    model=self.model,
-                    messages=messages,
-                    stream=True,
-                    **extra_params
-                )
+                completion = await self._create_async(messages, extra_params)
 
                 if self.is_deepseek_thinking:
                     full_response = await self._process_deepseek_streaming_response_async(completion)
@@ -414,6 +661,7 @@ class GPT:
                     # Process streaming response asynchronously
                     full_response = ""
                     async for chunk in completion:
+                        self._note_chunk_usage(chunk)
                         if chunk.choices and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
                             chunk_text = chunk.choices[0].delta.content
                             print(chunk_text, end="", flush=True)
@@ -421,7 +669,7 @@ class GPT:
                     print()  # New line after response
 
                 # Update cost statistics
-                self._update_usage(prompt, full_response)
+                self._update_usage(counted_prompt, full_response)
                 return full_response
 
     def _process_deepseek_streaming_response(self, completion) -> str:
@@ -438,6 +686,9 @@ class GPT:
         is_answering = False
 
         for chunk in completion:
+            self._note_chunk_usage(chunk)
+            if not getattr(chunk, "choices", None):
+                continue
             delta = chunk.choices[0].delta
 
             # Handle reasoning content (thinking process)
@@ -471,6 +722,9 @@ class GPT:
         is_answering = False
 
         async for chunk in completion:
+            self._note_chunk_usage(chunk)
+            if not getattr(chunk, "choices", None):
+                continue
             delta = chunk.choices[0].delta
 
             # Handle reasoning content (thinking process)

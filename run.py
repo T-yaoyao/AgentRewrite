@@ -23,9 +23,7 @@ from src.utils.get_data_statistics import get_data_statistics, get_index_info, f
 from src.Rewrite_Middleware.middleware import DBMS, DBMS_Syntax_Tool
 from src.utils.agent_template import MessageContent, Message, MemoryWindow, MessageQueue
 from src.Query_Rewriter.langgraph_rewriter import LangGraphQueryRewriter
-from src.utils.llm_client import GPT
-
-COST_EXPLOSION_PCT_GUARD = 1000.0
+from src.utils.llm_client import GPT, FatalAPIError
 
 def parse_arguments():
     """Parse parameters from command line or use default values"""
@@ -55,6 +53,29 @@ def parse_arguments():
     
     return parser.parse_args()
 
+
+
+def _is_query_result(row) -> bool:
+    return isinstance(row, dict) and row.get("id") is not None and "original_query" in row
+
+
+def _cache_hit_rate(hit_tokens: int, prompt_tokens: int):
+    if prompt_tokens <= 0:
+        return None
+    return round(hit_tokens / prompt_tokens, 6)
+
+
+def _results_with_dataset_cache(rows):
+    """Query rows plus one trailing dataset cache summary. The summary has no SQL."""
+    hit_tokens = sum(int(row.get("cache_hit_tokens") or 0) for row in rows)
+    prompt_tokens = sum(int(row.get("cache_prompt_tokens") or 0) for row in rows)
+    summary = {
+        "dataset_cache_hit_rate": _cache_hit_rate(hit_tokens, prompt_tokens),
+        "cache_hit_tokens": hit_tokens,
+        "cache_prompt_tokens": prompt_tokens,
+        "dataset_llm_costs": round(sum(float(row.get("llm_costs") or 0) for row in rows), 6),
+    }
+    return list(rows) + [summary]
 
 
 def setup_directories(output_dir: str, enable_rewriter: bool):
@@ -100,10 +121,9 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
             with open(final_output_file, "r", encoding='utf-8') as f:
                 existing_results = json.load(f)
                 if isinstance(existing_results, list):
-                    all_results = existing_results
+                    all_results = [row for row in existing_results if _is_query_result(row)]
                     for row in all_results:
-                        if isinstance(row, dict):
-                            row.pop("agent_trace", None)
+                        row.pop("agent_trace", None)
                     result_index = {
                         str(row.get("id")): idx
                         for idx, row in enumerate(all_results)
@@ -146,6 +166,8 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
                 end_time = time.time()
                 rewrite_time = end_time - start_time
                 success = True
+            except FatalAPIError:
+                raise
             except Exception as e:
                 print(f"❌ Error processing query {item.get('id', 'N/A')}: {str(e)}")
                 import traceback
@@ -170,6 +192,26 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
             cost_after = usage_after.get("total_cost_rmb", 0.0)
             query_llm_cost = max(0.0, cost_after - cost_before)
             query_llm_cost = round(query_llm_cost, 6)
+            cache_hit_tokens = max(
+                0,
+                int(usage_after.get("cache_hit_tokens") or 0)
+                - int(usage_before.get("cache_hit_tokens") or 0),
+            )
+            cache_prompt_tokens = max(
+                0,
+                int(usage_after.get("cache_prompt_tokens") or 0)
+                - int(usage_before.get("cache_prompt_tokens") or 0),
+            )
+            uncached_input_tokens = max(
+                0,
+                int(usage_after.get("uncached_input_tokens") or 0)
+                - int(usage_before.get("uncached_input_tokens") or 0),
+            )
+            billed_output_tokens = max(
+                0,
+                int(usage_after.get("billed_output_tokens") or 0)
+                - int(usage_before.get("billed_output_tokens") or 0),
+            )
 
             tpch_entry = {}
             if success and isinstance(rewritten_sql, dict):
@@ -187,35 +229,14 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
                 "rewrite_rules": tpch_entry.get("rewrite_rules"),
                 "time_cost": rewrite_time,
                 "llm_costs": query_llm_cost,
+                "cache_hit_tokens": cache_hit_tokens,
+                "uncached_input_tokens": uncached_input_tokens,
+                "billed_output_tokens": billed_output_tokens,
+                "cache_hit_rate": _cache_hit_rate(cache_hit_tokens, cache_prompt_tokens),
+                "cache_prompt_tokens": cache_prompt_tokens,
                 "rewrite_suggestion": suggestion if success else "Error occurred during processing",
             }
 
-            # Write-time guard: if cost explodes beyond threshold, fallback to original SQL in output JSON.
-            try:
-                oc = float(tmp.get("original_costs") or 0.0)
-                rc = float(tmp.get("rewrite_costs") or 0.0)
-                cost_increase_pct = ((rc - oc) / oc * 100.0) if oc > 0 else 0.0
-            except (TypeError, ValueError):
-                oc, rc, cost_increase_pct = 0.0, 0.0, 0.0
-            if oc > 0 and cost_increase_pct > COST_EXPLOSION_PCT_GUARD:
-                print(
-                    f"🛡️ 写入防护触发：query {item['id']} cost 增幅 {cost_increase_pct:.1f}% "
-                    f"(> {COST_EXPLOSION_PCT_GUARD:.0f}%)，回退写入 original SQL。"
-                )
-                tmp["rewritten_query"] = initial_sql
-                tmp["rewrite_costs"] = oc
-                tmp["costs_reduction_rate"] = 0
-                tmp["rewrite_rules"] = None
-                if isinstance(tmp.get("rewrite_suggestion"), list):
-                    tmp["rewrite_suggestion"].append(
-                        {
-                            "group": "保护机制",
-                            "produced_suggestion": (
-                                f"写入防护触发：重写 cost 增幅 {cost_increase_pct:.1f}% 超过 "
-                                f"{COST_EXPLOSION_PCT_GUARD:.0f}%，输出已回退到原始 SQL。"
-                            ),
-                        }
-                    )
             # Upsert by id: overwrite existing entry instead of appending duplicates
             item_id = str(tmp.get("id"))
             existing_idx = result_index.get(item_id)
@@ -228,7 +249,12 @@ async def run_query_rewriter(args, directories, dbms, data_statistics, schema_fi
 
             # Write all results to the final output file
             with open(final_output_file, "w", encoding='utf-8') as f:
-                json.dump(all_results, f, indent=4, ensure_ascii=False)
+                json.dump(
+                    _results_with_dataset_cache(all_results),
+                    f,
+                    indent=4,
+                    ensure_ascii=False,
+                )
 
             # If saving logs, write individual log files
             if args.save_rewriter_logs:
@@ -346,4 +372,7 @@ async def main():
     print("\n✨ Processing completed successfully!")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except FatalAPIError:
+        raise SystemExit(1)

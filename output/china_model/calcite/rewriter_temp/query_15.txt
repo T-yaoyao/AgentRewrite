@@ -1,0 +1,98 @@
+Query ID: 15
+==================================================
+
+Original: SELECT COUNT(C) FILTER (WHERE g_0_f_1), COUNT(D) FILTER (WHERE g_0_f_0) FROM (SELECT SAL > 1000 AS C, SAL < 500 AS D, GROUPING(SAL > 1000, SAL < 500) = 0 AND SAL > 1000 AS g_0_f_0, GROUPING(SAL > 1000, SAL < 500) = 0 AND SAL < 500 AS g_0_f_1 FROM EMP GROUP BY SAL > 1000, SAL < 500) AS t3
+Rewritten: SELECT COUNT(*) FILTER (WHERE b), COUNT(*) FILTER (WHERE a) FROM (SELECT SAL > 1000 AS a, SAL < 500 AS b FROM EMP GROUP BY SAL > 1000, SAL < 500) t
+Time Cost: 465.78s
+Suggestion: []
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_FILTER_TRANSPOSE: UCT=1.274
+   → FILTER_SUB_QUERY_TO_CORRELATE: UCT=1.261
+   → UNION_REMOVE: UCT=1.173
+{"applied_rules": ["PROJECT_REDUCE_EXPRESSIONS", "AGGREGATE_PROJECT_MERGE", "AGGREGATE_MERGE", "AGGREGATE_REMOVE"]}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["PROJECT_REDUCE_EXPRESSIONS", "AGGREGATE_PROJECT_MERGE", "AGGREGATE_MERGE", "AGGREGATE_REMOVE"],
+  "step_sqls": [
+    "SELECT COUNT(C) FILTER (WHERE g_0_f_1), COUNT(D) FILTER (WHERE g_0_f_0) FROM (SELECT SAL > 1000 AS C, SAL < 500 AS D, SAL > 1000 AS g_0_f_0, SAL < 500 AS g_0_f_1 FROM EMP GROUP BY SAL > 1000, SAL < 500) AS t3",
+    "SELECT COUNT(c) FILTER (WHERE d), COUNT(d) FILTER (WHERE c) FROM (SELECT SAL > 1000 AS c, SAL < 500 AS d FROM EMP GROUP BY SAL > 1000, SAL < 500) AS t2",
+    "SELECT COUNT(c) FILTER (WHERE d), COUNT(d) FILTER (WHERE c) FROM (SELECT DISTINCT SAL > 1000 AS c, SAL < 500 AS d FROM EMP) AS t2",
+    "SELECT COUNT(DISTINCT (SAL > 1000, SAL < 500)) FILTER (WHERE SAL < 500), COUNT(DISTINCT (SAL > 1000, SAL < 500)) FILTER (WHERE SAL > 1000) FROM EMP"
+  ],
+  "semantic_correctness_guarantee": "1) PROJECT_REDUCE_EXPRESSIONS：原 SQL 的内层是普通 GROUP BY（无 GROUPING SETS/CUBE/ROLLUP），因此对分组表达式调用 GROUPING(SAL>1000, SAL<500) 恒返回 0，于是 'GROUPING(...)=0 AND SAL>1000' 与 'GROUPING(...)=0 AND SAL<500' 可分别化简为 'SAL>1000' 与 'SAL<500'，即 g_0_f_0 ≡ C、g_0_f_1 ≡ D。该化简对每一行的取值逐行相同，不改变任何结果。\n2) AGGREGATE_PROJECT_MERGE：夹在外层聚合与内层聚合之间的投影仅输出 4 列，其中 g_0_f_0 与 C、g_0_f_1 与 D 是同一表达式的重复列。合并该投影后，外层聚合改为直接引用去重后的两列 c=SAL>1000、d=SAL<500，引用关系一一对应（COUNT(C) FILTER(WHERE g_0_f_1) → COUNT(c) FILTER(WHERE d)；COUNT(D) FILTER(WHERE g_0_f_0) → COUNT(d) FILTER(WHERE c)），外层聚合的输入行集（每个 (SAL>1000, SAL<500) 分组一行）完全不变。\n3) AGGREGATE_MERGE：内层聚合不含任何聚合函数，GROUP BY SAL>1000, SAL<500 的输出恰是 EMP 中二元组 (SAL>1000, SAL<500) 的去重集合，与 SELECT DISTINCT SAL>1000, SAL<500 输出的多重集完全一致（含 NULL 分组时 GROUP BY 与 DISTINCT 的 NULL 相等语义也一致；本 Schema 中 SAL 为 NOT NULL，不存在 NULL）。外层 COUNT 仍作用在同一去重行集上，两处仅有的聚合被合并为一条含 DISTINCT 去重的聚合流水线。\n4) AGGREGATE_REMOVE：外层 'COUNT(c) FILTER(WHERE d)' 作用于 (c,d) 的去重行集，等价于在 EMP 原始行上执行 'COUNT(DISTINCT (SAL>1000, SAL<500)) FILTER(WHERE SAL<500)'：FILTER 先按同一谓词 SAL<500 过滤，再对通过行的 (c,d) 组合去重计数，与'先按 (c,d) 去重、再统计 d 为真的行数'一一对应（去重行集中 d 为真的行 ⟺ 原始行集中 (c,d) 组合在 d 为真条件下出现的不同取值）。第二个聚合项同理（c ⟺ SAL>1000）。据此可去掉独立的 DISTINCT 子查询（内层聚合被移除），只剩单层聚合。\n5) NULL 与 COUNT 语义：Schema 定义 sal INTEGER NOT NULL，故 SAL>1000、SAL<500 永不为 NULL；分组/去重产生的 c、d 均为非 NULL 布尔值，COUNT(非NULL表达式) 对每个 qualifying 行计 1，重写中的 COUNT(DISTINCT ...) 同样只统计非 NULL 的组合，二者均不会因 NULL 丢行。即便假设 SAL 可为 NULL：原 SQL 中 NULL 行落入 (NULL,NULL) 组，g_0_f_0/g_0_f_1 为 NULL 使 FILTER 排除该组；重写中 NULL 行的两个 FILTER 谓词结果均为 NULL 同样被排除，语义仍一致。\n6) 结果集形状：原查询外层无 GROUP BY，输出恒为单行两列（COUNT 均为 bigint），分别等于'是否存在 SAL<500 的行'与'是否存在 SAL>1000 的行'（存在为 1，否则为 0）；重写后的最终 SQL 同样是无分组键的单行两列聚合，取值逐输入一致（含空表时两边均为 (0,0)），无 ORDER BY、无重复行问题，列顺序与语义完全保持。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "内层 GROUP BY 输出即 (SAL>1000, SAL<500) 的去重行集，GROUPING 恒为 0 使 FILTER 谓词分别化简为 SAL<500 与 SAL>1000，故原 SQL 的两个计数等于去重行集中 d 为真 / c 为真的行数；重写在原始行上先以同一谓词过滤再 COUNT(DISTINCT (c,d))，计数对象一一对应，且 SAL NOT NULL 无 NULL 语义分歧，两查询恒输出相同的单行两列。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+{
+  "terminate": false,
+  "reason": "original_cost=844507.34，rewritten_cost=1818510.49，涨幅约115%，远超10%，不满足第1、2、3条任何一条。虽然重写后计划深度从6降到2、结构更简单，但扫描行数从18750113增至45000217，COUNT(DISTINCT) 导致聚合代价和整体代价显著上升，整体明显退步，不保留。",
+  "no_further_optimization": false,
+  "next_step_advice": "退回在原 SQL 基础上改写：保留 GROUP BY (SAL>1000, SAL<500) 的分组聚合形态，避免 COUNT(DISTINCT)。可尝试去掉外层派生表，直接写 SELECT COUNT(*) FILTER (WHERE SAL>1000), COUNT(*) FILTER (WHERE SAL<500) FROM EMP GROUP BY (SAL>1000, SAL<500) 后再外层汇总，或改用单层条件聚合 COUNT(CASE WHEN SAL>1000 THEN 1 END)、COUNT(CASE WHEN SAL<500 THEN 1 END) 直接对 EMP 扫描一次完成，消除嵌套子查询和重复扫描。"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_FILTER_TRANSPOSE: UCT=1.274
+   → FILTER_SUB_QUERY_TO_CORRELATE: UCT=1.260
+   → UNION_REMOVE: UCT=1.174
+{"applied_rules": ["AGGREGATE_EXPAND_DISTINCT_AGGREGATES"]}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+```json
+{
+  "applied_rules": ["AGGREGATE_EXPAND_DISTINCT_AGGREGATES"],
+  "step_sqls": [
+    "SELECT COUNT(*) FILTER (WHERE b), COUNT(*) FILTER (WHERE a) FROM (SELECT SAL > 1000 AS a, SAL < 500 AS b FROM EMP GROUP BY SAL > 1000, SAL < 500) t"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写：应用 AGGREGATE_EXPAND_DISTINCT_AGGREGATES，将原 SQL 中的两个 COUNT(DISTINCT ...) FILTER (...) 聚合改写为「内层按去重键 GROUP BY + 外层 COUNT(*) FILTER 条件聚合」的形态。两个 DISTINCT 聚合的去重键完全相同，均为行表达式 (SAL > 1000, SAL < 500)，因此只需一次 GROUP BY（无需示例中的 UNION ALL 双分支），避免了上一轮反馈中指出的重复扫描与代价暴涨问题（本次仅对 EMP 扫描一次）。\n2. 键与 FILTER 的对应关系：内层子查询按 (SAL > 1000, SAL < 500) 分组，输出列 a = (SAL > 1000)、b = (SAL < 500)。原 SQL 的 FILTER 条件恰好就是去重键的两个分量：FILTER (WHERE SAL < 500) 等价于 b = true，FILTER (WHERE SAL > 1000) 等价于 a = true。由于 a、b 由同一行 SAL 计算得出，分组内所有行的这两个布尔值恒定，故 FILTER 在行级与组级求值结果一致。\n3. 等价性论证：COUNT(DISTINCT (a, b)) FILTER (WHERE c) 统计的是满足 c 的行中不同 (a,b) 取值的个数。分组后每个非空分组对应一个唯一的 (a,b) 取值；且任一分组 b=true 蕴含该分组中每行都满足 SAL<500（a=true 同理），因此满足 FILTER 的行所对应的去重键集合恰为「该分量为 true 的非空分组集合」。外层 COUNT(*) FILTER (WHERE b) / COUNT(*) FILTER (WHERE a) 逐分组计数，与原语义完全一致。\n4. NULL 处理：Schema 中 emp.sal 为 INTEGER NOT NULL，因此 SAL > 1000 与 SAL < 500 永不为 NULL，不存在 NULL 键或 FILTER 结果为 NULL 的歧义；行表达式 (a, b) 本身也永不为 NULL，COUNT(DISTINCT) 不会因 NULL 被剔除而引入差异。\n5. 空表情形：若 EMP 为空，内层子查询返回空集，外层 COUNT(*) FILTER 结果为 0（COUNT 对空输入返回 0），与原 SQL 的 COUNT(DISTINCT ...) FILTER 空输入返回 0 一致。\n6. 重复行与顺序：原查询无 GROUP BY/HAVING/ORDER BY/LIMIT，结果为单行两列标量聚合；改写后同为单行两列聚合，两列顺序保持「先 SAL<500 的计数、后 SAL>1000 的计数」，列的数据类型均为整数计数，结果集语义完全等价。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "原 SQL 中 GROUPING(SAL>1000, SAL< 500)=0 在普通 GROUP BY 下恒为真，故 g_0_f_0/g_0_f_1 分别退化为 a/b；且 sal NOT NULL 使布尔表达式非空，组内 COUNT(C)=COUNT(*)，重写与原 SQL 的两个条件计数逐列一致。", "differences": []}"
+✅ 语义等价
+📊 开始评估优化结果...
+{
+  "terminate": true,
+  "reason": "original_cost=844507.34, rewritten_cost=844507.23, 代价严格降低，命中第 1 条。计划树深度不变(6->6)，扫描行数不变，SQL 逻辑也更简化（去掉了 GROUPING() 冗余谓词，COUNT(*) FILTER 更直接）。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 230
+   - 规则序列: ['AGGREGATE_EXPAND_DISTINCT_AGGREGATES']
+   - 估计代价: 原始=844507.34, 重写=844507.23，相对变化: 0.00%
+✅ 成功存储，记录ID: b49c8719-0f8f-44ae-bf04-6c9f25782884
+
+🎲 UCT Math Update: 1 rules, step_sum=+0.5356 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=844507.3400, rc=844507.2300)
+   结构分细节: rows 18750113.0->18750113.0 (score=+0.000), depth 6.0->6.0 (score=+0.000)
+✅ UCT Update Complete:
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: P(s,a)=N/A, reward=+0.536, count=1, avg=+0.536
+
+----------------------------------------
+

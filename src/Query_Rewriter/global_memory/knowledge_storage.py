@@ -26,7 +26,6 @@ class KnowledgeStorage:
         original_sql: str,
         rewritten_sql: str,
         rule_sequence: List[str],
-        groups: str,
         original_cost: float,
         rewritten_cost: float,
         metadata: Optional[Dict] = None
@@ -38,7 +37,6 @@ class KnowledgeStorage:
             original_sql: Original SQL query
             rewritten_sql: Rewritten SQL query
             rule_sequence: List of applied rule IDs
-            groups: Optimization groups (comma-separated)
             original_cost: Original query cost
             rewritten_cost: Rewritten query cost
             metadata: Additional metadata
@@ -74,13 +72,11 @@ class KnowledgeStorage:
             print(f"💾 正在存储优化案例到向量数据库...")
             print(f"   - SQL指纹长度: {len(fingerprint)}")
             print(f"   - 规则序列: {rule_sequence}")
-            print(f"   - 优化组别: {groups}")
             print(f"   - 估计代价: 原始={original_cost}, 重写={rewritten_cost}，相对变化: {cost_note}")
             
             record_id = self.vector_store.add(
                 sql_fingerprint=fingerprint,
                 rule_sequence=rule_sequence,
-                groups=groups,
                 metadata=storage_metadata,
             )
             

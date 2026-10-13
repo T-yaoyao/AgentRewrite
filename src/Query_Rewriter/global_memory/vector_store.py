@@ -231,7 +231,6 @@ class VectorStore:
         self,
         sql_fingerprint: str,
         rule_sequence: List[str],
-        groups: str,
         metadata: Optional[Dict] = None,
     ) -> str:
         """
@@ -240,7 +239,6 @@ class VectorStore:
         Args:
             sql_fingerprint: Normalized SQL template
             rule_sequence: List of applied rule IDs
-            groups: Optimization groups (comma-separated)
             metadata: Additional metadata (cost fields are never persisted)
             
         Returns:
@@ -253,7 +251,6 @@ class VectorStore:
         record_metadata = {
             "sql_fingerprint": sql_fingerprint,
             "rule_sequence": json.dumps(rule_sequence),
-            "groups": groups,
             "frequency": "1",
             "success": "true"
         }

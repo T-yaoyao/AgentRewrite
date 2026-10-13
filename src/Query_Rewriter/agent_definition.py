@@ -25,18 +25,9 @@ STRICT_JSON_SCHEMAS = {
         "schema": {
             "type": "object",
             "properties": {
-                "groups": {"type": "string"},
                 "applied_rules": {"type": "array", "items": {"type": "string"}},
-                "rule_effect_scores": {
-                    "type": "object",
-                    "additionalProperties": {"type": "number"},
-                },
-                "rule_effect_confidence": {
-                    "type": "object",
-                    "additionalProperties": {"type": "number"},
-                },
             },
-            "required": ["groups", "applied_rules", "rule_effect_scores", "rule_effect_confidence"],
+            "required": ["applied_rules"],
             "additionalProperties": False,
         },
     },
@@ -53,10 +44,9 @@ STRICT_JSON_SCHEMAS = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "group": {"type": "string"},
                             "produced_suggestion": {"type": "string"},
                         },
-                        "required": ["group", "produced_suggestion"],
+                        "required": ["produced_suggestion"],
                         "additionalProperties": False,
                     },
                 },
@@ -86,15 +76,13 @@ STRICT_JSON_SCHEMAS = {
         "schema": {
             "type": "object",
             "properties": {
-                "groups": {"type": "string"},
                 "applied_rules": {"type": "array", "items": {"type": "string"}},
-                "rewritten_sql": {"type": "string"},
+                "step_sqls": {"type": "array", "items": {"type": "string"}},
                 "semantic_correctness_guarantee": {"type": "string"},
             },
             "required": [
-                "groups",
                 "applied_rules",
-                "rewritten_sql",
+                "step_sqls",
                 "semantic_correctness_guarantee",
             ],
             "additionalProperties": False,
@@ -155,6 +143,22 @@ STRICT_JSON_SCHEMAS = {
 }
 
 
+def _rewritten_sql_from_steps(parsed: dict, base_sql: str) -> bool:
+    """最终 SQL 取 step_sqls 最后一项。空序列表示未改写，沿用 base_sql。"""
+    parsed.pop("rewritten_sql", None)
+    steps = parsed.get("step_sqls")
+    if not isinstance(steps, list):
+        return False
+    if not steps:
+        parsed["rewritten_sql"] = base_sql
+        return True
+    last = steps[-1]
+    if not isinstance(last, str) or not last.strip():
+        return False
+    parsed["rewritten_sql"] = last.strip()
+    return True
+
+
 def _merge_rewrite_semantic_fields(parsed: dict) -> None:
     """
     统一 semantic_correctness_guarantee 与旧字段 semantic_check；
@@ -173,236 +177,156 @@ def _merge_rewrite_semantic_fields(parsed: dict) -> None:
     parsed["semantic_check"] = parsed.get("semantic_correctness_guarantee", "")
 
 
+def _stable_rule_catalog(rule_library: dict) -> tuple:
+    """固定 rule_id 顺序的规则目录，以及放到 user 后缀里的 UCT 分数。"""
+    sections = []
+    scores = []
+    for group, rules in (rule_library or {}).items():
+        if not isinstance(rules, dict) or not rules:
+            continue
+        rows = []
+        for rule_id, rule_data in rules.items():
+            score = None
+            if isinstance(rule_data, tuple) and len(rule_data) >= 2:
+                desc = rule_data[0]
+                if isinstance(rule_data[1], (int, float)) and not isinstance(rule_data[1], bool):
+                    score = float(rule_data[1])
+            else:
+                desc = rule_data
+            rows.append((str(rule_id), str(desc)))
+            if score is not None:
+                scores.append((str(rule_id), score))
+        rows.sort(key=lambda item: item[0])
+        body = "\n".join(f"- {rid}: {desc}" for rid, desc in rows)
+        sections.append(f"### {group}\n{body}")
+    scores.sort(key=lambda item: item[0])
+    return "\n".join(sections), scores
+
+
 class ReasoningAgent(Agent):
     """MDP-based Reasoning Agent"""
     def __init__(self, mq: MessageQueue):
         super().__init__("ReasoningAgent", mq, gpt = GPT(
         api_key=os.getenv("REASONING_MODEL_API_KEY"),
         model=os.getenv("REASONING_MODEL"),
-        base_url=os.getenv("REASONING_MODEL_URL")
+        base_url=os.getenv("REASONING_MODEL_URL"),
+        thinking_type=os.getenv("REASONING_MODEL_THINKING"),
+        reasoning_effort=os.getenv("REASONING_MODEL_REASONING_EFFORT"),
         ))
 
-    @staticmethod
-    def _sanitize_rule_effect_scores(applied_rules, raw_scores) -> Dict[str, float]:
-        """
-        Keep only positive numeric scores for selected rules and normalize to sum=1.
-        """
-        if not isinstance(applied_rules, list) or not applied_rules:
-            return {}
-        if not isinstance(raw_scores, dict):
-            return {}
-
-        cleaned: Dict[str, float] = {}
-        for rid in applied_rules:
-            v = raw_scores.get(rid)
-            if isinstance(v, bool):
-                continue
-            if isinstance(v, (int, float)):
-                fv = float(v)
-                if fv > 0:
-                    cleaned[rid] = fv
-            elif isinstance(v, str):
-                s = v.strip()
-                if not s:
-                    continue
-                try:
-                    fv = float(s)
-                except ValueError:
-                    continue
-                if fv > 0:
-                    cleaned[rid] = fv
-
-        total = sum(cleaned.values())
-        if total <= 0:
-            return {}
-        return {rid: cleaned[rid] / total for rid in cleaned}
-
-    @staticmethod
-    def _sanitize_rule_effect_confidence(applied_rules, raw_confidence) -> Dict[str, float]:
-        """
-        Keep confidence values in [0, 1] for selected rules only.
-        """
-        if not isinstance(applied_rules, list) or not applied_rules:
-            return {}
-        if not isinstance(raw_confidence, dict):
-            return {}
-
-        cleaned: Dict[str, float] = {}
-        for rid in applied_rules:
-            v = raw_confidence.get(rid)
-            if isinstance(v, bool):
-                continue
-            if isinstance(v, (int, float)):
-                cleaned[rid] = float(max(0.0, min(1.0, float(v))))
-            elif isinstance(v, str):
-                s = v.strip()
-                if not s:
-                    continue
-                try:
-                    fv = float(s)
-                except ValueError:
-                    continue
-                cleaned[rid] = float(max(0.0, min(1.0, fv)))
-        return cleaned
-
-    async def select_rule_sequence(self, sql: str, decision_advice: list, rule_library: dict, data_statistics: str, explain_info: str, iteration_round: int = 1, previous_feedback: dict = None, few_shot_examples: list = None, index_info: str = "") -> dict:
-        """Select appropriate rule sequence based on DecisionAgent's advice with UCT scores"""
-        advice_text = json.dumps(decision_advice, ensure_ascii=False, indent=2)
-
-        # Build rule library text with UCT scores
-        rule_text = ""
-        all_groups = []
-        all_rules = []
-        
-        # Check if rule_library contains UCT scores (tuple format) or plain descriptions
-        has_uct_scores = False
-        for group, rules in rule_library.items():
-            if rules:
-                first_val = next(iter(rules.values()))
-                if isinstance(first_val, tuple):
-                    has_uct_scores = True
-                break
-        
-        for group, rules in rule_library.items():
-            all_groups.append(group)
-            rule_text += f"### {group}\n"
-            
-            # Sort rules by UCT score if available (descending)
-            sorted_rules = []
-            for rule_id, rule_data in rules.items():
-                if has_uct_scores and isinstance(rule_data, tuple):
-                    desc, score = rule_data
-                    sorted_rules.append((rule_id, desc, score))
-                else:
-                    sorted_rules.append((rule_id, rule_data, 1.0))  # Default score 1.0
-            
-            sorted_rules.sort(key=lambda x: x[2], reverse=True)
-            
-            for rule_id, desc, score in sorted_rules:
-                all_rules.append(rule_id)
-                if has_uct_scores:
-                    rule_text += f"- {rule_id} [UCT分数: {score:.3f}]: {desc}\n"
-                else:
-                    rule_text += f"- {rule_id}: {desc}\n"
-
-        groups_text = ", ".join(all_groups)
+    async def select_rule_sequence(self, sql: str, rule_library: dict, data_statistics: str, explain_info: str, iteration_round: int = 1, previous_feedback: dict = None, few_shot_examples: list = None, index_info: str = "") -> dict:
+        """根据 PlanAnalyzer 的执行计划分析，从全量规则库选择规则序列。"""
+        rule_text, uct_scores = _stable_rule_catalog(rule_library)
 
         previous_feedback_text = ""
         if previous_feedback:
-            previous_feedback_text = f"""
-            此SQL已经经过第{iteration_round-1}轮优化，但评估结果为需要继续优化。
-            上一轮信息：
-            {json.dumps(previous_feedback, ensure_ascii=False, indent=2)}
-            请基于上一轮的经验和失败原因重新选择规则序列，避免重复同样的错误。
-            """
-        
-        # Build few-shot examples context
-        few_shot_context = ""
-        if few_shot_examples and len(few_shot_examples) > 0:
-            few_shot_context = "\n\n<相似历史案例>\n"
-            few_shot_context += "以下是历史上相似SQL的优化案例，供参考（你可以参考这些案例的思路，但需要根据当前SQL的具体情况选择规则）：\n\n"
-            for i, example in enumerate(few_shot_examples[:3], 1):
-                few_shot_context += f"案例{i}:\n"
-                few_shot_context += f"- 相似度: {example.get('score', 0):.4f}\n"
-                few_shot_context += f"- SQL指纹: {example.get('sql_fingerprint', '')[:150]}...\n"
-                few_shot_context += f"- 应用的规则序列: {example.get('rule_sequence', [])}\n"
-                few_shot_context += f"- 优化组别: {example.get('groups', '')}\n"
-                few_shot_context += f"- 命中次数: {example.get('frequency', 0)}\n\n"
-            few_shot_context += "</相似历史案例>\n"
+            previous_feedback_text = (
+                f"<上一轮反馈>\n"
+                f"此 SQL 已经经过第{iteration_round - 1}轮优化，但评估结果为需要继续优化。\n"
+                f"{json.dumps(previous_feedback, ensure_ascii=False, indent=2)}\n"
+                f"请基于上一轮的经验和失败原因重新选择规则序列，避免重复同样的错误。\n"
+                f"</上一轮反馈>"
+            )
 
-        uct_guidance = """
-        【UCT分数说明】
-        规则后面的 [UCT分数: x.xxx] 表示该规则在历史上的表现评分：
-        - 高分规则（>0.7）：历史成功率较高，通常更可靠
-        - 中分规则（0.4-0.7）：有一定成功案例，需结合SQL结构判断
-        - 低分规则（<0.4）：历史表现一般或为较少尝试的新规则
-        可以优先选择 UCT 分数高的规则，但需要结合当前SQL的具体结构做最终判断，不要盲目选择。
-        """ if has_uct_scores else ""
-        
-        prompt = textwrap.dedent(f"""
+        few_shot_context = ""
+        if few_shot_examples:
+            lines = [
+                "<相似历史案例>",
+                "以下是历史上相似 SQL 的优化案例，供参考（可以参考思路，但需要根据当前 SQL 选择规则）：",
+            ]
+            for i, example in enumerate(few_shot_examples[:3], 1):
+                lines.append(f"案例{i}:")
+                lines.append(f"- 相似度: {example.get('score', 0):.4f}")
+                lines.append(f"- SQL指纹: {example.get('sql_fingerprint', '')[:150]}...")
+                lines.append(f"- 应用的规则序列: {example.get('rule_sequence', [])}")
+                lines.append(f"- 命中次数: {example.get('frequency', 0)}")
+            lines.append("</相似历史案例>")
+            few_shot_context = "\n".join(lines)
+
+        if uct_scores:
+            score_lines = "\n".join(f"- {rid}: {score:.3f}" for rid, score in uct_scores)
+            uct_block = (
+                "<uct_scores>\n"
+                "下列分数是各规则在当前上下文上的 LinUCB 分数，不是规则说明的一部分。\n"
+                "高分（>0.7）历史表现较好；中分（0.4-0.7）需结合 SQL 判断；低分（<0.4）历史表现一般或尝试较少。\n"
+                "可以优先考虑高分规则，但必须结合当前 SQL 结构，不要只按分数选择。\n"
+                f"{score_lines}\n"
+                "</uct_scores>"
+            )
+        else:
+            uct_block = "<uct_scores>\n本轮未提供 UCT 分数。\n</uct_scores>"
+
+        system_message = textwrap.dedent(f"""
         <Mission>
-        你是一名经验丰富的 DBA，你的任务是基于 SQL / 执行计划 / 统计信息，从全量规则库中直接挑选合适的优化规则序列。你只负责选择规则，不进行任何重写操作。
+        你是一名经验丰富的 DBA。你是规则选择的第一个模型：根据 PlanAnalyzer 给出的执行计划分析、当前 SQL 和统计信息，从全量规则库中挑选优化规则序列。你只负责选择规则，不进行任何重写操作，也不要等待别的 agent 预先指定优化组。
 
         1. 规则选择原则：
-           - 只能选择与当前SQL结构相符且能够优化该SQL的规则
+           - 只能选择与当前SQL结构相符、并且有助于改善执行计划、降低执行时间的规则
            - 当查询语句包含复杂的WHERE/JOIN条件，或存在重复子查询计算时，可考虑使用公共表表达式（CTE）
            - 若查询语句本身结构简单，或使用CTE无法减少冗余计算，则应避免过度使用CTE，多余的CTE可能会增加系统开销
         2. 规则选择逻辑：
-           - 先分析输入SQL的结构和执行计划中的瓶颈
-           - 逐一考虑规则库中的规则，判断其是否适用
-           - 挑选能够解决问题的规则
-           - 按照规则依赖关系进行排序
-           {few_shot_context}
+           - 先读 <执行计划分析结果>，定位高代价算子和结构瓶颈
+           - 再对照当前 SQL、统计信息和索引，从全量规则库中找出能一起解决这些瓶颈的规则
+           - 考虑规则之间的依赖和配合：谓词下推、连接改写、子查询去相关、聚合或投影清理如果要先后作用，就按应用顺序放进同一条序列
+           - 目标是一条重写规则序列，使后续重写能够优化执行计划并降低执行时间。存在多个互补规则时不要只选一条
+           - UCT 分数相同或都接近冷启动时，不要默认选目录里靠前的那一条
+           - 只有确实没有任何规则能改善当前计划时，applied_rules 才返回 []
+        3. 输出要求：**只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）。字段：
+        - applied_rules: 字符串数组，按应用顺序列出规则 ID；必须来自 <rule_library>，禁止编造；若无适用规则则为 []
+        - 不要输出 groups、贡献分或置信度。规则效果由后续 EXPLAIN 代价差测量
 
-        {previous_feedback_text}
-        
-        {uct_guidance}
-
-        <sql语句（当前轮次基底 SQL；若为第2轮及以后，则是上一轮 rewritten_sql）>
-        {sql}
-
-        <decision_advice>
-        {advice_text}
+        示例：{{"applied_rules": ["RULE_ID_1", "RULE_ID_2"]}}
 
         <rule_library>
         {rule_text}
+        </rule_library>
+        """).strip()
 
+        prompt = textwrap.dedent(f"""
         <统计信息>
         {data_statistics}
 
         <索引信息>
         {index_info}
 
+        <sql语句（当前轮次基底 SQL；若为第2轮及以后，则是上一轮 rewritten_sql）>
+        {sql}
+
         <执行计划分析结果>
         {explain_info}
-
-        3. 输出要求：**只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）。字段：
-        - groups: 字符串，填写你判断本次所选规则涉及的类别；可为单个类别或多个类别的逗号分隔字符串，不要求与 decision_advice 中的 group 保持一致
-        - applied_rules: 字符串数组，按应用顺序列出规则 ID；必须来自 <rule_library>，禁止编造；若无适用规则则为 []
-        - rule_effect_scores: 对象，键为 applied_rules 中的 rule_id，值为该规则预估贡献分（正数）。建议总和约为 1；若无规则则 {{}}
-        - rule_effect_confidence: 对象，键为 applied_rules 中的 rule_id，值为该规则效果估计的置信度（0到1之间）
-
-        示例：{{"groups": "连接优化, 谓词简化", "applied_rules": ["RULE_ID_1"], "rule_effect_scores": {{"RULE_ID_1": 1.0}}, "rule_effect_confidence": {{"RULE_ID_1": 0.8}}}}
-        """)
+        """).strip()
+        if few_shot_context:
+            prompt = f"{prompt}\n\n{few_shot_context}"
+        if previous_feedback_text:
+            prompt = f"{prompt}\n\n{previous_feedback_text}"
+        prompt = f"{prompt}\n\n{uct_block}"
 
         thought_chain = await self.llm.get_LLM_response_async(
             prompt=prompt,
+            system_message=system_message,
             json_format=True,
             json_schema=STRICT_JSON_SCHEMAS["rule_selection"],
         )
 
         default = {
-            "groups": groups_text,
             "applied_rules": [],
             "chosen_rule_prior": [],
-            "rule_effect_scores": {},
-            "rule_effect_confidence": {},
         }
         parsed, _ = parse_llm_json(thought_chain, default)
         if parsed and isinstance(parsed.get("applied_rules"), list):
             parsed["chosen_rule_prior"] = []
-            parsed["rule_effect_scores"] = self._sanitize_rule_effect_scores(
-                parsed.get("applied_rules", []),
-                parsed.get("rule_effect_scores", {}),
-            )
-            parsed["rule_effect_confidence"] = self._sanitize_rule_effect_confidence(
-                parsed.get("applied_rules", []),
-                parsed.get("rule_effect_confidence", {}),
-            )
+            parsed.pop("groups", None)
+            parsed.pop("rule_effect_scores", None)
+            parsed.pop("rule_effect_confidence", None)
             return parsed
         sequence_match = re.search(r"<rule_sequence>(.*?)</rule_sequence>", thought_chain, re.DOTALL)
         inner = sequence_match.group(1).strip() if sequence_match else thought_chain
         parsed2, _ = parse_llm_json(inner, default)
         if parsed2 and isinstance(parsed2.get("applied_rules"), list):
             parsed2["chosen_rule_prior"] = []
-            parsed2["rule_effect_scores"] = self._sanitize_rule_effect_scores(
-                parsed2.get("applied_rules", []),
-                parsed2.get("rule_effect_scores", {}),
-            )
-            parsed2["rule_effect_confidence"] = self._sanitize_rule_effect_confidence(
-                parsed2.get("applied_rules", []),
-                parsed2.get("rule_effect_confidence", {}),
-            )
+            parsed2.pop("groups", None)
+            parsed2.pop("rule_effect_scores", None)
+            parsed2.pop("rule_effect_confidence", None)
             return parsed2
         return default
 
@@ -450,7 +374,7 @@ class DecisionAgent(Agent):
         </上一轮未改进/恶化反馈>
         """
         
-        prompt = textwrap.dedent(f"""
+        system_message = textwrap.dedent("""
         <Mission>
         你是一名经验丰富的 SQL查询重写优化专家，你的任务是判断给定的 SQL 查询是否可以通过查询重写优化来提升执行性能。
 
@@ -459,12 +383,11 @@ class DecisionAgent(Agent):
            - <统计信息>: 数据库表统计信息
            - <索引信息>: 表索引（索引名与定义）
            - <执行计划分析结果>: 智能执行计划分析器生成的分析结果
-           {few_shot_context}
-           {previous_feedback_text}
+           - 若 user 中提供了相似历史案例或上一轮反馈，一并阅读
 
         若提供了“上一轮未改进/恶化反馈”，必须优先据此重新选择优化方向：
            - 避免重复上一轮失败思路
-           - 针对反馈中的未改进原因和 next_step_advice 调整优化组
+           - 针对反馈中的未改进原因和 next_step_advice 调整优化方向
            - advice 中要体现对失败原因的修正策略（不是泛化建议）
 
         2. 基于执行计划分析中的高代价算子信息，判断SQL是否可以通过以下优化方式提升性能：
@@ -488,12 +411,14 @@ class DecisionAgent(Agent):
            - 执行计划显示已经是最佳执行方式
            - SQL已经不能单纯通过查询重写优化来提升性能，需要结合索引或物理优化方式来提升性能
 
-        4. 如果可以优化，在 advice 中给出建议数组；否则 advice 为 []。advice 每项含 group（八类之一）与 produced_suggestion（字符串）。
-           八类：子查询优化、连接优化、谓词简化、常量折叠、聚合优化、投影优化、排序优化、集合优化。
+        4. 如果可以优化，在 advice 中给出建议数组；否则 advice 为 []。advice 每项只含 produced_suggestion（字符串）。
+           建议可以覆盖：子查询优化、连接优化、谓词简化、常量折叠、聚合优化、投影优化、排序优化、集合优化。
 
         5. **只输出一个 JSON 对象**（不要 markdown、不要注释）。字段：
-           can_optimize（布尔）、reason（字符串）、advice（数组，元素为 {{"group","produced_suggestion"}}）。
+           can_optimize（布尔）、reason（字符串）、advice（数组，元素为 {"produced_suggestion"}）。
+        """).strip()
 
+        prompt = textwrap.dedent(f"""
         <sql语句>
         {sql}
 
@@ -505,10 +430,15 @@ class DecisionAgent(Agent):
 
         <执行计划分析结果>
         {explain_info}
-        """)
+        """).strip()
+        if few_shot_context:
+            prompt = f"{prompt}\n{few_shot_context}"
+        if previous_feedback_text:
+            prompt = f"{prompt}\n{previous_feedback_text}"
 
         thought_chain = await self.llm.get_LLM_response_async(
             prompt=prompt,
+            system_message=system_message,
             json_format=True,
             json_schema=STRICT_JSON_SCHEMAS["initial_check"],
         )
@@ -524,77 +454,57 @@ class DecisionAgent(Agent):
         parsed.setdefault("can_optimize", False)
         parsed.setdefault("advice", [])
         parsed.setdefault("reason", "")
+        cleaned_advice = []
+        for item in parsed.get("advice") or []:
+            if isinstance(item, dict):
+                item.pop("group", None)
+                item.pop("groups", None)
+            cleaned_advice.append(item)
+        parsed["advice"] = cleaned_advice
         return parsed
 
     async def evaluate_with_costs(self, optimization_info: dict, iteration_round: int = 1) -> dict:
         """Evaluate rewrite quality and whether to terminate optimization loop."""
         original_costs = optimization_info.get("original_costs", 0)
         rewritten_costs = optimization_info.get("rewritten_costs", 0)
-        groups = optimization_info.get("groups", "")
         applied_rules = optimization_info.get("applied_rules", [])
-        optimization_advice = optimization_info.get("optimization_advice", [])
         original_sql = optimization_info.get("original_sql", "")
         rewritten_sql = optimization_info.get("rewritten_sql", "")
-        original_explain = optimization_info.get("original_explain_plan_json", "")
-        rewritten_explain = optimization_info.get("rewritten_explain_plan_json", "")
-        advice_text = json.dumps(optimization_advice, ensure_ascii=False, indent=2) if optimization_advice else "[]"
-        plan_struct = optimization_info.get("plan_structure_analysis")
-        struct_block = ""
-        if plan_struct:
-            struct_block = textwrap.dedent(f"""
+        original_plan_analysis = optimization_info.get("original_plan_analysis", "")
+        rewritten_plan_analysis = optimization_info.get("rewritten_plan_analysis", "")
+        rows_depth_comparison = optimization_info.get("rows_depth_comparison", "")
 
-            <heuristic_plan_structure_summary>
-            以下为对两套 EXPLAIN JSON 的轻量结构统计（节点类型计数、估计行数求和等），
-            仅供与全文 EXPLAIN 对照；其中“估计行数求和”只是弱参考，若与全文结构信号冲突以全文结构分析为准。
-            {json.dumps(plan_struct, ensure_ascii=False, indent=2)}
-            </heuristic_plan_structure_summary>
-            """)
+        system_message = textwrap.dedent("""
+        你负责判断本轮 SQL 重写是否保留。优化器估计代价可能不准，但保留条件只有下面三条，满足任意一条即保留。
 
-        prompt = textwrap.dedent(f"""
-        你负责评估 SQL 优化是否达标，并判断是否终止优化流程。
+        1. 代价降低就保留。rewritten_cost 严格小于 original_cost 时，terminate=true。
+        2. 代价涨幅不超过 10%，并且综合来看计划得到改进时也保留。rewritten_cost <= original_cost * 1.10 是前提。在这个前提下，综合 <plan_rows_depth> 的 rows、depth，以及两份 PlanAnalyzer 全部节点来判断，不要求这些方面全部改善。计划形态包括过滤下推、连接方式或访问路径是否更合理，重复扫描或相关子查询是否减少。多数方面更好、没有明显退步时，terminate=true。代价涨幅超过 10% 不保留。涨幅在 10% 以内，但 rows、depth 和节点结构整体没有改进，也不保留。
+        3. 执行计划的代价和结构都没有变化，但 SQL 逻辑更简化时也保留。必须同时满足：
+           - 估计代价与原来相同，没有升高也没有降低；
+           - 计划树深度、扫描行数和算子结构都没有变化；
+           - SQL 逻辑确实更简，例如常量已折叠、冗余谓词或重复表达式已去掉、等价聚合写得更直接，嵌套更少。
+           只是空白、别名或排版不同，不算逻辑简化，不保留。
 
-        基于 `original_sql` 与 `rewritten_sql` 的 SQL 语句与 EXPLAIN 做综合评估，重点对比：
-        1) 执行计划变化（扫描方式、连接顺序/算法、过滤下推、排序聚合、临时表/回表、并行度等）；
-        2) 结构性改进/退化信号（是否丢失关键访问路径、是否新增无补偿的高开销排序/物化、是否出现明显不合理的数据膨胀等）；
-        3) 重写 SQL 改进点（执行计划层面 + SQL 逻辑层面）；
-        4) 成本差异（cost 仅作弱信号，不能单独决定结论；即使 costs 增大明显，也只能作为辅助佐证，不能脱离结构分析单独判为恶化）。
+        原始 SQL 与重写 SQL 一致时单独判断。忽略空白和末尾分号后，<original_sql> 与 <enhanced_sql> 相同，说明本轮没有改写，不要用第 1、2、3 条当成保留成功。此时只判断这条 SQL 还能不能通过查询重写降低执行代价或执行时间：
+        - 仍有可重写空间：terminate=false，no_further_optimization=false。next_step_advice 只写下一轮可执行的 SQL 重写，例如去掉冗余派生表、谓词下推、去相关或半连接。下一轮在当前 SQL 上继续。
+        - 没有可重写空间：计划已经合理，或者只剩下索引、统计信息等物理手段。terminate=true，no_further_optimization=true，next_step_advice 写“无需下一步优化”。
 
-        注意：`original_sql` 和 `enhanced_sql` 的 costs 来自优化器，可能不准确。必须采用以下原则：
-        - 结构优先：结构信号优先级高于 cost。
-        - cost弱化：cost 只能辅助佐证，禁止仅凭 cost 判定优劣。
-        - 若结构与 cost 冲突，优先相信结构信号。
-        - DSS/OLAP 特殊原则：对于大表分析型 SQL，Seq Scan / Parallel Seq Scan 不天然是负信号；若重写消除了重复执行、相关子查询、回表、随机探测，或通过 CTE/派生表/预聚合实现“一次扫描 + 复用公共结果”，则即使出现全表扫描，也不得直接据此判为恶化。
-        - 访问路径判断原则：索引/位图扫描减少，并不自动等于退化；必须结合扫描次数是否减少、子计划是否消失、过滤是否前移、是否减少重复 I/O、是否增强并行/聚合复用来综合判断。
-        - 行数估计弱化：行数估计求和（各节点 Plan Rows 累加）仅作辅助参考，不能单独作为“明显恶化”的依据；尤其在 CTE、派生表、预聚合、去相关、JOIN 重排场景下，该指标可能显著失真。
-        - 特殊高优先级规则：若行数估计求和（Plan Rows累加）大幅下降（如降至原10%以下），则优先视为优化成功，不得仅因 Seq Scan 增加或 cost 上升而判为恶化。
-        - 另一类高优先级正信号：若检测到去相关（decorrelation）、子计划减少、重复执行被消除、或公共中间结果经 CTE/预聚合/派生表复用，则不得仅因 Seq Scan 增加或 cost 上升而直接判为恶化，应优先倾向保留重写 SQL。
-        - 成功终止优先规则：若检测到去相关、子计划减少、重复执行消除、或 CTE/派生表/预聚合复用公共中间结果，且未发现明确且可验证的灾难性结构退化证据，则可直接视为“优秀重写”并给出 terminate=true；不要求同时满足 cost 明显下降。
-        - 若已检测到去相关/子计划减少/CTE复用/预聚合等高优先级正信号，除非还能指出“明确且可验证的灾难性结构退化证据”（如关键大表被重复扫描、过滤明显失效导致主干数据量失控、并行完全丢失且无任何补偿、引入新的高开销排序/物化主瓶颈），否则不得给出以“全表扫描”或“索引减少”为主因的负面结论。
-        - cost 使用约束：即使 costs 增大超过 50%，也只有在同时存在上述“明确且可验证的灾难性结构退化证据”时，才可将其作为支持 terminate=false 的辅助证据；若结构显示去相关/复用/减少重复执行，则不得仅因高 cost 增幅否定该重写。
-
-        终止条件：
-        - `terminate = true`（满足任一即终止）：
-          a. 结构上明确改进；或
-          b. 检测到去相关、子计划减少、重复执行消除、或 CTE/派生表/预聚合复用等高优先级正信号，且不存在明确灾难性结构退化证据；或
-          c. 行数估计求和（Plan Rows累加）大幅度降低（如降至原10%以下），无论cost是否增加，均视为优化成功；或
-          d. costs大幅度降低；或
-          e. 判断"下一步重写已几乎无改进空间"（no_further_optimization=true）。
-        - `terminate = false`：
-          结构上明确恶化（如关键大表被重复扫描、并行度显著下降且无补偿、过滤明显失效导致主干数据量失控、明显引入新的高开销排序/物化主瓶颈等）。注意：不得仅因出现全表扫描、索引/位图扫描减少、cost 明显上升、或行数估计求和上升就判为恶化。
-        - 重要补充：
-          若本轮并非“明确恶化”，而是“已有明显正向结构收益，但仍可能继续微调”，可直接 terminate=true；不要因为“也许还能继续优化”就默认 terminate=false。
-          若本轮“未改进或恶化”，且仍存在可执行的下一步优化方向，必须给出 terminate=false，并在 next_step_advice 中写明下一轮应如何基于当前 rewritten_sql 继续改写。
-          第一轮重写以 original_sql 为基底；若进入下一轮，则默认是在上一轮 rewritten_sql 的基础上继续改写，而不是回退到 original_sql 重新开始。
-          本评估阶段不再决定“是否保留 SQL”；最终输出默认沿用当前 rewritten_sql。
+        输出约定：
+        - 保留：terminate=true，no_further_optimization=true，next_step_advice 写“无需下一步优化”。
+        - 不保留且仍可能改进：terminate=false，no_further_optimization=false，并在 next_step_advice 中说明下一轮如何基于当前 rewritten_sql 继续改写。下一轮在当前重写结果上继续，不退回 original_sql 重来。
+        - 不保留且已无可行改进：terminate=false，no_further_optimization=true。
+        - 两条 SQL 一致且没有可重写空间：按上面的单独判断，terminate=true。
 
         严格仅输出以下 JSON（不得有任何额外文本）：
-        {{
+        {
           "terminate": true/false,
-          "reason": "简要说明依据：执行计划变化、结构性改进/退化信号、cost（仅辅助）、改进点、最终结论；若存在去相关/子计划减少/公共结果复用等高优先级正信号，应明确说明其为何足以支持成功终止；若引用行数估计求和或高 cost，只能作为辅助信息，不得将其单独作为恶化结论依据；若不确定终止需明确不确定原因。",
+          "reason": "写明 original_cost、rewritten_cost 和涨幅，并说明命中第 1 条、第 2 条或第 3 条中的哪一条。第 2 条要写明涨幅是否在 10% 以内，以及树深度、扫描行数、计划结构综合起来是否得到改进；第 3 条要写明代价和计划结构未变，以及 SQL 逻辑何处更简。两条 SQL 一致时，写明是否还有查询重写空间，以及因此继续还是终止。",
           "no_further_optimization": true/false,
-          "next_step_advice": "当 terminate=false 时，必须给出下一轮可执行改进建议；terminate=true 时可写“无需下一步优化”。"
-        }}
+          "next_step_advice": "terminate=false 且仍可能改进时，给出下一轮可执行建议；否则写“无需下一步优化”。"
+        }
+        """).strip()
 
+        prompt = textwrap.dedent(f"""
         <original_sql>
         {original_sql}
         </original_sql>
@@ -611,27 +521,28 @@ class DecisionAgent(Agent):
         {rewritten_costs}
         </enhanced_sql_costs>
 
-        <original_sql_explain>
-        {json.dumps(original_explain, ensure_ascii=False, indent=2) if isinstance(original_explain, (dict, list)) else original_explain}
-        </original_sql_explain>
+        <plan_rows_depth>
+        {rows_depth_comparison}
+        </plan_rows_depth>
 
-        <enhanced_sql_explain>
-        {json.dumps(rewritten_explain, ensure_ascii=False, indent=2) if isinstance(rewritten_explain, (dict, list)) else rewritten_explain}
-        </enhanced_sql_explain>
-        {struct_block}
+        <original_plan_analysis>
+        {original_plan_analysis}
+        </original_plan_analysis>
+
+        <rewritten_plan_analysis>
+        {rewritten_plan_analysis}
+        </rewritten_plan_analysis>
 
         <optimization_context>
         round: {iteration_round}
-        groups: {groups}
-        optimization_advice:
-        {advice_text}
         applied_rules:
         {applied_rules}
         </optimization_context>
-        """)
+        """).strip()
 
         response = await self.llm.get_LLM_response_async(
             prompt=prompt,
+            system_message=system_message,
             json_format=True,
             json_schema=STRICT_JSON_SCHEMAS["evaluation"],
         )
@@ -893,14 +804,11 @@ class RewriteAgent(Agent):
         sql: str,
         rule_sequence: dict,
         optimization_direction: str,
-        data_statistics: str,
         schema_content: Optional[str] = None,
-        index_info: str = "",
         previous_feedback: Optional[dict] = None,
     ) -> dict:
         """Execute SQL rewriting based on selected rule sequence with semantic equivalence check"""
         applied_rules = rule_sequence.get("applied_rules", [])
-        groups = rule_sequence.get("groups", "")
 
         sch = (schema_content or "").strip()
         schema_section = (
@@ -910,16 +818,6 @@ class RewriteAgent(Agent):
         </SQL Schema>
 """
             if sch
-            else ""
-        )
-        idx = (index_info or "").strip()
-        idx_section = (
-            f"""
-        <索引信息>
-        {idx}
-        </索引信息>
-"""
-            if idx
             else ""
         )
         previous_feedback_section = ""
@@ -937,24 +835,24 @@ class RewriteAgent(Agent):
         </规则示例库_examples（按已选规则匹配，供改写参考）>
 """
 
-        prompt = textwrap.dedent(f"""
+        system_message = textwrap.dedent("""
         <Mission>
         你是一名经验丰富的 DBA，你的任务是按照指定的规则序列对SQL进行重写。
 
         1. 输入信息：
            - <base_sql>: 当前轮次的基底 SQL。第一轮它等于原始SQL；若进入下一轮，它就是上一轮 rewritten_sql
            - <rule_sequence>: 要应用的规则序列
-           - <optimization_direction>: 优化方向
-           - <统计信息>: 数据库表统计信息
-           - （若下方提供）<SQL Schema>: 与当前查询相关的表 DDL
-           - （若下方提供）<索引信息>: 表索引信息
+           - <optimization_direction>: PlanAnalyzer 对当前 SQL 的执行计划分析，用来定位瓶颈
+           - （若 user 中提供）<SQL Schema>: 与当前查询相关的表 DDL
            - <规则示例库_examples>: 与已选规则对应的标准「原始查询 -> 重写查询」示例，只能作为模式参考，不能照抄示例中的表名、列名或谓词
-           - （若下方提供）<上一轮评估反馈（重点修复）>: 未改进/恶化原因与下一步改进建议，必须优先处理
+           - （若 user 中提供）<上一轮评估反馈（重点修复）>: 未改进/恶化原因与下一步改进建议，必须优先处理
 
         2. 重写要求：
-           - **最高优先级约束**：必须优先保证 rewritten_sql 与原始SQL在语义上完全等价；任何优化都不得以改变结果集语义为代价
-           - 参考 <规则示例库_examples> 中每条规则的典型改写模式和等价性注意点，但必须结合当前 SQL、Schema 和统计信息重新判断适用性
-           - 一次性完成全部规则的应用，不分步骤应用，最终输出重写 SQL**：直接写最终版本
+           - **最高优先级约束**：必须优先保证 step_sqls 最后一项与原始SQL在语义上完全等价；任何优化都不得以改变结果集语义为代价
+           - 参考 <规则示例库_examples> 中每条规则的典型改写模式和等价性注意点，但必须结合当前 SQL 和 Schema 重新判断适用性
+           - 仍只输出一次 JSON。按 applied_rules 的顺序逐条应用：step_sqls[i] 是在 base_sql 上只应用了前 i+1 条规则后的完整 SQL
+           - step_sqls 与 applied_rules 等长、同序。每一步只新增该位置的那一条规则，不要在同一步提前应用后面的规则
+           - step_sqls 的最后一项就是最终 SQL，不要再输出 rewritten_sql。无规则时 step_sqls 为 []
            - 确保SQL的语法正确性
            - **必须保持查询语义的等价性**：重写后的SQL必须与原始SQL在语义上完全等价
            - 若提供了上一轮评估反馈，说明这是增量改写场景；必须在当前基底 SQL 的基础上继续优化，而不是回退并从原始 SQL 重新开始
@@ -971,6 +869,15 @@ class RewriteAgent(Agent):
            - 若有易误判点（如过滤提前、HAVING/ORDER BY 与 LIMIT、NULL、重复行、相关子查询相关列），**明确**你判定仍等价的理由。
            不得写与代码不一致的空话；不得省略「保证说明」字段。
 
+        5. **只输出一个 JSON 对象**（不要 <rewrite> 标签、不要 markdown）。字段：
+           - applied_rules: 数组，与 user 中给出的本次序列一致
+           - step_sqls: 字符串数组，与 applied_rules 等长。step_sqls[i] 为只应用到第 i+1 条规则时的完整 SQL；最后一项就是最终 SQL。不要输出 rewritten_sql
+           - semantic_correctness_guarantee: 上述第 4 点「语义正确性保证说明」全文（多行可放在同一字符串，用 \\n 转义换行）
+        """).strip()
+
+        prompt = textwrap.dedent(f"""
+        本次 applied_rules 必须原样返回: {json.dumps(applied_rules, ensure_ascii=False)}
+
         <base_sql>
         {sql}
 
@@ -979,27 +886,20 @@ class RewriteAgent(Agent):
 
         <optimization_direction>
         {optimization_direction}
-
-        <统计信息>
-        {data_statistics}
-{schema_section}{idx_section}{rule_examples_section}{previous_feedback_section}
-        5. **只输出一个 JSON 对象**（不要 <rewrite> 标签、不要 markdown）。字段：
-           - groups: 字符串 "{groups}"
-           - applied_rules: 数组，与当前序列一致：{json.dumps(applied_rules, ensure_ascii=False)}
-           - rewritten_sql: 重写后的完整可执行 SQL（字符串内换行用 \\n）
-           - semantic_correctness_guarantee: 上述第 4 点「语义正确性保证说明」全文（多行可放在同一字符串，用 \\n 转义换行）
-        """)
+        """).strip()
+        prompt = f"{prompt}\n{schema_section}{rule_examples_section}{previous_feedback_section}"
 
         thought_chain = await self.llm.get_LLM_response_async(
             prompt=prompt,
+            system_message=system_message,
             json_format=True,
             json_schema=STRICT_JSON_SCHEMAS["rewrite"],
         )
 
         try:
             parsed, _ = parse_llm_json(thought_chain, {})
-            if parsed and parsed.get("rewritten_sql"):
-                parsed.setdefault("groups", groups)
+            if parsed and _rewritten_sql_from_steps(parsed, sql):
+                parsed.pop("groups", None)
                 parsed.setdefault("applied_rules", applied_rules)
                 _merge_rewrite_semantic_fields(parsed)
                 return parsed
@@ -1007,8 +907,8 @@ class RewriteAgent(Agent):
             rewrite_match = re.search(r"<rewrite>(.*?)</rewrite>", thought_chain, re.DOTALL)
             inner = rewrite_match.group(1).strip() if rewrite_match else thought_chain
             parsed, _ = parse_llm_json(inner, {})
-            if parsed and parsed.get("rewritten_sql"):
-                parsed.setdefault("groups", groups)
+            if parsed and _rewritten_sql_from_steps(parsed, sql):
+                parsed.pop("groups", None)
                 parsed.setdefault("applied_rules", applied_rules)
                 _merge_rewrite_semantic_fields(parsed)
                 return parsed
@@ -1021,7 +921,6 @@ class RewriteAgent(Agent):
             if extracted_sql:
                 print(f"✅ 成功从响应中提取SQL")
                 return {
-                    "groups": groups,
                     "applied_rules": applied_rules,
                     "rewritten_sql": extracted_sql,
                     "semantic_correctness_guarantee": "",
@@ -1030,7 +929,6 @@ class RewriteAgent(Agent):
                 }
 
             return {
-                "groups": groups,
                 "applied_rules": applied_rules,
                 "rewritten_sql": sql,  # fallback to original
                 "semantic_correctness_guarantee": "",
@@ -1045,7 +943,6 @@ class RewriteAgent(Agent):
             if extracted_sql:
                 print(f"✅ 成功从响应中提取SQL")
                 return {
-                    "groups": groups,
                     "applied_rules": applied_rules,
                     "rewritten_sql": extracted_sql,
                     "semantic_correctness_guarantee": "",
@@ -1055,7 +952,6 @@ class RewriteAgent(Agent):
                 }
             
             return {
-                "groups": groups,
                 "applied_rules": applied_rules,
                 "rewritten_sql": sql,
                 "semantic_correctness_guarantee": "",
@@ -1074,12 +970,25 @@ class RewriteAgent(Agent):
         """在保留优化结构前提下最小修复语义，使与原始 SQL 结果集等价。"""
         diff_text = json.dumps(differences, ensure_ascii=False, indent=2) if differences else "[]"
         rules_text = json.dumps(applied_rules, ensure_ascii=False) if applied_rules else "[]"
-        prompt = textwrap.dedent(f"""
+        system_message = textwrap.dedent("""
         <Mission>
         你是 DBA。当前重写 SQL 经语义检查判定与原始 SQL 不等价。
         你的任务是：**仅修复 differences 指出的差异相关片段**，而不是对整条 SQL 重新改写。
         请在**尽量保留现有优化结构**（JOIN/CTE/子查询形态）的前提下，对「当前重写 SQL」做**最小修改**，使其与原始 SQL **结果集语义等价**。
 
+        修复约束（必须遵守）：
+        0. **最高优先级约束**：必须优先保证修复后 SQL 与 original_sql 语义等价；禁止为了“看起来更优”而改变结果集语义。
+        1. 只允许改动 differences 直接涉及的片段（相关谓词、JOIN 条件、聚合列、子查询条件等）。
+        2. 不要重排与 differences 无关的 JOIN/CTE 结构，不要整体重写 SQL。
+        3. 不应用任何优化规则，也不要新增、撤销、重排或替换已选规则已经完成的改写。
+        4. 若必须改动规则应用才能恢复等价，不要改写，返回 {"fixed_sql":"","note":"无法在保留规则应用的前提下修复"}。
+        5. 若 differences 为空或信息不足，返回原 rewritten_sql，不要臆造新重写。
+        6. 能修复时，输出必须是**可执行完整 SQL**，且与原始 SQL 结果集等价。
+
+        输出要求：**只输出一个 JSON 对象**（不要 markdown），格式：
+        {"fixed_sql": "修复后的完整 SQL 单行或合理换行", "note": "一句话说明如何修复"}
+        """).strip()
+        prompt = textwrap.dedent(f"""
         <original_sql>
         {original_sql}
 
@@ -1091,20 +1000,10 @@ class RewriteAgent(Agent):
 
         <语义差异点 differences>
         {diff_text}
-
-        修复约束（必须遵守）：
-        0. **最高优先级约束**：必须优先保证修复后 SQL 与 original_sql 语义等价；禁止为了“看起来更优”而改变结果集语义。
-        1. 只允许改动 differences 直接涉及的片段（相关谓词、JOIN 条件、聚合列、子查询条件等）。
-        2. 不要重排与 differences 无关的 JOIN/CTE 结构，不要整体重写 SQL。
-        3. 保留当前重写 SQL 中已生效的优化（除非该优化正是导致不等价的根因）。
-        4. 若 differences 为空或信息不足，返回原 rewritten_sql，不要臆造新重写。
-        5. 输出必须是**可执行完整 SQL**，且与原始 SQL 结果集等价。
-
-        输出要求：**只输出一个 JSON 对象**（不要 markdown），格式：
-        {{"fixed_sql": "修复后的完整 SQL 单行或合理换行", "note": "一句话说明如何修复"}}
-        """)
+        """).strip()
         resp = await self.llm.get_LLM_response_async(
             prompt=prompt,
+            system_message=system_message,
             json_format=True,
             json_schema=STRICT_JSON_SCHEMAS["semantic_fix"],
         )
@@ -1127,7 +1026,7 @@ class RewriteAgent(Agent):
         stats_block = f"\n        <统计信息>\n        {data_statistics}\n" if data_statistics else ""
         idx_block = f"\n        <索引信息>\n        {index_info}\n" if index_info else ""
 
-        prompt = textwrap.dedent(f"""
+        system_message = textwrap.dedent("""
         <Mission>
         你是一名经验丰富的 DBA，你的任务是基于语法错误信息修正重写后的SQL。
 
@@ -1137,16 +1036,17 @@ class RewriteAgent(Agent):
            - <original_sql>: 原始SQL（用于保持语义等价性）
            - <error_info>: **当前语法检查错误信息**（这是你需要修复的具体错误）
            - <previous_rewrite>: 上次重写结果（包含之前尝试的SQL和可能的错误信息）
-        {stats_block}{idx_block}
+           - 若 user 中提供统计信息或索引信息，一并参考
 
         2. 修正要求：
            - **最高优先级约束**：必须优先保证 rewritten_sql 与 original_sql 的语义等价；语法修复不得引入语义漂移
            - **仔细分析 <error_info> 中的错误信息**，这是数据库返回的具体语法错误位置和原因
            - 如果 <previous_rewrite> 中包含之前的错误信息，参考它们避免重复同样的错误
-           - 仅做“最小修复”：只修改触发错误的必要片段（如列引用、别名、GROUP BY项、函数参数）
-           - 尽量保留 current rewritten SQL 的优化结构（CTE 组织、JOIN 形态、聚合层次、谓词布局），不要整体改写
-           - 禁止无关改动：不要新增/删除非必要子查询、不要替换为原始 SQL，除非当前 SQL 无法通过最小修复挽救
-           - 修正SQL语法错误，确保修正后的SQL能够通过语法检查
+           - 仅做“最小修复”：只修改触发语法错误的必要片段（如列引用、别名、GROUP BY项、函数参数）
+           - 不应用任何优化规则，也不要新增、撤销、重排或替换已选规则已经完成的改写
+           - 禁止无关改动：不要新增/删除非必要子查询，不要整体改写
+           - 如果必须改动规则应用才能通过语法检查，返回 {"rewritten_sql":"","note":"无法在保留规则应用的前提下修复"}
+           - 能修复时，确保修正后的SQL能够通过语法检查
            - **必须保持查询语义正确性**：修正后的SQL必须与原始SQL在语义上完全等价
            - 生成可执行的、语法正确的SQL
 
@@ -1154,8 +1054,9 @@ class RewriteAgent(Agent):
            - **只输出一个 JSON 对象**（不要 markdown / 不要额外文本）
            - 必须包含字段 rewritten_sql，值为修正后的完整可执行 SQL
            - 可选字段 note 用一句话说明修复点
-           - 示例：{{"rewritten_sql":"SELECT ...","note":"修复了别名不存在错误"}}
-
+           - 示例：{"rewritten_sql":"SELECT ...","note":"修复了别名不存在错误"}
+        """).strip()
+        prompt = textwrap.dedent(f"""
         <original_sql>
         {sql}
 
@@ -1164,56 +1065,62 @@ class RewriteAgent(Agent):
 
         <previous_rewrite>
         {json.dumps(previous_rewrite, ensure_ascii=False, indent=2)}
-        """)
+        """).strip()
+        if stats_block or idx_block:
+            prompt = f"{prompt}\n{stats_block}{idx_block}"
 
         response = await self.llm.get_LLM_response_async(
             prompt=prompt,
+            system_message=system_message,
             json_format=True,
             json_schema=STRICT_JSON_SCHEMAS["iterative_rewrite"],
         )
         data = parse_llm_json_with_default(response, {})
-        rewritten_sql = data.get("rewritten_sql") if isinstance(data, dict) else ""
-        if isinstance(rewritten_sql, str) and rewritten_sql.strip():
-            return rewritten_sql.strip()
-        # Fallback for non-compliant model outputs.
+        if isinstance(data, dict) and "rewritten_sql" in data:
+            rewritten_sql = data.get("rewritten_sql")
+            if isinstance(rewritten_sql, str) and rewritten_sql.strip():
+                return rewritten_sql.strip()
+            return ""
         return self._extract_sql_from_response_robust(response)
     
     async def correct_sql(self, original_sql: str, rewritten_sql: str, error: str) -> str:
         """Correct SQL syntax errors while maintaining semantic equivalence"""
-        prompt = textwrap.dedent(f"""
+        system_message = textwrap.dedent("""
         你是一名经验丰富的 DBA，核心任务是修正 SQL 语法错误，同时保持语义等价性。
         **最高优先级约束**：必须优先保证修复后 SQL 与 original_sql 语义一致；不得为了通过语法而改变结果集语义。
-        1. 修正以下 SQL 语句，使用提供的错误消息。
+        1. 修正 user 中的 SQL 语句，使用提供的错误消息。
+           注意：如果 SQL 包含双引号，请保留它们 exactly as they appear.
+           只修正 <rewritten_sql> 中的语法；不要与原始 SQL 对齐，
+           且不要包含任何 "EXPLAIN (FORMAT JSON)" 子句。
+           修正后的 SQL 必须与原始 SQL 在语义上等价。
 
-            * 注意：如果 SQL 包含双引号，请保留它们 exactly as they appear.
-            <rewritten_sql>
-            {rewritten_sql}
+        请严格遵循以下格式：
+        [format]
+        </analysis>
+        分析错误原因和修正方案
+        </analysis>
 
-           错误消息:
-            {error}
+        </corrected_sql>
+        ```sql
+        插入修正后的 SQL 语句。
+        ```
+        </corrected_sql>
+        """).strip()
+        prompt = textwrap.dedent(f"""
+        <rewritten_sql>
+        {rewritten_sql}
 
-            下面是重写 SQL 的原始形式，用于参考模式。
-            只修正 <rewritten_sql> 中的语法；不要与原始 SQL 对齐，
-            且不要包含任何 "EXPLAIN (FORMAT JSON)" 子句！
-            **重要**：修正后的SQL必须与原始SQL在语义上等价。
+        错误消息:
+        {error}
 
-            <original_sql>
-            {original_sql}
+        <original_sql>
+        {original_sql}
+        """).strip()
 
-            请严格遵循以下格式：
-            [format]
-            </analysis>
-            分析错误原因和修正方案
-            </analysis>
-
-            </corrected_sql>
-            ```sql
-            插入修正后的 SQL 语句。
-            ```
-            </corrected_sql>
-            """)
-
-        response = await self.llm.get_LLM_response_async(prompt=prompt)
+        response = await self.llm.get_LLM_response_async(
+            prompt=prompt,
+            system_message=system_message,
+        )
         corrected_sql = self.extract_corrected_sql_content(response)
         return corrected_sql
     
@@ -1445,10 +1352,10 @@ class SemanticCheckAgent(Agent):
             if retry_ctx
             else "可将首轮自辩与两 SQL 交叉核验；自辩与**当前**重写 SQL 或事实矛盾时，以**当前** SQL 与事实为准，不得采信过时的自辩句段。"
         )
-        prompt = textwrap.dedent(f"""
+        system_message = textwrap.dedent("""
         你是 SQL 语义审计专家，你要分析判断原始SQL和重写SQL是否等价。等价含义：**同一库状态、同一参数下，两查询结果集相同（行集合与列语义一致；允许列名/顺序在逻辑上等价时的合理差异，但若会改变行数或聚合语义则不等价）**。
 
-        输入优先级（**{prior_note}**）：
+        输入优先级：
         1. **原始 SQL** 与 **当前重写 SQL** 的实际语义（谓词、JOIN、GROUP BY、DISTINCT、子查询相关性、NULL 处理等）——**永远最高**。
         2. **SQL Schema**：主键、唯一约束、函数依赖、可据此认可的等价变形（例如已知 PK 下 GROUP BY 的化简）。
         3. **索引信息**（若提供）：通常不改变关系层面的结果集语义；PRIMARY KEY/UNIQUE 类索引可辅助推断唯一性，与 Schema 一并用于等价推理。**不得以「有无非唯一索引」代替 SQL 逻辑判断是否等价**。
@@ -1469,29 +1376,31 @@ class SemanticCheckAgent(Agent):
         - 禁止误判：在满足上述强约束时，不能使用“计数对象不同”“中间分组行数不同”“内层多了 ename”作为不等价理由；这些只影响中间态，不影响最终结果。
         - 若判 `equivalent=false`，`differences` 中每一项都必须对应一个**会改变最终结果集**的具体点；不得输出空泛差异。若做不到，请改判 `equivalent=true`。
 
+        **只输出一个 JSON**（不要其它文字）：
+        {
+            "equivalent": true 或 false,
+            "message": "一句话。首轮可简述自辩与事实；若存在多轮修正，请对**当前两 SQL**下结论，勿复述过时的首轮自辩。",
+            "differences": [{"type": "类型", "description": "一句话", "location": "位置"}]
+        }
+        equivalent 为 true 时 differences 必须为 []。
+        """).strip()
+        prompt = textwrap.dedent(f"""
+        {prior_note}
+
         <原始 SQL>
         {original_sql}
 
         <当前重写 SQL>
         {rewritten_sql}
-        {retry_ctx}
-        {schema_ctx}{index_ctx}
-        {sem_ctx}
-        <应用规则_规则ID与文字描述>
-        {rules_text}
-        </应用规则_规则ID与文字描述>
-        {rule_examples_ctx}
-
-        **只输出一个 JSON**（不要其它文字）：
-        {{
-            "equivalent": true 或 false,
-            "message": "一句话。首轮可简述自辩与事实；若存在多轮修正，请对**当前两 SQL**下结论，勿复述过时的首轮自辩。",
-            "differences": [{{"type": "类型", "description": "一句话", "location": "位置"}}]
-        }}
-        equivalent 为 true 时 differences 必须为 []。
-        """)
+        """).strip()
+        prompt = (
+            f"{prompt}\n{retry_ctx}{schema_ctx}{index_ctx}\n{sem_ctx}\n"
+            f"<应用规则_规则ID与文字描述>\n{rules_text}\n</应用规则_规则ID与文字描述>\n"
+            f"{rule_examples_ctx}"
+        )
         response = await self.llm.get_LLM_response_async(
             prompt=prompt,
+            system_message=system_message,
             json_format=True,
             json_schema=STRICT_JSON_SCHEMAS["semantic_equivalence"],
         )
