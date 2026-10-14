@@ -120,9 +120,9 @@ class GlobalMemoryManager:
                 if result.get('id') == record_id:
                     records.append({
                         'id': record_id,
-                        'sql_fingerprint': result.get('metadata', {}).get('sql_fingerprint', '')[:100],
+                        'original_sql': result.get('metadata', {}).get('original_sql', ''),
                         'rule_sequence': result.get('metadata', {}).get('rule_sequence', ''),
-                        'frequency': result.get('metadata', {}).get('frequency', '0')
+                        'rewritten_sql': result.get('metadata', {}).get('rewritten_sql', ''),
                     })
                     break
         return records

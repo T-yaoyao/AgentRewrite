@@ -241,16 +241,17 @@ def ensure_parent(path: Path) -> None:
 def load_examples(examples_path: Path) -> List[Dict[str, Any]]:
     data = json.loads(examples_path.read_text(encoding="utf-8"))
     rows: List[Dict[str, Any]] = []
-    for category, payload in data.items():
-        for index, example in enumerate(payload.get("examples", []), start=1):
+    rules = data if isinstance(data, list) else []
+    for rule in rules:
+        rule_id = rule.get("id", "")
+        for index, example in enumerate(rule.get("examples", []), start=1):
             rows.append(
                 {
-                    "id": f"{category}.{index:03d}.{example.get('id', '')}",
-                    "category": category,
-                    "rule_id": example.get("id", ""),
+                    "id": f"{rule_id}.{index:03d}",
+                    "rule_id": rule_id,
                     "original_query": example.get("original_query", ""),
                     "rewritten_query": example.get("rewritten_query", ""),
-                    "rule_description": example.get("rule_description", ""),
+                    "example_description": example.get("example_description", ""),
                 }
             )
     return rows

@@ -7,7 +7,6 @@ import statistics
 import sys
 import os
 from pathlib import Path
-import collections
 import re
 
 # Setup project paths first
@@ -50,6 +49,7 @@ SKIP_ORIGINAL_BY_DB = {
 }
 SKIP_ORIGINAL_FIXED_TIMEOUT = 300.0
 
+
 class Evaluation():
     def __init__(self, evaluation_queries_path, result_storage_path, filtered_path, timeout=300, no_restart=False):
         self.evaluation_queries_path = evaluation_queries_path
@@ -69,6 +69,21 @@ class Evaluation():
         if v is None:
             return ""
         return str(v).strip()
+
+    def _counts_as_time_improvement(self, row, min_relative_time_improvement):
+        """Count a query when execution time drops by more than the relative threshold."""
+        original_t = row.get("original_execution_time")
+        rewrite_t = row.get("rewrite_execution_time")
+        if (
+            not isinstance(original_t, (int, float))
+            or isinstance(original_t, bool)
+            or not isinstance(rewrite_t, (int, float))
+            or isinstance(rewrite_t, bool)
+            or original_t <= 0
+        ):
+            return False
+        relative_drop = (original_t - rewrite_t) / original_t
+        return relative_drop > min_relative_time_improvement
 
     @staticmethod
     def _normalize_sql_for_compare(sql_text):
@@ -231,26 +246,93 @@ class Evaluation():
             return
         print("⚠️  Warning: Could not restart PostgreSQL.")
 
+    def _drop_query_result(self, conn, cursor):
+        """Release a finished result without building a Python row list."""
+        try:
+            if cursor is not None and not cursor.closed:
+                cursor.close()
+        except Exception:
+            pass
+        try:
+            if conn is not None and not conn.closed:
+                conn.rollback()
+        except Exception:
+            pass
+
+    def _result_fingerprint(self, conn, query, timeout):
+        """Multiset fingerprint computed in the database, returned as one row."""
+        body = str(query or "").strip().rstrip(";")
+        if not body:
+            return None
+        fingerprint_sql = (
+            "SELECT count(*)::bigint, "
+            "coalesce(sum(hashtextextended(t::text, 0)), 0)::numeric, "
+            "coalesce(sum(hashtextextended(t::text, 1)), 0)::numeric "
+            f"FROM ({body}) AS t"
+        )
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"SET statement_timeout = {timeout * 1000};")
+            cursor.execute(fingerprint_sql)
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return (int(row[0]), str(row[1]), str(row[2]))
+        except psycopg2.OperationalError as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if "canceling statement due to statement timeout" in str(e):
+                return -2
+            print(f"Error executing query: {e}")
+            return None
+        except psycopg2.Error as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            print(f"Error executing query: {e}")
+            return None
+        finally:
+            self._drop_query_result(conn, cursor)
+
+    @staticmethod
+    def _execution_seconds_from_explain(plan_payload):
+        """Read PostgreSQL Execution Time (milliseconds) from EXPLAIN JSON."""
+        payload = plan_payload
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if isinstance(payload, list):
+            payload = payload[0] if payload else {}
+        if not isinstance(payload, dict) or "Execution Time" not in payload:
+            return None
+        return float(payload["Execution Time"]) / 1000.0
+
     def execute_query(self, conn, cursor, query, timeout,return_flag=False):
         try:
             # Set PostgreSQL statement timeout
             cursor.execute(f"SET statement_timeout = {timeout * 1000};")
-            start_time = time.time()
-            
-            # Execute the query
-            cursor.execute(query)
-            end_time = time.time()
-
-            execution_result = None
+            body = str(query or "").strip().rstrip(";")
+            # Time the server execution only. A normal execute() keeps the
+            # whole result in libpq before it returns, which OOM-kills large
+            # calcite results. EXPLAIN ANALYZE discards rows on the server
+            # and still uses the same plan, including parallel workers.
+            cursor.execute(
+                "EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) " + body
+            )
+            elapsed = self._execution_seconds_from_explain(cursor.fetchone()[0])
             try:
-                execution_result = cursor.fetchall()  # Fetch all results
-            except psycopg2.ProgrammingError as e:
-                pass            
+                conn.rollback()
+            except Exception:
+                pass
+            if elapsed is None:
+                return (None, None) if return_flag else None
 
             if return_flag == False:
-                return end_time - start_time
+                return elapsed
             else:
-                return end_time - start_time, execution_result
+                return elapsed, None
         
         except psycopg2.OperationalError as e:
             if "canceling statement due to statement timeout" in str(e):
@@ -352,17 +434,20 @@ class Evaluation():
                 
                 if i == 0:
                     print("start init hot database execution")
-                    original_time, original_result = self.execute_query(conn, cursor, original_query, timeout, return_flag=True)
+                    original_time = self.execute_query(conn, cursor, original_query, timeout)
+                    cursor = conn.cursor()
                     print(f"this is the init: original query excute time: {original_time}")
                     if original_time == -2:
                         ORIGINAL_TIME_OUT = True
                         break
-                    elif original_time == -1:
+                    elif original_time == -1 or original_time is None:
                         break
-                    else:
-                        continue
+                    original_result = self._result_fingerprint(conn, original_query, timeout)
+                    cursor = conn.cursor()
+                    continue
 
                 original_time = self.execute_query(conn, cursor, original_query, timeout)
+                cursor = conn.cursor()
                 print(f"the {i}-th/{iteration} iteration original query excute time: {original_time}")
                 if original_time == -2:
                     ORIGINAL_TIME_OUT = True
@@ -411,7 +496,8 @@ class Evaluation():
                 if i == 0:
                     print("start init hot database execution")
                     try:
-                        rewritten_time, rewritten_result = self.execute_query(conn, cursor, rewritten_query, timeout, return_flag=True)
+                        rewritten_time = self.execute_query(conn, cursor, rewritten_query, timeout)
+                        cursor = conn.cursor()
                     except Exception as e:
                         if "connection" in str(e).lower() or "cursor" in str(e).lower():
                             print(f"Connection error, retrying after restart: {e}")
@@ -425,18 +511,21 @@ class Evaluation():
                             if conn is None:
                                 return None, None, None, None, None, None
                             cursor = conn.cursor()
-                            rewritten_time, rewritten_result = self.execute_query(conn, cursor, rewritten_query, timeout, return_flag=True)
+                            rewritten_time = self.execute_query(conn, cursor, rewritten_query, timeout)
+                            cursor = conn.cursor()
                         else:
                             raise e
                     print(f"this is the init: rewrite query excute time: {rewritten_time}")
                     if rewritten_time == -2:
                         REWRITTEN_TIME_OUT = True
                         break
-                    elif rewritten_time == -1:
+                    elif rewritten_time == -1 or rewritten_time is None:
                         break
-                    else:
-                        continue
+                    rewritten_result = self._result_fingerprint(conn, rewritten_query, timeout)
+                    cursor = conn.cursor()
+                    continue
                 rewritten_time = self.execute_query(conn, cursor, rewritten_query, timeout)
+                cursor = conn.cursor()
                 print(f"the {i}-th/{iteration} iteration rewrite query excute time: {rewritten_time}")
                 if rewritten_time == -2:
                     REWRITTEN_TIME_OUT = True
@@ -508,10 +597,13 @@ class Evaluation():
                 skipped_original = self._should_skip_original(query_id)
                 if skipped_original:
                     equivalance = True
-                elif original_result != None and rewritten_result != None and original_execution_time != self.timeout and rewrite_execution_time != self.timeout:
-                    original_counts = collections.Counter(original_result)
-                    rewritten_counts = collections.Counter(rewritten_result)
-                    equivalance = (original_counts == rewritten_counts)
+                elif (
+                    isinstance(original_result, tuple)
+                    and isinstance(rewritten_result, tuple)
+                    and original_execution_time != self.timeout
+                    and rewrite_execution_time != self.timeout
+                ):
+                    equivalance = original_result == rewritten_result
                 else:
                     equivalance = False
                 result_data = {
@@ -534,7 +626,7 @@ class Evaluation():
 
         print(f"Experiment results appended to {self.result_storage_path}")
     
-    def cal(self, equivalence_threshold=0.01, min_abs_time_improvement=0.1):
+    def cal(self, equivalence_threshold=0.01, min_relative_time_improvement=0.1):
         Metric = []
         result_data = []
         all_result_data = []
@@ -613,16 +705,7 @@ class Evaluation():
         equivalent_count = sum(1 for x in all_result_data if x.get("equivalence") is True)
         improved_count = sum(
             1 for x in all_result_data
-            if (
-                isinstance(x.get("original_execution_time"), (int, float))
-                and isinstance(x.get("rewrite_execution_time"), (int, float))
-                and (
-                    x.get("original_execution_time") - x.get("rewrite_execution_time")
-                    > min_abs_time_improvement
-                )
-                and self._normalize_sql_for_compare(x.get("original_query", "")) !=
-                self._normalize_sql_for_compare(x.get("rewritten_query", ""))
-            )
+            if self._counts_as_time_improvement(x, min_relative_time_improvement)
         )
         stats_result = {
             "total_queries": total_queries,
@@ -631,7 +714,7 @@ class Evaluation():
             "improved_count": improved_count,
             "improvement_rate": (improved_count / total_queries) if total_queries else 0.0,
             "equivalence_threshold": equivalence_threshold,
-            "min_abs_time_improvement": min_abs_time_improvement,
+            "min_relative_time_improvement": min_relative_time_improvement,
         }
 
         output_data = [ori_result, re_result, stats_result] + all_result_data
@@ -702,8 +785,8 @@ def parse_arguments():
                         help="Disable database restart between queries (runs 5 times, removes min/max)")
     parser.add_argument("--equivalence_threshold", type=float, default=0.01,
                         help="Threshold metadata for equivalence rate reporting (default: 0.01)")
-    parser.add_argument("--min_abs_time_improvement", type=float, default=0.1,
-                        help="Absolute time improvement threshold in seconds for improvement_rate counting (default: 0.1)")
+    parser.add_argument("--min_relative_time_improvement", type=float, default=0.1,
+                        help="Relative execution-time drop required for improvement_rate counting (default: 0.1, meaning more than 10%%)")
     parser.add_argument("--time-only", action="store_true", default=False,
                         help="Only measure execution time, skip full rewrite and semantic check")
     parser.add_argument("--watch_queries", action="store_true", default=False,
@@ -720,7 +803,7 @@ if __name__ == "__main__":
     time_out = args.time_out
     no_restart = args.no_restart
     equivalence_threshold = args.equivalence_threshold
-    min_abs_time_improvement = args.min_abs_time_improvement
+    min_relative_time_improvement = args.min_relative_time_improvement
     time_only = getattr(args, 'time_only', False)
     watch_queries = getattr(args, 'watch_queries', False)
     watch_interval = max(0.5, float(getattr(args, 'watch_interval', 2.0)))
@@ -817,10 +900,13 @@ if __name__ == "__main__":
             skipped_original = model._should_skip_original(query_id)
             if skipped_original:
                 equivalance = True
-            elif original_result != None and rewritten_result != None and original_result != -1 and rewritten_result != -1 and total_original_time != time_out and total_rewrite_time != time_out:
-                original_counts = collections.Counter(original_result)
-                rewritten_counts = collections.Counter(rewritten_result)
-                equivalance = (original_counts == rewritten_counts)
+            elif (
+                isinstance(original_result, tuple)
+                and isinstance(rewritten_result, tuple)
+                and total_original_time != time_out
+                and total_rewrite_time != time_out
+            ):
+                equivalance = original_result == rewritten_result
 
             if equivalance:
                 stats["equiv_number"] += 1
@@ -848,7 +934,7 @@ if __name__ == "__main__":
             # Refresh metrics after each newly evaluated query.
             model.cal(
                 equivalence_threshold=equivalence_threshold,
-                min_abs_time_improvement=min_abs_time_improvement,
+                min_relative_time_improvement=min_relative_time_improvement,
             )
         return processed_now
 
@@ -884,6 +970,6 @@ if __name__ == "__main__":
 
     model.cal(
         equivalence_threshold=equivalence_threshold,
-        min_abs_time_improvement=min_abs_time_improvement,
+        min_relative_time_improvement=min_relative_time_improvement,
     )
 

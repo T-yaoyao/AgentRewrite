@@ -227,7 +227,7 @@ $$b_a \leftarrow b_a + r \cdot x$$
 
 #### 3.4.1 核心机制
 
-权重来源由 `DecisionAgent`（推理Agent）在规则选择时输出：
+权重来源由 `EvaluationAgent`（推理Agent）在规则选择时输出：
 
 ```json
 {
@@ -471,7 +471,7 @@ class LangGraphQueryRewriter:
             few_shot = self._format_similar_cases(similar_cases)
         
         # 整合双轨信息，调用LLM
-        selected_rules = await self.decision_agent.select_rules(
+        selected_rules = await self.evaluation_agent.select_rules(
             context=context,
             candidate_rules=scored_rules[:10],
             few_shot_examples=few_shot

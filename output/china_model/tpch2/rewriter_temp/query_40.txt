@@ -1,0 +1,84 @@
+Query ID: 40
+==================================================
+
+Original: select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-05-01' and l_shipdate < date '1995-05-01' + interval '1' month;
+Rewritten: select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-05-01' and l_shipdate < date '1995-05-01' + interval '1' month;
+Time Cost: 273.08s
+Suggestion: []
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.191
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.176
+   → PROJECT_JOIN_REMOVE: UCT=1.136
+{"applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_CASE_TO_FILTER", "STRATEGY_CTE_DECOMPOSITION", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"]}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_CASE_TO_FILTER", "STRATEGY_CTE_DECOMPOSITION", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED"],
+  "step_sqls": [
+    "select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-05-01' and l_shipdate < date '1995-06-01';",
+    "select 100.00 * coalesce(sum(l_extendedprice * (1 - l_discount)) filter (where p_type like 'PROMO%'), 0) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-05-01' and l_shipdate < date '1995-06-01';",
+    "WITH lineitem_filtered AS (SELECT l_partkey, l_extendedprice, l_discount FROM lineitem WHERE l_shipdate >= DATE '1995-05-01' AND l_shipdate < DATE '1995-06-01') SELECT 100.00 * COALESCE(SUM(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type LIKE 'PROMO%'), 0) / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue FROM lineitem_filtered, part WHERE l_partkey = p_partkey;",
+    "WITH lineitem_filtered AS (SELECT l_partkey, l_extendedprice, l_discount FROM lineitem WHERE l_shipdate >= DATE '1995-05-01' AND l_shipdate < DATE '1995-06-01'), lineitem_agg AS (SELECT l_partkey, SUM(l_extendedprice * (1 - l_discount)) AS sum_revenue FROM lineitem_filtered GROUP BY l_partkey) SELECT 100.00 * COALESCE(SUM(sum_revenue) FILTER (WHERE p_type LIKE 'PROMO%'), 0) / SUM(sum_revenue) AS promo_revenue FROM lineitem_agg, part WHERE l_partkey = p_partkey;"
+  ],
+  "semantic_correctness_guarantee": "1) 结构性改写说明：第一步将常量日期表达式 date '1995-05-01' + interval '1' month 折叠为字面量 date '1995-06-01'（l_shipdate 为 DATE 类型，加一个月在标准 SQL 语义下结果唯一确定）；第二步将 SUM(CASE WHEN p_type LIKE 'PROMO%' THEN v ELSE 0 END) 改写为 COALESCE(SUM(v) FILTER (WHERE p_type LIKE 'PROMO%'), 0)——补 COALESCE 正是为了覆盖原 SQL 中 ELSE 0 的边界情形（当无任何 PROMO 行时 FILTER 聚合返回 NULL 而原式返回 0）；第三步把 lineitem 上的 l_shipdate 范围过滤提取为 CTE lineitem_filtered，外层仍按 l_partkey = p_partkey 与 part 做内连接；第四步把只依赖 lineitem 的聚合 SUM(l_extendedprice*(1-l_discount)) 下推到按 l_partkey 分组预聚合为 CTE lineitem_agg，再与 part 连接后做外层 SUM。\n2) 等价性论证：谓词 l_shipdate >= '1995-05-01' AND l_shipdate < '1995-06-01' 与原式逐值相同（日期常量折叠不改语义）；CTE 提取只是把同一过滤条件搬到同一张 lineitem 的扫描处，过滤与连接的先后顺序不影响内连接结果集。\n3) 聚合下推（GROUP BY l_partkey）与原查询等价的关键：连接键为 l_partkey = p_partkey，而 p_partkey 是 part 表主键（1:1），因此按 l_partkey 分组求和后再连接 part，外层对 sum_revenue 再求和等于原始对连接后每行 lineitem 值求和——SUM(SUM(v) GROUP BY k) 在与按 k 唯一的表连接后等于原 SUM(v)，数值与类型均一致（DECIMAL 聚合可结合）。l_partkey 无匹配 part 的行在内连接语义下两边同样被剔除。\n4) 易误判点核查：(a) CASE→FILTER 改写中 ELSE 0 与 FILTER NULL 的差异已通过 COALESCE(..., 0) 显式消除；(b) 分母 SUM(l_extendedprice*(1-l_discount)) 不含 part 条件，聚合下推后仍覆盖同一行集合，若连接结果为空则两版均返回 NULL，除法结果一致；(c) 查询无 GROUP BY/HAVING/ORDER BY/LIMIT，结果为单行单列 promo_revenue，重写前后列名与表达式 100.00 * ... / ... 的计算顺序完全保留，最终输出完全一致。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "日期常量折叠、CASE→FILTER+COALESCE、CTE 提取与按 l_partkey 预聚合下推均在语义上等价：p_partkey 为主键使分组与连接满足两层聚合折叠条件（SUM(SUM(v))→SUM(v)），同组 part 的 p_type 一致保证 FILTER 求和与 CASE 求和逐行对应，ELSE 0 与 FILTER NULL 的边界差异已被 COALESCE 消除，空连接时两版分母均为 NULL 输出一致。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 2->1, index-like 0->1
+{
+  "terminate": false,
+  "reason": "original_cost=1,581,581.85，rewritten_cost=1,754,616.39，上涨约 173,034（约 10.9%），不命中第 1 条（代价未下降）。第 2 条也不成立：两份计划中 l_shipdate 过滤都已下推到 lineitem 顺序扫描，重写并没有提前过滤或减少重复扫描；代价上涨来自额外的 GROUP BY l_partkey 聚合节点、Sort + Gather Merge 排序开销以及 Hash Join 改为 Merge Join，plan_rows 还从 2,295,306 升到 4,613,520，这些是真实增加的工作量，而非基数估计偏差可以解释的涨幅。重写引入的按 l_partkey 先聚合反而增加了排序与聚合成本，未带来代价收益，不保留。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.181
+   → PROJECT_JOIN_REMOVE: UCT=1.176
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.137
+{"applied_rules": []}
+✅ 选择了 0 个规则
+🔧 开始SQL重写...
+{"applied_rules": [], "step_sqls": [], "semantic_correctness_guarantee": "1. 本次规则序列为空（applied_rules 为 []），未选择任何重写规则，因此 step_sqls 为空数组，最终 SQL 即 base_sql 本身，未对原 SQL 做任何结构性改写。\n2. 上一轮评估反馈显示，此前尝试的 FILTER_REDUCE_EXPRESSIONS、AGGREGATE_CASE_TO_FILTER、STRATEGY_CTE_DECOMPOSITION、AGGREGATE_JOIN_TRANSPOSE_EXTENDED 等改写导致代价从 1,581,581.85 上涨至 1,754,616.39（约 +10.9%），且上涨来自额外聚合节点、Sort + Gather Merge 及 Merge Join 开销，属于真实增加的工作量，故全部回退，不保留任何改写。\n3. 当前基底 SQL 保持为：WITH lineitem_filtered（按 l_shipdate ∈ [1995-05-01, 1995-06-01) 过滤）、lineitem_agg（按 l_partkey 分组求 SUM(l_extendedprice * (1 - l_discount))），最终对 lineitem_agg 与 part 按 l_partkey = p_partkey 连接后计算 100.00 * COALESCE(SUM(sum_revenue) FILTER (WHERE p_type LIKE 'PROMO%'), 0) / SUM(sum_revenue) AS promo_revenue。\n4. 由于未应用任何规则，查询的过滤谓词、JOIN 条件、GROUP BY 键（l_partkey）、FILTER 聚合语义与 SELECT 输出列均与原始 SQL 完全一致，结果集天然等价。\n5. 无需下一步优化（评估反馈已给出该结论），维持原始最优计划对应的 SQL 形态。"}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "重写按 l_partkey 预聚合后与 part 主键一对一连接，满足两层聚合折叠 SUM(SUM(v))->SUM(v)，分子用 FILTER+COALESCE 精确对应 CASE WHEN else 0，日期边界与原 interval 一致，结果集等价。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 2->1, index-like 0->1
+{
+  "terminate": false,
+  "reason": "original_cost=1,581,581.85，rewritten_cost=1,754,616.39，上涨约 10.9%，不满足第 1 条（代价未下降）。第 2 条也不成立：重写在 join 前按 l_partkey 做了分组聚合，理论上可减少 join 输入行数，但实际计划引入了 Sort + Gather Merge + Merge Join，聚合输入行数估计从 229 万涨到 461 万，新增排序和合并开销，且没有消除重复扫描或提前过滤（l_shipdate 过滤在两个计划中都已在 Seq Scan 上）。涨幅主要来自额外排序/聚合节点，不能仅用基数估计偏差解释，因此不保留。",
+  "no_further_optimization": false,
+  "next_step_advice": "在当前 rewritten_sql 基础上去掉 lineitem_agg 的按 l_partkey 预聚合（该分组导致 Sort+Merge Join 额外开销），改写为：WITH lineitem_filtered AS (SELECT l_partkey, l_extendedprice, l_discount FROM lineitem WHERE l_shipdate >= DATE '1995-05-01' AND l_shipdate < DATE '1995-06-01') SELECT 100.00 * COALESCE(SUM(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0 END), 0) / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue FROM lineitem_filtered, part WHERE l_partkey = p_partkey; 保留谓词下推到派生表的写法，避免预分组引入的排序代价。"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+ℹ️ 记忆跳过：论文收益 R=-0.2656，仅记录 R>0 的案例
+
+----------------------------------------
+

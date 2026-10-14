@@ -34,7 +34,7 @@ from src.Rewrite_Middleware.Agent_Memory_Buffer.memory_buffer import (
     create_memory_buffer,
 )
 from src.Query_Rewriter.agent_definition import (
-    DecisionAgent,
+    EvaluationAgent,
     ReasoningAgent,
     RewriteAgent,
     SemanticCheckAgent,
@@ -79,7 +79,7 @@ class RewriteState(TypedDict, total=False):
     initial_explain_info: str
     evaluation_reason: str
     evaluation_terminate: bool
-    evaluation_no_further_optimization: bool
+    evaluation_keep: bool
     evaluation_next_step_advice: str
 
     original_cost: float
@@ -216,10 +216,10 @@ class LangGraphQueryRewriter:
         self.MAX_ITERATION_LOOP = MAX_ITERATION_LOOP
 
         self.reasoning_agent = ReasoningAgent(message_queue)
-        self.decision_agent = DecisionAgent(message_queue)
+        self.evaluation_agent = EvaluationAgent(message_queue)
         self.rewrite_agent = RewriteAgent(message_queue)
         self.semantic_check_agent = SemanticCheckAgent(message_queue)
-        self.decision_agent.watch(["ReasoningAgent", "ExplainAgent"])
+        self.evaluation_agent.watch(["ReasoningAgent", "ExplainAgent"])
 
         self.llm_semaphore = asyncio.Semaphore(3)
         self.db_semaphore = asyncio.Semaphore(5)
@@ -668,7 +668,6 @@ class LangGraphQueryRewriter:
         if reward <= 0.0:
             print(f"ℹ️ 记忆跳过：论文收益 R={reward:+.4f}，仅记录 R>0 的案例")
             return
-        detail = self._compute_structure_reward(original_explain, rewritten_explain)
         try:
             self.global_memory.store_successful_optimization(
                 original_sql=original_sql,
@@ -676,11 +675,6 @@ class LangGraphQueryRewriter:
                 rule_sequence=rule_sequence,
                 original_cost=original_cost,
                 rewritten_cost=rewritten_cost,
-                metadata={
-                    "rows_score": float(detail.get("rows_score", 0.0)),
-                    "depth_score": float(detail.get("depth_score", 0.0)),
-                    "paper_reward": reward,
-                },
             )
         except Exception as ex:
             print(f"⚠️ 知识库存储失败: {ex}")
@@ -873,7 +867,6 @@ class LangGraphQueryRewriter:
                     few_shot = filtered[:3]
                     best = filtered[0]
                     if best.get("id"):
-                        self.global_memory.update_hit_frequency(best["id"])
                         retrieved_id = best["id"]
                 else:
                     print(
@@ -948,15 +941,13 @@ class LangGraphQueryRewriter:
             scored_rules = self.bandit.score_rules(lib, context)
             
             # Build UCT-scored rule library for LLM
-            uct_scored_lib = {}
-            for group, rule_id, score, desc in scored_rules:
-                if group not in uct_scored_lib:
-                    uct_scored_lib[group] = {}
-                uct_scored_lib[group][rule_id] = (desc, score)
+            uct_scored_lib = {
+                rule_id: (desc, score) for rule_id, score, desc in scored_rules
+            }
             
             print(f"📊 UCT scored {len(scored_rules)} rules")
             top_3 = scored_rules[:3]
-            for g, rid, score, _ in top_3:
+            for rid, score, _ in top_3:
                 print(f"   → {rid}: UCT={score:.3f}")
             
             async with self.llm_semaphore:
@@ -996,7 +987,6 @@ class LangGraphQueryRewriter:
                 rr = await self.rewrite_agent.rewrite_with_rule_sequence(
                     base_sql,
                     sel,
-                    state.get("initial_explain_info") or "",
                     schema_content=state.get("schema_content") or "",
                     previous_feedback=state.get("previous_feedback"),
                 )
@@ -1398,12 +1388,12 @@ class LangGraphQueryRewriter:
                     f"✅ 估计代价降幅 {pct:.1f}% 超过 {thr_pct:.0f}%，跳过 LLM 评估，直接终止并保留重写 SQL"
                 )
                 ev = {
+                    "keep": True,
                     "terminate": True,
                     "reason": (
                         f"估计代价降幅 {pct:.1f}% 超过 {thr_pct:.0f}%，"
                         "按规则跳过模型评估：直接终止多轮优化并保留本轮重写 SQL。"
                     ),
-                    "no_further_optimization": True,
                     "next_step_advice": "无需下一步优化。",
                 }
                 trace.append(
@@ -1416,25 +1406,22 @@ class LangGraphQueryRewriter:
                 )
             else:
                 struct_for_prompt = self._compute_structure_reward(o_exp, r_exp)
-                rows_depth_comparison = (
-                    f"rows {struct_for_prompt.get('o_rows', 0.0):.1f}"
-                    f"->{struct_for_prompt.get('r_rows', 0.0):.1f}, "
-                    f"depth {struct_for_prompt.get('o_depth', 0.0):.1f}"
-                    f"->{struct_for_prompt.get('r_depth', 0.0):.1f}"
-                )
                 info = {
                     "original_costs": oc,
                     "rewritten_costs": rc,
                     "original_plan_analysis": self._plan_analyzer_report(o_exp),
                     "rewritten_plan_analysis": self._plan_analyzer_report(r_exp),
-                    "rows_depth_comparison": rows_depth_comparison,
+                    "original_scan_rows": f"{struct_for_prompt.get('o_rows', 0.0):.1f}",
+                    "rewritten_scan_rows": f"{struct_for_prompt.get('r_rows', 0.0):.1f}",
+                    "original_plan_depth": f"{struct_for_prompt.get('o_depth', 0.0):.1f}",
+                    "rewritten_plan_depth": f"{struct_for_prompt.get('r_depth', 0.0):.1f}",
                     "applied_rules": applied,
                     "original_sql": init_sql,
                     "rewritten_sql": rw,
                     "reason": (state.get("previous_feedback") or {}).get("reason", ""),
                 }
                 async with self.llm_semaphore:
-                    ev = await self.decision_agent.evaluate_with_costs(info, rnd)
+                    ev = await self.evaluation_agent.evaluate_with_costs(info, rnd)
                 trace.append(
                     {
                         "node": "evaluation",
@@ -1442,8 +1429,8 @@ class LangGraphQueryRewriter:
                         "plan_structure_analysis": plan_struct,
                     }
                 )
-            terminate = ev.get("terminate", True)
-            no_further_optimization = bool(ev.get("no_further_optimization", False))
+            terminate = bool(ev.get("terminate", True))
+            keep = bool(ev.get("keep", False))
             eval_reason = str(ev.get("reason", "") or "")
             next_step_advice = str(ev.get("next_step_advice", "") or "").strip()
             uncertain_markers = (
@@ -1523,7 +1510,7 @@ class LangGraphQueryRewriter:
                 "best_rules": best_rules,
                 "evaluation_reason": ev.get("reason", "") or "",
                 "evaluation_terminate": terminate,
-                "evaluation_no_further_optimization": no_further_optimization,
+                "evaluation_keep": keep,
                 "evaluation_next_step_advice": next_step_advice,
                 "agent_trace": trace,
                 "current_sql": rw,
@@ -1531,7 +1518,7 @@ class LangGraphQueryRewriter:
 
             if terminate:
                 out["should_terminate"] = True
-                if rw != init_sql:
+                if keep and rw != init_sql:
                     if is_uncertain:
                         print("ℹ️ 评估不确定：保留重写 SQL，但跳过记忆库与 UCT 更新。")
                     else:
@@ -1577,7 +1564,7 @@ class LangGraphQueryRewriter:
                 if ratio > self.COST_ROLLBACK_PCT:
                     print(
                         f"ℹ️  估计代价上升 {ratio:.1f}%（> {self.COST_ROLLBACK_PCT}%）。"
-                        "已到最大轮数，最终输出以 Decision 是否保留为准。"
+                        "已到最大轮数，最终输出以评估是否保留为准。"
                     )
                 if rw != init_sql:
                     if is_uncertain:
@@ -1657,7 +1644,7 @@ class LangGraphQueryRewriter:
             }
         init_sql = _state_sql(state["initial_sql"])
         kept_sql = _state_sql(state.get("rewritten_sql") or "")
-        agent_kept = bool(state.get("evaluation_terminate")) and bool(kept_sql) and kept_sql != init_sql
+        agent_kept = bool(state.get("evaluation_keep")) and bool(kept_sql) and kept_sql != init_sql
         if agent_kept:
             final_sql = kept_sql
             rc_raw = state.get("final_rewritten_costs", oc)
@@ -1665,13 +1652,13 @@ class LangGraphQueryRewriter:
             sel = state.get("selected_rules") or {}
             rules = sel.get("applied_rules") or None
             print(
-                f"✅ Decision 保留本轮重写，输出该 SQL，估计代价 {rc:.4f}"
+                f"✅ 评估保留本轮重写，输出该 SQL，估计代价 {rc:.4f}"
             )
         else:
             final_sql = init_sql
             rc = float(oc) if isinstance(oc, (int, float)) else 0.0
             rules = None
-            print("ℹ️ Decision 未保留重写，输出原 SQL")
+            print("ℹ️ 评估未保留重写，输出原 SQL")
         rate = round(((oc - rc) / oc * 100) if oc > 0 else 0.0, 2)
         return {
             "tpch": [
@@ -1719,7 +1706,7 @@ class LangGraphQueryRewriter:
             "initial_explain_info": "",
             "evaluation_reason": "",
             "evaluation_terminate": True,
-            "evaluation_no_further_optimization": False,
+            "evaluation_keep": False,
             "evaluation_next_step_advice": "",
             "original_cost": 0.0,
             "current_cost": 0.0,

@@ -1,0 +1,65 @@
+Query ID: 38
+==================================================
+
+Original: select c_count, count(*) as custdist from ( select c_custkey, count(o_orderkey) from customer left outer join orders on c_custkey = o_custkey and o_comment not like '%unusual%deposits%' group by c_custkey ) as c_orders (c_custkey, c_count) group by c_count order by custdist desc, c_count desc;
+Rewritten: select c_count, count(*) as custdist from ( select c_custkey, count(*) * coalesce(max(o.cnt), 0) as c_count from customer left outer join ( select o_custkey, count(o_orderkey) as cnt from orders where o_comment not like '%unusual%deposits%' group by o_custkey ) o on c_custkey = o_custkey group by c_custkey ) as c_orders (c_custkey, c_count) group by c_count order by custdist desc, c_count desc;
+Time Cost: 381.78s
+Suggestion: []
+🔍 PlanAnalyzer 分析当前 SQL...
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.275
+   → PROJECT_JOIN_REMOVE: UCT=1.179
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.168
+{"applied_rules": ["AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "AGGREGATE_REMOVE"]}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+```json
+{
+  "applied_rules": ["AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "AGGREGATE_REMOVE"],
+  "step_sqls": [
+    "select c_count, count(*) as custdist from ( select c_custkey, coalesce(o.cnt, 0) as c_count from customer left outer join ( select o_custkey, count(o_orderkey) as cnt from orders where o_comment not like '%unusual%deposits%' group by o_custkey ) o on c_custkey = o_custkey group by c_custkey, o.cnt ) as c_orders (c_custkey, c_count) group by c_count order by custdist desc, c_count desc;",
+    "select c_count, count(*) as custdist from ( select c_custkey, coalesce(o.cnt, 0) as c_count from customer left outer join ( select o_custkey, count(o_orderkey) as cnt from orders where o_comment not like '%unusual%deposits%' group by o_custkey ) o on c_custkey = o_custkey ) as c_orders (c_custkey, c_count) group by c_count order by custdist desc, c_count desc;"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写说明（规则1 AGGREGATE_JOIN_TRANSPOSE_EXTENDED）：原内层子查询对 customer LEFT JOIN orders 的结果按 c_custkey 做 count(o_orderkey)。由于该聚合只依赖 orders 一侧（c_custkey 仅为分组键，且 customer.c_custkey 是主键、每组恰一行），将其改写为：先对 orders 按 o_custkey 预聚合（select o_custkey, count(o_orderkey) from orders where o_comment not like '%unusual%deposits%' group by o_custkey），再与 customer 左连接。\n2. 过滤谓词位置等价性：原 SQL 中 o_comment not like '%unusual%deposits%' 位于 LEFT JOIN 的 ON 子句中，作用是使不满足该条件的订单不参与匹配（而非过滤客户行）。改写后将其下推为预聚合子查询的 WHERE，作用域仍是同一批订单行：对每个客户，参与计数的订单集合 = 满足 o_custkey = c_custkey 且 o_comment not like 模式的订单，与原 ON 条件完全一致。\n3. NULL/0 计数等价性：原 SQL 中无匹配订单的客户因 LEFT JOIN 产生 o_orderkey 为 NULL 的行，count(o_orderkey) 返回 0；改写后该类客户在预聚合子查询中无对应行，左连接得到 cnt 为 NULL，用 coalesce(o.cnt, 0) 还原为 0，保证 c_count 值域一致（两种写法均不会产生 NULL 的 c_count）。由于 o_orderkey 是主键非空，count(o_orderkey) 等价于对匹配行计数，预聚合的 count(o_orderkey) 语义相同。\n4. 中间 GROUP BY 的引入与等价性：预聚合后每个 c_custkey 至多连接到一行（o_custkey 在预聚合结果中唯一），故改写后中间层写作 group by c_custkey, o.cnt（为保证标准 SQL 语法合法而把 o.cnt 一并列出），每组仍恰为客户的一行，c_count = coalesce(o.cnt,0)，与原 group by c_custkey + count(o_orderkey) 的输出完全一致。\n5. 规则2 AGGREGATE_REMOVE：删除中间层的 group by c_custkey, o.cnt。由于 customer.c_custkey 是主键、预聚合子查询按 o_custkey 分组后每个 o_custkey 唯一，左连接结果中每个 c_custkey 恰好出现一行（coalesce 为逐行标量表达式，非聚合），该 GROUP BY 不做任何真正聚合、不改变行数与取值，删除后结果集不变。外层的 group by c_count 与 count(*) 是真实聚合、order by custdist desc, c_count desc 保持原序，均未改动。"
+}
+```
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+❌ 确定性等价验证不通过: NEQ
+{"fixed_sql": "select c_count, count(*) as custdist from ( select c_custkey, count(*) * coalesce(max(o.cnt), 0) as c_count from customer left outer join ( select o_custkey, count(o_orderkey) as cnt from orders where o_comment not like '%unusual%deposits%' group by o_custkey ) o on c_custkey = o_custkey group by c_custkey ) as c_orders (c_custkey, c_count) group by c_count order by custdist desc, c_count desc;", "note": "不等价点在于重写删除了内层对 c_custkey 的 GROUP BY（该删除仅在 c_custkey 具唯一性时成立）：当 customer 中 c_custkey 存在重复或 NULL 时，原始 SQL 每个键只输出一行且计数为该键行数×满足条件的订单数，而重写按行输出且丢失了行数倍数；修复为保留已下推的订单聚合，在内层重新按 c_custkey 分组，并用 count(*)（该键的行数）乘以 coalesce(max(o.cnt),0) 精确恢复原始计数与一行一键的语义。"}
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+{"equivalent": true, "message": "重写将依赖 orders 单侧的聚合下推为按 o_custkey 预聚合后左连接，谓词从 ON 下推到子查询 WHERE 作用域一致；由于 customer.c_custkey 是主键且预聚合结果中 o_custkey 唯一，每个 c_custkey 恰连接一行，count(*)=1、max(cnt)=cnt，故 count(*)*coalesce(max(cnt),0) 恰等于该客户匹配且满足 not like 条件的订单数，与原 count(o_orderkey)（o_orderkey 非空主键）逐客户一致，外层聚合与排序未变。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 21847074.0 -> 15239528.0 (重写侧约为原的 69.7555%)
+{
+  "keep": true,
+  "terminate": true,
+  "reason": "original_cost=1518160.95，rewritten_cost=1209721.43，代价下降约20.3%。同时聚合下推使 orders 先按 o_custkey 聚合，连接输入行数从 21847074 降至 15239528，计划结构更优（代价降低 + 聚合下推减少连接输入），命中保留条件1和2。",
+  "next_step_advice": "无需下一步优化"
+}
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 265
+   - 规则序列: ['AGGREGATE_JOIN_TRANSPOSE_EXTENDED', 'AGGREGATE_REMOVE']
+   - 估计代价: 原始=1518160.95, 重写=1209721.43，相对变化: 20.32%
+✅ 成功存储，记录ID: 0b05b67e-71f6-466a-8e14-deb9685be7a7
+
+🎲 UCT Math Update: 2 rules, step_sum=+0.2032 (cost=+0.2032, rows=+0.3024, depth=+0.0000, oc=1518160.9500, rc=1209721.4300)
+   结构分细节: rows 21847074.0->15239528.0 (score=+0.302), depth 9.0->9.0 (score=+0.000)
+✅ UCT Update Complete:
+   → AGGREGATE_JOIN_TRANSPOSE_EXTENDED: P(s,a)=N/A, reward=+0.174, count=13, avg=+0.154
+   → AGGREGATE_REMOVE: P(s,a)=N/A, reward=+0.030, count=21, avg=+0.137
+
+----------------------------------------
+

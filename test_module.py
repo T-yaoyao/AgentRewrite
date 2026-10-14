@@ -118,7 +118,7 @@ class TestRewriteMiddleware(unittest.TestCase):
         
         test_prompt = "What is the capital of France?"
         print(f"The reasoning agent configuration is: {os.getenv('REASONING_MODEL')}, base URL: {os.getenv('REASONING_MODEL_URL')}")
-        print(f"The decision agent configuration is: {os.getenv('DECISION_MODEL')}, base URL: {os.getenv('DECISION_MODEL_URL')}")
+        print(f"The evaluation agent configuration is: {os.getenv('EVALUATION_MODEL')}, base URL: {os.getenv('EVALUATION_MODEL_URL')}")
         print(f"The assistant agent configuration is: {os.getenv('ASSISTANT_MODEL')}, base URL: {os.getenv('ASSISTANT_MODEL_URL')}")
         
         llm_configs = [
@@ -129,10 +129,10 @@ class TestRewriteMiddleware(unittest.TestCase):
                 "base_url": os.getenv("REASONING_MODEL_URL"),
             },
             {
-                "name": "Decision",
-                "api_key": os.getenv("DECISION_MODEL_API_KEY"),
-                "model": os.getenv("DECISION_MODEL"),
-                "base_url": os.getenv("DECISION_MODEL_URL"),
+                "name": "Evaluation",
+                "api_key": os.getenv("EVALUATION_MODEL_API_KEY"),
+                "model": os.getenv("EVALUATION_MODEL"),
+                "base_url": os.getenv("EVALUATION_MODEL_URL"),
             },
             {
                 "name": "Assistant",

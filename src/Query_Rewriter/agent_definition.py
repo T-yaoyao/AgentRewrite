@@ -1,11 +1,9 @@
 
 import json
-import math
 import os
 import re
 import textwrap
 import sys
-from collections import Counter
 from typing import Any, Dict, List, Optional
 
 # Setup project paths
@@ -16,7 +14,6 @@ load_project_env()
 from src.utils.agent_template import MessageQueue, Agent
 from src.utils.llm_client import GPT
 from src.utils.llm_json_utils import parse_llm_json, parse_llm_json_with_default
-from src.Query_Rewriter.global_memory.sql_fingerprint import SQLFingerprintGenerator
 
 STRICT_JSON_SCHEMAS = {
     "rule_selection": {
@@ -31,42 +28,18 @@ STRICT_JSON_SCHEMAS = {
             "additionalProperties": False,
         },
     },
-    "initial_check": {
-        "name": "initial_optimization_check",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "can_optimize": {"type": "boolean"},
-                "reason": {"type": "string"},
-                "advice": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "produced_suggestion": {"type": "string"},
-                        },
-                        "required": ["produced_suggestion"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["can_optimize", "reason", "advice"],
-            "additionalProperties": False,
-        },
-    },
     "evaluation": {
         "name": "rewrite_evaluation",
         "strict": True,
         "schema": {
             "type": "object",
             "properties": {
+                "keep": {"type": "boolean"},
                 "terminate": {"type": "boolean"},
                 "reason": {"type": "string"},
-                "no_further_optimization": {"type": "boolean"},
                 "next_step_advice": {"type": "string"},
             },
-            "required": ["terminate", "reason", "no_further_optimization", "next_step_advice"],
+            "required": ["keep", "terminate", "reason", "next_step_advice"],
             "additionalProperties": False,
         },
     },
@@ -177,30 +150,32 @@ def _merge_rewrite_semantic_fields(parsed: dict) -> None:
     parsed["semantic_check"] = parsed.get("semantic_correctness_guarantee", "")
 
 
+def _rule_catalog_entry(rule_data):
+    """推理 agent 只接收规则描述。示例留在重写和等价判断。"""
+    score = None
+    desc = rule_data
+    if isinstance(rule_data, tuple) and len(rule_data) >= 2:
+        desc = rule_data[0]
+        if isinstance(rule_data[1], (int, float)) and not isinstance(rule_data[1], bool):
+            score = float(rule_data[1])
+    if isinstance(desc, dict):
+        desc = desc.get("description") or ""
+    return str(desc or ""), score
+
+
 def _stable_rule_catalog(rule_library: dict) -> tuple:
     """固定 rule_id 顺序的规则目录，以及放到 user 后缀里的 UCT 分数。"""
-    sections = []
+    rows = []
     scores = []
-    for group, rules in (rule_library or {}).items():
-        if not isinstance(rules, dict) or not rules:
-            continue
-        rows = []
-        for rule_id, rule_data in rules.items():
-            score = None
-            if isinstance(rule_data, tuple) and len(rule_data) >= 2:
-                desc = rule_data[0]
-                if isinstance(rule_data[1], (int, float)) and not isinstance(rule_data[1], bool):
-                    score = float(rule_data[1])
-            else:
-                desc = rule_data
-            rows.append((str(rule_id), str(desc)))
-            if score is not None:
-                scores.append((str(rule_id), score))
-        rows.sort(key=lambda item: item[0])
-        body = "\n".join(f"- {rid}: {desc}" for rid, desc in rows)
-        sections.append(f"### {group}\n{body}")
+    for rule_id, rule_data in (rule_library or {}).items():
+        desc, score = _rule_catalog_entry(rule_data)
+        rows.append((str(rule_id), desc))
+        if score is not None:
+            scores.append((str(rule_id), score))
+    rows.sort(key=lambda item: item[0])
     scores.sort(key=lambda item: item[0])
-    return "\n".join(sections), scores
+    body = "\n".join(f"- {rid}: {desc}" for rid, desc in rows)
+    return body, scores
 
 
 class ReasoningAgent(Agent):
@@ -236,10 +211,8 @@ class ReasoningAgent(Agent):
             ]
             for i, example in enumerate(few_shot_examples[:3], 1):
                 lines.append(f"案例{i}:")
-                lines.append(f"- 相似度: {example.get('score', 0):.4f}")
-                lines.append(f"- SQL指纹: {example.get('sql_fingerprint', '')[:150]}...")
-                lines.append(f"- 应用的规则序列: {example.get('rule_sequence', [])}")
-                lines.append(f"- 命中次数: {example.get('frequency', 0)}")
+                lines.append(f"- 原始SQL: {example.get('original_sql', '')}")
+                lines.append(f"- 规则ID: {example.get('rule_sequence', [])}")
             lines.append("</相似历史案例>")
             few_shot_context = "\n".join(lines)
 
@@ -248,7 +221,6 @@ class ReasoningAgent(Agent):
             uct_block = (
                 "<uct_scores>\n"
                 "下列分数是各规则在当前上下文上的 LinUCB 分数，不是规则说明的一部分。\n"
-                "高分（>0.7）历史表现较好；中分（0.4-0.7）需结合 SQL 判断；低分（<0.4）历史表现一般或尝试较少。\n"
                 "可以优先考虑高分规则，但必须结合当前 SQL 结构，不要只按分数选择。\n"
                 f"{score_lines}\n"
                 "</uct_scores>"
@@ -261,7 +233,7 @@ class ReasoningAgent(Agent):
         你是一名经验丰富的 DBA。你是规则选择的第一个模型：根据 PlanAnalyzer 给出的执行计划分析、当前 SQL 和统计信息，从全量规则库中挑选优化规则序列。你只负责选择规则，不进行任何重写操作，也不要等待别的 agent 预先指定优化组。
 
         1. 规则选择原则：
-           - 只能选择与当前SQL结构相符、并且有助于改善执行计划、降低执行时间的规则
+           - 只能选择与当前SQL结构相符、并且有助于改善执行计划、降低执行时间的规则，或者能够简化原始查询逻辑表达式的规则。
            - 当查询语句包含复杂的WHERE/JOIN条件，或存在重复子查询计算时，可考虑使用公共表表达式（CTE）
            - 若查询语句本身结构简单，或使用CTE无法减少冗余计算，则应避免过度使用CTE，多余的CTE可能会增加系统开销
         2. 规则选择逻辑：
@@ -270,10 +242,10 @@ class ReasoningAgent(Agent):
            - 考虑规则之间的依赖和配合：谓词下推、连接改写、子查询去相关、聚合或投影清理如果要先后作用，就按应用顺序放进同一条序列
            - 目标是一条重写规则序列，使后续重写能够优化执行计划并降低执行时间。存在多个互补规则时不要只选一条
            - UCT 分数相同或都接近冷启动时，不要默认选目录里靠前的那一条
-           - 只有确实没有任何规则能改善当前计划时，applied_rules 才返回 []
+           - 计划分析或者原始SQL已经指出重复子查询、过滤偏晚或可折叠常量时，必须选出针对该瓶颈的规则，applied_rules 不能返回 []
+           - 没有这类瓶颈、也确实没有任何规则能改善当前计划或者能够简化原始查询逻辑表达式时，applied_rules 才返回 []
         3. 输出要求：**只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）。字段：
         - applied_rules: 字符串数组，按应用顺序列出规则 ID；必须来自 <rule_library>，禁止编造；若无适用规则则为 []
-        - 不要输出 groups、贡献分或置信度。规则效果由后续 EXPLAIN 代价差测量
 
         示例：{{"applied_rules": ["RULE_ID_1", "RULE_ID_2"]}}
 
@@ -331,137 +303,17 @@ class ReasoningAgent(Agent):
         return default
 
 
-class DecisionAgent(Agent):
-    """Summarize Optimization Suggestions Agent"""
+class EvaluationAgent(Agent):
+    """评估本轮重写是否保留。"""
     def __init__(self, mq: MessageQueue):
-        super().__init__("DecisionAgent", mq, gpt = GPT(
-    api_key=os.getenv("DECISION_MODEL_API_KEY"),
-    model=os.getenv("DECISION_MODEL"),
-    base_url=os.getenv("DECISION_MODEL_URL"),
-    thinking_type=os.getenv("DECISION_MODEL_THINKING"),
-    reasoning_effort=os.getenv("DECISION_MODEL_REASONING_EFFORT"),
+        super().__init__("EvaluationAgent", mq, gpt = GPT(
+    api_key=os.getenv("EVALUATION_MODEL_API_KEY"),
+    model=os.getenv("EVALUATION_MODEL"),
+    base_url=os.getenv("EVALUATION_MODEL_URL"),
+    thinking_type=os.getenv("EVALUATION_MODEL_THINKING"),
+    reasoning_effort=os.getenv("EVALUATION_MODEL_REASONING_EFFORT"),
 ))
         self.watch(["ReasoningAgent", "ExplainAgent"])
-
-    async def initial_optimization_check(
-        self,
-        sql: str,
-        data_statistics: str,
-        explain_info: str,
-        few_shot_examples: list = None,
-        index_info: str = "",
-        previous_feedback: dict = None,
-    ) -> dict:
-        """Initial check to determine if SQL can be optimized through rewriting"""
-        
-        # Build few-shot examples context
-        few_shot_context = ""
-        if few_shot_examples and len(few_shot_examples) > 0:
-            few_shot_context = "\n\n<相似历史案例>\n"
-            few_shot_context += "以下是历史上相似SQL的优化案例，供参考：\n\n"
-            for i, example in enumerate(few_shot_examples[:3], 1):
-                few_shot_context += f"案例{i}:\n"
-                few_shot_context += f"- 相似度: {example.get('score', 0):.4f}\n"
-                few_shot_context += f"- SQL指纹: {example.get('sql_fingerprint', '')[:100]}...\n"
-                few_shot_context += f"- 应用的规则序列: {example.get('rule_sequence', [])}\n"
-                few_shot_context += f"- 命中次数: {example.get('frequency', 0)}\n\n"
-            few_shot_context += "</相似历史案例>\n"
-        previous_feedback_text = ""
-        if previous_feedback:
-            previous_feedback_text = f"""
-        <上一轮未改进/恶化反馈>
-        {json.dumps(previous_feedback, ensure_ascii=False, indent=2)}
-        </上一轮未改进/恶化反馈>
-        """
-        
-        system_message = textwrap.dedent("""
-        <Mission>
-        你是一名经验丰富的 SQL查询重写优化专家，你的任务是判断给定的 SQL 查询是否可以通过查询重写优化来提升执行性能。
-
-        1. 分析输入信息：
-           - <sql语句>: 当前轮次的基底 SQL。第一轮它等于原始SQL；若进入下一轮，它就是上一轮的 rewritten_sql
-           - <统计信息>: 数据库表统计信息
-           - <索引信息>: 表索引（索引名与定义）
-           - <执行计划分析结果>: 智能执行计划分析器生成的分析结果
-           - 若 user 中提供了相似历史案例或上一轮反馈，一并阅读
-
-        若提供了“上一轮未改进/恶化反馈”，必须优先据此重新选择优化方向：
-           - 避免重复上一轮失败思路
-           - 针对反馈中的未改进原因和 next_step_advice 调整优化方向
-           - advice 中要体现对失败原因的修正策略（不是泛化建议）
-
-        2. 基于执行计划分析中的高代价算子信息，判断SQL是否可以通过以下优化方式提升性能：
-           - 子查询优化：子查询转换为JOIN、相关子查询优化、CTE分解等
-           - 连接优化：连接顺序调整、连接条件优化、半连接转换等
-           - 谓词简化：过滤条件下推、合并、表达式简化等
-           - 常量折叠：常量表达式预计算、常量列处理等
-           - 聚合优化：GROUP BY优化、聚合函数简化、聚合下推等
-           - 投影优化：列裁剪、多余投影消除等
-           - 排序优化：冗余排序消除、排序下推等
-           - 集合优化：UNION优化、集合操作转换等
-
-        3. 判断标准：
-           [True] - 可以优化：
-           - 执行计划中存在明显性能瓶颈（如Seq Scan高代价算子、Nested Loop低效连接等）
-           - SQL结构复杂，存在可优化的模式（如子查询、复杂JOIN、多层嵌套等）
-           - 统计信息显示存在优化空间（如大表扫描、小表关联等）
-
-           [False] - 不需要优化：
-           - SQL已经是最优结构，执行计划合理
-           - 执行计划显示已经是最佳执行方式
-           - SQL已经不能单纯通过查询重写优化来提升性能，需要结合索引或物理优化方式来提升性能
-
-        4. 如果可以优化，在 advice 中给出建议数组；否则 advice 为 []。advice 每项只含 produced_suggestion（字符串）。
-           建议可以覆盖：子查询优化、连接优化、谓词简化、常量折叠、聚合优化、投影优化、排序优化、集合优化。
-
-        5. **只输出一个 JSON 对象**（不要 markdown、不要注释）。字段：
-           can_optimize（布尔）、reason（字符串）、advice（数组，元素为 {"produced_suggestion"}）。
-        """).strip()
-
-        prompt = textwrap.dedent(f"""
-        <sql语句>
-        {sql}
-
-        <统计信息>
-        {data_statistics}
-
-        <索引信息>
-        {index_info}
-
-        <执行计划分析结果>
-        {explain_info}
-        """).strip()
-        if few_shot_context:
-            prompt = f"{prompt}\n{few_shot_context}"
-        if previous_feedback_text:
-            prompt = f"{prompt}\n{previous_feedback_text}"
-
-        thought_chain = await self.llm.get_LLM_response_async(
-            prompt=prompt,
-            system_message=system_message,
-            json_format=True,
-            json_schema=STRICT_JSON_SCHEMAS["initial_check"],
-        )
-
-        default_result = {
-            "can_optimize": False,
-            "reason": "无法解析LLM响应，默认认为无需优化",
-            "advice": [],
-        }
-        parsed, _ = parse_llm_json(thought_chain, default_result)
-        if not parsed:
-            return default_result
-        parsed.setdefault("can_optimize", False)
-        parsed.setdefault("advice", [])
-        parsed.setdefault("reason", "")
-        cleaned_advice = []
-        for item in parsed.get("advice") or []:
-            if isinstance(item, dict):
-                item.pop("group", None)
-                item.pop("groups", None)
-            cleaned_advice.append(item)
-        parsed["advice"] = cleaned_advice
-        return parsed
 
     async def evaluate_with_costs(self, optimization_info: dict, iteration_round: int = 1) -> dict:
         """Evaluate rewrite quality and whether to terminate optimization loop."""
@@ -472,35 +324,30 @@ class DecisionAgent(Agent):
         rewritten_sql = optimization_info.get("rewritten_sql", "")
         original_plan_analysis = optimization_info.get("original_plan_analysis", "")
         rewritten_plan_analysis = optimization_info.get("rewritten_plan_analysis", "")
-        rows_depth_comparison = optimization_info.get("rows_depth_comparison", "")
+        original_scan_rows = optimization_info.get("original_scan_rows", "")
+        rewritten_scan_rows = optimization_info.get("rewritten_scan_rows", "")
+        original_plan_depth = optimization_info.get("original_plan_depth", "")
+        rewritten_plan_depth = optimization_info.get("rewritten_plan_depth", "")
 
         system_message = textwrap.dedent("""
-        你负责判断本轮 SQL 重写是否保留。优化器估计代价可能不准，但保留条件只有下面三条，满足任意一条即保留。
+        你负责判断本轮 SQL 重写是否保留，以及是否终止优化。依据估计代价、<scan_rows>、<plan_depth> 和两份 PlanAnalyzer 对比判断。优化器估计代价可能不准，小幅上涨本身不构成性能恶化。<scan_rows> 是各节点 Plan Rows 的累加，表示计划要处理的估计扫描行数，不是 Total Cost。<plan_depth> 是执行计划树的最大深度。
 
-        1. 代价降低就保留。rewritten_cost 严格小于 original_cost 时，terminate=true。
-        2. 代价涨幅不超过 10%，并且综合来看计划得到改进时也保留。rewritten_cost <= original_cost * 1.10 是前提。在这个前提下，综合 <plan_rows_depth> 的 rows、depth，以及两份 PlanAnalyzer 全部节点来判断，不要求这些方面全部改善。计划形态包括过滤下推、连接方式或访问路径是否更合理，重复扫描或相关子查询是否减少。多数方面更好、没有明显退步时，terminate=true。代价涨幅超过 10% 不保留。涨幅在 10% 以内，但 rows、depth 和节点结构整体没有改进，也不保留。
-        3. 执行计划的代价和结构都没有变化，但 SQL 逻辑更简化时也保留。必须同时满足：
-           - 估计代价与原来相同，没有升高也没有降低；
-           - 计划树深度、扫描行数和算子结构都没有变化；
-           - SQL 逻辑确实更简，例如常量已折叠、冗余谓词或重复表达式已去掉、等价聚合写得更直接，嵌套更少。
-           只是空白、别名或排版不同，不算逻辑简化，不保留。
+        只要满足下面任一条件，就保留当前 SQL 并终止：keep=true，terminate=true，next_step_advice 写“无需下一步优化”。
+        1. 估计代价降低。
+        2. <scan_rows> 中重写侧的估计扫描行数低于原始侧。行数下降优先于代价上升，也优先于连接方式变化。Hash Join 变成 Nested Loop，但内侧是索引扫描且扫描行数下降，仍然保留。
+        3. <plan_depth> 中重写侧的树深低于原始侧，或重写后的执行计划结构相对更优，执行时间会更短。包括但不限于减少了重复扫描、把过滤提前，或减少了聚合与连接的输入行数。
+        4. 估计代价没有降低，但逻辑简化。包括但不限于常量折叠、去掉冗余谓词、过滤下推等。
 
-        原始 SQL 与重写 SQL 一致时单独判断。忽略空白和末尾分号后，<original_sql> 与 <enhanced_sql> 相同，说明本轮没有改写，不要用第 1、2、3 条当成保留成功。此时只判断这条 SQL 还能不能通过查询重写降低执行代价或执行时间：
-        - 仍有可重写空间：terminate=false，no_further_optimization=false。next_step_advice 只写下一轮可执行的 SQL 重写，例如去掉冗余派生表、谓词下推、去相关或半连接。下一轮在当前 SQL 上继续。
-        - 没有可重写空间：计划已经合理，或者只剩下索引、统计信息等物理手段。terminate=true，no_further_optimization=true，next_step_advice 写“无需下一步优化”。
+        只有当前重写 SQL 相对原始 SQL 性能明显极大恶化时，才不保留并继续下一轮重新优化：keep=false，terminate=false。next_step_advice 只写下一轮可执行的 SQL 重写，下一轮在当前 rewritten_sql 上继续，不退回 original_sql。明显极大恶化必须同时满足：估计代价大幅上升，并且 <scan_rows> 上升或计划明显做了更多工作。更多工作指同一张大表被多扫，或大表本身成为 Nested Loop 的内表并被反复扫描。扫描行数下降时，不得仅因 Hash Join 变成 Nested Loop 或树深变化判为极大恶化。
 
-        输出约定：
-        - 保留：terminate=true，no_further_optimization=true，next_step_advice 写“无需下一步优化”。
-        - 不保留且仍可能改进：terminate=false，no_further_optimization=false，并在 next_step_advice 中说明下一轮如何基于当前 rewritten_sql 继续改写。下一轮在当前重写结果上继续，不退回 original_sql 重来。
-        - 不保留且已无可行改进：terminate=false，no_further_optimization=true。
-        - 两条 SQL 一致且没有可重写空间：按上面的单独判断，terminate=true。
+        忽略空白和末尾分号后，<original_sql> 与 <enhanced_sql> 相同，说明本轮没有改写。此时仍有查询重写空间则 terminate=false，并写下一步可重写建议；没有可重写空间，或只剩下索引、统计信息等物理手段，则 terminate=true，next_step_advice 写“无需下一步优化”。
 
         严格仅输出以下 JSON（不得有任何额外文本）：
         {
+          "keep": true/false,
           "terminate": true/false,
-          "reason": "写明 original_cost、rewritten_cost 和涨幅，并说明命中第 1 条、第 2 条或第 3 条中的哪一条。第 2 条要写明涨幅是否在 10% 以内，以及树深度、扫描行数、计划结构综合起来是否得到改进；第 3 条要写明代价和计划结构未变，以及 SQL 逻辑何处更简。两条 SQL 一致时，写明是否还有查询重写空间，以及因此继续还是终止。",
-          "no_further_optimization": true/false,
-          "next_step_advice": "terminate=false 且仍可能改进时，给出下一轮可执行建议；否则写“无需下一步优化”。"
+          "reason": "写明 original_cost、rewritten_cost、涨幅，以及 <scan_rows> 和 <plan_depth> 的前后变化，并说明命中哪一条：代价降低；扫描行数下降；树深下降或计划结构更优；逻辑简化；或性能明显极大恶化。两条 SQL 一致时，写明是否还有查询重写空间。",
+          "next_step_advice": "terminate 为 true 时写“无需下一步优化”；terminate 为 false 时写下一轮的 SQL 重写建议。"
         }
         """).strip()
 
@@ -521,9 +368,15 @@ class DecisionAgent(Agent):
         {rewritten_costs}
         </enhanced_sql_costs>
 
-        <plan_rows_depth>
-        {rows_depth_comparison}
-        </plan_rows_depth>
+        <scan_rows>
+        original: {original_scan_rows}
+        rewritten: {rewritten_scan_rows}
+        </scan_rows>
+
+        <plan_depth>
+        original: {original_plan_depth}
+        rewritten: {rewritten_plan_depth}
+        </plan_depth>
 
         <original_plan_analysis>
         {original_plan_analysis}
@@ -548,241 +401,101 @@ class DecisionAgent(Agent):
         )
 
         fallback = {
+            "keep": False,
             "terminate": True,
             "reason": "无法解析响应，默认终止优化",
-            "no_further_optimization": True,
             "next_step_advice": "无需下一步优化。",
         }
         result = parse_llm_json_with_default(response, fallback)
         if not isinstance(result, dict):
             return fallback
+        result.setdefault("keep", False)
         result.setdefault("terminate", True)
         result.setdefault("reason", "")
-        result.setdefault("no_further_optimization", False)
         result.setdefault("next_step_advice", "")
+        result["keep"] = bool(result.get("keep"))
+        result["terminate"] = bool(result.get("terminate"))
+        if result["terminate"] and not str(result.get("next_step_advice") or "").strip():
+            result["next_step_advice"] = "无需下一步优化。"
         return result
 
 
 # Utility functions for rule management
-CATEGORY_TO_GROUP_MAPPING = {
-    "SUBQUERY_OPTIMIZATION": "子查询优化",
-    "JOIN_OPTIMIZATION": "连接优化",
-    "PREDICATE_OPTIMIZATION": "谓词简化",
-    "CONSTANT_OPTIMIZATION": "常量折叠",
-    "AGGREGATE_OPTIMIZATION": "聚合优化",
-    "PROJECTION_OPTIMIZATION": "投影优化",
-    "SORT_OPTIMIZATION": "排序优化",
-    "SET_OPERATION_OPTIMIZATION": "集合优化",
-}
-
-
-def load_rule_knowledge_base() -> dict:
-    """Load rule knowledge base from Rule_Examples.json"""
+def load_rule_knowledge_base() -> list:
+    """Load the flat rule list from Rule_Examples.json."""
     try:
         rule_file = "/root/AgentRewrite/src/Rewrite_Middleware/Structured_Knowledge_Base/preparation/data/Rule_Examples.json"
         with open(rule_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        return data
+        return data if isinstance(data, list) else []
     except Exception as e:
         print(f"Error loading rule knowledge base: {e}")
-        return {}
-
-def get_rules_by_groups(groups: list) -> dict:
-    """Get rules from knowledge base based on optimization groups"""
-    rule_kb = load_rule_knowledge_base()
-    result = {}
-
-    # Group mapping to categories in Rule_Examples.json
-    group_mapping = {v: k for k, v in CATEGORY_TO_GROUP_MAPPING.items()}
-
-    for group in groups:
-        category = group_mapping.get(group)
-        if category and category in rule_kb:
-            result[group] = rule_kb[category].get("rules", {})
-
-    return result
+        return []
 
 
 def get_all_rules() -> dict:
-    """Get the full rule library without filtering by optimization group."""
-    rule_kb = load_rule_knowledge_base()
+    """Return {rule_id: description} for every rule, with no category grouping."""
     result = {}
-
-    for category, category_data in rule_kb.items():
-        group_name = CATEGORY_TO_GROUP_MAPPING.get(category, category)
-        rules = category_data.get("rules", {}) if isinstance(category_data, dict) else {}
-        if isinstance(rules, dict) and rules:
-            result[group_name] = rules
-
-    return result
-
-RULE_EXAMPLES_MAX_PER_RULE = 1
-_RULE_EXAMPLE_FINGERPRINT_GENERATOR = SQLFingerprintGenerator()
-_TABLE_FROM_JOIN_RE = re.compile(
-    r"(?is)\b(?:FROM|JOIN|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+JOIN|"
-    r"CROSS\s+JOIN|STRAIGHT_JOIN|UPDATE|INTO)\s+"
-    r"(?:ONLY\s+)?"
-    r"(?:(\w+)\s*\.\s*)?(\w+)"
-)
-_TABLE_NAME_SKIP = {
-    "select", "where", "group", "order", "having", "limit", "offset",
-    "union", "except", "intersect", "on", "using", "lateral", "unnest",
-    "values", "case", "when", "set", "dual", "generate_series",
-}
-
-
-def _tables_in_appearance_order(sql: str) -> List[str]:
-    """Return unique base table names in first-appearance order from FROM/JOIN/UPDATE/INTO."""
-    text = str(sql or "")
-    if not text.strip():
-        return []
-    text = re.sub(r"--[^\n]*", " ", text)
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    text = re.sub(r"'(?:''|[^'])*'", " ", text)
-    seen = set()
-    ordered: List[str] = []
-    for match in _TABLE_FROM_JOIN_RE.finditer(text):
-        name = match.group(2)
-        if not name:
+    for rule in load_rule_knowledge_base():
+        if not isinstance(rule, dict) or not rule.get("id"):
             continue
-        base = name.lower()
-        if base in _TABLE_NAME_SKIP or base in seen:
-            continue
-        seen.add(base)
-        ordered.append(base)
-    return ordered
-
-
-def _anonymize_tables_by_appearance(sql: str) -> str:
-    """Replace base table names with t1..tn by appearance order, using placeholders to avoid collisions."""
-    tables = _tables_in_appearance_order(sql)
-    if not tables:
-        return sql
-    index_of = {name: idx for idx, name in enumerate(tables, start=1)}
-    result = sql
-    for name in sorted(tables, key=len, reverse=True):
-        result = re.sub(
-            rf"(?i)(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])",
-            f"__PASR_TBL_{index_of[name]}__",
-            result,
-        )
-    for idx in range(1, len(tables) + 1):
-        result = result.replace(f"__PASR_TBL_{idx}__", f"t{idx}")
+        result[str(rule["id"])] = str(rule.get("description") or "")
     return result
 
 
-def _sql_fingerprint(sql_text: str) -> str:
-    """Return a table-anonymized SQL fingerprint for rule-example similarity."""
-    if not isinstance(sql_text, str) or not sql_text.strip():
-        return ""
-    try:
-        anonymized = _anonymize_tables_by_appearance(sql_text)
-        return _RULE_EXAMPLE_FINGERPRINT_GENERATOR.get_template(anonymized) or anonymized
-    except Exception:
-        return sql_text
-
-
-def _fingerprint_tokens(fingerprint: str) -> Counter:
-    """Tokenize a SQL fingerprint into a lightweight bag-of-words vector."""
-    if not fingerprint:
-        return Counter()
-    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[(),=*<>!+\-/:]", fingerprint.lower())
-    return Counter(tokens)
-
-
-def _cosine_similarity(left: Counter, right: Counter) -> float:
-    if not left or not right:
-        return 0.0
-    dot = sum(value * right.get(key, 0) for key, value in left.items())
-    left_norm = math.sqrt(sum(value * value for value in left.values()))
-    right_norm = math.sqrt(sum(value * value for value in right.values()))
-    if left_norm == 0.0 or right_norm == 0.0:
-        return 0.0
-    return dot / (left_norm * right_norm)
-
-
-def _rule_example_similarity(current_sql: str, example_query: str) -> Dict[str, Any]:
-    """Compare current SQL with an example original SQL using anonymized fingerprint cosine similarity."""
-    current_fp = _sql_fingerprint(current_sql)
-    example_fp = _sql_fingerprint(example_query)
-    score = _cosine_similarity(_fingerprint_tokens(current_fp), _fingerprint_tokens(example_fp))
-    return {
-        "score": float(score),
-        "current_fingerprint": current_fp,
-        "example_fingerprint": example_fp,
+def get_rule_examples(rule_ids: list, current_sql: Optional[str] = None) -> dict:
+    """Return each selected rule's description and all of its examples."""
+    del current_sql
+    by_id = {
+        str(rule.get("id")): rule
+        for rule in load_rule_knowledge_base()
+        if isinstance(rule, dict) and rule.get("id")
     }
-
-
-def get_rule_examples(
-    rule_ids: list,
-    current_sql: Optional[str] = None,
-    max_per_rule: int = RULE_EXAMPLES_MAX_PER_RULE,
-) -> dict:
-    """
-    按规则 ID 拉取最相关示例。
-
-    - 若某个 rule_id 只有 1 条示例：直接选择。
-    - 若某个 rule_id 有多条示例且提供 current_sql：将表名按出现顺序规范为 t1..tn 后，
-      比较 current_sql 与 example.original_query 的 SQL 指纹余弦相似度，选择 Top-1
-      （或 max_per_rule 指定的 Top-K）。
-    - 若未提供 current_sql：退化为文件顺序 Top-K，保持旧调用兼容。
-    """
-    rule_kb = load_rule_knowledge_base()
-    candidates: Dict[str, list] = {}
-    want = set(rule_ids)
-
-    for category_data in rule_kb.values():
-        for example in category_data.get("examples", []):
-            rule_id = example.get("id")
-            if rule_id not in want:
-                continue
-            candidates.setdefault(rule_id, []).append(example)
-
-    result: Dict[str, list] = {}
-    limit = max(1, int(max_per_rule or 1))
+    result: Dict[str, dict] = {}
     for rule_id in rule_ids:
-        rule_id_s = str(rule_id)
-        items = candidates.get(rule_id_s, [])
-        if not items:
+        rule = by_id.get(str(rule_id))
+        if not rule:
             continue
-        if len(items) == 1 or not current_sql:
-            result[rule_id_s] = [dict(item) for item in items[:limit]]
-            continue
-
-        scored_items = []
-        for item in items:
-            meta = _rule_example_similarity(current_sql, item.get("original_query", ""))
-            enriched = dict(item)
-            enriched["_similarity_score"] = meta["score"]
-            enriched["_current_fingerprint"] = meta["current_fingerprint"]
-            enriched["_example_fingerprint"] = meta["example_fingerprint"]
-            scored_items.append(enriched)
-        scored_items.sort(key=lambda item: item.get("_similarity_score", 0.0), reverse=True)
-        result[rule_id_s] = scored_items[:limit]
-
+        examples = [
+            dict(example)
+            for example in (rule.get("examples") or [])
+            if isinstance(example, dict)
+        ]
+        result[str(rule_id)] = {
+            "description": str(rule.get("description") or ""),
+            "examples": examples,
+        }
     return result
 
 
-def format_rule_examples_for_semantic_check(ex_map: Dict[str, list]) -> str:
-    """
-    将 get_rule_examples 结果格式化为 SemanticCheck prompt 中「规则 ID + 描述 + 示例」的示例块。
-    """
-    if not ex_map:
-        return (
-            "（知识库 Rule_Examples.json 中未找到与「应用规则」ID 完全匹配的 examples 条目时："
-            "仅依据上文的规则文字描述与两 SQL 判断；不臆造示例。）"
-        )
+def format_rule_examples_for_semantic_check(ex_map: Dict[str, dict], rule_ids: Optional[list] = None) -> str:
+    """按给定顺序输出每条规则的 ID、规则描述和全部示例。"""
+    ordered = [str(rule_id) for rule_id in rule_ids] if rule_ids else list((ex_map or {}).keys())
+    if not ordered:
+        return "（未选择规则。）"
     parts: List[str] = []
-    for rid in sorted(ex_map.keys(), key=str):
-        items = ex_map[rid]
-        parts.append(f"## 规则 `{rid}` 的知识库示例（标准「原始 → 重写」）")
-        for i, ex in enumerate(items, 1):
+    for rid in ordered:
+        block = (ex_map or {}).get(rid)
+        if not isinstance(block, dict):
+            parts.append(f"规则ID: {rid}")
+            parts.append("规则描述: （规则描述缺失）")
+            parts.append("示例: 无")
+            parts.append("")
+            continue
+        parts.append(f"规则ID: {rid}")
+        parts.append(f"规则描述: {block.get('description', '')}")
+        examples = block.get("examples") or []
+        if not examples:
+            parts.append("示例: 无")
+        for i, ex in enumerate(examples, 1):
             if not isinstance(ex, dict):
                 continue
-            parts.append(f"  - 示例 {i}:")
-            parts.append(f"    - 原始查询: {ex.get('original_query', '')}")
-            parts.append(f"    - 重写查询: {ex.get('rewritten_query', '')}")
-            parts.append(f"    - 示例内说明: {ex.get('rule_description', '')}")
+            parts.append(f"示例 {i}:")
+            example_desc = ex.get("example_description", "")
+            if example_desc:
+                parts.append(f"  示例描述: {example_desc}")
+            parts.append(f"  原始查询: {ex.get('original_query', '')}")
+            parts.append(f"  重写查询: {ex.get('rewritten_query', '')}")
         parts.append("")
     return "\n".join(parts).strip()
 
@@ -797,13 +510,12 @@ class RewriteAgent(Agent):
             thinking_type=os.getenv("REWRITE_MODEL_THINKING"),
             reasoning_effort=os.getenv("REWRITE_MODEL_REASONING_EFFORT"),
         ))
-        self.watch(["DecisionAgent", "ReasoningAgent"])
+        self.watch(["EvaluationAgent", "ReasoningAgent"])
 
     async def rewrite_with_rule_sequence(
         self,
         sql: str,
         rule_sequence: dict,
-        optimization_direction: str,
         schema_content: Optional[str] = None,
         previous_feedback: Optional[dict] = None,
     ) -> dict:
@@ -828,11 +540,11 @@ class RewriteAgent(Agent):
         </上一轮评估反馈（重点修复）>
 """
         rule_examples = get_rule_examples(applied_rules, current_sql=sql)
-        rule_examples_text = format_rule_examples_for_semantic_check(rule_examples)
+        rule_examples_text = format_rule_examples_for_semantic_check(rule_examples, applied_rules)
         rule_examples_section = f"""
-        <规则示例库_examples（按已选规则匹配，供改写参考）>
+        <已选规则（规则ID、规则描述、全部示例）>
         {rule_examples_text}
-        </规则示例库_examples（按已选规则匹配，供改写参考）>
+        </已选规则（规则ID、规则描述、全部示例）>
 """
 
         system_message = textwrap.dedent("""
@@ -842,17 +554,16 @@ class RewriteAgent(Agent):
         1. 输入信息：
            - <base_sql>: 当前轮次的基底 SQL。第一轮它等于原始SQL；若进入下一轮，它就是上一轮 rewritten_sql
            - <rule_sequence>: 要应用的规则序列
-           - <optimization_direction>: PlanAnalyzer 对当前 SQL 的执行计划分析，用来定位瓶颈
            - （若 user 中提供）<SQL Schema>: 与当前查询相关的表 DDL
-           - <规则示例库_examples>: 与已选规则对应的标准「原始查询 -> 重写查询」示例，只能作为模式参考，不能照抄示例中的表名、列名或谓词
+           - <已选规则>: 按应用顺序列出每条规则的规则ID、规则描述和全部示例。规则描述说明规则本身；示例描述只说明这一条示例。示例只能作为模式参考，不能照抄其中的表名、列名或谓词
            - （若 user 中提供）<上一轮评估反馈（重点修复）>: 未改进/恶化原因与下一步改进建议，必须优先处理
 
         2. 重写要求：
-           - **最高优先级约束**：必须优先保证 step_sqls 最后一项与原始SQL在语义上完全等价；任何优化都不得以改变结果集语义为代价
-           - 参考 <规则示例库_examples> 中每条规则的典型改写模式和等价性注意点，但必须结合当前 SQL 和 Schema 重新判断适用性
+           - **最高优先级约束**：必须优先保证 step_sqls 每一项尤其是最后一项与原始SQL在语义上完全等价；任何优化都不得以改变结果集语义为代价
+           - 按 <已选规则> 中的规则ID、规则描述和示例改写。一条规则有多个示例时，按与当前 SQL 结构对应的那条来改写，不要把同一改法的示例混用
            - 仍只输出一次 JSON。按 applied_rules 的顺序逐条应用：step_sqls[i] 是在 base_sql 上只应用了前 i+1 条规则后的完整 SQL
            - step_sqls 与 applied_rules 等长、同序。每一步只新增该位置的那一条规则，不要在同一步提前应用后面的规则
-           - step_sqls 的最后一项就是最终 SQL，不要再输出 rewritten_sql。无规则时 step_sqls 为 []
+           - step_sqls 的最后一项就是最终 SQL。无规则时 step_sqls 为 []
            - 确保SQL的语法正确性
            - **必须保持查询语义的等价性**：重写后的SQL必须与原始SQL在语义上完全等价
            - 若提供了上一轮评估反馈，说明这是增量改写场景；必须在当前基底 SQL 的基础上继续优化，而不是回退并从原始 SQL 重新开始
@@ -863,7 +574,7 @@ class RewriteAgent(Agent):
            - 列名、数据类型、排序顺序等必须保持一致
            - 聚合函数、窗口函数、子查询等必须保持相同的语义
         4. **semantic_correctness_guarantee（语义正确性保证说明，必填）**：
-           用**中文**分条写清（建议 3–8 条，须可被审计员**逐条**对照原 SQL 与重写 SQL 独立核验），至少包含：
+           用**中文**分条写清（建议 3–5 条，须可被审计员**逐条**对照原 SQL 与重写 SQL 独立核验），至少包含：
            - 相对原 SQL 做了哪些**结构性**改写（下推/合并/去相关/CTE 展开等），对应到哪些谓词、JOIN 或子查询作用域。
            - **为何**在 Schema 与 TPC-DS/常规 SQL 语义下，这些改写仍与原始查询**结果集**等价；涉及 GROUP BY/主键/相关子查询时，写出键与相关列。
            - 若有易误判点（如过滤提前、HAVING/ORDER BY 与 LIMIT、NULL、重复行、相关子查询相关列），**明确**你判定仍等价的理由。
@@ -883,9 +594,6 @@ class RewriteAgent(Agent):
 
         <rule_sequence>
         {json.dumps(rule_sequence, ensure_ascii=False, indent=2)}
-
-        <optimization_direction>
-        {optimization_direction}
         """).strip()
         prompt = f"{prompt}\n{schema_section}{rule_examples_section}{previous_feedback_section}"
 
@@ -967,26 +675,23 @@ class RewriteAgent(Agent):
         applied_rules: list,
         differences: list,
     ) -> str:
-        """在保留优化结构前提下最小修复语义，使与原始 SQL 结果集等价。"""
+        """对照两条 SQL 找出可能不等价处，在不改变已选规则应用的前提下做最小修复。"""
         diff_text = json.dumps(differences, ensure_ascii=False, indent=2) if differences else "[]"
         rules_text = json.dumps(applied_rules, ensure_ascii=False) if applied_rules else "[]"
         system_message = textwrap.dedent("""
         <Mission>
-        你是 DBA。当前重写 SQL 经语义检查判定与原始 SQL 不等价。
-        你的任务是：**仅修复 differences 指出的差异相关片段**，而不是对整条 SQL 重新改写。
-        请在**尽量保留现有优化结构**（JOIN/CTE/子查询形态）的前提下，对「当前重写 SQL」做**最小修改**，使其与原始 SQL **结果集语义等价**。
+        你是 DBA。确定性等价检查判定当前重写 SQL 与原始 SQL 不等价。检查结果通常只有 NEQ，不会给出具体差异位置。
+        你的任务是：自己对照 original_sql 与当前重写 SQL，判断哪里可能导致结果集不同，并在**不改变已选规则已经完成的改写**的前提下做**最小修改**，使两条 SQL 的结果集等价。
 
         修复约束（必须遵守）：
         0. **最高优先级约束**：必须优先保证修复后 SQL 与 original_sql 语义等价；禁止为了“看起来更优”而改变结果集语义。
-        1. 只允许改动 differences 直接涉及的片段（相关谓词、JOIN 条件、聚合列、子查询条件等）。
-        2. 不要重排与 differences 无关的 JOIN/CTE 结构，不要整体重写 SQL。
-        3. 不应用任何优化规则，也不要新增、撤销、重排或替换已选规则已经完成的改写。
-        4. 若必须改动规则应用才能恢复等价，不要改写，返回 {"fixed_sql":"","note":"无法在保留规则应用的前提下修复"}。
-        5. 若 differences 为空或信息不足，返回原 rewritten_sql，不要臆造新重写。
-        6. 能修复时，输出必须是**可执行完整 SQL**，且与原始 SQL 结果集等价。
+        1. differences 里若只有 NEQ、为空，或没有 SQL 内部位置，自己检查谓词范围、JOIN 条件、聚合与 GROUP BY、DISTINCT、NULL、重复行、相关列和 ORDER BY/LIMIT，找出可能导致结果集不同的片段。
+        2. 只改你判定会导致结果集变化的片段。不要重排无关的 JOIN/CTE，不要整体重写，做最小结构修改。
+        3. 不应用任何新的优化规则，也不要新增、撤销、重排或替换已选规则已经完成的改写。
+        5. 能修复时，输出必须是**可执行完整 SQL**，且与原始 SQL 结果集等价。
 
         输出要求：**只输出一个 JSON 对象**（不要 markdown），格式：
-        {"fixed_sql": "修复后的完整 SQL 单行或合理换行", "note": "一句话说明如何修复"}
+        {"fixed_sql": "修复后的完整 SQL 单行或合理换行", "note": "一句话说明你判定的不等价点和如何修复"}
         """).strip()
         prompt = textwrap.dedent(f"""
         <original_sql>
@@ -1082,70 +787,6 @@ class RewriteAgent(Agent):
                 return rewritten_sql.strip()
             return ""
         return self._extract_sql_from_response_robust(response)
-    
-    async def correct_sql(self, original_sql: str, rewritten_sql: str, error: str) -> str:
-        """Correct SQL syntax errors while maintaining semantic equivalence"""
-        system_message = textwrap.dedent("""
-        你是一名经验丰富的 DBA，核心任务是修正 SQL 语法错误，同时保持语义等价性。
-        **最高优先级约束**：必须优先保证修复后 SQL 与 original_sql 语义一致；不得为了通过语法而改变结果集语义。
-        1. 修正 user 中的 SQL 语句，使用提供的错误消息。
-           注意：如果 SQL 包含双引号，请保留它们 exactly as they appear.
-           只修正 <rewritten_sql> 中的语法；不要与原始 SQL 对齐，
-           且不要包含任何 "EXPLAIN (FORMAT JSON)" 子句。
-           修正后的 SQL 必须与原始 SQL 在语义上等价。
-
-        请严格遵循以下格式：
-        [format]
-        </analysis>
-        分析错误原因和修正方案
-        </analysis>
-
-        </corrected_sql>
-        ```sql
-        插入修正后的 SQL 语句。
-        ```
-        </corrected_sql>
-        """).strip()
-        prompt = textwrap.dedent(f"""
-        <rewritten_sql>
-        {rewritten_sql}
-
-        错误消息:
-        {error}
-
-        <original_sql>
-        {original_sql}
-        """).strip()
-
-        response = await self.llm.get_LLM_response_async(
-            prompt=prompt,
-            system_message=system_message,
-        )
-        corrected_sql = self.extract_corrected_sql_content(response)
-        return corrected_sql
-    
-    def extract_corrected_sql_content(self, text: str) -> str:
-        """
-        Extract content between </corrected_sql> and </corrected_sql> tags.
-        """
-        # First, try to match the format with ```sql
-        pattern1 = r'</corrected_sql>\s*```sql\s*(.*?)\s*```\s*</corrected_sql>'
-        match1 = re.search(pattern1, text, re.DOTALL)
-        if match1:
-            return match1.group(1).strip()
-
-        # If no match is found, try to match the plain text format without ```
-        pattern2 = r'</corrected_sql>\s*(.*?)\s*</corrected_sql>'
-        match2 = re.search(pattern2, text, re.DOTALL)
-        if match2:
-            sql_content = match2.group(1).strip()
-            # Remove any ```sql markers
-            sql_content = re.sub(r'^```sql\s*', '', sql_content)
-            sql_content = re.sub(r'\s*```$', '', sql_content)
-            return sql_content.strip()
-        
-        print(f"Warning: Could not extract corrected SQL from response: {text[:200]}...")
-        return ""
 
     def _extract_sql_from_response_robust(self, text: str) -> str:
         """Robust SQL extraction from LLM response"""
@@ -1250,33 +891,13 @@ class SemanticCheckAgent(Agent):
         last_rejection_message: Optional[str] = None,
         last_rejection_differences: Optional[List[Dict[str, Any]]] = None,
     ) -> dict:
-        # Build "规则ID + 规则描述" text for semantic audit context.
-        if rewrite_rules:
-            rule_kb = load_rule_knowledge_base()
-            rule_desc_map: Dict[str, str] = {}
-            if isinstance(rule_kb, dict):
-                for category_data in rule_kb.values():
-                    if not isinstance(category_data, dict):
-                        continue
-                    rules_block = category_data.get("rules", {})
-                    if isinstance(rules_block, dict):
-                        for rid, desc in rules_block.items():
-                            rule_desc_map[str(rid)] = str(desc)
-            rule_lines = []
-            for rid in rewrite_rules:
-                rid_s = str(rid)
-                desc = rule_desc_map.get(rid_s, "（规则描述缺失）")
-                rule_lines.append(f"- {rid_s}: {desc}")
-            rules_text = "\n".join(rule_lines)
-        else:
-            rules_text = "无"
         rule_examples = get_rule_examples(rewrite_rules or [], current_sql=original_sql)
-        rule_examples_text = format_rule_examples_for_semantic_check(rule_examples)
+        rule_examples_text = format_rule_examples_for_semantic_check(rule_examples, rewrite_rules or [])
         rule_examples_ctx = textwrap.dedent(f"""
 
-            <应用规则_examples（知识库标准示例，仅作等价模式参考）>
+            <已选规则（规则ID、规则描述、全部示例）>
             {rule_examples_text}
-            </应用规则_examples（知识库标准示例，仅作等价模式参考）>
+            </已选规则（规则ID、规则描述、全部示例）>
             """)
         g = (str(semantic_correctness_guarantee).strip() if semantic_correctness_guarantee else "")
         s0 = (str(semantic_check).strip() if semantic_check is not None else "")
@@ -1360,8 +981,7 @@ class SemanticCheckAgent(Agent):
         2. **SQL Schema**：主键、唯一约束、函数依赖、可据此认可的等价变形（例如已知 PK 下 GROUP BY 的化简）。
         3. **索引信息**（若提供）：通常不改变关系层面的结果集语义；PRIMARY KEY/UNIQUE 类索引可辅助推断唯一性，与 Schema 一并用于等价推理。**不得以「有无非唯一索引」代替 SQL 逻辑判断是否等价**。
         4. **首轮「语义正确性保证说明」**（若提供）：**仅**作辅助线索，须与 1 逐条核对。若存在「语义修正_第N轮_必读」块，说明**当前重写 SQL 可能已按你方上一轮意见改过**——**禁止**用首轮自辩中仅适用**历史版本**的论述来否掉**已经变化后**的当前 SQL；自辩与**当前**重写 SQL 明显不符时，**忽略**不适用的自辩段。
-        5. **应用规则（ID + 文字描述）**：本查询**声称**依这些规则做等价改写。当「当前重写 SQL」可判定为**完全按**规则描述所体现的典型变换意图忠实套用（同构的改写模式、未在规则意图之外缩小/扩大过滤范围、未擅自改变聚合/分组/去重语义），且与 **Schema/约束** 无矛盾时，应将其视为**强等价先验**：默认倾向 `equivalent=true`，除非你能给出**明确且可核验的结果集变化证据**。
-        6. **应用规则 examples**：若提供了知识库标准示例，可参考其中「原始 -> 重写」的等价模式和注意点；但示例中的表名、列名和谓词只是模板，不得替代对当前两条 SQL 的实际语义判断。
+        5. **已选规则（规则ID、规则描述、全部示例）**：本查询**声称**依这些规则做等价改写。规则描述说明规则本身，示例描述只说明对应那一条示例。当「当前重写 SQL」可判定为**完全按**规则描述和对应示例所体现的典型变换意图忠实套用（同构的改写模式、未在规则意图之外缩小/扩大过滤范围、未擅自改变聚合/分组/去重语义），且与 **Schema/约束** 无矛盾时，应将其视为**强等价先验**：默认倾向 `equivalent=true`，除非你能给出**明确且可核验的结果集变化证据**。示例中的表名、列名和谓词只是模板，不得替代对当前两条 SQL 的实际语义判断。
 
         通用原则：
         - **规则驱动等价先验**：在 Schema 不否定结论的前提下，若重写在结构上等价于「对原 SQL 应用规则 R」且与 R 的文字描述所示变换意图一致、无多余语义偏移，应默认采纳 `equivalent=true`；只有当你能给出**明确、具体、可复核**的反例时，才允许推翻这一先验。
@@ -1395,7 +1015,6 @@ class SemanticCheckAgent(Agent):
         """).strip()
         prompt = (
             f"{prompt}\n{retry_ctx}{schema_ctx}{index_ctx}\n{sem_ctx}\n"
-            f"<应用规则_规则ID与文字描述>\n{rules_text}\n</应用规则_规则ID与文字描述>\n"
             f"{rule_examples_ctx}"
         )
         response = await self.llm.get_LLM_response_async(

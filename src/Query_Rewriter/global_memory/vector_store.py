@@ -223,9 +223,7 @@ class VectorStore:
         hash_bytes = hash_obj.digest()
         return [float(b) / 255.0 for b in hash_bytes]
     
-    _FORBIDDEN_METADATA_KEYS = frozenset(
-        {"cost_reduction_rate", "original_cost", "rewritten_cost"}
-    )
+    _CASE_METADATA_KEYS = ("original_sql", "rewritten_sql", "rule_sequence")
 
     def add(
         self,
@@ -234,56 +232,43 @@ class VectorStore:
         metadata: Optional[Dict] = None,
     ) -> str:
         """
-        Add a new optimization case to the knowledge base
-        
-        Args:
-            sql_fingerprint: Normalized SQL template
-            rule_sequence: List of applied rule IDs
-            metadata: Additional metadata (cost fields are never persisted)
-            
-        Returns:
-            Record ID
+        Add one case. The stored vector is the embedding of sql_fingerprint.
+        Metadata keeps only original SQL, rule IDs, and rewritten SQL.
+        The fingerprint text itself is not stored.
         """
         record_id = str(uuid.uuid4())
         embedding = self.generate_embedding(sql_fingerprint)
-        
-        # Prepare metadata (do not store estimated cost or cost reduction in Chroma)
+        extra = metadata or {}
+        original_sql = str(extra.get("original_sql") or "")
+        rewritten_sql = str(extra.get("rewritten_sql") or "")
         record_metadata = {
-            "sql_fingerprint": sql_fingerprint,
+            "original_sql": original_sql,
+            "rewritten_sql": rewritten_sql,
             "rule_sequence": json.dumps(rule_sequence),
-            "frequency": "1",
-            "success": "true"
         }
-        
-        if metadata:
-            record_metadata.update(metadata)
-        for k in self._FORBIDDEN_METADATA_KEYS:
-            record_metadata.pop(k, None)
-        
+
         if self.collection:
             try:
                 self.collection.add(
                     ids=[record_id],
                     embeddings=[embedding],
                     metadatas=[record_metadata],
-                    documents=[sql_fingerprint]
+                    documents=[original_sql],
                 )
             except Exception as e:
                 print(f"⚠️ Failed to add to ChromaDB: {e}")
-                # Fallback to in-memory
                 self._in_memory_store[record_id] = {
                     "embedding": embedding,
                     "metadata": record_metadata,
-                    "document": sql_fingerprint
+                    "document": original_sql,
                 }
         else:
-            # In-memory storage
             self._in_memory_store[record_id] = {
                 "embedding": embedding,
                 "metadata": record_metadata,
-                "document": sql_fingerprint
+                "document": original_sql,
             }
-        
+
         return record_id
     
     def query(self, query_text: str, top_k: int = 3) -> List[Dict]:
@@ -430,43 +415,48 @@ class VectorStore:
 
     def strip_legacy_cost_metadata(self) -> int:
         """
-        Remove cost-related keys from every record's metadata (in-place migration).
-
-        Strips: cost_reduction_rate, original_cost, rewritten_cost (see _FORBIDDEN_METADATA_KEYS).
-        Vectors and documents are unchanged.
-
-        Returns:
-            Number of records whose metadata was modified.
+        Keep only original_sql, rewritten_sql, and rule_sequence on each record.
+        Embeddings stay. The document is set to original_sql so the fingerprint text is not kept.
         """
-        keys = self._FORBIDDEN_METADATA_KEYS
+        allowed = self._CASE_METADATA_KEYS
         updated = 0
         if self.collection:
             try:
-                res = self.collection.get(include=["metadatas"])
+                res = self.collection.get(include=["metadatas", "documents"])
                 ids = res.get("ids") or []
                 metadatas = res.get("metadatas") or []
+                documents = res.get("documents") or []
                 if len(ids) != len(metadatas):
                     print("⚠️ strip_legacy_cost_metadata: ids/metadatas length mismatch, aborting")
                     return 0
                 batch_ids: List[str] = []
                 batch_meta: List[Dict] = []
+                batch_docs: List[str] = []
                 batch_size = 128
 
                 for i, rid in enumerate(ids):
                     old = dict(metadatas[i] or {})
-                    if not any(k in old for k in keys):
+                    new_meta = {k: old.get(k, "") for k in allowed}
+                    if "rule_sequence" not in old:
+                        new_meta["rule_sequence"] = "[]"
+                    new_doc = str(new_meta.get("original_sql") or "")
+                    old_doc = documents[i] if i < len(documents) else None
+                    if old == new_meta and old_doc == new_doc:
                         continue
-                    new_meta = {k: v for k, v in old.items() if k not in keys}
                     batch_ids.append(rid)
                     batch_meta.append(new_meta)
+                    batch_docs.append(new_doc)
                     if len(batch_ids) >= batch_size:
-                        self.collection.update(ids=batch_ids, metadatas=batch_meta)
+                        self.collection.update(
+                            ids=batch_ids, metadatas=batch_meta, documents=batch_docs
+                        )
                         updated += len(batch_ids)
-                        batch_ids = []
-                        batch_meta = []
+                        batch_ids, batch_meta, batch_docs = [], [], []
 
                 if batch_ids:
-                    self.collection.update(ids=batch_ids, metadatas=batch_meta)
+                    self.collection.update(
+                        ids=batch_ids, metadatas=batch_meta, documents=batch_docs
+                    )
                     updated += len(batch_ids)
             except Exception as e:
                 print(f"⚠️ strip_legacy_cost_metadata (Chroma) failed: {e}")
@@ -477,11 +467,15 @@ class VectorStore:
             return updated
 
         for _rid, record in getattr(self, "_in_memory_store", {}).items():
-            m = record.get("metadata") or {}
-            if not any(k in m for k in keys):
+            m = dict(record.get("metadata") or {})
+            new_meta = {k: m.get(k, "") for k in allowed}
+            if "rule_sequence" not in m:
+                new_meta["rule_sequence"] = "[]"
+            new_doc = str(new_meta.get("original_sql") or "")
+            if m == new_meta and record.get("document") == new_doc:
                 continue
-            for k in keys:
-                m.pop(k, None)
+            record["metadata"] = new_meta
+            record["document"] = new_doc
             updated += 1
         return updated
     

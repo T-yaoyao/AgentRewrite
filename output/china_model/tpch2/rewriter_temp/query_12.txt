@@ -1,0 +1,86 @@
+Query ID: 12
+==================================================
+
+Original: select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1994-02-01' and o_orderdate < date '1994-02-01' + interval '3' month and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;
+Rewritten: select o_orderpriority, count(*) as order_count from orders o where o_orderdate >= date '1994-02-01' and o_orderdate < date '1994-05-01' and exists (select 1 from lineitem l where l.l_orderkey = o.o_orderkey and l.l_commitdate < l.l_receiptdate) group by o_orderpriority order by o_orderpriority;
+Time Cost: 155.98s
+Suggestion: []
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → FILTER_SUB_QUERY_TO_CORRELATE: UCT=1.365
+   → PROJECT_JOIN_REMOVE: UCT=1.272
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.157
+{"applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "FILTER_SUB_QUERY_TO_CORRELATE", "STRATEGY_CTE_DECOMPOSITION"]}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": [
+    "FILTER_REDUCE_EXPRESSIONS",
+    "FILTER_SUB_QUERY_TO_CORRELATE",
+    "STRATEGY_CTE_DECOMPOSITION"
+  ],
+  "step_sqls": [
+    "select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1994-02-01' and o_orderdate < date '1994-05-01' and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;",
+    "select o_orderpriority, count(*) as order_count from orders join (select distinct l_orderkey from lineitem where l_commitdate < l_receiptdate) as sub_lineitem on orders.o_orderkey = sub_lineitem.l_orderkey where o_orderdate >= date '1994-02-01' and o_orderdate < date '1994-05-01' group by o_orderpriority order by o_orderpriority;",
+    "with valid_orders as (select distinct l_orderkey from lineitem where l_commitdate < l_receiptdate) select o_orderpriority, count(*) as order_count from orders join valid_orders on orders.o_orderkey = valid_orders.l_orderkey where o_orderdate >= date '1994-02-01' and o_orderdate < date '1994-05-01' group by o_orderpriority order by o_orderpriority;"
+  ],
+  "semantic_correctness_guarantee": "1. 常量折叠（FILTER_REDUCE_EXPRESSIONS）：将 WHERE 中的 `date '1994-02-01' + interval '3' month` 折叠为日期常量 `date '1994-05-01'`。日期加法在标准 SQL 中结果确定（2月+3个月=5月，无月末溢出问题），故 `o_orderdate < date '1994-05-01'` 与原表达式在所有行上的判定完全一致，不改变过滤结果集。\n2. EXISTS 去相关改写为 JOIN + DISTINCT（FILTER_SUB_QUERY_TO_CORRELATE）：原 EXISTS 子查询为相关子查询，条件是 `l_orderkey = o_orderkey AND l_commitdate < l_receiptdate`。改写为先对 lineitem 按 `l_commitdate < l_receiptdate` 过滤并对连接键 l_orderkey 去重（SELECT DISTINCT l_orderkey），再与 orders 按 `o_orderkey = l_orderkey` 内连接。EXISTS 语义是『存在至少一条满足条件的 lineitem 行即保留该 order』，去重后的派生表保证每个满足条件的 o_orderkey 在右表恰好出现一次，因此 JOIN 不会放大 orders 行数，count(*) 与 GROUP BY o_orderpriority 的聚合结果与原查询逐组一致。\n3. NULL 语义：连接键 orders.o_orderkey 为主键（非空），lineitem.l_orderkey 声明为 NOT NULL 且有外键约束指向 orders，因此内连接不会因 NULL 匹配产生与 EXISTS 不同的行为（EXISTS 中相关条件 l_orderkey = o_orderkey 若含 NULL 本来也为 UNKNOWN 不成立），故无需额外 IS NOT NULL 过滤。\n4. CTE 提取（STRATEGY_CTE_DECOMPOSITION）：将派生表 `(select distinct l_orderkey from lineitem where ...)` 提取为标准 CTE `valid_orders`，外层直接 `JOIN valid_orders`。CTE 在标准 SQL 中即内联视图，展开后与步骤 2 的派生表写法完全等价，过滤条件与去重键不变，仅结构层级简化。\n5. 输出与排序：SELECT 列表、GROUP BY 键（o_orderpriority）、聚合函数 count(*) 以及 ORDER BY o_orderpriority 均未改变；orders 每行在连接后至多出现一次（右表已按 l_orderkey 去重），最终结果集的行、列及顺序与原始 SQL 完全一致。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 1->0, Hash/Merge 0->1
+{
+  "terminate": false,
+  "reason": "original_cost=1,287,360.70，rewritten_cost=2,536,283.06，涨幅约 97%。重写把 EXISTS 半连接改为对 lineitem 全表扫描（5998 万行）后再 Group/Unique 去重的 CTE，再做 Hash Join，代价大幅上升。原计划的 Nested Loop Semi 虽代价高，但重写后需要全量扫描并对 5998 万行 lineitem 做去重聚合，明显做了更多工作（plan_rows 从 225,423 涨到 11,646,668）。这不属于第 1 条（代价未下降），也不属于第 2 条（去重/全扫是额外工作而非减少重复工作或过滤提前，涨幅无法用基数估计偏差解释）。因此不保留。",
+  "no_further_optimization": false,
+  "next_step_advice": "退回保留原 EXISTS 半连接结构（在当前 rewritten_sql 基础上改回），可尝试的重写方向：1) 保留 EXISTS 但把 orders 的日期过滤不变，让优化器继续走 index scan 的 semi join；2) 若使用 CTE 去重，可在 lineitem 子查询中先按 l_orderkey 与 orders 关联减少去重输入量，即改写为半连接形式：select o_orderpriority, count(*) from orders o where o_orderdate >= date '1994-02-01' and o_orderdate < date '1994-05-01' and exists (select 1 from lineitem l where l.l_orderkey = o.o_orderkey and l.l_commitdate < l.l_receiptdate) group by o_orderpriority order by o_orderpriority；并避免对 lineitem 的独立全表扫描去重。"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → FILTER_SUB_QUERY_TO_CORRELATE: UCT=1.371
+   → PROJECT_JOIN_REMOVE: UCT=1.272
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.161
+{"applied_rules": ["JOIN_TO_CORRELATE"]}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+{"applied_rules": ["JOIN_TO_CORRELATE"], "step_sqls": ["select o_orderpriority, count(*) as order_count from orders o where o_orderdate >= date '1994-02-01' and o_orderdate < date '1994-05-01' and exists (select 1 from lineitem l where l.l_orderkey = o.o_orderkey and l.l_commitdate < l.l_receiptdate) group by o_orderpriority order by o_orderpriority;"], "semantic_correctness_guarantee": "1. 结构性改写：将原 SQL 中 `orders JOIN valid_orders（CTE: select distinct l_orderkey from lineitem where l_commitdate < l_receiptdate）ON orders.o_orderkey = valid_orders.l_orderkey` 这一连接改写为相关 EXISTS 子查询 `(select 1 from lineitem l where l.l_orderkey = o.o_orderkey and l.l_commitdate < l.l_receiptdate)`，即把 JOIN 转为相关子查询（半连接）形式；orders 上的日期谓词 `o_orderdate >= date '1994-02-01' and o_orderdate < date '1994-05-01'` 原样保留在最外层 WHERE 中，GROUP BY o_orderpriority、count(*)、ORDER BY 均不变。\n2. 等价性论证：原 CTE 对 lineitem 按 l_orderkey 做 DISTINCT 去重后与 orders 按 o_orderkey 内连接。由于 orders.o_orderkey 是主键（每行 o_orderkey 唯一），且 valid_orders 已按 l_orderkey 去重，该 JOIN 对每个 orders 行至多匹配一条 valid_orders 记录，因此每个满足条件的订单在外层结果中恰好出现一次——这正是 EXISTS 半连接的语义：`o_orderkey ∈ {l_orderkey | lineitem 中存在 l_commitdate < l_receiptdate 的行}`。EXISTS 只判断存在性、不产生重复行，故 group by 后 count(*) 与原查询完全一致。\n3. 谓词位置：子查询内谓词 `l.l_commitdate < l.l_receiptdate` 与原 CTE 的 WHERE 条件逐字相同；关联条件 `l.l_orderkey = o.o_orderkey` 与原 JOIN 条件 `orders.o_orderkey = valid_orders.l_orderkey` 逐字相同，仅作用域从 JOIN/CTE 移入相关子查询，未改变任何过滤逻辑。\n4. 易误判点说明：(a) 重复行问题——若原 CTE 未做 DISTINCT，直接改 EXISTS 会消除重复导致计数变化；但本查询原 CTE 使用了 `select distinct l_orderkey`，且 o_orderkey 为主键，JOIN 本身就是一对一匹配，因此 EXISTS 改写不丢失也不增加任何外层行。(b) NULL 问题——关联列 o_orderkey、l_orderkey 均为 NOT NULL，不存在 NULL 连接键导致 JOIN 与 EXISTS 语义分歧的情况。(c) GROUP BY/ORDER BY 与聚合——分组键 o_orderpriority、聚合 count(*)、排序方式均未改动，结果集的列名（order_count）、行数与顺序完全一致。(d) 针对上一轮评估反馈：本次不再引入对 lineitem 的独立全表扫描 + DISTINCT 去重的 CTE，而是保留相关 EXISTS 半连接结构，让优化器可基于 orders 的日期过滤走 Nested Loop Semi / index scan，符合反馈中给出的建议方向。"}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+{
+  "terminate": true,
+  "reason": "original_cost=1287360.7，rewritten_cost=1287360.7，代价无变化，计划结构与行数（225423->225423）完全一致，命中第 3 条。改动仅为别名（o、l）和将 interval '3' month 常量折叠为日期字面量，而原计划本身已将其折叠为相同的过滤条件，不构成实际逻辑简化。该查询为简单的日期过滤 + 索引半连接 + 分组聚合，执行计划已合理，仅剩索引（如 o_orderdate）等物理手段，无进一步查询重写空间，故终止。",
+  "no_further_optimization": true,
+  "next_step_advice": "无需下一步优化"
+}
+ℹ️ 记忆跳过：论文收益 R=+0.0000，仅记录 R>0 的案例
+
+🎲 UCT Math Update: 1 rules, step_sum=+0.4924 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1287360.7000, rc=1287360.7000)
+   结构分细节: rows 225423.0->225423.0 (score=+0.000), depth 6.0->6.0 (score=+0.000)
+✅ UCT Update Complete:
+   → JOIN_TO_CORRELATE: P(s,a)=N/A, reward=+0.492, count=4, avg=-0.268
+
+----------------------------------------
+

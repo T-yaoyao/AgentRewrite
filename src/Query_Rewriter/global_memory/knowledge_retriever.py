@@ -54,9 +54,8 @@ class KnowledgeRetriever:
             formatted_result = {
                 "id": result['id'],
                 "score": result['score'],
-                "sql_fingerprint": metadata.get('sql_fingerprint', ''),
+                "original_sql": metadata.get('original_sql', '') or result.get('document') or '',
                 "rule_sequence": rule_sequence,
-                "frequency": int(metadata.get('frequency', '0')),
             }
             formatted_results.append(formatted_result)
         

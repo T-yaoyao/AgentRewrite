@@ -69,11 +69,17 @@ def _results_with_dataset_cache(rows):
     """Query rows plus one trailing dataset cache summary. The summary has no SQL."""
     hit_tokens = sum(int(row.get("cache_hit_tokens") or 0) for row in rows)
     prompt_tokens = sum(int(row.get("cache_prompt_tokens") or 0) for row in rows)
+    time_costs = [
+        float(row["time_cost"])
+        for row in rows
+        if isinstance(row.get("time_cost"), (int, float)) and not isinstance(row.get("time_cost"), bool)
+    ]
     summary = {
         "dataset_cache_hit_rate": _cache_hit_rate(hit_tokens, prompt_tokens),
         "cache_hit_tokens": hit_tokens,
         "cache_prompt_tokens": prompt_tokens,
         "dataset_llm_costs": round(sum(float(row.get("llm_costs") or 0) for row in rows), 6),
+        "average_time_cost": round(sum(time_costs) / len(time_costs), 6) if time_costs else None,
     }
     return list(rows) + [summary]
 

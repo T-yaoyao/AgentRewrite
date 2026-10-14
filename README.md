@@ -91,9 +91,9 @@ REASONING_MODEL_API_KEY=[your_api_key_here]
 REASONING_MODEL=deepseek-r1
 REASONING_MODEL_URL=[your_model_url_here]
 
-DECISION_MODEL_API_KEY=[your_api_key_here]
-DECISION_MODEL=claude-3-7-sonnet-20250219
-DECISION_MODEL_URL=[your_model_url_here]
+EVALUATION_MODEL_API_KEY=[your_api_key_here]
+EVALUATION_MODEL=claude-3-7-sonnet-20250219
+EVALUATION_MODEL_URL=[your_model_url_here]
 
 ASSISTANT_MODEL_API_KEY=[your_api_key_here]
 ASSISTANT_MODEL=claude-3-7-sonnet-20250219
@@ -129,7 +129,7 @@ The system will automatically test each unit to make sure the whole rewrite proc
 | Test Module | Description | Purpose |
 |-------------|-------------|---------|
 | **🔌 DBMS Connection** | Tests PostgreSQL database connectivity | Validates database connection and basic operations |
-| **🤖 LLM Connection** | Tests all three LLM agents connectivity | Validates Reasoning, Decision, and Assistant agent connections |
+| **🤖 LLM Connection** | Tests all three LLM agents connectivity | Validates Reasoning, Evaluation, and Assistant agent connections |
 | **📊 Data Distribution** | Tests database statistics retrieval | Ensures proper database profiling and statistics collection |
 | **🔍 DBMS Explain Tool** | Tests SQL execution plan generation | Validates query plan analysis capabilities |
 | **📚 Knowledge Base Tool** | Tests knowledge retrieval system | Validates optimization knowledge base functionality |
@@ -376,7 +376,7 @@ In the course of rewriting with QUITE, we discovered a range of strategies previ
 #### 🔧 LLM Agent-based Query Rewriter
 - **`src/Query_Rewriter/`**: Main query rewriting engine
   - `langgraph_rewriter.py`: LangGraph orchestration for the rewrite workflow
-  - `agent_definition.py`: Definitions for Reasoning, Assistant, and Decision agents
+  - `agent_definition.py`: Definitions for Reasoning, Assistant, and Evaluation agents
 
 #### 🛠️ Rewrite Middleware
 - **`src/Rewrite_Middleware/`**: Database interaction and verification tools

@@ -461,31 +461,25 @@ class RuleBandit:
 
     def score_rules(
         self,
-        rule_library: Dict[str, Dict[str, str]],
+        rule_library: Dict[str, str],
         context: np.ndarray,
-    ) -> List[Tuple[str, str, float, str]]:
+    ) -> List[Tuple[str, float, str]]:
         """
         Calculate UCB scores for all rules in the library.
         
         Args:
-            rule_library: {group: {rule_id: description}}
+            rule_library: {rule_id: description}
             context: Context feature vector
             
         Returns:
-            List of (group, rule_id, ucb_score, description) sorted by score descending
+            List of (rule_id, ucb_score, description) sorted by score descending
         """
-        # The same rule_id can sit in several categories. LinUCB state is per id,
-        # so keep one entry and prefer the longer description.
-        best: Dict[str, Tuple[str, str, float, str]] = {}
-        for group, rules in rule_library.items():
-            for rule_id, rule_desc in rules.items():
-                desc = rule_desc if isinstance(rule_desc, str) else str(rule_desc)
-                score = self.calculate_ucb_score(rule_id, context)
-                prev = best.get(rule_id)
-                if prev is None or len(desc) > len(prev[3]):
-                    best[rule_id] = (group, rule_id, score, desc)
-        scored_rules = list(best.values())
-        scored_rules.sort(key=lambda x: x[2], reverse=True)
+        scored_rules = []
+        for rule_id, rule_desc in rule_library.items():
+            desc = rule_desc if isinstance(rule_desc, str) else str(rule_desc)
+            score = self.calculate_ucb_score(rule_id, context)
+            scored_rules.append((rule_id, score, desc))
+        scored_rules.sort(key=lambda item: item[1], reverse=True)
         return scored_rules
     
     def update(self, rule_id: str, context: np.ndarray, reward: float):
