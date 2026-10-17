@@ -8,9 +8,9 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "$SCRIPT_DIR/setup_env.sh"
 
 # Path variables (now using PROJECT_ROOT from setup_env.sh)
-INPUT_QUERIES="${PROJECT_ROOT}/dataset/queries/calcite_test.json"
-SCHEMA_FILE="${PROJECT_ROOT}/dataset/schemas/calcite_schemas.sql"
-OUTPUT_DIR="${PROJECT_ROOT}/output/china_model/calcite3"
+INPUT_QUERIES="${PROJECT_ROOT}/dataset/queries/dsb_test.json"
+SCHEMA_FILE="${PROJECT_ROOT}/dataset/schemas/dsb_schemas.sql"
+OUTPUT_DIR="${PROJECT_ROOT}/output/china_model/dsb"
 
 # Feature flags
 ENABLE_REWRITER="--enable_rewriter"

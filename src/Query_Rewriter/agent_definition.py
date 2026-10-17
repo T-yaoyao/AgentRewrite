@@ -243,6 +243,10 @@ class ReasoningAgent(Agent):
            - 目标是一条重写规则序列，使后续重写能够优化执行计划并降低执行时间。存在多个互补规则时不要只选一条
            - UCT 分数相同或都接近冷启动时，不要默认选目录里靠前的那一条
            - 计划分析或者原始SQL已经指出重复子查询、过滤偏晚或可折叠常量时，必须选出针对该瓶颈的规则，applied_rules 不能返回 []
+           - 按执行计划里的算子结构选规则，不要按表名选。相关子查询被逐行重复计算时，选能按相关键计算一次再连接的规则，不要选会把一次计算改回逐行执行的规则
+           - 只有对聚合结果的每一次使用都成立的过滤才能下推到聚合前。不成立时，不要选靠复制这段聚合来下推的规则
+           - 半连接用来先缩小输入。不要选会让同一张大表先被半连接扫描、再被相同键的 JOIN 再扫描一次的规则
+           - 同一过滤或同一标量子查询出现多次时，选能让它只计算一次再被多处使用的规则。选择性高的条件在小表上、大表还要继续连接时，选能先得到小结果再连接大表的规则
            - 没有这类瓶颈、也确实没有任何规则能改善当前计划或者能够简化原始查询逻辑表达式时，applied_rules 才返回 []
         3. 输出要求：**只输出一个 JSON 对象**（不要 XML 标签、不要 markdown）。字段：
         - applied_rules: 字符串数组，按应用顺序列出规则 ID；必须来自 <rule_library>，禁止编造；若无适用规则则为 []
@@ -330,15 +334,19 @@ class EvaluationAgent(Agent):
         rewritten_plan_depth = optimization_info.get("rewritten_plan_depth", "")
 
         system_message = textwrap.dedent("""
-        你负责判断本轮 SQL 重写是否保留，以及是否终止优化。依据估计代价、<scan_rows>、<plan_depth> 和两份 PlanAnalyzer 对比判断。优化器估计代价可能不准，小幅上涨本身不构成性能恶化。<scan_rows> 是各节点 Plan Rows 的累加，表示计划要处理的估计扫描行数，不是 Total Cost。<plan_depth> 是执行计划树的最大深度。
+        你负责判断本轮 SQL 重写是否保留，以及是否终止优化。依据估计代价、<scan_rows>、<plan_depth> 和两份 PlanAnalyzer 对比判断。优化器估计代价可能不准，小幅上涨本身不构成性能恶化。<scan_rows> 是各节点 Plan Rows 的累加，表示计划要处理的估计扫描行数，不是 Total Cost。<plan_depth> 是执行计划树的最大深度。数量级代价上涨指 rewritten_cost 达到 original_cost 的 10 倍或以上。
 
         只要满足下面任一条件，就保留当前 SQL 并终止：keep=true，terminate=true，next_step_advice 写“无需下一步优化”。
         1. 估计代价降低。
-        2. <scan_rows> 中重写侧的估计扫描行数低于原始侧。行数下降优先于代价上升，也优先于连接方式变化。Hash Join 变成 Nested Loop，但内侧是索引扫描且扫描行数下降，仍然保留。
-        3. <plan_depth> 中重写侧的树深低于原始侧，或重写后的执行计划结构相对更优，执行时间会更短。包括但不限于减少了重复扫描、把过滤提前，或减少了聚合与连接的输入行数。
-        4. 估计代价没有降低，但逻辑简化。包括但不限于常量折叠、去掉冗余谓词、过滤下推等。
+        2. <scan_rows> 中重写侧的估计扫描行数低于原始侧，且估计代价没有数量级上涨。在这个前提下，行数下降优先于小幅代价上升，也优先于连接方式变化。Hash Join 变成 Nested Loop，但内侧是索引扫描且扫描行数下降，仍然保留。扫描行数下降不能压过数量级的代价上涨：rewritten_cost >= 10 * original_cost 时，不得因 scan_rows 下降而保留。
+        3. <plan_depth> 中重写侧的树深低于原始侧，或重写后的执行计划结构相对更优，执行时间会更短。包括但不限于减少了重复扫描、把过滤提前，或减少了聚合与连接的输入行数。本条不能压过数量级的代价上涨。
+        4. 估计代价没有降低，但逻辑简化。包括但不限于常量折叠、去掉冗余谓词、过滤下推等。本条不适用于数量级代价上涨。
+        5. 估计代价上升，但重写去掉了原始计划中的相关 SubPlan：相关标量子查询不再对每一行外层输入重复执行，而是按相关键分组计算一次，再连接回去。这种去相关即使估计代价上升、scan_rows 上升，也不要丢弃。若上涨已达数量级，则本条不成立，按下面的明显极大恶化处理。把已经按相关键分组的计算改回逐行相关 SubPlan，不属于本条。
 
-        只有当前重写 SQL 相对原始 SQL 性能明显极大恶化时，才不保留并继续下一轮重新优化：keep=false，terminate=false。next_step_advice 只写下一轮可执行的 SQL 重写，下一轮在当前 rewritten_sql 上继续，不退回 original_sql。明显极大恶化必须同时满足：估计代价大幅上升，并且 <scan_rows> 上升或计划明显做了更多工作。更多工作指同一张大表被多扫，或大表本身成为 Nested Loop 的内表并被反复扫描。扫描行数下降时，不得仅因 Hash Join 变成 Nested Loop 或树深变化判为极大恶化。
+        只有当前重写 SQL 相对原始 SQL 性能明显极大恶化时，才不保留并继续下一轮重新优化：keep=false，terminate=false。next_step_advice 只写下一轮可执行的 SQL 重写，下一轮在当前 rewritten_sql 上继续，不退回 original_sql。明显极大恶化满足下面任一情况：
+        - 估计代价数量级上涨（rewritten_cost >= 10 * original_cost）。此时即使 <scan_rows> 下降、树深下降，或连接从 Hash Join 变成索引 Nested Loop，也不保留。
+        - 估计代价大幅上升，并且 <scan_rows> 上升或计划明显做了更多工作，同时没有去掉相关 SubPlan。更多工作指同一张大表被多扫，或大表本身成为 Nested Loop 的内表并被反复扫描，或把已经按相关键分组的计算改回逐行相关 SubPlan。
+        去掉相关 SubPlan 且代价上涨未达数量级时，不得判为极大恶化。扫描行数下降时，不得仅因 Hash Join 变成 Nested Loop 或树深变化判为极大恶化；数量级代价上涨本身就是极大恶化。
 
         忽略空白和末尾分号后，<original_sql> 与 <enhanced_sql> 相同，说明本轮没有改写。此时仍有查询重写空间则 terminate=false，并写下一步可重写建议；没有可重写空间，或只剩下索引、统计信息等物理手段，则 terminate=true，next_step_advice 写“无需下一步优化”。
 
@@ -346,7 +354,7 @@ class EvaluationAgent(Agent):
         {
           "keep": true/false,
           "terminate": true/false,
-          "reason": "写明 original_cost、rewritten_cost、涨幅，以及 <scan_rows> 和 <plan_depth> 的前后变化，并说明命中哪一条：代价降低；扫描行数下降；树深下降或计划结构更优；逻辑简化；或性能明显极大恶化。两条 SQL 一致时，写明是否还有查询重写空间。",
+          "reason": "写明 original_cost、rewritten_cost、涨幅，以及 <scan_rows> 和 <plan_depth> 的前后变化，并说明命中哪一条：代价降低；扫描行数下降且未达数量级代价上涨；树深下降或计划结构更优；逻辑简化；去掉相关 SubPlan；或性能明显极大恶化（含数量级代价上涨）。两条 SQL 一致时，写明是否还有查询重写空间。",
           "next_step_advice": "terminate 为 true 时写“无需下一步优化”；terminate 为 false 时写下一轮的 SQL 重写建议。"
         }
         """).strip()
@@ -567,6 +575,7 @@ class RewriteAgent(Agent):
            - 确保SQL的语法正确性
            - **必须保持查询语义的等价性**：重写后的SQL必须与原始SQL在语义上完全等价
            - 若提供了上一轮评估反馈，说明这是增量改写场景；必须在当前基底 SQL 的基础上继续优化，而不是回退并从原始 SQL 重新开始
+           - 规则描述写明不适用的情形就不要套用。下推到子查询时只投影后续需要的列。同一段聚合或过滤被多处使用时不要复制一份来绕过共享
            - 生成可执行的SQL
 
         3. 语义等价性检查：

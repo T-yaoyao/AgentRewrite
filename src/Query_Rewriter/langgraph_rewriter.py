@@ -659,14 +659,21 @@ class LangGraphQueryRewriter:
         original_explain: Any,
         rewritten_explain: Any,
     ) -> None:
-        """仅当论文融合收益 R>0 时写入案例向量库。"""
+        """论文融合收益 R>0，或估计代价下降时，写入案例向量库。"""
         if not self.global_memory:
             return
         reward = self._paper_sequence_reward(
             original_cost, rewritten_cost, original_explain, rewritten_explain
         )
-        if reward <= 0.0:
-            print(f"ℹ️ 记忆跳过：论文收益 R={reward:+.4f}，仅记录 R>0 的案例")
+        cost_decreased = (
+            isinstance(original_cost, (int, float))
+            and not isinstance(original_cost, bool)
+            and isinstance(rewritten_cost, (int, float))
+            and not isinstance(rewritten_cost, bool)
+            and rewritten_cost < original_cost
+        )
+        if reward <= 0.0 and not cost_decreased:
+            print(f"ℹ️ 记忆跳过：论文收益 R={reward:+.4f}，且估计代价未下降")
             return
         try:
             self.global_memory.store_successful_optimization(

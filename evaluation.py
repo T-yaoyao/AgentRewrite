@@ -45,7 +45,7 @@ import argparse
 SKIP_ORIGINAL_BY_DB = {
     "tpch": {"46", "47", "48", "55", "56", "57"},
     "dsb": {"55", "56", "57", "79", "109", "110", "111", "136", "137", "138"},
-    "calcite": {"50", "53", "56"},
+    "calcite": {"40","50", "53", "56"},
 }
 SKIP_ORIGINAL_FIXED_TIMEOUT = 300.0
 
@@ -71,7 +71,9 @@ class Evaluation():
         return str(v).strip()
 
     def _counts_as_time_improvement(self, row, min_relative_time_improvement):
-        """Count a query when execution time drops by more than the relative threshold."""
+        """Count an equivalent query when execution time drops by more than the relative threshold."""
+        if row.get("equivalence") is not True:
+            return False
         original_t = row.get("original_execution_time")
         rewrite_t = row.get("rewrite_execution_time")
         if (
