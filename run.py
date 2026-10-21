@@ -39,6 +39,8 @@ def parse_arguments():
     parser.add_argument("--schema_file", type=str, 
                        default=None,
                        help="Path to the schema file for the database")
+    parser.add_argument("--database", "-d", type=str, default=None,
+                       help="PostgreSQL database name. Defaults to DB_NAME in .env")
     parser.add_argument("--max_iterations", type=int, default=2,
                        help="Maximum iteration loops for query rewriting")
 
@@ -319,7 +321,9 @@ async def main():
     # database and schema setup
     ###########################################################
     
-    # obtain database name and statistics
+    # obtain database name and statistics. A CLI database overrides .env.
+    if args.database and str(args.database).strip():
+        os.environ["DB_NAME"] = str(args.database).strip()
     dbms = DBMS()
     DB_NAME = dbms.db_name
     data_statistics = None

@@ -1,0 +1,94 @@
+Query ID: 56
+==================================================
+
+Original: select * from emp where empno > ANY (  select deptno from dept where emp.job = dept.name);
+Rewritten: SELECT emp.* FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.name = emp.job AND emp.empno > dept.deptno)
+Time Cost: 207.17s
+Suggestion: []
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → PROJECT_JOIN_REMOVE: UCT=1.272
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.251
+   → SEMI_JOIN_FILTER_TRANSPOSE: UCT=1.247
+{"applied_rules": ["JOIN_REDUCE_EXPRESSIONS", "SEMI_JOIN_FILTER_TRANSPOSE"]}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["JOIN_REDUCE_EXPRESSIONS", "SEMI_JOIN_FILTER_TRANSPOSE"],
+  "step_sqls": [
+    "SELECT emp.* FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE emp.job = dept.name AND emp.empno > dept.deptno)",
+    "SELECT emp.* FROM emp WHERE EXISTS (SELECT 1 FROM LATERAL (SELECT deptno FROM dept WHERE dept.name = emp.job) AS dept_filtered WHERE emp.empno > dept_filtered.deptno)"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写一（第1步，JOIN_REDUCE_EXPRESSIONS）：把原 SQL 的相关标量子查询比较 emp.empno > ANY (SELECT deptno FROM dept WHERE emp.job = dept.name) 改写为半连接（EXISTS）形式，并将冗余的计算消除——原内层查询投影的 deptno 仅用于 ANY 比较，改写后把比较 emp.empno > dept.deptno 直接并入半连接条件，内层只投影 SELECT 1，不保留任何多余表达式。2. 等价性依据一：按标准 SQL 语义，x > ANY(S) 为真当且仅当存在 S 中元素 s 使 x > s 为 TRUE，即 EXISTS(SELECT 1 FROM dept WHERE emp.job = dept.name AND emp.empno > dept.deptno)。Schema 中 dept.deptno 与 emp.empno 均 NOT NULL，不存在 NULL 带来的三值逻辑差异；即便考虑 NULL，在 WHERE 过滤语境下 ANY 返回 UNKNOWN 与 EXISTS 返回 FALSE 的最终过滤结果也一致。dept 为空或无 job 匹配行时子查询为空集，ANY 与 EXISTS 均为假，两侧一致。3. 结构性改写二（第2步，SEMI_JOIN_FILTER_TRANSPOSE）：把半连接条件中的相关谓词 dept.name = emp.job（对固定外层 emp 行而言是 dept 侧的过滤条件）从半连接条件下推到半连接的右侧输入，即通过 LATERAL 派生表 dept_filtered 先按 emp.job 过滤 dept，再在外层用 emp.empno > dept_filtered.deptno 完成半连接比较；派生表只投影后续需要的 deptno 列。4. 等价性依据二：对每一个外层 emp 行，LATERAL 子查询 (SELECT deptno FROM dept WHERE dept.name = emp.job) 与原内层 WHERE emp.job = dept.name 过滤出的行集完全相同，随后 EXISTS 中 emp.empno > deptno 的存在性判断与第1步的合取条件逐行等价，因此两步改写对每个 emp 行的真值判定完全一致。5. 易误判点核验：(a) 结果集形状——原 SQL 为 select * from emp（单表），改写为 SELECT emp.* 后列名、列序、类型完全一致；(b) 重复行——ANY/EXISTS 是存在性判断，不会因 dept 中多行匹配 job 而复制 emp 行，两个步骤都保持每个 emp 行至多出现一次，与原 SQL 一致；(c) 无 GROUP BY/HAVING/ORDER BY/LIMIT，不存在聚合或排序语义被改变的风险；(d) 相关子查询相关列仅 emp.job 与 emp.empno，均为外层行的确定性取值，下推不引入作用域歧义。综上，最终 SQL 与原始 SQL 在该 Schema 下返回完全相同的结果集。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "x > ANY(S) 语义即存在 s∈S 使 x>s 为真；deptno/empno 均 NOT NULL 无三值逻辑差异，LATERAL 先按 emp.job 过滤 dept 再做 EXISTS 比较与原相关 ANY 子查询逐行等价，行集与列语义一致。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 2->1, index-like 0->1 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 59852345.0 -> 22500112.0 (重写侧约为原的 37.5927%)
+{
+  "keep": false,
+  "terminate": false,
+  "reason": "original_cost=2,278,896.74，rewritten_cost=61,636,476,855.42，涨幅约 27000 倍，达到数量级上涨（rewritten_cost >= 10 * original_cost）。<scan_rows> 重写侧 22,500,112 低于原始侧 59,852,345，<plan_depth> 由 3 降为 2，但数量级代价上涨本身即构成明显极大恶化，扫描行数下降与树深下降均不能压过该涨幅。重写后 emp 表 45,000,000 行上出现逐行相关 SubPlan（EXISTS 对每行外层输入重复执行 dept 索引扫描），而原始计划本就是 Hash Semi Join，属于把批量连接改回逐行相关子查询的计划恶化，命中'性能明显极大恶化（数量级代价上涨）'。",
+  "next_step_advice": "放弃 LATERAL EXISTS 相关子查询改写，下一轮建议将 ANY 子查询直接改写为基于 emp 与 dept 的 Hash Semi Join 形式：SELECT emp.* FROM emp WHERE emp.empno > ANY(SELECT dept.deptno FROM dept WHERE dept.name = emp.job)，或显式改写为 SELECT emp.* FROM emp JOIN dept ON emp.job = dept.name AND emp.empno > dept.deptno，保留原始计划的 Hash Semi Join 结构，避免逐行相关执行。"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → PROJECT_JOIN_REMOVE: UCT=1.272
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.253
+   → SEMI_JOIN_FILTER_TRANSPOSE: UCT=1.246
+{"applied_rules": ["FILTER_CORRELATE", "PROJECT_CORRELATE_TRANSPOSE"]}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["FILTER_CORRELATE", "PROJECT_CORRELATE_TRANSPOSE"],
+  "step_sqls": [
+    "SELECT emp.* FROM emp WHERE EXISTS (SELECT 1 FROM LATERAL (SELECT deptno FROM dept WHERE dept.name = emp.job AND emp.empno > dept.deptno) AS dept_filtered)",
+    "SELECT emp.* FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.name = emp.job AND emp.empno > dept.deptno)"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写一（FILTER_CORRELATE，第 1 步）：原 SQL 中 EXISTS 子查询的 WHERE 谓词 emp.empno > dept_filtered.deptno 位于 LATERAL 派生表 dept_filtered 之上，本步将该过滤条件下推到 LATERAL 的输入端，即合入 LATERAL 子查询内部：SELECT deptno FROM dept WHERE dept.name = emp.job AND emp.empno > dept.deptno。由于 dept_filtered 仅由 dept 投影而来，dept_filtered.deptno 与 dept.deptno 是同一列值，下推后谓词语义完全不变；EXISTS 量词保持不变。\n2. 结构性改写二（PROJECT_CORRELATE_TRANSPOSE，第 2 步）：下推之后，LATERAL 别名 dept_filtered 在子查询其余部分（SELECT 1 及任何表达式）中不再被引用，LATERAL 包装层只是纯粹的一层投影中转。本步去掉该包装，将内层 dept 子查询直接作为 EXISTS 的输入：EXISTS (SELECT 1 FROM dept WHERE dept.name = emp.job AND emp.empno > dept.deptno)，仅保留 EXISTS 判存所需的最小结构，消除 LATERAL 相关执行形态。\n3. 等价性论证（EXISTS 与 NULL）：EXISTS 只判断子查询是否返回至少一行，不关心返回行数与重复行，因此把谓词在 dept 行级上提前过滤、去掉一层投影包装，都不改变 EXISTS 的判定结果。谓词中 emp.empno、dept.deptno 按 Schema 均为 NOT NULL，比较不会引入三值逻辑歧义；dept.name = emp.job 中两列也均为 NOT NULL，无 NULL 匹配行为差异。\n4. 相关列核验：相关谓词仅涉及外层 emp.empno、emp.job 与内层 dept.name、dept.deptno。下推前 dept_filtered.deptno 唯一来源是 dept.deptno，下推后直接引用 dept.deptno，键与相关列一一对应；外层输出仍为 emp.* 全部列，列名、顺序、类型与原 SQL 完全一致。\n5. 与上一轮反馈的对照：本轮未引入 LATERAL 相关 SubPlan 的逐行执行形态，最终 SQL 是不含 LATERAL 的普通 EXISTS 半连接结构，优化器可将其去相关为 emp 与 dept 的（Hash）Semi Join（连接条件 emp.job = dept.name AND emp.empno > dept.deptno），与原始计划的批量连接形态一致，避免上一轮数量级的代价恶化。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "x > ANY(S) 等价于 EXISTS(S 中存在元素 e 使 x>e)；原 SQL 中 ANY 子查询按相关性 emp.job=dept.name 过滤 dept，重写为 EXISTS (dept.name=emp.job AND emp.empno>dept.deptno) 完全一致，deptno/name 均非 NULL，无三值逻辑差异，输出列 emp.* 相同。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+{
+  "keep": true,
+  "terminate": false,
+  "reason": "original_cost=2278896.74，rewritten_cost=2278896.74，无涨幅；<scan_rows> 前后均为 59852345.0 无变化；<plan_depth> 前后均为 3 无变化。两条 SQL 已被规划器优化为相同的 Semi Hash Join 计划，重写把 ANY 相关子查询改写为 EXISTS 形式，属于逻辑简化（语义等价、更易读），符合保留条件。但计划仍是全量扫描 emp 45,000,000 行的 Semi Join，还有查询重写空间。",
+  "next_step_advice": "尝试把 EXISTS 改写为按相关键分组后再连接的形式：SELECT emp.* FROM emp JOIN (SELECT name, MIN(deptno) AS min_deptno FROM dept GROUP BY name) d ON emp.job = d.name WHERE emp.empno > d.min_deptno，使 dept 侧先聚合去重，减少 Hash Join 的输入行数与比较次数。"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+ℹ️ 记忆跳过：论文收益 R=+0.0000，且估计代价未下降
+
+🎲 UCT Math Update: 2 rules, step_sum=+1.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=2278896.7400, rc=2278896.7400)
+   结构分细节: rows 59852345.0->59852345.0 (score=+0.000), depth 3.0->3.0 (score=+0.000)
+✅ UCT Update Complete:
+   → FILTER_CORRELATE: P(s,a)=N/A, reward=+0.000, count=1, avg=+0.000
+   → PROJECT_CORRELATE_TRANSPOSE: P(s,a)=N/A, reward=+1.000, count=1, avg=+1.000
+
+----------------------------------------
+

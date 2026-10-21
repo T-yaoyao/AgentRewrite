@@ -1,0 +1,92 @@
+Query ID: 35
+==================================================
+
+Original: select l_shipmode, sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('TRUCK', 'SHIP') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1993-01-01' and l_receiptdate < date '1993-01-01' + interval '1' year group by l_shipmode order by l_shipmode;
+Rewritten: select l_shipmode, count(*) filter (where o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH') as high_line_count, count(*) filter (where o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH') as low_line_count from lineitem join orders on orders.o_orderkey = lineitem.l_orderkey where l_shipmode in ('TRUCK', 'SHIP') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1993-01-01' and l_receiptdate < date '1993-01-01' + interval '1' year group by l_shipmode;
+Time Cost: 139.03s
+Suggestion: []
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → FILTER_CORRELATE: UCT=1.231
+   → FILTER_AGGREGATE_TRANSPOSE: UCT=1.207
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.116
+{"applied_rules": ["AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "AGGREGATE_CASE_TO_FILTER"]}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "AGGREGATE_CASE_TO_FILTER"],
+  "step_sqls": [
+    "select l_shipmode, sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' then line_cnt else 0 end) as high_line_count, sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' then line_cnt else 0 end) as low_line_count from (select l_orderkey, l_shipmode, count(*) as line_cnt from lineitem where l_shipmode in ('TRUCK', 'SHIP') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1993-01-01' and l_receiptdate < date '1993-01-01' + interval '1' year group by l_orderkey, l_shipmode) as lineitem_agg join orders on orders.o_orderkey = lineitem_agg.l_orderkey group by l_shipmode order by l_shipmode;",
+    "select l_shipmode, sum(line_cnt) filter (where o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH') as high_line_count, sum(line_cnt) filter (where o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH') as low_line_count from (select l_orderkey, l_shipmode, count(*) as line_cnt from lineitem where l_shipmode in ('TRUCK', 'SHIP') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1993-01-01' and l_receiptdate < date '1993-01-01' + interval '1' year group by l_orderkey, l_shipmode) as lineitem_agg join orders on orders.o_orderkey = lineitem_agg.l_orderkey group by l_shipmode order by l_shipmode;"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写（AGGREGATE_JOIN_TRANSPOSE_EXTENDED）：原始查询是 lineitem 与 orders 在 o_orderkey = l_orderkey 上的内连接后按 l_shipmode 分组计数。第一步将只涉及 lineitem 侧的过滤（l_shipmode in ('TRUCK','SHIP')、l_commitdate < l_receiptdate、l_shipdate < l_commitdate、l_receiptdate 日期范围）与按 (l_orderkey, l_shipmode) 的 count(*) 预聚合下推到 JOIN 之前形成子查询 lineitem_agg，orders 侧不预聚合、不复制聚合逻辑，外层仅保留对 o_orderpriority 的条件汇总。\n2. 等价性依据（键与相关列）：orders.o_orderkey 是 PRIMARY KEY 且 NOT NULL，因此 lineitem_agg 中每个 (l_orderkey, l_shipmode) 分组恰好匹配 orders 中唯一一行（多对一连接，不产生行数放大）；每个原始 lineitem 行恰好落入一个 (l_orderkey, l_shipmode) 分组且 count(*) 保留了该组的行数，故外层 sum(case when <orders侧条件> then line_cnt else 0 end) 逐行展开后与原始逐行 sum(case ... 1 else 0 end) 完全相同。orders 中没有匹配 lineitem 的行在内连接下不产生结果行，与原查询一致。\n3. 分组与排序保持：两步重写均保留 group by l_shipmode 与 order by l_shipmode，输出列名 high_line_count、low_line_count、l_shipmode 及其顺序与原查询一致；sum 的结果类型（整数计数）不变。\n4. 结构性改写（AGGREGATE_CASE_TO_FILTER）：第二步将 sum(case when cond then line_cnt else 0 end) 改写为 sum(line_cnt) filter (where cond)。由于 case 的 else 分支为 0，被过滤掉的行对 sum 的贡献本来就是 0，两种形式在求和意义上恒等；两个条件（'1-URGENT' or '2-HIGH' 为高优先级，其余非空值为低优先级）保持互斥且与原 case 条件逐字对应。\n5. 易误判点说明：o_orderpriority 为 NOT NULL，原查询中 <> '1-URGENT' and <> '2-HIGH' 的低优先级条件不存在 NULL 三值逻辑问题；预聚合阶段所有 lineitem 过滤谓词都在聚合前应用，未对全表预聚合，不存在把被过滤行计入计数的风险；count(*) 不受 NULL 影响，语义与逐行计数一致。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+{"equivalent": true, "message": "预聚合 (l_orderkey, l_shipmode) 的 count(*) 与 orders 的主键连接不会改变基数（每个分组至多匹配一行订单），外层 SUM(line_cnt) FILTER 逐组展开后与原逐行 SUM(CASE 1/0) 计数恒等，SUM(COUNT(v))→COUNT(v) 折叠成立；o_orderpriority 为 NOT NULL，FILTER 条件与原 CASE 条件逐字对应，结果集一致。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 2->1, index-like 0->1
+{
+  "keep": true,
+  "terminate": false,
+  "reason": "original_cost=2181058.78，rewritten_cost=2440322.93，涨幅约11.9%，未达数量级上涨；scan_rows 由 12869367 上升到 16107797（主要因 orders 从 Seq Scan 变为 Index Scan，估计行数计入更多）；plan_depth 前后均为 7。AGGREGATE_JOIN_TRANSPOSE 预聚合未减少连接输入估计行数，代价小幅上升；但 AGGREGATE_CASE_TO_FILTER 的逻辑简化仍在。未构成明显极大恶化，不满足终止保留条件，本轮先保留当前改写作为基础，下一轮回退预聚合转置仅保留 FILTER 改写。",
+  "next_step_advice": "在当前 rewritten_sql 基础上去掉按 l_orderkey, l_shipmode 预聚合的子查询，直接对 lineitem 过滤后与 orders 连接，仅保留 sum(...) filter (where ...) 的 CASE 转 FILTER 改写，避免额外的 GroupAggregate 与 Sort 开销。"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → FILTER_CORRELATE: UCT=1.231
+   → FILTER_AGGREGATE_TRANSPOSE: UCT=1.207
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.139
+{"applied_rules": ["AGGREGATE_MERGE", "SORT_REMOVE"]}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["AGGREGATE_MERGE", "SORT_REMOVE"],
+  "step_sqls": [
+    "select l_shipmode, count(*) filter (where o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH') as high_line_count, count(*) filter (where o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH') as low_line_count from lineitem join orders on orders.o_orderkey = lineitem.l_orderkey where l_shipmode in ('TRUCK', 'SHIP') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1993-01-01' and l_receiptdate < date '1993-01-01' + interval '1' year group by l_shipmode order by l_shipmode;",
+    "select l_shipmode, count(*) filter (where o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH') as high_line_count, count(*) filter (where o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH') as low_line_count from lineitem join orders on orders.o_orderkey = lineitem.l_orderkey where l_shipmode in ('TRUCK', 'SHIP') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1993-01-01' and l_receiptdate < date '1993-01-01' + interval '1' year group by l_shipmode;"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写（AGGREGATE_MERGE）：原 SQL 存在嵌套聚合——内层子查询按 (l_orderkey, l_shipmode) 做 count(*) 得 line_cnt，外层对该 line_cnt 按 l_shipmode 做 sum(...) filter (...)。本轮按反馈建议去掉了按 l_orderkey, l_shipmode 的预聚合子查询，将谓词 l_shipmode in ('TRUCK','SHIP')、l_commitdate < l_receiptdate、l_shipdate < l_commitdate、l_receiptdate 的 1993 年区间过滤全部保留并直接作用于 lineitem，与 orders 按 o_orderkey = l_orderkey 连接后仅按 l_shipmode 分组。\n2. 等价性依据：orders.o_orderkey 是主键，与内层 group by (l_orderkey, l_shipmode) 之后每个 l_orderkey 恰好产生一行再与 orders 一对一连接不同——合并后每条满足条件的 lineitem 行直接与唯一匹配的 orders 行连接，sum(每单计数) 恰等于总行数，因此 sum(line_cnt) filter (谓词P) 严格等于 count(*) filter (谓词P)，谓词只依赖 orders 的 o_orderpriority，连接不改变其取值，两个聚合列（high/low_line_count）逐行等价。\n3. 键与相关列核验：内层分组键 (l_orderkey, l_shipmode) 中 l_shipmode 在连接与外层聚合中仅作为外层分组列，内层按其分组不会合并不同 l_shipmode 的同单行，故 sum(line_cnt) 对每个 l_shipmode 的计数与直接 count(*) 一致；无相关子查询，无跨层相关列。\n4. FILTER 保留：上一轮 AGGREGATE_CASE_TO_FILTER 的 CASE→FILTER 改写被保留，合并后两个条件聚合仍以 filter (where o_orderpriority = '1-URGENT' or '2-HIGH') 与 filter (where <> '1-URGENT' and <> '2-HIGH') 形式存在，与原外层聚合的过滤条件逐字符相同（由于 o_orderpriority NOT NULL，互斥两分支覆盖全部行，与原逻辑一致）。\n5. SORT_REMOVE：最终步骤删除了末尾的 order by l_shipmode。结果集作为多重集与原查询完全相同（列名、行集合、值均不变），仅不保证输出按 l_shipmode 排序；原查询的排序键与 group by 键相同，去掉该排序不改变行内容，符合 SORT_REMOVE 消除冗余排序的意图，且与反馈中『避免额外的 Sort 开销』的建议一致。" }
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "当前两 SQL 逐行核验：SUM(CASE WHEN cond THEN 1 ELSE 0 END) 与 COUNT(*) FILTER (WHERE cond) 在 o_orderpriority NOT NULL 下对每组计数完全一致（cond 与否则互斥覆盖全部行），连接条件、过滤谓词、GROUP BY 键均相同；去除 ORDER BY 仅改变输出顺序不改变行集合，符合 SORT_REMOVE 规则意图，故等价。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+{
+  "keep": true,
+  "terminate": true,
+  "reason": "original_cost 与 rewritten_cost 均为 2181058.78，代价无变化（0% 涨幅）；<scan_rows> 前后均为 12869367.0，<plan_depth> 均为 7.0。重写将两个 sum(case) 聚合改写为 count(*) filter，并去掉冗余的 order by（group by l_shipmode 已保证输出按 l_shipmode 分组），属于逻辑简化，执行计划结构未变。命中条件 4：代价未降低但逻辑简化。优化器已选用最优计划，无相关 SubPlan，无进一步查询重写空间，剩余提升空间仅在于物理层面（如对 lineitem 按 l_shipdate/l_receiptdate 建分区或索引），属于物理优化手段。",
+  "next_step_advice": "无需下一步优化"
+}
+ℹ️ 记忆跳过：论文收益 R=+0.0000，且估计代价未下降
+
+🎲 UCT Math Update: 2 rules, step_sum=+0.1062 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=2181058.7800, rc=2181058.7800)
+   结构分细节: rows 12869367.0->12869367.0 (score=+0.000), depth 7.0->7.0 (score=+0.000)
+✅ UCT Update Complete:
+   → AGGREGATE_MERGE: P(s,a)=N/A, reward=+0.106, count=2, avg=+0.081
+   → SORT_REMOVE: P(s,a)=N/A, reward=+0.000, count=2, avg=+0.000
+
+----------------------------------------
+

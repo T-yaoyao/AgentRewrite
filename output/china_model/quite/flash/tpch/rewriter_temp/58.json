@@ -1,0 +1,35 @@
+[
+    {
+        "id": "58",
+        "original_query": "select s_name, count(*) as numwait from supplier, lineitem l1, orders, nation where s_suppkey = l1.l_suppkey and o_orderkey = l1.l_orderkey and o_orderstatus = 'F' and l1.l_receiptdate > l1.l_commitdate and exists ( select * from lineitem l2 where l2.l_orderkey = l1.l_orderkey and l2.l_suppkey <> l1.l_suppkey ) and not exists ( select * from lineitem l3 where l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey and l3.l_receiptdate > l3.l_commitdate ) and s_nationkey = n_nationkey and n_name = 'MOZAMBIQUE' group by s_name order by numwait desc, s_name limit 100;",
+        "rewritten_query": "WITH candidate_orders AS (\n    SELECT DISTINCT l1.l_orderkey\n    FROM nation n\n    JOIN supplier s ON s.s_nationkey = n.n_nationkey\n    JOIN lineitem l1 ON l1.l_suppkey = s.s_suppkey\n    JOIN orders o ON o.o_orderkey = l1.l_orderkey\n    WHERE n.n_name = 'MOZAMBIQUE'\n      AND o.o_orderstatus = 'F'\n      AND l1.l_receiptdate > l1.l_commitdate\n),\norder_stats AS (\n    SELECT\n        l.l_orderkey,\n        COUNT(DISTINCT l.l_suppkey) AS supplier_count,\n        COUNT(DISTINCT l.l_suppkey) FILTER (WHERE l.l_receiptdate > l.l_commitdate) AS late_supplier_count,\n        COUNT(*) FILTER (WHERE l.l_receiptdate > l.l_commitdate) AS late_line_count,\n        MAX(l.l_suppkey) FILTER (WHERE l.l_receiptdate > l.l_commitdate) AS late_suppkey\n    FROM lineitem l\n    JOIN candidate_orders c ON c.l_orderkey = l.l_orderkey\n    GROUP BY l.l_orderkey\n)\nSELECT\n    s.s_name,\n    SUM(os.late_line_count) AS numwait\nFROM order_stats os\nJOIN supplier s ON s.s_suppkey = os.late_suppkey\nWHERE os.supplier_count > 1\n  AND os.late_supplier_count = 1\nGROUP BY s.s_name\nORDER BY numwait DESC, s.s_name\nLIMIT 100;",
+        "original_plan_cost": 3088689.67,
+        "rewritten_plan_cost": 16156229.56,
+        "plan_cost_reduction_rate": -423.0771390510074,
+        "time_cost": 179.23527264595032,
+        "llm_costs": 0.221666,
+        "cache_hit_tokens": 1152,
+        "uncached_input_tokens": 48885,
+        "billed_output_tokens": 47623,
+        "cache_hit_rate": 0.023023,
+        "cache_prompt_tokens": 50037,
+        "rewrite_suggestion": [
+            {
+                "group": "Subquery_optimization",
+                "produced_suggestion": "Eliminate correlated EXISTS and NOT EXISTS subqueries on lineitem. Their semantics (order has >1 supplier and no other supplier with a late line) are replaced by per-order aggregation: supplier_count > 1 and late_supplier_count = 1. This removes the full parallel seq scan of lineitem l3 (anti-join) and per-row index probes into l2."
+            },
+            {
+                "group": "Predicate_simplification",
+                "produced_suggestion": "Early filtering: only orders containing a late lineitem from a MOZAMBIQUE supplier with o_orderstatus = 'F' can possibly qualify. These are pre-computed in candidate_orders, drastically reducing the rows the per-order aggregation must touch (nation selectivity ~1/25, late-line selectivity ~1/6)."
+            },
+            {
+                "group": "Query_optimization",
+                "produced_suggestion": "Use conditional aggregation (COUNT(DISTINCT) FILTER, COUNT(*) FILTER, MAX() FILTER) to compute supplier_count, late_supplier_count, late_line_count and late_suppkey in one pass per candidate order. Since exactly one late supplier exists, all late lines in the order belong to it, so MAX(l_suppkey) FILTER identifies it and COUNT(*) FILTER counts its late lines — preserving exact equivalence with the original count(*)."
+            },
+            {
+                "group": "Join_optimization",
+                "produced_suggestion": "Convert implicit comma joins to explicit ANSI JOINs and drive candidate_orders from the highly selective nation filter. The final join drops the redundant nation re-check: candidate_orders guarantees the unique late supplier is a MOZAMBIQUE supplier."
+            }
+        ]
+    }
+]

@@ -51,12 +51,16 @@ SKIP_ORIGINAL_FIXED_TIMEOUT = 300.0
 
 
 class Evaluation():
-    def __init__(self, evaluation_queries_path, result_storage_path, filtered_path, timeout=300, no_restart=False):
+    def __init__(self, evaluation_queries_path, result_storage_path, filtered_path, timeout=300, no_restart=False, database=None):
         self.evaluation_queries_path = evaluation_queries_path
         self.result_storage_path = result_storage_path
         self.filtered_path = filtered_path
         self.timeout = timeout
         self.no_restart = no_restart
+        chosen = str(database).strip() if database and str(database).strip() else (os.getenv("DB_NAME") or "")
+        self.db_name = chosen
+        if chosen:
+            os.environ["DB_NAME"] = chosen
         
         # Set iteration count based on restart mode
         # no_restart mode: 5 iterations, remove max/min, average remaining 3
@@ -166,14 +170,14 @@ class Evaluation():
 
     def _should_skip_original(self, query_id) -> bool:
         """Whether original SQL execution should be skipped for this query id."""
-        db_name = (os.getenv("DB_NAME") or "").strip().lower()
+        db_name = (self.db_name or "").strip().lower()
         if not db_name:
             return False
         skip_ids = SKIP_ORIGINAL_BY_DB.get(db_name, set())
         return self._normalize_id(query_id) in skip_ids
 
     def connect_to_database(self, retries=5, wait_time=5):
-        db_name = os.getenv("DB_NAME")
+        db_name = self.db_name or os.getenv("DB_NAME")
         db_user= os.getenv("DB_USER")
         db_password= os.getenv("DB_PASSWORD")
         db_host= os.getenv("DB_HOST")
@@ -783,6 +787,8 @@ def parse_arguments():
                         help="Path to the filtered SQL file (JSON format)")
     parser.add_argument("-t", "--time_out", type=int, required=True, 
                         help="Query timeout in seconds")
+    parser.add_argument("-d", "--database", type=str, default=None,
+                        help="PostgreSQL database name. Defaults to DB_NAME in .env")
     parser.add_argument("--no_restart", action="store_true", default=False,
                         help="Disable database restart between queries (runs 5 times, removes min/max)")
     parser.add_argument("--equivalence_threshold", type=float, default=0.01,
@@ -826,7 +832,7 @@ if __name__ == "__main__":
 
     ensure_file_exists(storage_path)
     ensure_file_exists(filtered_path)
-    model = Evaluation(queries_path, storage_path, filtered_path, time_out, no_restart=no_restart)
+    model = Evaluation(queries_path, storage_path, filtered_path, time_out, no_restart=no_restart, database=args.database)
 
 
     # Resume + dedupe existing results

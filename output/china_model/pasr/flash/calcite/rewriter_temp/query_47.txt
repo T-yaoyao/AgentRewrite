@@ -1,0 +1,95 @@
+Query ID: 47
+==================================================
+
+Original: SELECT * FROM EMP LEFT JOIN (SELECT * FROM DEPT) AS t ON EMP.DEPTNO = t.DEPTNO ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY
+Rewritten: SELECT * FROM EMP AS s LEFT JOIN DEPT AS t ON s.DEPTNO = t.DEPTNO ORDER BY s.SAL FETCH NEXT 10 ROWS ONLY
+Time Cost: 66.52s
+Suggestion: []
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第1轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.234
+   → JOIN_PUSH_TRANSITIVE_PREDICATES: UCT=1.175
+   → FILTER_VALUES_MERGE: UCT=1.102
+{"applied_rules": ["PROJECT_REMOVE", "SORT_JOIN_TRANSPOSE"]}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["PROJECT_REMOVE", "SORT_JOIN_TRANSPOSE"],
+  "step_sqls": [
+    "SELECT * FROM EMP LEFT JOIN DEPT AS t ON EMP.DEPTNO = t.DEPTNO ORDER BY EMP.SAL FETCH NEXT 10 ROWS ONLY",
+    "SELECT * FROM (SELECT * FROM EMP ORDER BY SAL) AS s LEFT JOIN DEPT AS t ON s.DEPTNO = t.DEPTNO ORDER BY s.SAL FETCH NEXT 10 ROWS ONLY"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写一（PROJECT_REMOVE）：原 SQL 中 derived table (SELECT * FROM DEPT) AS t 只是对 DEPT 的全列简单转发，不含过滤、聚合、DISTINCT 或 LIMIT，因此直接替换为基表 DEPT AS t。由于该子查询投影了 DEPT 的全部列且未做重命名，SELECT * 展开后的列集合与列顺序（EMP 全列在前、DEPT 全列在后）与原 SQL 完全一致。\n2. 结构性改写二（SORT_JOIN_TRANSPOSE）：ORDER BY 仅依赖左表 EMP 的 SAL 列，且连接为 LEFT JOIN，保证 EMP 的每一行（无论是否匹配 DEPT）都在结果中恰好出现一次，因此把排序下推到 EMP 扫描之后、JOIN 之前，得到 (SELECT * FROM EMP ORDER BY SAL) AS s LEFT JOIN DEPT ...。子查询保留 EMP 全列（外层 SELECT * 需要全部列），外层仍保留 ORDER BY s.SAL 与 FETCH NEXT 10 ROWS ONLY，最终输出顺序仍由外层 ORDER BY 决定。\n3. 等价性依据：LEFT JOIN 是行级一元扩展（每条 EMP 行按 ON 条件匹配 0 或 1 条 DEPT 行，dept.deptno 为主键），不改变行间相对顺序的语义；先按 SAL 排序 EMP 再 LEFT JOIN，与先 JOIN 再按 SAL 排序，产生的行多重集合相同。FETCH NEXT 10 ROWS ONLY 在外层 ORDER BY s.SAL 之后应用，取到的恰是 SAL 最小的 10 条 EMP 行及其 JOIN 结果，与原 SQL 一致。\n4. 易误判点说明：(a) SAL 列在 emp 表中 NOT NULL，不存在 NULL 排序位置差异；(b) SAL 相同的并列行在两种写法下均为非确定性选择，且 FETCH 的平局截断语义在两版中同样非确定，属于 SQL 标准允许的等价范围；(c) 外层 SELECT * 在下推排序后仍通过 s 转发 EMP 全部列，未丢失或改名任何输出列；(d) 排序被复制到内层但外层 ORDER BY 保留，最终排序键与方向（默认升序）不变。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "重写为规则 PROJECT_REMOVE 与 SORT_JOIN_TRANSPOSE 的忠实套用：派生表 (SELECT * FROM DEPT) 为全列转发可去除；排序键仅依赖左表 EMP.SAL 且 LEFT JOIN 下每条 EMP 行恰好出现一次，排序下推不改变行多重集合；外层仍保留 ORDER BY s.SAL 与 FETCH NEXT 10，SAL 非空且 DEPT.DEPTNO 为主键使 LEFT JOIN 不产生多倍行，结果集等价（SAL 平局截断在两版中同为非确定性，属允许范围）。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 2->1, index-like 0->1
+{
+  "keep": false,
+  "terminate": false,
+  "reason": "original_cost=1,452,006.13，rewritten_cost=4,652,416.32，涨幅约3.2倍，未达10倍数量级但代价明显上升。scan_rows 由 101,779,908 升至 127,500,624（外层排序后整表45M行参与 Nested Loop 连接）；plan_depth 由 6 降至 5，但树深下降并未带来实质结构收益。重写把 ORDER BY SAL 下推到连接之前，导致对 45,000,000 行的 EMP 全量排序后再与 DEPT 做 Nested Loop（即使内侧为 Index Scan+Memoize），排序的输入行数和连接的外层行数没有减少，未命中任何保留条件（代价上升、扫描行数上升、无相关 SubPlan 去除、非逻辑简化）。也不构成数量级代价上涨的明显极大恶化，故不保留并继续下一轮优化。",
+  "next_step_advice": "回退 SORT_JOIN_TRANSPOSE 下推排序的改写，保持原连接后再排序的结构（先 LEFT JOIN DEPT 再 ORDER BY SAL 取前10行），并尝试仅投影连接所需列以消除 SELECT *，或将 LEFT JOIN 改写为基于 emp.sal 排序后取前10行再与 DEPT 关联的等价形式，减少 Sort 与连接的输入行数。"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.233
+   → JOIN_PUSH_TRANSITIVE_PREDICATES: UCT=1.166
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+{"applied_rules": ["SORT_REMOVE"]}
+✅ 选择了 1 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["SORT_REMOVE"],
+  "step_sqls": [
+    "SELECT * FROM EMP AS s LEFT JOIN DEPT AS t ON s.DEPTNO = t.DEPTNO ORDER BY s.SAL FETCH NEXT 10 ROWS ONLY"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写：原 SQL 中内层子查询 (SELECT * FROM EMP ORDER BY SAL) AS s 的 ORDER BY SAL 被删除，并按规则示例的模式将子查询就地展开为对 EMP 的直接引用，随后与 DEPT 做 LEFT JOIN，外层保留 ORDER BY s.SAL FETCH NEXT 10 ROWS ONLY。\n2. 等价性理由：内层 ORDER BY SAL 与外层 ORDER BY s.SAL 的排序键完全相同（同一列 s.SAL 即 EMP.SAL）。外层的 ORDER BY 才是决定最终输出顺序的排序；在 LEFT JOIN 的关系代数语义下，连接结果与输入行的物理顺序无关，因此内层排序对最终结果集（行内容、行数、外层排序后的输出顺序）没有任何可观测影响，属于规则 SORT_REMOVE 所定义的『外层与内层排序键相同』的冗余排序。\n3. FETCH NEXT 10 ROWS ONLY 的易误判点：LIMIT 是在外层 ORDER BY s.SAL 之后应用的，删除内层排序不改变进入外层排序的行集合（仍是 EMP 全部行经 LEFT JOIN 后的行），因此取前 10 行的资格判定不受影响。对于 SAL 存在并列（tie）的情形，两种写法都只按 SAL 单键排序，并列行之间的先后顺序在 SQL 语义上均为未定义（nondeterministic），二者返回的并列行可能不同但这与原 SQL 自身的非确定性一致，不构成语义差异。\n4. LEFT JOIN 语义保持：重写未触碰连接类型、连接条件 (s.DEPTNO = t.DEPTNO) 及任何谓词；DEPT 的 DEPTNO 为主键，连接产生的行数与 NULL 扩展行为与原 SQL 完全一致。SELECT * 的输出列（先 s 的全部列、后 t 的全部列）及列名、数据类型均未改变。\n5. 该改写消除了对 EMP 全表的一层重复排序（排序键与最终排序键相同），在代价上减少了一次 Sort 算子，且不引入任何新的扫描或连接结构，语义上可通过对照原 SQL 逐条核验：行集合相同、外层排序键相同、LIMIT 位置相同。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{
+    "equivalent": true,
+    "message": "原始 SQL 中的子查询 (SELECT * FROM DEPT) 本身不含 ORDER BY，重写仅将其展开为对 DEPT 的直接引用并保留相同的 LEFT JOIN 条件、外层 ORDER BY SAL 与 FETCH NEXT 10；行集合、列、排序、取行数均一致（首轮自辩所述内层排序场景与当前 SQL 不符，但不影响等价结论）。",
+    "differences": []
+}
+✅ 语义等价
+📊 开始评估优化结果...
+{
+  "keep": true,
+  "terminate": true,
+  "reason": "两轮代价相同（original_cost=1452006.13，rewritten_cost=1452006.13，涨幅 0%），<scan_rows> 均为 101779908.0，<plan_depth> 均为 6.0，计划结构完全一致。本次改写仅去掉无意义的 DEPT 子查询包装，属于逻辑简化（命中第 4 条），且未造成任何性能恶化，应保留。",
+  "next_step_advice": "无需下一步优化"
+}
+ℹ️ 记忆跳过：论文收益 R=+0.0000，且估计代价未下降
+
+🎲 UCT Math Update: 1 rules, step_sum=+0.6879 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1452006.1300, rc=1452006.1300)
+   结构分细节: rows 101779908.0->101779908.0 (score=+0.000), depth 6.0->6.0 (score=+0.000)
+✅ UCT Update Complete:
+   → SORT_REMOVE: P(s,a)=N/A, reward=+0.688, count=1, avg=+0.688
+
+----------------------------------------
+

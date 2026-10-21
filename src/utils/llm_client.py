@@ -163,12 +163,18 @@ class GPT:
         """
         RMB per token: (cached input, uncached input, output).
 
-        DeepSeek-V4-Pro uses the off-peak column: 0.15 / 4.5 / 13.5 yuan per million.
-        GLM-5.3 uses 2 / 8 / 28 yuan per million.
+        DeepSeek-V4-Pro off-peak: 0.15 / 4.5 / 13.5 yuan per million.
+        DeepSeek-V4.1-Flash off-peak: 0.02 / 1 / 4 yuan per million.
+        GLM-5.3: 2 / 8 / 28 yuan per million.
+        GLM-5.3-Flash: 0.23 / 0.8 / 2.8 yuan per million.
         """
         name = (self.model or "").lower()
+        if "deepseek" in name and "flash" in name:
+            return (0.02 / 1_000_000, 1.0 / 1_000_000, 4.0 / 1_000_000)
         if "deepseek-v4-pro" in name:
             return (0.15 / 1_000_000, 4.5 / 1_000_000, 13.5 / 1_000_000)
+        if "glm-5.3" in name and "flash" in name:
+            return (0.23 / 1_000_000, 0.8 / 1_000_000, 2.8 / 1_000_000)
         if "glm-5.3" in name:
             return (2.0 / 1_000_000, 8.0 / 1_000_000, 28.0 / 1_000_000)
         return None
