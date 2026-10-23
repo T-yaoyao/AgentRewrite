@@ -115,7 +115,6 @@ STRICT_JSON_SCHEMAS = {
     },
 }
 
-
 def _rewritten_sql_from_steps(parsed: dict, base_sql: str) -> bool:
     """最终 SQL 取 step_sqls 最后一项。空序列表示未改写，沿用 base_sql。"""
     parsed.pop("rewritten_sql", None)
@@ -697,7 +696,7 @@ class RewriteAgent(Agent):
         1. differences 里若只有 NEQ、为空，或没有 SQL 内部位置，自己检查谓词范围、JOIN 条件、聚合与 GROUP BY、DISTINCT、NULL、重复行、相关列和 ORDER BY/LIMIT，找出可能导致结果集不同的片段。
         2. 只改你判定会导致结果集变化的片段。不要重排无关的 JOIN/CTE，不要整体重写，做最小结构修改。
         3. 不应用任何新的优化规则，也不要新增、撤销、重排或替换已选规则已经完成的改写。
-        5. 能修复时，输出必须是**可执行完整 SQL**，且与原始 SQL 结果集等价。
+        4. 能修复时，输出必须是**可执行完整 SQL**，且与原始 SQL 结果集等价。
 
         输出要求：**只输出一个 JSON 对象**（不要 markdown），格式：
         {"fixed_sql": "修复后的完整 SQL 单行或合理换行", "note": "一句话说明你判定的不等价点和如何修复"}

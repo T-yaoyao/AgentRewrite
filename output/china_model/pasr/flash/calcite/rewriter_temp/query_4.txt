@@ -3,16 +3,15 @@ Query ID: 4
 
 Original: SELECT NAME FROM (SELECT DEPTNO, NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT 2 * DEPTNO AS f0 FROM DEPT GROUP BY 2 * DEPTNO) AS t5 WHERE DEPTNO = t5.f0)) AS t2
 Rewritten: SELECT NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT 2 * DEPTNO AS f0 FROM DEPT) AS t5 WHERE DEPTNO = t5.f0)
-Time Cost: 35.64s
+Time Cost: 39.86s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
-🧊 历史案例相似度较低，不使用 few-shot
 🔍 计划分析器开始分析...
 ✅ 计划分析器完成分析
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → PROJECT_MERGE: UCT=1.267
+   → AGGREGATE_JOIN_REMOVE: UCT=1.274
    → AGGREGATE_CASE_TO_FILTER: UCT=1.100
    → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.100
 {"applied_rules": ["AGGREGATE_REMOVE", "PROJECT_MERGE"]}
@@ -24,7 +23,7 @@ Suggestion: []
     "SELECT NAME FROM (SELECT DEPTNO, NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT 2 * DEPTNO AS f0 FROM DEPT) AS t5 WHERE DEPTNO = t5.f0)) AS t2",
     "SELECT NAME FROM DEPT WHERE EXISTS (SELECT 1 FROM (SELECT 2 * DEPTNO AS f0 FROM DEPT) AS t5 WHERE DEPTNO = t5.f0)"
   ],
-  "semantic_correctness_guarantee": "1. 结构性改写一（AGGREGATE_REMOVE）：将 EXISTS 子查询中的 (SELECT 2 * DEPTNO AS f0 FROM DEPT GROUP BY 2 * DEPTNO) 的 GROUP BY 去掉，得到 (SELECT 2 * DEPTNO AS f0 FROM DEPT)。该 GROUP BY 键 2 * DEPTNO 与投影列完全一致且不含任何聚合函数，本身等价于 DISTINCT；又因其只被 EXISTS 消费，EXISTS 仅判断行是否存在、不关心重复行数量，因此去掉 GROUP BY 不改变 EXISTS 的真假判定。\n2. 结构性改写二（PROJECT_MERGE）：外层 SELECT NAME FROM (... ) AS t2 与中层 SELECT DEPTNO, NAME FROM DEPT WHERE ... 是连续两层纯投影（无聚合、无 DISTINCT、无 LIMIT），且外层只引用 NAME。将外层投影合并进中层，谓词 WHERE EXISTS (...) 与中层扫描作用于同一 DEPT 实例，直接合并为 SELECT NAME FROM DEPT WHERE EXISTS (...)，谓词作用域不变。\n3. 相关子查询保持不变：EXISTS 内层的 WHERE DEPTNO = t5.f0 中 DEPTNO 是中层/合并后外层 DEPT 的相关列（t5 中只有 f0 列），重写前后该相关子查询的结构和相关列引用完全一致，未做去相关或下推改动。\n4. 语义等价性：DEPT 的两处扫描（外层与 EXISTS 内层）在原 SQL 中本就相互独立（内层 FROM DEPT 是独立扫描，仅通过 f0 与相关列比较），重写未改变任何扫描次数、过滤条件或比较逻辑；deptno 是主键且 NOT NULL，但本重写不依赖主键假设，仅在原语义本就成立的前提下做了消除冗余 GROUP BY 与冗余投影层的改写。\n5. 输出列与结果集：最终输出仍为单列 NAME，行集合由「DEPT 中存在另一行（或自身）满足 2 * 该行 DEPTNO = 相关行 DEPTNO」的行构成，与原始 SQL 在含 NULL/重复行的任意数据下结果集完全一致（本 Schema 下 name NOT NULL、deptno NOT NULL，无 NULL 边界问题）。"
+  "semantic_correctness_guarantee": "1. AGGREGATE_REMOVE：内层子查询 (SELECT 2 * DEPTNO AS f0 FROM DEPT GROUP BY 2 * DEPTNO) 的 GROUP BY 2 * DEPTNO 上没有任何聚合函数，仅为按表达式去重分组；且该子查询只被外层 EXISTS 的半连接语义使用（WHERE DEPTNO = t5.f0），EXISTS 只判断行是否存在、与行重复数无关，因此去掉 GROUP BY 后 EXISTS 的真值判定完全不变，等价重写为 SELECT 2 * DEPTNO AS f0 FROM DEPT。\n2. PROJECT_MERGE：外层 SELECT NAME FROM (... ) AS t2 与内层 SELECT DEPTNO, NAME FROM DEPT WHERE ... 是连续两层纯投影（无聚合、无 DISTINCT、无 LIMIT），外层仅引用 NAME 列，故合并为一层 SELECT NAME FROM DEPT WHERE EXISTS (...)，去掉中间层 t2。\n3. 相关性判定：合并后 EXISTS 子查询中的 DEPTNO = t5.f0 里的 DEPTNO 原本就来自内层 SELECT DEPTNO, NAME FROM DEPT 的作用域（t5 中只有 f0 列），合并外层投影不改变该谓词的绑定来源，语义不变。\n4. NULL 与重复行：子查询 t5 若去掉 GROUP BY 后可能含重复 f0 行，但 EXISTS 的结果只取决于是否存在至少一行匹配，重复行不影响真值；DEPT.name 为 NOT NULL，外层投影 NAME 的列名与空值行为与原 SQL 完全一致。\n5. 最终 SQL 的结果集（列名 NAME、行集、重复行数）与原始 SQL 完全一致。"
 }
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
@@ -33,7 +32,7 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{"equivalent": true, "message": "EXISTS 只判定行存在性，去掉子查询中无聚合的 GROUP BY 不改变 f0 值集合的存在性判定；外层纯投影合并到中层不改变输出列 NAME 与过滤条件，两 SQL 结果集一致。", "differences": []}
+{"equivalent": true, "message": "去掉 GROUP BY 仅去除子查询结果去重，EXISTS 半连接真值不受重复行影响；投影合并后 DEPTNO 仍绑定外层 DEPT 的作用域，结果集完全一致，自辩与当前 SQL 事实相符。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 2250000.0 -> 1575000.0 (重写侧约为原的 70.0000%)
@@ -42,13 +41,13 @@ DBMS_syntax_Tool ends...
    - SQL指纹长度: 159
    - 规则序列: ['AGGREGATE_REMOVE', 'PROJECT_MERGE']
    - 估计代价: 原始=63099.39, 重写=31458.75，相对变化: 50.14%
-✅ 成功存储，记录ID: 85188bda-7ca2-49ef-8059-9f72059622c7
+✅ 成功存储，记录ID: 70da8acf-d999-48ba-b9c1-c80ad4b436d7
 
 🎲 UCT Math Update: 2 rules, step_sum=+0.5014 (cost=+0.5014, rows=+0.3000, depth=+0.0000, oc=63099.3900, rc=31458.7500)
    结构分细节: rows 2250000.0->1575000.0 (score=+0.300), depth 3.0->3.0 (score=+0.000)
 ✅ UCT Update Complete:
-   → AGGREGATE_REMOVE: P(s,a)=N/A, reward=+0.501, count=1, avg=+0.501
-   → PROJECT_MERGE: P(s,a)=N/A, reward=+0.000, count=2, avg=+0.491
+   → AGGREGATE_REMOVE: P(s,a)=N/A, reward=+0.501, count=2, avg=+0.501
+   → PROJECT_MERGE: P(s,a)=N/A, reward=+0.000, count=3, avg=+0.000
 
 ----------------------------------------
 

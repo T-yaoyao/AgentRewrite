@@ -192,7 +192,7 @@ class LangGraphQueryRewriter:
     # 估计代价变差超过该比例时回退到 best/原 SQL；结构分析若显示明显改进可保留（见 plan_structure_compare）。
     COST_ROLLBACK_PCT = 50.0
     # If estimated cost drops by more than this fraction vs original, skip LLM evaluation and exit.
-    EARLY_TERMINATE_COST_REDUCTION_RATIO = 0.40
+    EARLY_TERMINATE_COST_REDUCTION_RATIO = 1.00
     # Reward fusion: combine optimizer cost signal with plan-structure signal.
     REWARD_COST_WEIGHT = 0.60
     REWARD_ROWS_WEIGHT = 0.20

@@ -2,8 +2,8 @@ Query ID: 48
 ==================================================
 
 Original: SELECT sal, SUM(comm), MIN(comm), SUM(DISTINCT sal) FROM emp GROUP BY sal
-Rewritten: SELECT sal, SUM(CASE WHEN grp = 2 THEN comm END), MIN(CASE WHEN grp = 2 THEN comm END), SUM(CASE WHEN grp = 1 THEN sal END) FROM (SELECT sal, NULL::int AS comm, 1 AS grp FROM emp GROUP BY sal UNION ALL SELECT sal, comm, 2 AS grp FROM emp) AS g GROUP BY sal
-Time Cost: 40.33s
+Rewritten: SELECT sal, SUM(CASE WHEN grp = 1 THEN comm END), MIN(CASE WHEN grp = 1 THEN comm END), SUM(CASE WHEN grp = 2 THEN dsal END) FROM (SELECT sal, comm, NULL::integer AS dsal, 1 AS grp FROM emp UNION ALL SELECT sal, NULL::integer AS comm, sal AS dsal, 2 AS grp FROM emp GROUP BY sal) AS g GROUP BY sal
+Time Cost: 54.29s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,13 +12,13 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.242
-   → JOIN_PUSH_TRANSITIVE_PREDICATES: UCT=1.192
-   → SORT_REMOVE: UCT=1.154
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+   → AGGREGATE_UNION_AGGREGATE_FIRST: UCT=1.100
 {"applied_rules": ["AGGREGATE_EXPAND_DISTINCT_AGGREGATES"]}
 ✅ 选择了 1 个规则
 🔧 开始SQL重写...
-{"applied_rules": ["AGGREGATE_EXPAND_DISTINCT_AGGREGATES"], "step_sqls": ["SELECT sal, SUM(CASE WHEN grp = 2 THEN comm END), MIN(CASE WHEN grp = 2 THEN comm END), SUM(CASE WHEN grp = 1 THEN sal END) FROM (SELECT sal, NULL::int AS comm, 1 AS grp FROM emp GROUP BY sal UNION ALL SELECT sal, comm, 2 AS grp FROM emp) AS g GROUP BY sal"], "semantic_correctness_guarantee": "1. 结构性改写：将原查询中唯一的 DISTINCT 聚合 SUM(DISTINCT sal) 按规则展开为 UNION ALL 子查询。分支1（grp=1）按 sal 去重（SELECT sal ... GROUP BY sal）为 DISTINCT 聚合提供去重后的输入；分支2（grp=2）保留原始行（SELECT sal, comm FROM emp）供非 DISTINCT 聚合 SUM(comm)、MIN(comm) 使用；外层仍按 sal GROUP BY，并用 CASE WHEN grp = 1/2 将两条输入流各自路由到对应的聚合。\n2. SUM(DISTINCT sal) 等价性：外层按 sal 分组后，grp=1 分支在每个 sal 组内恰好贡献一行且其值就是该组的 sal，故 SUM(CASE WHEN grp=1 THEN sal END) 在组内等于该组唯一的去重 sal 值，与原查询 SUM(DISTINCT sal) GROUP BY sal 的结果完全一致（emp.sal 为 NOT NULL，不存在 NULL 分组干扰）。\n3. SUM(comm)、MIN(comm) 等价性：grp=2 分支逐行携带原始 (sal, comm)，外层 CASE WHEN grp=2 THEN comm END 使 grp=1 行对该聚合贡献 NULL，而 SUM/MIN 聚合会自动忽略 NULL，因此组内结果与原查询直接对 emp 行聚合完全相同（comm 为 NOT NULL，无额外 NULL 影响）。\n4. 分组与行集等价：外层 GROUP BY sal 与原查询一致；UNION ALL 只是把去重流与原始流拼接，不改变外层分组键，也不产生列名变化（列依次为 sal、sum、min、sum，与原查询输出列一一对应）。\n5. 易误判点核查：CASE 在非匹配分支产生 NULL 而非 0，确保不会污染 SUM/MIN；MIN 忽略 NULL 的语义保证 grp=1 行不影响 MIN(comm)；去重流 GROUP BY sal 与外层分组键相同，不存在跨组泄漏。综上，重写 SQL 与原始 SQL 在任意 emp 数据下返回相同结果集。"}
+{"applied_rules": ["AGGREGATE_EXPAND_DISTINCT_AGGREGATES"], "step_sqls": ["SELECT sal, SUM(CASE WHEN grp = 1 THEN comm END), MIN(CASE WHEN grp = 1 THEN comm END), SUM(CASE WHEN grp = 2 THEN dsal END) FROM (SELECT sal, comm, NULL::integer AS dsal, 1 AS grp FROM emp UNION ALL SELECT sal, NULL::integer AS comm, sal AS dsal, 2 AS grp FROM emp GROUP BY sal) AS g GROUP BY sal"], "semantic_correctness_guarantee": "1. 结构性改写：将 SUM(DISTINCT sal) 按规则示例的『分支去重 + grp 标记 + CASE 聚合』模式展开。子查询 g 由两支 UNION ALL 组成：grp=1 分支保留 emp 的原始行（sal, comm），供非 DISTINCT 聚合 SUM(comm)、MIN(comm) 使用；grp=2 分支按 sal 做 GROUP BY 去重（SELECT ... FROM emp GROUP BY sal），每个不同的 sal 恰好产生一行，供 SUM(DISTINCT sal) 使用。外层保持 GROUP BY sal，用 CASE WHEN grp 过滤各分支只对目标列聚合。\n2. SUM(comm) / MIN(comm) 等价性：外层按 sal 分组后，grp=1 的行集合恰好等于原 emp 中该 sal 组的全部原始行（逐行保留、无去重、无复制），grp=2 行的 comm 为 NULL，被 SUM/MIN 忽略（comm 在 Schema 中为 NOT NULL，NULL 仅为类型对齐的占位），因此每组结果与原 SQL 完全一致。\n3. SUM(DISTINCT sal) 等价性：外层每个 sal 组内，grp=2 分支恰贡献一行且 dsal = sal（因内层 GROUP BY sal 保证每个不同 sal 只出现一次），故 SUM(CASE WHEN grp=2 THEN dsal END) = sal；而原查询中组按 sal 划分，组内 DISTINCT sal 只有一个值，SUM(DISTINCT sal) 也等于 sal。两者在每组上恒等。\n4. NULL 与重复行：sal、comm 均为 NOT NULL，不存在 NULL 参与聚合的歧义；SUM/MIN 对 CASE 产生的 NULL 自动跳过，GROUP BY sal 对 NULL 键的处理与原 SQL 一致（本例无 NULL 键）。UNION ALL 不去重，grp=1 分支行数与原表完全相同，不引入或丢失重复行。\n5. 输出列与排序：外层四个表达式未加别名，派生列名 sal / sum / min / sum 与原 SQL 一致；原 SQL 无 ORDER BY，结果行序不作保证，与原 SQL 语义相同。整个改写在分组键 sal 与相关列 grp/dsal 上可逐组独立核验。"}
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -26,11 +26,7 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{
-    "equivalent": true,
-    "message": "当前重写SQL完全符合AGGREGATE_EXPAND_DISTINCT_AGGREGATES规则：grp=2分支逐行携带(sal,comm)使SUM/MIN(CASE WHEN grp=2 THEN comm END)与原SUM(comm)/MIN(comm)在NULL忽略语义下逐组相同；grp=1分支按sal去重后每组恰好一行且值即为该组sal，故SUM(CASE WHEN grp=1 THEN sal END)等于组内SUM(DISTINCT sal)=sal本身；sal/comm均为NOT NULL，外层GROUP BY sal与原查询一致，结果集等价。",
-    "differences": []
-}
+{"equivalent": true, "message": "逐组核验：grp=1 分支逐行保留 emp 原始行使 SUM(comm)/MIN(comm) 与原查询一致；grp=2 分支按 sal 去重后每组恰贡献一行 dsal=sal，与原查询组内 SUM(DISTINCT sal)=sal 恒等；CASE 产生的 NULL 被聚合忽略，UNION ALL 不改变行基数，结果集等价。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 90001277.0 -> 82503518.0 (重写侧约为原的 91.6693%)
@@ -39,12 +35,12 @@ DBMS_syntax_Tool ends...
    - SQL指纹长度: 70
    - 规则序列: ['AGGREGATE_EXPAND_DISTINCT_AGGREGATES']
    - 估计代价: 原始=9047037.7, 重写=2109985.82，相对变化: 76.68%
-✅ 成功存储，记录ID: 91b8236a-6e13-412a-8406-1f57c06621c2
+✅ 成功存储，记录ID: c9f820a3-4a94-484d-98e7-5eb108753a2c
 
 🎲 UCT Math Update: 1 rules, step_sum=+0.7668 (cost=+0.7668, rows=+0.0833, depth=-1.0000, oc=9047037.7000, rc=2109985.8200)
    结构分细节: rows 90001277.0->82503518.0 (score=+0.083), depth 3.0->8.0 (score=-1.000)
 ✅ UCT Update Complete:
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: P(s,a)=N/A, reward=+0.767, count=3, avg=+0.794
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: P(s,a)=N/A, reward=+0.767, count=4, avg=+0.584
 
 ----------------------------------------
 

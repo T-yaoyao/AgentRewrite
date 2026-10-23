@@ -3,7 +3,7 @@ Query ID: 33
 
 Original: SELECT t6.JOB, CAST(t6.EXPR1 * t7.f1 AS INTEGER) FROM (SELECT JOB, SUM(SAL) AS EXPR1 FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t6 INNER JOIN (SELECT NAME, COUNT(*) AS f1 FROM DEPT GROUP BY NAME) AS t7 ON t6.JOB = t7.NAME
 Rewritten: SELECT t6.JOB, CAST(t6.EXPR1 * t7.f1 AS INTEGER) FROM (SELECT JOB, SUM(SAL) AS EXPR1 FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t6 INNER JOIN (SELECT NAME, COUNT(*) AS f1 FROM DEPT GROUP BY NAME) AS t7 ON t6.JOB = t7.NAME
-Time Cost: 46.97s
+Time Cost: 156.99s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,13 +12,20 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.187
-   → JOIN_PUSH_TRANSITIVE_PREDICATES: UCT=1.134
+   → UNION_REMOVE: UCT=1.197
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.189
    → AGGREGATE_CASE_TO_FILTER: UCT=1.100
-{"applied_rules": []}
-✅ 选择了 0 个规则
+{"applied_rules": ["FILTER_INTO_JOIN", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "PROJECT_JOIN_TRANSPOSE"]}
+✅ 选择了 3 个规则
 🔧 开始SQL重写...
-{"applied_rules": [], "step_sqls": [], "semantic_correctness_guarantee": "1. 本次 applied_rules 为空，未选择任何重写规则，因此不进行任何结构性改写，step_sqls 为空数组。\n2. 最终输出 SQL 与 base_sql（即原始 SQL）逐字符一致：对 EMP 按 JOB 过滤 ENAME='A' 并求 SUM(SAL)，对 DEPT 按 NAME 求 COUNT(*)，两子查询在 JOB=NAME 上做 INNER JOIN，再计算 CAST(EXPR1 * f1 AS INTEGER)。\n3. 语义等价性由「未做任何改写」直接保证：结果集、列名、数据类型、行序均与原始 SQL 完全相同，审计员可直接对照确认两段 SQL 文本一致。"}
+{
+  "applied_rules": ["FILTER_INTO_JOIN", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "PROJECT_JOIN_TRANSPOSE"],
+  "step_sqls": [
+    "SELECT t6.JOB, CAST(t6.EXPR1 * t7.f1 AS INTEGER) FROM (SELECT JOB, SUM(SAL) AS EXPR1 FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t6 INNER JOIN (SELECT NAME, COUNT(*) AS f1 FROM DEPT GROUP BY NAME) AS t7 ON t6.JOB = t7.NAME",
+    "SELECT t6.JOB, CAST(t6.EXPR1 * t7.f1 AS INTEGER) FROM (SELECT JOB, SUM(SAL) AS EXPR1 FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t6 INNER JOIN (SELECT NAME, COUNT(*) AS f1 FROM DEPT GROUP BY NAME) AS t7 ON t6.JOB = t7.NAME",
+    "SELECT t6.JOB, CAST(t6.EXPR1 * t7.f1 AS INTEGER) FROM (SELECT JOB, SUM(SAL) AS EXPR1 FROM EMP WHERE ENAME = 'A' GROUP BY JOB) AS t6 INNER JOIN (SELECT NAME, COUNT(*) AS f1 FROM DEPT GROUP BY NAME) AS t7 ON t6.JOB = t7.NAME"
+  ],
+  "semantic_correctness_guarantee": "1. FILTER_INTO_JOIN 检查：谓词 ENAME = 'A' 只依赖 EMP 一侧，按照规则示例 2 的目标形态，它应被推入该侧 JOIN 输入的子查询中并只投影后续需要的列。当前 base_sql 中该谓词已位于左输入子查询 t6 内部（SELECT JOB, SUM(SAL) AS EXPR1 FROM EMP WHERE ENAME = 'A' GROUP BY JOB），且外层查询再无任何可下推的 WHERE 条件，故该规则应用后 SQL 保持不变。\n2. AGGREGATE_JOIN_TRANSPOSE_EXTENDED 检查：两个聚合各自只依赖单侧表（t6 按 JOB 对 EMP 求 SUM(SAL)，t7 按 NAME 对 DEPT 求 COUNT(*)），均已提前到 JOIN 之前执行，且分组键与 JOIN 键一致（t6.JOB = t7.NAME），JOIN 之后无需再做任何汇总——最终表达式 EXPR1 * f1 只是两行聚合结果的逐行乘法，不含 SUM/COUNT 等再聚合。规则所述『先过滤再聚合，不对全表预聚合』也已满足（EMP 侧先过滤 ENAME='A' 再聚合）。因此该规则的目标形态已达成，应用后 SQL 不变。\n3. PROJECT_JOIN_TRANSPOSE 检查：根投影只需要 t6.JOB、t6.EXPR1、t7.f1 三个值（t7.NAME 仅用于 JOIN 条件）。左侧子查询恰好只投影 JOB、EXPR1，右侧子查询恰好只投影 NAME、f1，均为后续所需列，无冗余列可删、无投影可进一步上提或下推，故应用后 SQL 不变。\n4. 等价性论证：三步 step_sqls 与 base_sql 文本完全相同，查询树（Project → Join → 两个单侧 Aggregate）未发生任何改变，因此结果集、列名（JOB 及 CAST 表达式列）、数据类型（CAST(... AS INTEGER)）与原始 SQL 完全一致，不涉及过滤位置、NULL 语义、重复行或排序的任何变化。\n5. 未采用的替代方案：若强行把 ENAME='A' 从子查询移到 JOIN 的 ON 中，必须在 t6 中额外投影 ENAME 并将分组改为 GROUP BY JOB, ENAME，这会增加投影列、加重分组开销，违背规则『只投影后续需要的列』的要求且不带来任何收益，故不采用该方向的重写。"}
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -26,13 +33,13 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{"equivalent": true, "message": "重写 SQL 与原始 SQL 文本完全一致，语义等价直接成立。", "differences": []}
+{"equivalent": true, "message": "当前重写 SQL 与原始 SQL 文本完全相同，未做任何变换，结果集必然一致。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 {
   "keep": true,
   "terminate": true,
-  "reason": "两条 SQL 一致，代价不变（714062.18 → 714062.18），scan_rows 不变（492563 → 492563），plan_depth 不变（6 → 6），本轮无改写。计划瓶颈是 emp 表 45000000 行的全表 Seq Scan（占代价 98.4%），剩余优化主要靠 ENAME 列索引等物理手段，查询重写空间已耗尽。",
+  "reason": "original_cost 与 rewritten_cost 均为 714062.18，两轮 SQL 完全相同，scan_rows（492563 vs 492563）与 plan_depth（6 vs 6）均无变化，本轮没有实际改写。该查询已无查询重写空间：过滤 ENAME='A' 已无法进一步下推，两个聚合各自在基表上完成后再 Hash Join，结构已较优；主要瓶颈是对 emp 的全表 Seq Scan（占代价 98.4%），属于物理手段（索引、统计信息）范畴，不属 SQL 重写。",
   "next_step_advice": "无需下一步优化"
 }
 

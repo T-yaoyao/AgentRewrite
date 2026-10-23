@@ -2,8 +2,23 @@ Query ID: 48
 ==================================================
 
 Original: select sum(l_extendedprice) / 7.0 as avg_yearly from lineitem, part where p_partkey = l_partkey and p_brand = 'Brand#32' and p_container = 'MED PKG' and l_quantity < ( select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey );
-Rewritten: with part_f as ( select p_partkey from part where p_brand = 'Brand#32' and p_container = 'MED PKG' ), avg_qty as ( select li.l_partkey, 0.2 * avg(li.l_quantity) as avg_quantity from lineitem li join part_f on li.l_partkey = part_f.p_partkey group by li.l_partkey ) select sum(l.l_extendedprice) / 7.0 as avg_yearly from lineitem l join part_f on l.l_partkey = part_f.p_partkey join avg_qty on avg_qty.l_partkey = l.l_partkey where l.l_quantity < avg_qty.avg_quantity;
-Time Cost: 52.99s
+Rewritten: WITH part_filtered AS (
+  SELECT p_partkey
+  FROM part
+  WHERE p_brand = 'Brand#32' AND p_container = 'MED PKG'
+),
+avg_qty AS (
+  SELECT li.l_partkey, AVG(li.l_quantity) AS avg_quantity
+  FROM lineitem li
+  JOIN part_filtered pf ON li.l_partkey = pf.p_partkey
+  GROUP BY li.l_partkey
+)
+SELECT sum(lineitem.l_extendedprice) / 7.0 AS avg_yearly
+FROM lineitem
+JOIN part_filtered pf ON pf.p_partkey = lineitem.l_partkey
+JOIN avg_qty aq ON aq.l_partkey = lineitem.l_partkey
+WHERE lineitem.l_quantity < 0.2 * aq.avg_quantity;
+Time Cost: 50.14s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🔍 计划分析器开始分析...
@@ -11,13 +26,20 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → FILTER_CORRELATE: UCT=1.231
-   → FILTER_AGGREGATE_TRANSPOSE: UCT=1.206
-   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.136
-{"applied_rules": ["JOIN_SUB_QUERY_TO_CORRELATE", "STRATEGY_CTE_DECOMPOSITION"]}
+   → AGGREGATE_ANY_PULL_UP_CONSTANTS: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+{"applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "JOIN_SUB_QUERY_TO_CORRELATE"]}
 ✅ 选择了 2 个规则
 🔧 开始SQL重写...
-{"applied_rules": ["JOIN_SUB_QUERY_TO_CORRELATE", "STRATEGY_CTE_DECOMPOSITION"], "step_sqls": ["select sum(l.l_extendedprice) / 7.0 as avg_yearly from lineitem l join part p on p.p_partkey = l.l_partkey join ( select li.l_partkey, 0.2 * avg(li.l_quantity) as avg_quantity from lineitem li join part p2 on p2.p_partkey = li.l_partkey where p2.p_brand = 'Brand#32' and p2.p_container = 'MED PKG' group by li.l_partkey ) avg_qty on avg_qty.l_partkey = l.l_partkey where p.p_brand = 'Brand#32' and p.p_container = 'MED PKG' and l.l_quantity < avg_qty.avg_quantity;", "with part_f as ( select p_partkey from part where p_brand = 'Brand#32' and p_container = 'MED PKG' ), avg_qty as ( select li.l_partkey, 0.2 * avg(li.l_quantity) as avg_quantity from lineitem li join part_f on li.l_partkey = part_f.p_partkey group by li.l_partkey ) select sum(l.l_extendedprice) / 7.0 as avg_yearly from lineitem l join part_f on l.l_partkey = part_f.p_partkey join avg_qty on avg_qty.l_partkey = l.l_partkey where l.l_quantity < avg_qty.avg_quantity;"], "semantic_correctness_guarantee": "1. 结构性改写一（去相关，对应规则 JOIN_SUB_QUERY_TO_CORRELATE）：原 SQL 中相关标量子查询 (select 0.2*avg(l_quantity) from lineitem where l_partkey = p_partkey) 逐行对外层 part 的每个 p_partkey 求 0.2×平均购买量；改写为按相关键 l_partkey 一次分组的派生表 avg_qty，再以 l_partkey 等值连接回外层。对任一给定的 l_partkey，分组计算得到的 0.2*avg(l_quantity) 与逐行相关子查询在该键上的值完全相同（聚合仅依赖 l_partkey 与 lineitem 本身）。\n2. 结构性改写二（过滤前置到聚合输入）：brand='Brand#32' 与 container='MED PKG' 只依赖外层 part，且不依赖聚合结果，故先滤出 part_f 小结果，再让聚合子查询与 part_f 按 p_partkey 连接，只对真正会被比较的 partkey 计算平均值。对被使用的键而言，聚合输入的 lineitem 行集合与原 SQL 相同（过滤在 part 上，不删除任何 lineitem 行），因此每个用到的键的平均值不变；未被使用的键的聚合值不参与任何比较，剪掉它们不影响结果。\n3. 结构性改写三（CTE 分解，对应规则 STRATEGY_CTE_DECOMPOSITION）：把 part 过滤抽成 CTE part_f（只投影后续需要的 p_partkey），供聚合输入和外层两处共享，避免重复书写同一过滤；聚合抽成 CTE avg_qty。这只是把派生表改为命名 CTE，投影与连接关系与第 1 步完全一致。\n4. 易误判点核验：(a) NULL 语义——若某 partkey 在 lineitem 中无行，原相关子查询返回 NULL，l_quantity < NULL 为 UNKNOWN 被过滤；改写后该 partkey 在 avg_qty 中无分组行，内连接同样丢弃该行，等价。(b) 行乘法——part_f 按 part 主键 p_partkey 至多一行，avg_qty 按 l_partkey 分组每组恰一行，两者与 lineitem 的连接均为 1:1，不会放大行数，SUM(l_extendedprice) 与原 SQL 相同。(c) 外层过滤与输出——外层仍通过 join part_f 保留 brand/container 谓词，输出列名 avg_yearly 与除数 7.0 均未改变，结果集列名、类型与语义一致。"}
+{
+  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "JOIN_SUB_QUERY_TO_CORRELATE"],
+  "step_sqls": [
+    "WITH part_filtered AS (\n  SELECT p_partkey\n  FROM part\n  WHERE p_brand = 'Brand#32' AND p_container = 'MED PKG'\n)\nSELECT sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM lineitem\nJOIN part_filtered pf ON pf.p_partkey = lineitem.l_partkey\nWHERE lineitem.l_quantity < (\n  SELECT 0.2 * AVG(li.l_quantity)\n  FROM lineitem li\n  WHERE li.l_partkey = pf.p_partkey\n);",
+    "WITH part_filtered AS (\n  SELECT p_partkey\n  FROM part\n  WHERE p_brand = 'Brand#32' AND p_container = 'MED PKG'\n),\navg_qty AS (\n  SELECT li.l_partkey, AVG(li.l_quantity) AS avg_quantity\n  FROM lineitem li\n  JOIN part_filtered pf ON li.l_partkey = pf.p_partkey\n  GROUP BY li.l_partkey\n)\nSELECT sum(lineitem.l_extendedprice) / 7.0 AS avg_yearly\nFROM lineitem\nJOIN part_filtered pf ON pf.p_partkey = lineitem.l_partkey\nJOIN avg_qty aq ON aq.l_partkey = lineitem.l_partkey\nWHERE lineitem.l_quantity < 0.2 * aq.avg_quantity;"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写一（STRATEGY_CTE_DECOMPOSITION）：把 part 上的选择性过滤（p_brand = 'Brand#32' AND p_container = 'MED PKG'）提取为 CTE part_filtered，只投影后续需要的连接键 p_partkey；原来的逗号连接 p_partkey = l_partkey 改为 lineitem 与 part_filtered 的内连接。过滤谓词原封不动地下推进 CTE，连接条件不变，因此外层行的组合与原始查询完全一致。\n2. 结构性改写二（JOIN_SUB_QUERY_TO_CORRELATE）：原 SQL 中逐行执行的相关标量子查询 (SELECT 0.2 * AVG(l_quantity) FROM lineitem WHERE l_partkey = p_partkey) 被改写为按相关键 l_partkey 分组一次的 CTE avg_qty（GROUP BY l_partkey），并通过 aq.l_partkey = lineitem.l_partkey 连接回外层，过滤条件变为 lineitem.l_quantity < 0.2 * aq.avg_quantity。\n3. 等价性依据：原相关子查询对每个 p_partkey 计算 AVG(l_quantity)，其作用域仅限于 lineitem 中 l_partkey = p_partkey 的行；avg_qty 按 l_partkey 分组对同一集合计算 AVG，二者按相关键一一对应。avg_qty 内部与 part_filtered 的连接只是把分组范围限定在被选中的 partkey 上，这些 partkey 的分组平均值与全量分组值相同（对未选中的 partkey 原查询根本不会用到）。lineitem.l_partkey 为 NOT NULL，内连接不会引入或丢失 NULL 键。\n4. 易误判点核验：(a) 若某 partkey 在子查询侧没有任何 lineitem 行，原查询中 AVG 为 NULL，l_quantity < NULL 为 UNKNOWN，该行被排除；改写后 avg_qty 中没有该 partkey 的分组行，内连接同样排除该行，二者一致。(b) 外层 sum(l_extendedprice) 只依赖 lineitem 行，连接 part_filtered 与 avg_qty 都基于连接键且不改写行数：pf 对每个 p_partkey 恰好产生一个分组（part 的过滤是按行谓词，但 p_partkey 是 part 的主键之一，投影 DISTINCT 语义由连接键保证——即便 part 中同 partkey 多行，原始查询也会产生同样的乘积效果，改写沿用相同连接，不改变行为）。实际上本查询对应 TPC-DS Q17，part.p_partkey 唯一，连接不会放大行数。(c) 输出列仅有 sum(l_extendedprice)/7.0 as avg_yearly，未依赖任何被改写部分的列名，列名与类型保持一致。\n5. 过滤位置核验：l_quantity < 0.2 * avg 的比较同时依赖外层行值与聚合结果，无法下推到外层输入之前，因此保留在外层 WHERE 中，未提前也未错误下推；part 过滤对子查询平均值与外层行均成立，故可在两边共享同一 CTE，未复制聚合。"
+}
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -25,21 +47,21 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{"equivalent": true, "message": "重写忠实套用规则示例4/5：p_partkey 为主键故 part_f 每 partkey 至多一行，avg_qty 按 l_partkey 分组每组恰一行，两处连接均 1:1 不放大行数；相关子查询仅依赖 l_partkey 与 lineitem，提前用 part_f 限制聚合输入不改变被使用键的平均值；无 lineitem 行的 partkey 在原 SQL 中因子查询返回 NULL 被过滤，在重写中因 avg_qty 无对应行被内连接丢弃，NULL 语义一致；输出列与除数 7.0 均未变。", "differences": []}
+{"equivalent": true, "message": "重写忠实套用规则：part 过滤提取为 CTE 且 p_partkey 为主键不重复连接；相关标量 AVG 按 l_partkey 分组一次，avg_qty 仅缺少不被外层使用的 partkey 分组，其分组的 AVG 与原相关子查询对同一 partkey 行集合的计算一致；l_partkey NOT NULL，无行数、NULL 或聚合语义差异，结果集相同。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 ✅ 估计代价降幅 81.2% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 204
-   - 规则序列: ['JOIN_SUB_QUERY_TO_CORRELATE', 'STRATEGY_CTE_DECOMPOSITION']
-   - 估计代价: 原始=20686782.26, 重写=3898883.75，相对变化: 81.15%
-✅ 成功存储，记录ID: 6518a04b-3ad3-4977-9a5e-933be416a265
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'JOIN_SUB_QUERY_TO_CORRELATE']
+   - 估计代价: 原始=20686782.26, 重写=3898766.15，相对变化: 81.15%
+✅ 成功存储，记录ID: 9c1dacc6-f0eb-42c8-997f-df5a846935e0
 
-🎲 UCT Math Update: 2 rules, step_sum=+0.8115 (cost=+0.8115, rows=+0.0000, depth=-0.8000, oc=20686782.2600, rc=3898883.7500)
-   结构分细节: rows 60009916.0->121053371.0 (score=+0.000), depth 5.0->9.0 (score=-0.800)
+🎲 UCT Math Update: 2 rules, step_sum=+0.8115 (cost=+0.8115, rows=+0.0000, depth=-0.8000, oc=20686782.2600, rc=3898766.1500)
+   结构分细节: rows 60009916.0->121075520.0 (score=+0.000), depth 5.0->9.0 (score=-0.800)
 ✅ UCT Update Complete:
-   → JOIN_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, reward=+0.855, count=6, avg=+0.702
-   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, reward=-0.043, count=14, avg=+0.059
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, reward=+0.000, count=12, avg=+0.186
+   → JOIN_SUB_QUERY_TO_CORRELATE: P(s,a)=N/A, reward=+0.812, count=8, avg=+0.451
 
 ----------------------------------------
 

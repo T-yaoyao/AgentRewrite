@@ -2,8 +2,8 @@ Query ID: 11
 ==================================================
 
 Original: select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-01-01' + interval '3' month and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;
-Rewritten: select orders_filtered.o_orderpriority, count(*) as order_count from (select o_orderkey, o_orderpriority from orders where o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-04-01') as orders_filtered where exists ( select l_orderkey, l_commitdate, l_receiptdate from lineitem where l_orderkey = orders_filtered.o_orderkey and l_commitdate < l_receiptdate ) group by orders_filtered.o_orderpriority order by orders_filtered.o_orderpriority;
-Time Cost: 61.20s
+Rewritten: select fo.o_orderpriority, count(*) as order_count from orders fo where fo.o_orderdate >= date '1995-01-01' and fo.o_orderdate < date '1995-04-01' and exists ( select 1 from lineitem l where l.l_orderkey = fo.o_orderkey and l.l_commitdate < l.l_receiptdate ) group by fo.o_orderpriority order by fo.o_orderpriority;
+Time Cost: 147.57s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,24 +12,57 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.136
    → AGGREGATE_ANY_PULL_UP_CONSTANTS: UCT=1.100
    → AGGREGATE_CASE_TO_FILTER: UCT=1.100
-{"applied_rules":["FILTER_REDUCE_EXPRESSIONS","SEMI_JOIN_FILTER_TRANSPOSE","SEMI_JOIN_PROJECT_TRANSPOSE"]}
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.100
+{"applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "SEMI_JOIN_FILTER_TRANSPOSE", "STRATEGY_CTE_DECOMPOSITION"]}
 ✅ 选择了 3 个规则
 🔧 开始SQL重写...
 {
-  "applied_rules": [
-    "FILTER_REDUCE_EXPRESSIONS",
-    "SEMI_JOIN_FILTER_TRANSPOSE",
-    "SEMI_JOIN_PROJECT_TRANSPOSE"
-  ],
+  "applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "SEMI_JOIN_FILTER_TRANSPOSE", "STRATEGY_CTE_DECOMPOSITION"],
   "step_sqls": [
     "select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-04-01' and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate ) group by o_orderpriority order by o_orderpriority;",
-    "select orders_filtered.o_orderpriority, count(*) as order_count from (select * from orders where o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-04-01') as orders_filtered where exists ( select * from lineitem where l_orderkey = orders_filtered.o_orderkey and l_commitdate < l_receiptdate ) group by orders_filtered.o_orderpriority order by orders_filtered.o_orderpriority;",
-    "select orders_filtered.o_orderpriority, count(*) as order_count from (select o_orderkey, o_orderpriority from orders where o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-04-01') as orders_filtered where exists ( select l_orderkey, l_commitdate, l_receiptdate from lineitem where l_orderkey = orders_filtered.o_orderkey and l_commitdate < l_receiptdate ) group by orders_filtered.o_orderpriority order by orders_filtered.o_orderpriority;"
+    "select t.o_orderpriority, count(*) as order_count from ( select * from orders where o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-04-01' ) as t where exists ( select * from lineitem where l_orderkey = t.o_orderkey and l_commitdate < l_receiptdate ) group by t.o_orderpriority order by t.o_orderpriority;",
+    "with filtered_orders as ( select o_orderkey, o_orderpriority from orders where o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-04-01' ), qualifying_lineitem as ( select distinct l_orderkey from lineitem where l_commitdate < l_receiptdate ) select fo.o_orderpriority, count(*) as order_count from filtered_orders fo join qualifying_lineitem ql on fo.o_orderkey = ql.l_orderkey group by fo.o_orderpriority order by fo.o_orderpriority;"
   ],
-  "semantic_correctness_guarantee": "1. FILTER_REDUCE_EXPRESSIONS：将 WHERE 中的常量日期表达式 date '1995-01-01' + interval '3' month 折叠为日期常量 date '1995-04-01'。该表达式在原 SQL 中为确定性常量运算，折叠前后 o_orderdate < 的上界完全相同，过滤条件语义不变。\n2. SEMI_JOIN_FILTER_TRANSPOSE：参照示例 1 的模式，把 orders 表上的日期过滤条件下推/重排到派生表 (select * from orders where ...) 中，EXISTS 半连接条件保留在外层作用于 orders_filtered。由于两个日期谓词只引用 orders 自身列，与相关子查询无交集，先过滤再做半连接与原查询『过滤 + EXISTS』的组合在关系代数上可交换，结果集相同。\n3. 相关子查询改写：EXISTS 中的关联谓词 l_orderkey = o_orderkey 改为 l_orderkey = orders_filtered.o_orderkey，仅是把相关列显式限定到派生表别名，作用域与语义等价；EXISTS 只判断行是否存在，子查询 select * 与 select 具体列在 EXISTS 谓词下结果完全一致。\n4. SEMI_JOIN_PROJECT_TRANSPOSE：参照示例 1 的模式，去掉对后续无用的列——外层派生表只投影 group by、输出所需的 o_orderpriority 以及相关子查询引用的 o_orderkey（orders 主键，非空唯一，不引入重复行问题）；EXISTS 子查询只投影 EXISTS 判断所需的 l_orderkey、l_commitdate、l_receiptdate。EXISTS 的真值只取决于是否存在满足条件的行，与投影列数无关，因此裁剪列不改变任何行的存在性判断，也不改变 count(*) 与 group by 的结果。\n5. 最终 SQL 的输出列名（o_orderpriority、order_count）、分组键（o_orderpriority）、排序顺序（order by o_orderpriority）均与原 SQL 一致；orders 与 lineitem 均为 NOT NULL 列（见 Schema 主键/非空约束），不涉及 NULL 语义歧义，故重写后与原查询结果集完全等价。"
+  "semantic_correctness_guarantee": "1. FILTER_REDUCE_EXPRESSIONS：仅将常量日期表达式 date '1995-01-01' + interval '3' month 折叠为常量 date '1995-04-01'，这是纯常量求值，谓词 o_orderdate < date '1995-04-01' 与原表达式对任何 o_orderdate 取值结果相同（date + 3 个月为确定性运算），结果集不变。\n2. SEMI_JOIN_FILTER_TRANSPOSE：将 orders 上的两个本地过滤条件（o_orderdate >= date '1995-01-01' AND o_orderdate < date '1995-04-01'）下推到派生表 t 中，再在 t 上应用与 lineitem 的 EXISTS 半连接。本地过滤与半连接条件（l_orderkey = o_orderkey AND l_commitdate < l_receiptdate）引用的列不相交、相互独立，先过滤后判断 EXISTS 与原顺序等价；o_orderdate 为 NOT NULL，无 NULL 语义陷阱。输出列名保持 o_orderpriority、order_count，分组与排序键不变。\n3. STRATEGY_CTE_DECOMPOSITION：将半连接改写为 JOIN 两个 CTE——filtered_orders 只投影后续需要的 o_orderkey、o_orderpriority 并保留日期过滤；qualifying_lineitem 为 SELECT DISTINCT l_orderkey FROM lineitem WHERE l_commitdate < l_receiptdate。由于 lineitem 的 l_orderkey 为外键指向 orders.o_orderkey，满足 l_commitdate < l_receiptdate 的订单在 DISTINCT 后每个 l_orderkey 恰好一行，故 EXISTS（存在性判断，不关心匹配行数）等价于与该去重 CTE 的内连接；orders.o_orderkey 是主键，filtered_orders 中每个 o_orderkey 唯一，join 不会使行数放大或缩小，count(*) 按 o_orderpriority 分组的计数与原查询一致。\n4. 易误判点核验：(a) 使用 DISTINCT l_orderkey 而非直接 JOIN lineitem，避免了满足条件的多行 lineitem 把订单计数乘多，这正是示例 2 的去重模式；(b) EXISTS 与内连接在此等价的前提——去重后的半连接键集合——已由 qualifying_lineitem 的 DISTINCT 保证；(c) 最终输出列名 o_orderpriority、order_count 与原 SQL 完全一致，GROUP BY 与 ORDER BY 均为 o_orderpriority，排序顺序不变；(d) 所有列（o_orderdate、l_commitdate、l_receiptdate）在 Schema 中均为 NOT NULL，不存在 NULL 导致的三值逻辑差异。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+✅ 确定性等价验证通过
+📊 开始评估优化结果...
+📐 计划结构: Join: NestedLoop 1->0, Hash/Merge 0->1
+{
+  "keep": false,
+  "terminate": false,
+  "reason": "original_cost=1,367,672.22，rewritten_cost=2,541,460.77，涨幅约1.86倍，未达数量级但代价明显上升。<scan_rows> 从 244,916 恶化到 11,711,964（约48倍），原因是原计划通过相关 Semi Join（Nested Loop + lineitem 索引扫描）只需按匹配订单键逐行探测 lineitem 索引；重写后改为对 lineitem（6000万行）全表 Seq Scan 并做 Distinct/GroupAggregate 构建 Hash 侧，扫描行数和计划工作量大幅增加。<plan_depth> 从 6 升到 9。重写并未去掉相关 SubPlan（原计划本已是 Semi Join），不适用去相关保留条款。估计代价大幅上升且 scan_rows 大幅上升、计划做了更多工作（大表 lineitem 被全量扫描），命中性能明显极大恶化，不保留。",
+  "next_step_advice": "在当前重写基础上回退 lineitem 全量物化：将 qualifying_lineitem 的构建下推过滤，仅对满足 orders 日期过滤的订单键范围/集合做半连接探测，例如改回 select o_orderpriority, count(*) from (select o_orderkey, o_orderpriority from orders where o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-04-01') fo where exists (select 1 from lineitem l where l.l_orderkey = fo.o_orderkey and l.l_commitdate < l.l_receiptdate) group by o_orderpriority order by o_orderpriority，即恢复基于索引的 Semi Join 形式并保留日期过滤谓词。"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_ANY_PULL_UP_CONSTANTS: UCT=1.100
+   → AGGREGATE_CASE_TO_FILTER: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.100
+{"applied_rules": ["PROJECT_REMOVE", "JOIN_TO_CORRELATE"]}
+✅ 选择了 2 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["PROJECT_REMOVE", "JOIN_TO_CORRELATE"],
+  "step_sqls": [
+    "with qualifying_lineitem as ( select distinct l_orderkey from lineitem where l_commitdate < l_receiptdate ) select fo.o_orderpriority, count(*) as order_count from orders fo join qualifying_lineitem ql on fo.o_orderkey = ql.l_orderkey where fo.o_orderdate >= date '1995-01-01' and fo.o_orderdate < date '1995-04-01' group by fo.o_orderpriority order by fo.o_orderpriority;",
+    "select fo.o_orderpriority, count(*) as order_count from orders fo where fo.o_orderdate >= date '1995-01-01' and fo.o_orderdate < date '1995-04-01' and exists ( select 1 from lineitem l where l.l_orderkey = fo.o_orderkey and l.l_commitdate < l.l_receiptdate ) group by fo.o_orderpriority order by fo.o_orderpriority;"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写一（PROJECT_REMOVE，第1步）：filtered_orders 是对单表 orders 的简单列投影加日期过滤、且只被引用一次的 CTE，将其删除并把过滤谓词 o_orderdate >= date '1995-01-01' and o_orderdate < date '1995-04-01' 内联到主查询的 WHERE 中，直接扫描基表 orders（别名 fo）。该 CTE 无聚合、无 DISTINCT、无 LIMIT，且仅引用一次，内联不产生任何重复计算或重复行问题；谓词逐字保留，过滤范围与原 CTE 完全一致。\n2. 结构性改写二（JOIN_TO_CORRELATE，第2步）：将主查询与 qualifying_lineitem（select distinct l_orderkey from lineitem where l_commitdate < l_receiptdate）的内连接改写为相关 EXISTS 子查询 exists (select 1 from lineitem l where l.l_orderkey = fo.o_orderkey and l.l_commitdate < l.l_receiptdate)。qualifying_lineitem 的 DISTINCT 保证每个满足 l_commitdate < l_receiptdate 的 l_orderkey 恰好出现一次，因此对任一订单 fo，内连接匹配到至少一行 ⟺ EXISTS 为真；即该内连接在语义上精确等价于半连接（Semi Join），逐订单只会被计数一次，与原查询 count(*) 的计数语义一致。\n3. 键与相关列论证：orders.o_orderkey 是主键，过滤后的 fo 每个订单最多出现一次；EXISTS 子查询的相关列为 l.l_orderkey = fo.o_orderkey，与原连接条件完全相同，且子查询内的谓词 l.l_commitdate < l.l_receiptdate 与原 qualifying_lineitem 的 WHERE 条件逐字一致，未发生过滤条件的移动或丢失。\n4. 聚合与排序不变：GROUP BY fo.o_orderpriority 与 ORDER BY fo.o_orderpriority 保持原样；输出列名 o_orderpriority、order_count 与原查询一致；count(*) 在两种写法下对每个满足日期过滤且存在延迟行项目的订单各计一次，各优先级的计数值完全相同。\n5. 易误判点澄清：本改写未改变任何过滤谓词的位置（日期过滤仍作用于 orders，commitdate/receiptdate 比较仍作用于 lineitem）；未引入或消除重复行（内连接侧经 DISTINCT 去重，EXISTS 不产生行复制）；NULL 处理方面，两表相关列均声明为 NOT NULL，l_commitdate < l_receiptdate 与原查询求值一致；该改写同时落实了上一轮反馈的建议，恢复基于 orders 日期过滤驱动、按相关键逐行探测 lineitem 的半连接形式，避免 lineitem 全量扫描与物化。"
 }
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
@@ -42,17 +75,16 @@ DBMS_syntax_Tool ends...
 {
   "keep": true,
   "terminate": true,
-  "reason": "两份 SQL 的执行计划完全一致，original_cost=1367672.22，rewritten_cost=1367672.22，涨幅 0%；<scan_rows> 前后均为 244916.0，<plan_depth> 前后均为 6.0。重写仅将日期表达式常量折叠为 '1995-04-01'，规划器生成的计划（Seq Scan orders + Semi Nested Loop 索引扫描 lineitem + 聚合）没有任何变化，属于逻辑等价的微简化（常量折叠，命中条件 4），不存在性能恶化。已通过 Semi Join 去除了相关子查询的逐行重复执行形式，orders 过滤已下推，聚合与连接输入无冗余扫描，查询重写层面已无可进一步优化的空间，剩余改进只能依赖索引、统计信息等物理手段。",
+  "reason": "original_cost 与 rewritten_cost 均为 1367672.22，无变化；scan_rows 前后均为 244916.0，plan_depth 均为 6.0，执行计划结构完全一致（Semi Join、Seq Scan orders、Index Scan lineitem、Sort、Aggregate）。本轮重写仅做了别名规范化（orders→fo、lineitem→l）、date '1995-01-01' + interval '3' month 折叠为常量 '1995-04-01'、select * 改为 select 1、PROJECT_REMOVE 去掉冗余输出列，属于逻辑简化（常量折叠与冗余投影去除），命中第 4 条。无数量级代价上涨，计划无恶化，可保留并终止。剩余改进空间基本只有物理手段（如 lineitem 上 (l_orderkey, l_commitdate, l_receiptdate) 相关索引、统计信息），无进一步查询重写空间。",
   "next_step_advice": "无需下一步优化"
 }
 ℹ️ 记忆跳过：论文收益 R=+0.0000，且估计代价未下降
 
-🎲 UCT Math Update: 3 rules, step_sum=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1367672.2200, rc=1367672.2200)
+🎲 UCT Math Update: 2 rules, step_sum=+0.4619 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1367672.2200, rc=1367672.2200)
    结构分细节: rows 244916.0->244916.0 (score=+0.000), depth 6.0->6.0 (score=+0.000)
 ✅ UCT Update Complete:
-   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, reward=+0.000, count=3, avg=+0.000
-   → SEMI_JOIN_FILTER_TRANSPOSE: P(s,a)=N/A, reward=+0.000, count=1, avg=+0.000
-   → SEMI_JOIN_PROJECT_TRANSPOSE: P(s,a)=N/A, reward=+0.000, count=1, avg=+0.000
+   → PROJECT_REMOVE: P(s,a)=N/A, reward=+0.000, count=1, avg=+0.000
+   → JOIN_TO_CORRELATE: P(s,a)=N/A, reward=+0.462, count=2, avg=+0.448
 
 ----------------------------------------
 

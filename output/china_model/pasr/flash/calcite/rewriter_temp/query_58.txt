@@ -3,7 +3,7 @@ Query ID: 58
 
 Original: select coalesce(sum(count_comm), 0) from (   select deptno, count(comm) as count_comm   from emp   group by deptno, mgr) t
 Rewritten: select coalesce(count(comm), 0) from emp
-Time Cost: 30.12s
+Time Cost: 33.72s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,20 +12,13 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → PROJECT_CORRELATE_TRANSPOSE: UCT=1.272
-   → PROJECT_JOIN_REMOVE: UCT=1.269
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.257
-{"applied_rules": ["AGGREGATE_MERGE", "AGGREGATE_PROJECT_MERGE"]}
-✅ 选择了 2 个规则
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.210
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{"applied_rules": ["AGGREGATE_MERGE"]}
+✅ 选择了 1 个规则
 🔧 开始SQL重写...
-{
-  "applied_rules": ["AGGREGATE_MERGE", "AGGREGATE_PROJECT_MERGE"],
-  "step_sqls": [
-    "select coalesce(count(comm), 0) from emp",
-    "select coalesce(count(comm), 0) from emp"
-  ],
-  "semantic_correctness_guarantee": "1. 结构性改写：原 SQL 是嵌套聚合——内层 `select deptno, count(comm) as count_comm from emp group by deptno, mgr` 按分组键 (deptno, mgr) 输出每组的 COUNT(comm)，外层对 count_comm 求全局 SUM 后再 COALESCE。按 AGGREGATE_MERGE 规则（示例模式 SUM(内层聚合列) → 直接对底层列聚合），由于内层 GROUP BY (deptno, mgr) 是对 emp 全表的不重不漏划分，各组 count(comm) 之和恰好等于全表 count(comm)，因此合并为单层聚合 `count(comm)`；外层的 COALESCE(..., 0) 投影保留在最外层。\n2. 空表情形核验：原 SQL 在 emp 为空时内层返回 0 行，sum(count_comm) 为 NULL，coalesce 得 0；重写后 count(comm) 在空表上返回 0（COUNT 聚合在无输入行时返回 0 而非 NULL），coalesce(0, 0) 仍为 0。两端结果一致。\n3. NULL 语义核验：count(comm) 忽略 comm 为 NULL 的行；原 SQL 中各组 count 之和同样只统计 comm 非 NULL 的行，两者的非空计数完全一致，故 sum(各组 count) ≡ 全表 count(comm)。\n4. 重复行与列名核验：原查询外层无 GROUP BY，输出单行单列；重写后同样输出单行单列，且 coalesce 包裹方式、列的语义值均一致（无显式列名要求被改变）。内层分组键 deptno、mgr 仅用于划分，不出现在最终投影，合并后无需保留。\n5. 第二步 AGGREGATE_PROJECT_MERGE：第一步已将子查询消去，外层的纯投影 coalesce 已直接作用于聚合表达式之上，不存在『紧挨聚合的多余 SELECT 层』可再合并，故该步为保持性应用，SQL 不变；最终 SQL `select coalesce(count(comm), 0) from emp` 与原始 SQL 在任意 emp 数据上结果集完全等价。"
-}
+{"applied_rules":["AGGREGATE_MERGE"],"step_sqls":["select coalesce(count(comm), 0) from emp"],"semantic_correctness_guarantee":"1. 结构性改写：将外层 SUM 聚合与内层 GROUP BY (deptno, mgr) 的 COUNT(comm) 聚合合并为单层聚合。由于内层每个分组产出 count(comm)（该组中 comm 非 NULL 的行数），外层对这些计数求和，等价于对全表所有 comm 非 NULL 的行计数，即 count(comm)，因此子查询 t 被整体消除，改写为 select coalesce(count(comm), 0) from emp。\n2. 等价性依据：SUM(count(comm)) over groups = Σ_groups COUNT(comm) = COUNT(comm) over all rows。该恒等式对任意数据分布（包括 comm 含 NULL 的情形）都成立，因为每行 comm 非 NULL 时恰好被内层其所属 (deptno, mgr) 分组的 count 计入一次；GROUP BY 键 (deptno, mgr) 的存在不改变总和，仅改变计数在各组间的分布。\n3. 空结果处理：原 SQL 中 emp 为空时内层无分组行，sum(count_comm) 为 NULL，coalesce 转为 0；改写后 count(comm) 在空表上直接返回 0，coalesce 虽不再必要但保留以保持表达式结构与输出值完全一致（0 = 0）。\n4. 易误判点：内层 group by 中包含的 deptno、mgr 列在合并后被去除，这是安全的——它们仅作为分组键，不被外层投影或过滤引用，消除分组键不改变 SUM 聚合的总值。若原始 SQL 外层还有按 deptno 的 GROUP BY，则不能如此合并；本例中外层无 GROUP BY，故合并合法。\n5. 列名与类型：外层未使用别名，输出列名为表达式文本（如 coalesce），改写前后均为标量整数，结果集（单行单列整数值）完全一致。"}
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -33,22 +26,21 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{"equivalent": true, "message": "内层按 (deptno,mgr) 分组对 emp 全表不重不漏划分，SUM(COUNT(comm)) 折叠为全表 COUNT(comm)（符合强约束 SUM(COUNT(v))->COUNT(v)）；空表时两者经 COALESCE 均得 0，NULL 语义一致，结果集等价。", "differences": []}
+{"equivalent": true, "message": "SUM(各组COUNT(comm))恒等于全表COUNT(comm)，每行恰被其(deptno,mgr)组计入一次；空表时两者均得0，coalesce行为一致，结果集相同。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 38550188.0 -> 18750094.0 (重写侧约为原的 48.6381%)
 ✅ 估计代价降幅 83.0% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 111
-   - 规则序列: ['AGGREGATE_MERGE', 'AGGREGATE_PROJECT_MERGE']
+   - 规则序列: ['AGGREGATE_MERGE']
    - 估计代价: 原始=4138767.94, 重写=703880.35，相对变化: 82.99%
-✅ 成功存储，记录ID: 2ea9b6a5-8fb7-416b-93fe-1549f1b23c43
+✅ 成功存储，记录ID: b1d474e3-029d-4f2d-be72-134b7b7ef980
 
-🎲 UCT Math Update: 2 rules, step_sum=+0.8299 (cost=+0.8299, rows=+0.5136, depth=+0.2000, oc=4138767.9400, rc=703880.3500)
+🎲 UCT Math Update: 1 rules, step_sum=+0.8299 (cost=+0.8299, rows=+0.5136, depth=+0.2000, oc=4138767.9400, rc=703880.3500)
    结构分细节: rows 38550188.0->18750094.0 (score=+0.514), depth 5.0->4.0 (score=+0.200)
 ✅ UCT Update Complete:
-   → AGGREGATE_MERGE: P(s,a)=N/A, reward=+0.830, count=9, avg=+0.170
-   → AGGREGATE_PROJECT_MERGE: P(s,a)=N/A, reward=+0.000, count=4, avg=-0.000
+   → AGGREGATE_MERGE: P(s,a)=N/A, reward=+0.830, count=5, avg=+0.057
 
 ----------------------------------------
 

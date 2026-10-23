@@ -1,85 +1,101 @@
 #!/bin/bash
 set -e
 
-# QUITE System Run Script - Simple Configuration
+# QUITE / PASR run script.
+# Usage:
+#   bash scripts/run_quite.sh <dataset>
+#   bash scripts/run_quite.sh --dataset <dataset>
+#   bash scripts/run_quite.sh <dataset> --database <db_name>
+# dataset: calcite | tpch | dsb
+# Does not clear LinUCB stats or Chroma memory.
 
-# Source the common environment setup
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "$SCRIPT_DIR/setup_env.sh"
 
-# Path variables (now using PROJECT_ROOT from setup_env.sh)
-INPUT_QUERIES="${PROJECT_ROOT}/dataset/queries/dsb_test.json"
-SCHEMA_FILE="${PROJECT_ROOT}/dataset/schemas/dsb_schemas.sql"
-OUTPUT_DIR="${PROJECT_ROOT}/output/china_model/pasr/flash/dsb"
+DATASET=""
+DATABASE=""
 
-# Feature flags
-ENABLE_REWRITER="--enable_rewriter"
-SAVE_LOGS="--save_rewriter_logs"
+usage() {
+    echo "用法: bash scripts/run_quite.sh <dataset> [--database <db_name>]"
+    echo "      bash scripts/run_quite.sh --dataset <dataset> [--database <db_name>]"
+    echo "dataset: calcite | tpch | dsb"
+    exit 1
+}
 
-# Optional database: bash scripts/run_quite.sh --database dsb
-# or bash scripts/run_quite.sh dsb. Omitted values use DB_NAME from .env.
-DATABASE_ARGS=()
-if [[ $# -gt 0 ]]; then
+while [[ $# -gt 0 ]]; do
     case "$1" in
+        --dataset|-s)
+            [[ -n "${2:-}" ]] || usage
+            DATASET="$2"
+            shift 2
+            ;;
         --database|-d)
-            if [[ -z "${2:-}" ]]; then
-                echo "缺少数据库名。用法: bash scripts/run_quite.sh [--database 数据库名]"
-                exit 1
-            fi
-            DATABASE_ARGS=(--database "$2")
+            [[ -n "${2:-}" ]] || usage
+            DATABASE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
             ;;
         -*)
             echo "未知参数: $1"
-            exit 1
+            usage
             ;;
         *)
-            DATABASE_ARGS=(--database "$1")
+            if [[ -z "$DATASET" ]]; then
+                DATASET="$1"
+                shift
+            else
+                echo "多余位置参数: $1"
+                usage
+            fi
             ;;
     esac
+done
+
+if [[ -z "$DATASET" ]]; then
+    echo "请指定数据集。"
+    usage
 fi
 
-# Clear LinUCB statistics and the example memory before every run.
-python - << 'PY'
-import json
-import sys
-from pathlib import Path
+case "$DATASET" in
+    calcite|tpch|dsb)
+        ;;
+    *)
+        echo "不支持的数据集: $DATASET（仅支持 calcite | tpch | dsb）"
+        exit 1
+        ;;
+esac
 
-root = Path(__import__("os").environ["PROJECT_ROOT"])
-stats_path = root / "data" / "global_memory" / "rule_bandit_stats.json"
-stats_path.parent.mkdir(parents=True, exist_ok=True)
-stats_path.write_text("{}\n", encoding="utf-8")
-print(f"LinUCB 统计已清空: {stats_path}")
+INPUT_QUERIES="${PROJECT_ROOT}/dataset/queries/${DATASET}_test.json"
+SCHEMA_FILE="${PROJECT_ROOT}/dataset/schemas/${DATASET}_schemas.sql"
+OUTPUT_DIR="${PROJECT_ROOT}/output/china_model/flash/${DATASET}"
 
-try:
-    import pysqlite3
-    sys.modules["sqlite3"] = pysqlite3
-    import chromadb
-    from chromadb.config import Settings
-except Exception as exc:
-    print(f"记忆库清空失败: {exc}")
-    sys.exit(1)
+if [[ ! -f "$INPUT_QUERIES" ]]; then
+    echo "查询文件不存在: $INPUT_QUERIES"
+    exit 1
+fi
+if [[ ! -f "$SCHEMA_FILE" ]]; then
+    echo "Schema 文件不存在: $SCHEMA_FILE"
+    exit 1
+fi
 
-name = "sql_optimization_knowledge"
-client = chromadb.PersistentClient(
-    path=str(root / "data" / "global_memory" / "chroma_db"),
-    settings=Settings(anonymized_telemetry=False),
-)
-try:
-    before = client.get_collection(name).count()
-except Exception:
-    before = 0
-try:
-    client.delete_collection(name)
-except Exception:
-    pass
-after = client.get_or_create_collection(
-    name=name,
-    metadata={"description": "SQL optimization knowledge base"},
-).count()
-print(f"记忆库已清空: {before} -> {after}")
-PY
+# DB: explicit --database wins; otherwise use dataset name (overrides .env DB_NAME).
+if [[ -n "$DATABASE" ]]; then
+    DATABASE_ARGS=(--database "$DATABASE")
+else
+    DATABASE_ARGS=(--database "$DATASET")
+fi
 
-# Execute
+ENABLE_REWRITER="--enable_rewriter"
+SAVE_LOGS="--save_rewriter_logs"
+
+echo "数据集: ${DATASET}"
+echo "查询:   ${INPUT_QUERIES}"
+echo "Schema: ${SCHEMA_FILE}"
+echo "输出:   ${OUTPUT_DIR}"
+echo "数据库: ${DATABASE_ARGS[*]}"
+
 python run.py \
     --input_path "${INPUT_QUERIES}" \
     --output_dir "${OUTPUT_DIR}" \
@@ -87,4 +103,3 @@ python run.py \
     ${ENABLE_REWRITER} \
     ${SAVE_LOGS} \
     "${DATABASE_ARGS[@]}"
-

@@ -2,21 +2,26 @@ Query ID: 31
 ==================================================
 
 Original: select ps_partkey, sum(ps_supplycost * ps_availqty) as value from partsupp, supplier, nation where ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_name = 'ROMANIA' group by ps_partkey having sum(ps_supplycost * ps_availqty) > ( select sum(ps_supplycost * ps_availqty) * 0.0001000000 from partsupp, supplier, nation where ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_name = 'ROMANIA' ) order by value desc;
-Rewritten: WITH romanian_supply AS (
-    SELECT ps_partkey, ps_supplycost, ps_availqty
-    FROM partsupp
-    JOIN supplier ON ps_suppkey = s_suppkey
-    JOIN nation ON s_nationkey = n_nationkey AND n_name = 'ROMANIA'
+Rewritten: WITH n_f AS (
+  SELECT n_nationkey
+  FROM nation
+  WHERE n_name = 'ROMANIA'
+),
+ps_f AS (
+  SELECT ps.ps_partkey, ps.ps_supplycost, ps.ps_availqty
+  FROM partsupp AS ps
+  JOIN supplier AS s ON ps.ps_suppkey = s.s_suppkey
+  JOIN n_f ON s.s_nationkey = n_f.n_nationkey
 )
 SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value
-FROM romanian_supply
+FROM ps_f
 GROUP BY ps_partkey
 HAVING SUM(ps_supplycost * ps_availqty) > (
-    SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000
-    FROM romanian_supply
+  SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000
+  FROM ps_f
 )
 ORDER BY value DESC;
-Time Cost: 39.48s
+Time Cost: 51.38s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -25,20 +30,13 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → FILTER_CORRELATE: UCT=1.231
-   → FILTER_AGGREGATE_TRANSPOSE: UCT=1.207
-   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.121
-{"applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN"]}
-✅ 选择了 2 个规则
+   → AGGREGATE_ANY_PULL_UP_CONSTANTS: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+{"applied_rules": ["STRATEGY_CTE_DECOMPOSITION"]}
+✅ 选择了 1 个规则
 🔧 开始SQL重写...
-{
-  "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN"],
-  "step_sqls": [
-    "WITH romanian_supply AS (\n    SELECT ps_partkey, ps_supplycost, ps_availqty\n    FROM partsupp\n    JOIN supplier ON ps_suppkey = s_suppkey\n    JOIN nation ON s_nationkey = n_nationkey\n    WHERE n_name = 'ROMANIA'\n)\nSELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value\nFROM romanian_supply\nGROUP BY ps_partkey\nHAVING SUM(ps_supplycost * ps_availqty) > (\n    SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000\n    FROM romanian_supply\n)\nORDER BY value DESC;",
-    "WITH romanian_supply AS (\n    SELECT ps_partkey, ps_supplycost, ps_availqty\n    FROM partsupp\n    JOIN supplier ON ps_suppkey = s_suppkey\n    JOIN nation ON s_nationkey = n_nationkey AND n_name = 'ROMANIA'\n)\nSELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value\nFROM romanian_supply\nGROUP BY ps_partkey\nHAVING SUM(ps_supplycost * ps_availqty) > (\n    SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000\n    FROM romanian_supply\n)\nORDER BY value DESC;"
-  ],
-  "semantic_correctness_guarantee": "1. 结构性改写：原 SQL 中 FROM partsupp, supplier, nation + 三表连接与过滤 n_name = 'ROMANIA' 在主查询与标量子查询中完全重复，依据 STRATEGY_CTE_DECOMPOSITION（对应其示例 5 的『同一过滤对聚合的每次使用都成立时抽成 CTE』模式）把这段连接+过滤提取为 CTE romanian_supply，主查询按 ps_partkey 分组聚合，HAVING 中的非相关标量子查询改为对同一 CTE 求总和乘 0.0001000000，消除了重复的连接与过滤逻辑。\n2. 等价性依据：CTE 的行集与原查询中『ps_suppkey = s_suppkey AND s_nationkey = n_nationkey AND n_name = 'ROMANIA'' 的内连接结果完全相同（内连接下过滤在 ON/WHERE 中位置不影响结果集）；主查询的 GROUP BY ps_partkey 与 HAVING 中 SUM(ps_supplycost*ps_availqty) > (总 SUM * 0.0001000000) 的比较对象、比较符均与原 SQL 逐一对应，标量子查询仍是非相关标量子查询，返回单值，语义不变。\n3. FILTER_INTO_JOIN 改写：n_name = 'ROMANIA' 只依赖 nation 表，按该规则（示例 1 模式）将其从 WHERE 推入 nation 表 INNER JOIN 的 ON 条件，INNER JOIN 下谓词推入 ON 与保留在 WHERE 对结果集完全等价，因此第二步与第一步的行集相同。\n4. 列投影与输出一致性：CTE 内只投影后续需要的 ps_partkey、ps_supplycost、ps_availqty 三列（过滤与聚合均只用到这三列），不引入 SELECT *；外层输出列名 ps_partkey 与 value、以及 ORDER BY value DESC 的排序语义均与原 SQL 一致（value 相同行的次序在两版中同样未定义，属于相同的不确定性而非语义差异）。\n5. 易误判点核验：(a) HAVING 与 ORDER BY 的先后未改变——HAVING 先于 ORDER BY 执行，子查询值在两版中都是全量罗马尼亚供应的总和乘同一常数；(b) NULL 处理——ps_supplycost、ps_availqty、n_name 均 NOT NULL，SUM 不受 NULL 影响，且 SUM 为空时（无罗马尼亚行）原 SQL 与重写 SQL 的 HAVING 中比较同样产生 NULL（不通过）行为一致；(c) 重复行——partsupp 主键为 (ps_partkey, ps_suppkey)，CTE 未做 DISTINCT 也未引入额外连接基数，聚合输入行多重数与原 SQL 完全相同。"
-}
+{"applied_rules": ["STRATEGY_CTE_DECOMPOSITION"], "step_sqls": ["WITH n_f AS (\n  SELECT n_nationkey\n  FROM nation\n  WHERE n_name = 'ROMANIA'\n),\nps_f AS (\n  SELECT ps.ps_partkey, ps.ps_supplycost, ps.ps_availqty\n  FROM partsupp AS ps\n  JOIN supplier AS s ON ps.ps_suppkey = s.s_suppkey\n  JOIN n_f ON s.s_nationkey = n_f.n_nationkey\n)\nSELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value\nFROM ps_f\nGROUP BY ps_partkey\nHAVING SUM(ps_supplycost * ps_availqty) > (\n  SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000\n  FROM ps_f\n)\nORDER BY value DESC;"], "semantic_correctness_guarantee": "1. 结构性改写说明：原 SQL 中主查询与 HAVING 内的标量子查询使用完全相同的 FROM/WHERE（partsupp ⋈ supplier ⋈ nation 且 n_name = 'ROMANIA'）。按 STRATEGY_CTE_DECOMPOSITION 的「同一过滤被多处使用时合成一个 CTE」「选择性条件在小表上时先滤成小结果再连接大表」，将 nation 上的选择性过滤 n_name = 'ROMANIA' 提取为 CTE n_f（只投影连接键 n_nationkey），将三表连接提取为 CTE ps_f（只投影后续需要的 ps_partkey、ps_supplycost、ps_availqty），主查询与标量子查询均改为引用 ps_f。\n2. 等价性理由（连接谓词）：ps_f 内部保留了原连接条件 ps_suppkey = s_suppkey 与 s_nationkey = n_nationkey，且 n_f 未做去重，因此若 nation 中存在重名行，连接产生的重复行数量与原 SQL 完全一致；partsupp 的主键为 (ps_partkey, ps_suppkey)，supplier 的主键为 s_suppkey，连接基数与原 SQL 相同，GROUP BY ps_partkey 前的行集合不变。\n3. 等价性理由（聚合与 HAVING）：主查询对 ps_f 按 ps_partkey 求 SUM(ps_supplycost * ps_availqty)，标量子查询对同一 ps_f 求全体总和乘以 0.0001000000，两者读取的行集与原 SQL 中两处 FROM/WHERE 完全相同，故 HAVING 比较结果逐一相等；该过滤 n_name = 'ROMANIA' 对主聚合与标量子查询两处使用同时成立，符合规则中「一个过滤对聚合的每一次使用都成立时可放进该聚合（此处即共享 CTE）」的情形，且未复制聚合。\n4. 易误判点核对：(a) 输出列与别名保持 ps_partkey、value，ORDER BY value DESC 作用于相同聚合结果，排序顺序不变；(b) 标量子查询是非相关标量子查询，提取共享 CTE 不引入相关性变化；(c) SUM 忽略 NULL，但本 Schema 中 ps_supplycost、ps_availqty 均为 NOT NULL，乘积无 NULL，聚合值不变；(d) CTE 仅做下推过滤与投影，未引入 DISTINCT、LIMIT 或额外谓词，不产生去重或行数差异。因此重写 SQL 与原始 SQL 在结果集、列名、类型与排序上完全等价。"}
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -46,27 +44,26 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
-{"equivalent": true, "message": "重写将原 SQL 中重复的三表连接+过滤（ps_suppkey=s_suppkey、s_nationkey=n_nationkey、n_name='ROMANIA'）原样提取为 CTE romanian_supply，主查询与标量子查询均基于同一行集做与原 SQL 完全一致的聚合/HAVING/ORDER BY；CTE 未去重、未改连接基数，NULL 语义与空集行为一致，结果集等价。", "differences": []}
+{"equivalent": true, "message": "重写仅将主查询与标量子查询共用的 partsupp⋈supplier⋈nation(n_name='ROMANIA') 连接提取为共享 CTE n_f/ps_f，连接谓词、行基数、聚合、HAVING 比较与排序均保持一致，nation 主键唯一性也保证了 n_f 连接语义不变，结果集等价。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 📐 计划结构: SeqScan reduced by 3 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 7727067.0 -> 4703533.0 (重写侧约为原的 60.8709%)
 {
   "keep": true,
   "terminate": true,
-  "reason": "估计代价从 523443.29 降至 321292.93（降低约 39%）；scan_rows 从 7727067.0 降至 4703533.0；plan_depth 从 9.0 降至 7.0。重写通过 CTE 物化 romanian_supply 一次计算，消除了原始计划中对 partsupp/supplier/nation 三表连接的重复扫描（原计划 partsupp 被扫描两次共约 1600 万行，重写后 CTE 只物化一次，供聚合和子查询复用）。命中规则：估计代价降低；同时扫描行数下降、树深下降、计划结构更优，未达数量级代价上涨。",
+  "reason": "rewritten_cost 321,292.93 低于 original_cost 523,443.29（下降约 38.6%）；<scan_rows> 由 7,727,067 降至 4,703,533；<plan_depth> 由 9 降至 7。重写将公共过滤逻辑提取为 CTE，减少了对 partsupp/supplier/nation 的重复扫描与连接，计划结构更优。命中条件 1（估计代价降低）、条件 2（扫描行数下降且无数量级代价上涨）和条件 3（树深下降、计划结构更优），予以保留并终止。",
   "next_step_advice": "无需下一步优化"
 }
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 374
-   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_INTO_JOIN']
+   - 规则序列: ['STRATEGY_CTE_DECOMPOSITION']
    - 估计代价: 原始=523443.29, 重写=321292.93，相对变化: 38.62%
-✅ 成功存储，记录ID: 2d8923af-5de1-4b20-a75d-a1f587f0aea1
+✅ 成功存储，记录ID: cf91e426-ba99-45de-a3d6-dd6146874464
 
-🎲 UCT Math Update: 2 rules, step_sum=+0.3862 (cost=+0.3862, rows=+0.3913, depth=+0.2222, oc=523443.2900, rc=321292.9300)
+🎲 UCT Math Update: 1 rules, step_sum=+0.3862 (cost=+0.3862, rows=+0.3913, depth=+0.2222, oc=523443.2900, rc=321292.9300)
    结构分细节: rows 7727067.0->4703533.0 (score=+0.391), depth 9.0->7.0 (score=+0.222)
 ✅ UCT Update Complete:
-   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, reward=+0.386, count=7, avg=+0.079
-   → FILTER_INTO_JOIN: P(s,a)=N/A, reward=+0.000, count=12, avg=+0.017
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, reward=+0.386, count=6, avg=+0.244
 
 ----------------------------------------
 

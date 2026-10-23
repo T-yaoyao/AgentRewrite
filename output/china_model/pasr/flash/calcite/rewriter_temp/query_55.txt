@@ -2,8 +2,8 @@ Query ID: 55
 ==================================================
 
 Original: select empno, count(mgr) from emp group by empno, deptno
-Rewritten: SELECT empno, CASE WHEN mgr IS NOT NULL THEN 1 ELSE 0 END AS count FROM emp
-Time Cost: 41.50s
+Rewritten: select empno, cast(case when mgr is not null then 1 else 0 end as bigint) as "count" from emp
+Time Cost: 50.50s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,13 +12,19 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → PROJECT_JOIN_REMOVE: UCT=1.271
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.255
-   → SEMI_JOIN_FILTER_TRANSPOSE: UCT=1.247
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.246
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
 {"applied_rules": ["AGGREGATE_REMOVE"]}
 ✅ 选择了 1 个规则
 🔧 开始SQL重写...
-{"applied_rules": ["AGGREGATE_REMOVE"],"step_sqls": ["SELECT empno, CASE WHEN mgr IS NOT NULL THEN 1 ELSE 0 END AS count FROM emp"],"semantic_correctness_guarantee": "1. 结构性改写：原 SQL 为 SELECT empno, count(mgr) FROM emp GROUP BY empno, deptno。根据 Schema，empno 是表 emp 的主键（PRIMARY KEY，且 NOT NULL），因此每一行 empno 都唯一，GROUP BY empno 产生的每个分组恰好只包含一行；deptno 由 empno 函数决定（同一员工行只有唯一的 deptno），不会把 empno 相同的行拆成多个分组。即该 GROUP BY 实际上不做任何真正的聚合压缩，每个分组都是单行。\n2. 等价性论证：既然每个分组只有一行，聚合函数 count(mgr) 在该分组上的值就是这一行的 mgr 计数：当 mgr 非 NULL 时为 1，当 mgr 为 NULL 时为 0（COUNT 忽略 NULL，空输入计为 0）。因此可用标量表达式 CASE WHEN mgr IS NOT NULL THEN 1 ELSE 0 END 精确替代 count(mgr)，随后 GROUP BY 可整体移除，查询退化为对 emp 的逐行投影，输出行数与原分组结果行数完全一致（每行一个分组）。\n3. 列名与类型保持：原第二列输出名为 Postgres 默认的 \"count\"，类型为 BIGINT；重写通过别名 AS count 保持列名不变，CASE 表达式返回整数类型，与 COUNT 的整数语义一致（如需严格 BIGINT 可隐式兼容，整数值 0/1 在比较与展示上等价）。\n4. 易误判点核验：(a) 若 empno 不唯一，去掉 GROUP BY 会改变语义，但 Schema 中 emp_pkey 主键约束保证了唯一性，前提成立；(b) count 对 NULL 返回 0 而非 NULL，CASE 的 ELSE 0 分支精确复现了这一点，不会引入 NULL 语义偏差；(c) 原 GROUP BY 查询本身不保证行序，重写后的逐行扫描也不保证行序，两者作为多重集（multiset）结果完全相同；(d) 未引入任何新过滤、JOIN 或去重（无 DISTINCT），不会增删或合并任何行。"}
+{
+  "applied_rules": ["AGGREGATE_REMOVE"],
+  "step_sqls": [
+    "select empno, cast(case when mgr is not null then 1 else 0 end as bigint) as \"count\" from emp"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写：原查询为 `select empno, count(mgr) from emp group by empno, deptno`。由于 emp 表上有主键约束 `emp_pkey PRIMARY KEY (empno)`，按 empno 分组时每个分组恰好只包含一行（deptno 函数依赖于 empno，加入 GROUP BY 不会进一步切分分组），因此该 GROUP BY 是不产生真正聚合的退化分组，符合 AGGREGATE_REMOVE 规则的适用条件（分组键含主键 ⇒ 分组与输入行一一对应），故去掉 GROUP BY。\n2. 聚合表达式的等价替换：每个分组只有一行，因此 `count(mgr)` 在该行 mgr 非 NULL 时等于 1，mgr 为 NULL 时等于 0。故将聚合列替换为逐行表达式 `case when mgr is not null then 1 else 0 end`，并用 `cast(... as bigint)` 保持与 count 一致的 BIGINT 数据类型；列别名保持为 \"count\" 与原输出列名一致。\n3. 结果集等价性：对 emp 的每一行，重写后输出 (empno, count(mgr))，与原查询按 (empno, deptno) 分组后每组恰好一行、组内 count(mgr) 的取值完全一致；不丢行、不重复行、不改变 NULL 语义（count(mgr) 对全 NULL 组返回 0，表达式同样返回 0）。\n4. 易误判点说明：(a) 若 empno 不是主键，此改写不成立，但 Schema 中存在主键约束，判定安全；(b) 原查询无 ORDER BY，两个版本都不保证行序，行序差异不构成语义不等价；(c) count 与 count(*) 的区别已通过 CASE 表达式中的 NULL 判断精确保留。"
+}
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -26,21 +32,25 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{"equivalent": true, "message": "empno 为主键，GROUP BY empno, deptno 每组恰为一行，count(mgr) 等价于逐行的 CASE WHEN mgr IS NOT NULL THEN 1 ELSE 0，去 GROUP BY 后行集与列语义一致。", "differences": []}
+{
+    "equivalent": true,
+    "message": "empno 是主键，GROUP BY (empno, deptno) 每组恰一行，count(mgr) 退化为逐行 0/1 表达式，重写结果集与原查询一致。",
+    "differences": []
+}
 ✅ 语义等价
 📊 开始评估优化结果...
 📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 90000432.0 -> 45000216.0 (重写侧约为原的 50.0000%)
-✅ 估计代价降幅 60.3% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+✅ 估计代价降幅 55.4% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 54
    - 规则序列: ['AGGREGATE_REMOVE']
-   - 估计代价: 原始=2312066.05, 重写=918506.16，相对变化: 60.27%
-✅ 成功存储，记录ID: 1b71e228-6e77-4695-9e06-539ab42f952a
+   - 估计代价: 原始=2312066.05, 重写=1031006.7，相对变化: 55.41%
+✅ 成功存储，记录ID: 3fc9478f-e141-4af5-992d-0c157d921c00
 
-🎲 UCT Math Update: 1 rules, step_sum=+0.6027 (cost=+0.6027, rows=+0.5000, depth=+0.5000, oc=2312066.0500, rc=918506.1600)
+🎲 UCT Math Update: 1 rules, step_sum=+0.5541 (cost=+0.5541, rows=+0.5000, depth=+0.5000, oc=2312066.0500, rc=1031006.7000)
    结构分细节: rows 90000432.0->45000216.0 (score=+0.500), depth 2.0->1.0 (score=+0.500)
 ✅ UCT Update Complete:
-   → AGGREGATE_REMOVE: P(s,a)=N/A, reward=+0.603, count=12, avg=+0.125
+   → AGGREGATE_REMOVE: P(s,a)=N/A, reward=+0.554, count=9, avg=+0.211
 
 ----------------------------------------
 

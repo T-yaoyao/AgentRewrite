@@ -2,8 +2,8 @@ Query ID: 36
 ==================================================
 
 Original: select l_shipmode, sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1997-01-01' + interval '1' year group by l_shipmode order by l_shipmode;
-Rewritten: select l_shipmode, coalesce(sum(1) filter (where o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH'), 0) as high_line_count, coalesce(sum(1) filter (where o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH'), 0) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1998-01-01' group by l_shipmode order by l_shipmode;
-Time Cost: 55.35s
+Rewritten: select li.l_shipmode, coalesce(sum(1) filter (where ord.o_orderpriority = '1-URGENT' or ord.o_orderpriority = '2-HIGH'), 0) as high_line_count, coalesce(sum(1) filter (where ord.o_orderpriority <> '1-URGENT' and ord.o_orderpriority <> '2-HIGH'), 0) as low_line_count from lineitem li join orders ord on ord.o_orderkey = li.l_orderkey and li.l_shipmode in ('REG AIR', 'FOB') and li.l_commitdate < li.l_receiptdate and li.l_shipdate < li.l_commitdate and li.l_receiptdate >= date '1997-01-01' and li.l_receiptdate < date '1998-01-01' group by li.l_shipmode order by l_shipmode;
+Time Cost: 374.87s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,52 +12,88 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → FILTER_CORRELATE: UCT=1.231
-   → FILTER_AGGREGATE_TRANSPOSE: UCT=1.207
-   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.116
-{"applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_CASE_TO_FILTER"]}
-✅ 选择了 2 个规则
+   → AGGREGATE_ANY_PULL_UP_CONSTANTS: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+{"applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_CASE_TO_FILTER", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "JOIN_TO_CORRELATE"]}
+✅ 选择了 4 个规则
 🔧 开始SQL重写...
-{"applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_CASE_TO_FILTER"], "step_sqls": ["select l_shipmode, sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1998-01-01' group by l_shipmode order by l_shipmode;", "select l_shipmode, sum(1) filter (where o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH') as high_line_count, sum(1) filter (where o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH') as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1998-01-01' group by l_shipmode order by l_shipmode;"], "semantic_correctness_guarantee": "1. 结构性改写一（FILTER_REDUCE_EXPRESSIONS）：将 WHERE 中可静态求值的日期常量表达式 `l_receiptdate < date '1997-01-01' + interval '1' year` 折叠为常量 `l_receiptdate < date '1998-01-01'`。由于 date '1997-01-01' + interval '1' year 在 SQL 语义下恒等于 date '1998-01-01'，该谓词对每一行的求值结果完全相同，仅消除运行期常量计算，不改变过滤结果。\n2. 结构性改写二（AGGREGATE_CASE_TO_FILTER）：将 `sum(case when <cond> then 1 else 0 end)` 改写为 `sum(1) filter (where <cond>)`。对于任意分组，原写法对满足 cond 的行累加 1、不满足的行累加 0，其和等于组内满足 cond 的行数；FILTER 写法只对满足 cond 的行求和（每行贡献 1），同样等于组内满足 cond 的行数。o_orderpriority 为 NOT NULL，且两条件（= '1-URGENT' OR = '2-HIGH' 与 <> '1-URGENT' AND <> '2-HIGH'）互为补集，两个聚合值分别不变。\n3. 两个改写均不触及 JOIN 条件（o_orderkey = l_orderkey）、其余过滤谓词（l_shipmode IN、l_commitdate < l_receiptdate、l_shipdate < l_commitdate、l_receiptdate 范围）、GROUP BY l_shipmode 与 ORDER BY l_shipmode，因此分组键、输出列名（high_line_count、low_line_count）及排序顺序均与原 SQL 一致。\n4. 易误判点说明：CASE 的 ELSE 0 分支被 FILTER 排除后不会产生 NULL 求和问题（FILTER 写法下不满足条件的行不参与求和，空组时 SUM 返回 NULL，与原 CASE 写法在组内全为 0 行时的行为一致——但本查询按 l_shipmode 分组且组内至少有一行参与，两个聚合的 NULL 行为在两种写法下逐组一致）。无重复行或相关子查询语义受影响。"}
+{
+  "applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_CASE_TO_FILTER", "AGGREGATE_JOIN_TRANSPOSE_EXTENDED", "JOIN_TO_CORRELATE"],
+  "step_sqls": [
+    "select l_shipmode, sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1998-01-01' group by l_shipmode order by l_shipmode;",
+    "select l_shipmode, count(*) filter (where o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH') as high_line_count, count(*) filter (where o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH') as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1998-01-01' group by l_shipmode order by l_shipmode;",
+    "select l_shipmode, coalesce(sum(li.line_cnt) filter (where orders.o_orderpriority = '1-URGENT' or orders.o_orderpriority = '2-HIGH'), 0) as high_line_count, coalesce(sum(li.line_cnt) filter (where orders.o_orderpriority <> '1-URGENT' and orders.o_orderpriority <> '2-HIGH'), 0) as low_line_count from orders join (select l_orderkey, l_shipmode, cast(count(*) as integer) as line_cnt from lineitem where l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1998-01-01' group by l_orderkey, l_shipmode) li on orders.o_orderkey = li.l_orderkey group by l_shipmode order by l_shipmode;",
+    "select li.l_shipmode, coalesce(sum(li.line_cnt) filter (where ord.o_orderpriority = '1-URGENT' or ord.o_orderpriority = '2-HIGH'), 0) as high_line_count, coalesce(sum(li.line_cnt) filter (where ord.o_orderpriority <> '1-URGENT' and ord.o_orderpriority <> '2-HIGH'), 0) as low_line_count from (select l_orderkey, l_shipmode, cast(count(*) as integer) as line_cnt from lineitem where l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1998-01-01' group by l_orderkey, l_shipmode) li cross join lateral (select o_orderpriority from orders where orders.o_orderkey = li.l_orderkey) ord group by li.l_shipmode order by l_shipmode;"
+  ],
+  "semantic_correctness_guarantee": "1. FILTER_REDUCE_EXPRESSIONS：仅把常量日期表达式 date '1997-01-01' + interval '1' year 折算为日期常量 date '1998-01-01'（1997 年非闰年，加一年恰为 1998-01-01），谓词 l_receiptdate < date '1998-01-01' 与原式对每一行求值结果完全相同，其余条件与结构未变。\n2. AGGREGATE_CASE_TO_FILTER：SUM(CASE WHEN c THEN 1 ELSE 0 END) 恰等于组内满足 c 的行数；因 o_orderpriority 声明为 NOT NULL，c 永不为 NULL。故改写为 count(*) filter (where c)（c 为两段互补的 o_orderpriority 条件）。选择 count(*) 而非 sum(1) filter 是因为当组内无匹配行时 sum 返回 NULL 而原 CASE 形式返回 0，count(*) filter 对空集返回 0，与原语义逐值相等，且二者结果类型均为 bigint，与原列类型一致。\n3. AGGREGATE_JOIN_TRANSPOSE_EXTENDED：原查询以 o_orderkey = l_orderkey 连接，orders.o_orderkey 是主键，故每个 lineitem 行恰好匹配一条 orders 行（N:1，无扇出放大）。可安全地先按 (l_orderkey, l_shipmode) 对全部只含 lineitem 列的过滤（l_shipmode in (...)、l_commitdate < l_receiptdate、l_shipdate < l_commitdate、l_receiptdate 区间）后的行预聚合为 line_cnt，再与 orders 连接，外层按 l_shipmode 对 line_cnt 求和并用 filter 按 o_orderpriority 拆分。同一 (l_orderkey, l_shipmode) 组内所有行连接到同一订单，其 o_orderpriority 相同，sum(line_cnt) filter 与逐行计数完全一致；line_cnt cast 为 integer 使 sum 结果保持 bigint。因某 shipmode 组可能全部落在互补条件的另一侧，sum filter 可能为 NULL，故加 coalesce(..., 0) 以精确复现原 CASE...ELSE 0 的 0 值语义，列名与类型均不变。\n4. JOIN_TO_CORRELATE：将步骤 3 中与 orders 的内连接改写为 cross join lateral 相关子查询（相关列为 li.l_orderkey = orders.o_orderkey），lateral 内只投影外层需要的 o_orderpriority 一列。由于相关列命中主键，每个外层组至多产生一行；若不命中则该外层行被丢弃，与内连接（含逗号连接）的丢弃语义一致；原始外键关系保证每个 l_orderkey 必有匹配，因此不会额外丢失行。外层 group by li.l_shipmode 与 order by l_shipmode 的分组键、输出列名与排序均与原查询一致。\n5. 综上，四步改写均不改变被聚合的行集合、分组键（l_shipmode）、输出列（l_shipmode, high_line_count, low_line_count）及其 bigint 类型和按 l_shipmode 的排序，最终 SQL 与原始 SQL 在任意合法数据实例上返回逐行逐列相同的结果集。"
+}
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
-ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "重写为：常量折叠、按 (l_orderkey, l_shipmode) 预聚合 line_cnt、经 LATERAL 内连接 orders（o_orderkey 为主键，N:1 不放大基数）、外层按 l_shipmode 对 SUM(line_cnt) FILTER 分侧求和并用 coalesce 复现 CASE...ELSE 0 的零值语义；同一预聚合组内 o_orderpriority 唯一，SUM(CASE) 与分组计数逐值一致，过滤条件未变，结果集等价。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: Scan: SeqScan 2->1, index-like 0->1
 {
-    "equivalent": false,
-    "message": "重写自辩中「FILTER 空组 SUM 返回 NULL 与 CASE ELSE 0 行为一致」的说法有误：CASE WHEN...ELSE 0 在组内无匹配行时返回 0，而 SUM(1) FILTER 在组内无匹配行时返回 NULL，两者在该组上的聚合值不同，属于可核验的结果集差异。",
-    "differences": [
-        {
-            "type": "聚合NULL语义",
-            "description": "当某 l_shipmode 分组内不存在满足条件的行时，原SQL的 sum(case...else 0) 返回 0，重写SQL的 sum(1) filter (where...) 返回 NULL，high_line_count/low_line_count 值不同",
-            "location": "high_line_count 与 low_line_count 聚合表达式"
-        }
-    ]
+  "keep": false,
+  "terminate": false,
+  "reason": "original_cost=2180342.95，rewritten_cost=2438512.18，代价上涨约11.8%，未达数量级。<scan_rows> 由 12854868 上升到 16065530（重写侧先对 lineitem 按 (l_orderkey, l_shipmode) 预聚合再做 Merge Join，orders 侧由 Seq Scan 变为 Index Scan 使扫描行数增加）。<plan_depth> 前后均为 7.0，无改善。重写引入的预聚合子查询未减少代价也未减少扫描行数，且不属于去掉相关 SubPlan 的场景（lateral 相关扫描被规划为 Merge Join，orders 侧估计代价从 323761 升至 650762），总体做了更多工作，代价与扫描行数均上升，不符合保留条件，但上涨未达数量级，不构成数量级恶化。",
+  "next_step_advice": "放弃 AGGREGATE_JOIN_TRANSPOSE_EXTENDED 与 JOIN_TO_CORRELATE 改写，回到基于 join 的形式：保留 FILTER 聚合改写与日期常量折叠，直接对 lineitem 过滤后与 orders 做 join，再对 l_shipmode 分组聚合，即: select l_shipmode, sum(case when o_orderpriority in ('1-URGENT','2-HIGH') then 1 else 0 end) filter 改写为 filter 聚合形式, ... from lineitem join orders on o_orderkey=l_orderkey where <lineitem 过滤条件> group by l_shipmode order by l_shipmode;"
 }
-❌ 语义不等价: 重写自辩中「FILTER 空组 SUM 返回 NULL 与 CASE ELSE 0 行为一致」的说法有误：CASE WHEN...ELSE 0 在组内无匹配行时返回 0，而 SUM(1) FILTER 在组内无匹配行时返回 NULL，两者在该组上的聚合值不同，属于可核验的结果集差异。
-{"fixed_sql": "select l_shipmode, coalesce(sum(1) filter (where o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH'), 0) as high_line_count, coalesce(sum(1) filter (where o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH'), 0) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1998-01-01' group by l_shipmode order by l_shipmode;", "note": "当分组内无满足条件的行时，sum(1) filter 返回 NULL 而原 sum(case...else 0) 返回 0；用 coalesce 将 NULL 归约为 0，保留 FILTER 改写不变。"}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_ANY_PULL_UP_CONSTANTS: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+{"applied_rules":["FILTER_REDUCE_EXPRESSIONS","AGGREGATE_MERGE","FILTER_INTO_JOIN","AGGREGATE_CASE_TO_FILTER"]}
+✅ 选择了 4 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_MERGE", "FILTER_INTO_JOIN", "AGGREGATE_CASE_TO_FILTER"],
+  "step_sqls": [
+    "select li.l_shipmode, coalesce(sum(li.line_cnt) filter (where ord.o_orderpriority = '1-URGENT' or ord.o_orderpriority = '2-HIGH'), 0) as high_line_count, coalesce(sum(li.line_cnt) filter (where ord.o_orderpriority <> '1-URGENT' and ord.o_orderpriority <> '2-HIGH'), 0) as low_line_count from (select l_orderkey, l_shipmode, cast(count(*) as integer) as line_cnt from lineitem where l_shipmode in ('REG AIR', 'FOB') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1997-01-01' and l_receiptdate < date '1998-01-01' group by l_orderkey, l_shipmode) li cross join lateral (select o_orderpriority from orders where orders.o_orderkey = li.l_orderkey) ord group by li.l_shipmode order by l_shipmode;",
+    "select li.l_shipmode, coalesce(sum(case when ord.o_orderpriority = '1-URGENT' or ord.o_orderpriority = '2-HIGH' then 1 end), 0) as high_line_count, coalesce(sum(case when ord.o_orderpriority <> '1-URGENT' and ord.o_orderpriority <> '2-HIGH' then 1 end), 0) as low_line_count from lineitem li cross join lateral (select o_orderpriority from orders where orders.o_orderkey = li.l_orderkey) ord where li.l_shipmode in ('REG AIR', 'FOB') and li.l_commitdate < li.l_receiptdate and li.l_shipdate < li.l_commitdate and li.l_receiptdate >= date '1997-01-01' and li.l_receiptdate < date '1998-01-01' group by li.l_shipmode order by l_shipmode;",
+    "select li.l_shipmode, coalesce(sum(case when ord.o_orderpriority = '1-URGENT' or ord.o_orderpriority = '2-HIGH' then 1 end), 0) as high_line_count, coalesce(sum(case when ord.o_orderpriority <> '1-URGENT' and ord.o_orderpriority <> '2-HIGH' then 1 end), 0) as low_line_count from lineitem li join orders ord on ord.o_orderkey = li.l_orderkey and li.l_shipmode in ('REG AIR', 'FOB') and li.l_commitdate < li.l_receiptdate and li.l_shipdate < li.l_commitdate and li.l_receiptdate >= date '1997-01-01' and li.l_receiptdate < date '1998-01-01' group by li.l_shipmode order by l_shipmode;",
+    "select li.l_shipmode, coalesce(sum(1) filter (where ord.o_orderpriority = '1-URGENT' or ord.o_orderpriority = '2-HIGH'), 0) as high_line_count, coalesce(sum(1) filter (where ord.o_orderpriority <> '1-URGENT' and ord.o_orderpriority <> '2-HIGH'), 0) as low_line_count from lineitem li join orders ord on ord.o_orderkey = li.l_orderkey and li.l_shipmode in ('REG AIR', 'FOB') and li.l_commitdate < li.l_receiptdate and li.l_shipdate < li.l_commitdate and li.l_receiptdate >= date '1997-01-01' and li.l_receiptdate < date '1998-01-01' group by li.l_shipmode order by l_shipmode;"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写总览：第1步 FILTER_REDUCE_EXPRESSIONS 为无操作——原 SQL 中不存在恒真/恒假条件，日期谓词已是常量（date '1997-01-01'、date '1998-01-01'），无需折叠，SQL 保持不变。第2步 AGGREGATE_MERGE 去掉内层按 (l_orderkey, l_shipmode) 的 GROUP BY 与 count(*) 预聚合子查询，将两层聚合合并为对 lineitem×orders 连接结果的按 l_shipmode 单层聚合。第3步 FILTER_INTO_JOIN 把 cross join lateral 改写为等价的 INNER JOIN，并将仅依赖 li 侧的过滤条件（l_shipmode in (...)、l_commitdate < l_receiptdate、l_shipdate < l_commitdate、receiptdate 区间）全部推入 JOIN 的 ON 子句。第4步 AGGREGATE_CASE_TO_FILTER 把 sum(case when P then 1 end) 改写为 sum(1) filter (where P)。\n2. AGGREGATE_MERGE 等价性：内层 line_cnt = count(*) 是按 (l_orderkey, l_shipmode) 分组的行数；外层 sum(li.line_cnt) filter(P) 按 l_shipmode 求和。由于过滤条件 P 只依赖 ord.o_orderpriority，而同一 l_orderkey 对应唯一的 o_orderpriority（orders.o_orderkey 是主键），P 在每个内层分组内取值恒定，故 sum(分组行数 | P) = 满足 P 的明细行数之和，即对连接结果逐行 sum(1)（case when P then 1 end）。lateral 子查询仅含相关谓词 o_orderkey = li.l_orderkey，cross join lateral 与 INNER JOIN ON 该谓词逐行等价（每个 li 行匹配 0 或 1 个 ord 行，o_orderkey 为主键保证至多 1 行；无匹配时两种写法同样丢弃该行），连接不改变基数，因此合并前后分组求和结果完全一致。\n3. FILTER_INTO_JOIN 等价性：推入 ON 的全部条件（l_shipmode in (...)、两个日期不等式、receiptdate 范围）只引用 lineitem 的列，不引用 orders 的列，将其放在 ON 与放在 WHERE 对 INNER JOIN 语义完全相同；不存在跨表条件误下推，也未引入 SELECT * 包裹。\n4. CASE→FILTER 等价性与易误判点：(a) sum(case when P then 1 end) 与 sum(1) filter (where P) 在分组内无满足 P 的行时都返回 NULL，外层 coalesce(..., 0) 延续原 SQL 的语义，统一归为 0，与原查询的 coalesce(sum(...) filter ..., 0) 一致；(b) o_orderpriority 声明为 NOT NULL，'<>\\'1-URGENT\\' and <>\\'2-HIGH\\'' 的 low 过滤不会因 NULL 产生歧义，high/low 两个过滤器对连接结果构成完整划分，与原 SQL 相同；(c) lineitem 各比较谓词原样保留，NULL 行为与原查询完全一致；(d) 输出列名 l_shipmode、high_line_count、low_line_count 及 order by l_shipmode 排序均与原 SQL 保持一致，GROUP BY 键仍为 l_shipmode，聚合分组结果集逐行相等。"
+}
+🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
 DBMS_syntax_Tool ends...
-{"equivalent": true, "message": "当前重写 SQL 已用 COALESCE(..., 0) 包裹 FILTER 聚合，消除了上轮指出的空组/无匹配行时 SUM 返回 NULL 与 CASE ELSE 0 的差异；由于 GROUP BY l_shipmode 的每个分组至少含一行（否则不形成分组），原 sum(case when cond then 1 else 0) 恒等于 coalesce(sum(1) filter cond, 0)，且常量折叠 date '1997-01-01' + interval '1' year = date '1998-01-01' 不改变过滤范围，其余谓词、JOIN、分组、排序均一致，两 SQL 结果集等价。", "differences": []}
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "当前重写 SQL 与原始 SQL 在同一连接结果集上逐行等价：过滤条件全部保留且只下推了仅依赖 lineitem 的条件；sum(case when P then 1 else 0 end) 与 coalesce(sum(1) filter (where P),0) 在每组有/无匹配行时均产生相同结果（后者 NULL 由 coalesce 归 0）；date '1997-01-01'+interval '1' year 折叠为 date '1998-01-01' 精确相同；分组键与排序不变，o_orderkey 主键保证 join 基数不变。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 {
   "keep": true,
   "terminate": true,
-  "reason": "original_cost=2180342.95，rewritten_cost=2180342.95，代价持平；<scan_rows> 两侧均为 12854868.0 不变，<plan_depth> 均为 7.0 不变，执行计划结构完全一致。本轮将 CASE 聚合改写为 sum(1) filter (where ...) 并做常量折叠（date + interval 折叠为 '1998-01-01'），属于逻辑简化，命中条件 4，不会恶化。代价既未降低也未数量级上涨，简化后可读性和表达式求值效率略有提升，保留重写。已无可进一步降低代价的查询重写空间，剩余主要靠 lineitem(l_receiptdate, l_shipmode) 等索引或统计信息等物理手段。",
+  "reason": "original_cost 与 rewritten_cost 均为 2,180,342.95，代价无变化；<scan_rows> 前后均为 12,854,868，<plan_depth> 前后均为 7。两份执行计划结构完全一致，仅做了 CASE 聚合改写为 FILTER 语法的等价改写，属于逻辑简化（命中第 4 条），但执行计划无任何改变。由于已经应用了 FILTER_REDUCE_EXPRESSIONS、AGGREGATE_MERGE、FILTER_INTO_JOIN、AGGREGATE_CASE_TO_FILTER 等规则，查询重写空间已基本穷尽，剩余优化只能依赖索引、统计信息等物理手段。",
   "next_step_advice": "无需下一步优化"
 }
 ℹ️ 记忆跳过：论文收益 R=+0.0000，且估计代价未下降
 
-🎲 UCT Math Update: 2 rules, step_sum=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=2180342.9500, rc=2180342.9500)
+🎲 UCT Math Update: 4 rules, step_sum=+0.1059 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=2180342.9500, rc=2180342.9500)
    结构分细节: rows 12854868.0->12854868.0 (score=+0.000), depth 7.0->7.0 (score=+0.000)
 ✅ UCT Update Complete:
-   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, reward=+0.000, count=11, avg=+0.000
-   → AGGREGATE_CASE_TO_FILTER: P(s,a)=N/A, reward=+0.000, count=4, avg=+0.000
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, reward=+0.000, count=13, avg=+0.000
+   → AGGREGATE_MERGE: P(s,a)=N/A, reward=+0.106, count=1, avg=+0.106
+   → FILTER_INTO_JOIN: P(s,a)=N/A, reward=+0.000, count=20, avg=+0.001
+   → AGGREGATE_CASE_TO_FILTER: P(s,a)=N/A, reward=+0.000, count=6, avg=+0.000
 
 ----------------------------------------
 

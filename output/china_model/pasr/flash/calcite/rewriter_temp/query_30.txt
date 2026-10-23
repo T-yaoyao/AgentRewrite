@@ -3,7 +3,7 @@ Query ID: 30
 
 Original: SELECT MGR, SUM(SUM_SAL) FROM (SELECT MGR, SUM(SAL) AS SUM_SAL FROM EMP GROUP BY MGR, DEPTNO HAVING DEPTNO = 100) AS t2 GROUP BY MGR
 Rewritten: SELECT MGR, SUM(SAL) FROM EMP WHERE DEPTNO = 100 GROUP BY MGR
-Time Cost: 25.15s
+Time Cost: 79.61s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,19 +12,20 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
+   → UNION_REMOVE: UCT=1.198
    → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.187
-   → JOIN_PUSH_TRANSITIVE_PREDICATES: UCT=1.141
    → AGGREGATE_CASE_TO_FILTER: UCT=1.100
-{"applied_rules": ["AGGREGATE_FILTER_TRANSPOSE", "AGGREGATE_MERGE"]}
-✅ 选择了 2 个规则
+{"applied_rules": ["FILTER_AGGREGATE_TRANSPOSE", "AGGREGATE_ANY_PULL_UP_CONSTANTS", "AGGREGATE_MERGE"]}
+✅ 选择了 3 个规则
 🔧 开始SQL重写...
 {
-  "applied_rules": ["AGGREGATE_FILTER_TRANSPOSE", "AGGREGATE_MERGE"],
+  "applied_rules": ["FILTER_AGGREGATE_TRANSPOSE", "AGGREGATE_ANY_PULL_UP_CONSTANTS", "AGGREGATE_MERGE"],
   "step_sqls": [
     "SELECT MGR, SUM(SUM_SAL) FROM (SELECT MGR, SUM(SAL) AS SUM_SAL FROM EMP WHERE DEPTNO = 100 GROUP BY MGR, DEPTNO) AS t2 GROUP BY MGR",
+    "SELECT MGR, SUM(SUM_SAL) FROM (SELECT MGR, SUM(SAL) AS SUM_SAL FROM EMP WHERE DEPTNO = 100 GROUP BY MGR) AS t2 GROUP BY MGR",
     "SELECT MGR, SUM(SAL) FROM EMP WHERE DEPTNO = 100 GROUP BY MGR"
   ],
-  "semantic_correctness_guarantee": "1. 结构性改写一（AGGREGATE_FILTER_TRANSPOSE）：原 SQL 中内层子查询 t2 使用 GROUP BY MGR, DEPTNO 后用 HAVING DEPTNO = 100 过滤。由于 DEPTNO 是内层 GROUP BY 的分组列，HAVING DEPTNO = 100 与在聚合前用 WHERE DEPTNO = 100 过滤在语义上完全等价（分组列在每组内取值唯一），故将过滤下推为 WHERE DEPTNO = 100，并把 HAVING 从内层子查询中移除。\n2. 结构性改写二（AGGREGATE_MERGE）：外层按 MGR 对内层的 SUM(SAL) 再求和。内层按 (MGR, DEPTNO) 分组，其所有分组恰好是对应 MGR 值下分组的划分，因此 SUM(SUM(SAL)) 按 MGR 汇总等价于直接对满足 DEPTNO = 100 的行按 MGR 求 SUM(SAL)，两个嵌套 GROUP BY 被合并为一个聚合。\n3. 结果集等价性：外层仅投影 MGR 与 SUM(SUM_SAL)，未引用内层分组列 DEPTNO 的具体取值；SUM 满足对分组求和的结合律（SUM over SUM over 互不重叠的分组划分 = SUM over 全部行）。DEPTNO = 100 过滤在聚合前执行，参与聚合的行集合与原查询完全相同。\n4. 易误判点核验：(a) NULL 的 MGR 值：原查询与改写后都按 SQL 标准 GROUP BY 语义将 NULL MGR 归为一组，行为一致；(b) 列名：原外层 SUM(SUM_SAL) 与改写后 SUM(SAL) 均为未命名的聚合列，MGR 列名保持不变；(c) WHERE DEPTNO = 100 中 sal 参与聚合的行不含被过滤行，与原 HAVING 语义一致，不存在过滤时机引起的行集差异。"
+  "semantic_correctness_guarantee": "1. FILTER_AGGREGATE_TRANSPOSE：原内层子查询 GROUP BY MGR, DEPTNO HAVING DEPTNO = 100，HAVING 条件只依赖分组键 DEPTNO（字面量比较，无聚合），且该过滤对 t2 的唯一使用处（外层 GROUP BY MGR 聚合）同样成立，因此把 DEPTNO = 100 从 HAVING 下推为子查询内的 WHERE，聚合输入减少但分组结果不变。\n2. AGGREGATE_ANY_PULL_UP_CONSTANTS：下推过滤后，内层分组中 DEPTNO 被约束为常量 100，(MGR, DEPTNO) 的每个分组等价于按 MGR 单独分组（每组内 DEPTNO 恒为 100），故将常量列从 GROUP BY 中分离，按非常量列 MGR 分组即可；外层仅引用 MGR 与 SUM_SAL，不需要在结果中补回 DEPTNO 常量列，因此直接省略该列，不影响外层投影。\n3. AGGREGATE_MERGE：合并后内层为 SELECT MGR, SUM(SAL) ... GROUP BY MGR，外层为 SELECT MGR, SUM(SUM_SAL) ... GROUP BY MGR，两层分组键完全一致（均为 MGR），SUM(SUM(SAL)) 按 MGR 分组求和等于直接对 SAL 按 MGR 求和（加法结合律），故合并为单层 SELECT MGR, SUM(SAL) FROM EMP WHERE DEPTNO = 100 GROUP BY MGR。\n4. 语义等价性：原始查询与最终查询都在 DEPTNO = 100 的行集上按 MGR 分组并对 SAL 求和；DEPTNO 非 NULL 时谓词求值确定，无重复行歧义；结果列 MGR、SUM(SAL) 的名称与顺序与原查询外层输出一致（原查询输出列名为 MGR 与聚合列 sum）。\n5. 易误判点核对：HAVING 下推不改变 NULL 分组处理（DEPTNO NOT NULL 且比较为等值过滤）；原查询外层不含 HAVING/ORDER BY/LIMIT，不涉及排序或截断语义；两次聚合合并未引入或丢失重复行，分组键 MGR 保留 NULL 分组（MGR 可为 NULL，GROUP BY 对 NULL 单独成组的行为在前后完全一致）。"
 }
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
@@ -33,27 +34,57 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{"equivalent": true, "message": "内层按(MGR,DEPTNO)分组且HAVING DEPTNO=100等价于聚合前WHERE过滤，外层SUM(SUM(SAL))按MGR汇总符合SUM(COUNT/SUM)两层聚合折叠规则，与重写SQL语义一致。", "differences": []}
+{"equivalent": true, "message": "原SQL内层按(MGR,DEPTNO)分组且HAVING DEPTNO=100将分组约束为常量DEPTNO=100，等价于按MGR分组；外层SUM(SUM_SAL)对MGR分组满足SUM(SUM(v))->SUM(v)的强折叠规则，重写SQL在此过滤行集上按MGR对SAL求和，结果集一致。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 387.0 -> 286.0 (重写侧约为原的 73.9018%)
+{
+  "keep": true,
+  "terminate": false,
+  "reason": "original_cost=703897.34，rewritten_cost=703894.56，代价略降；scan_rows 从 387 降至 286；plan_depth 从 5 降为 4，减少了一层聚合。命中条件 1、2、3：代价降低、扫描行数下降且无数量级上涨、树深下降且计划结构更优（消除冗余的按 MGR,DEPTNO 分组聚合）。查询仍需全表扫描 emp（45M 行，Filter deptno=100），存在重写空间。",
+  "next_step_advice": "当前查询已是简单分组聚合，主要代价为 emp 全表扫描。可尝试重写利用谓词 deptno=100 的选择性（如先物化过滤结果或改写以配合索引），但 SQL 层面逻辑已简化到位；若无进一步可重写点，可考虑终止并建议在 DEPTNO 上建索引等物理优化手段。"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → UNION_REMOVE: UCT=1.199
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.189
+   → AGGREGATE_CASE_TO_FILTER: UCT=1.100
+{"applied_rules": []}
+✅ 选择了 0 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": [],
+  "step_sqls": [],
+  "semantic_correctness_guarantee": "1. 本次规则序列为空（applied_rules=[]），未选择任何重写规则，因此未对基底 SQL 做任何结构性改写，step_sqls 为空数组。\n2. 上一轮反馈指出查询已简化为简单的按 MGR 分组聚合（SELECT MGR, SUM(SAL) FROM EMP WHERE DEPTNO = 100 GROUP BY MGR），逻辑重写空间已耗尽；针对剩余的 emp 全表扫描代价，属于物理优化范畴（如在 DEPTNO 上建立索引），不属于本次 SQL 逻辑重写规则的适用范围，故依据「规则描述写明不适用的情形就不要套用」的要求终止改写。\n3. 由于未做任何改写，最终查询与原始 SQL 在文本与语义上完全一致：过滤条件 DEPTNO=100、分组键 MGR、聚合 SUM(SAL)、NULL 分组行为（MGR 可为 NULL 时按标准 GROUP BY 语义归为一组）均保持不变，结果集、列名与数据类型完全等价，无需额外的等价性论证点。"
+}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+✅ 语法检查通过
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "原SQL内层按(MGR,DEPTNO)分组且HAVING DEPTNO=100实际等价于WHERE过滤，外层SUM(SUM_SAL)对按MGR单层SUM(SAL)满足SUM(SUM(v))->SUM(v)折叠规则，两SQL结果集相同。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 387.0 -> 286.0 (重写侧约为原的 73.9018%)
 {
   "keep": true,
   "terminate": true,
-  "reason": "original_cost 为 703897.34，rewritten_cost 为 703894.56，代价略微降低；scan_rows 从 387.0 降至 286.0，plan_depth 从 5.0 降至 4.0。重写将聚合+HAVING 转置下推为 WHERE 过滤并合并两层聚合，减少了一层聚合节点和聚合输入行数，计划结构更优。命中条件 1、2、3、4（代价降低、扫描行数下降且未达数量级上涨、树深下降、逻辑简化）。",
+  "reason": "original_cost 703897.34，rewritten_cost 703894.56，代价略有降低；<scan_rows> 由 387.0 降至 286.0，<plan_depth> 由 5.0 降至 4.0。重写将 HAVING 中的 deptno 过滤下推到 WHERE，减少了聚合与连接的输入行数，去掉了双层聚合，逻辑更简化。命中条件：代价降低、扫描行数下降且未达数量级代价上涨、树深下降且计划结构更优。无数量级代价上涨，非性能恶化。",
   "next_step_advice": "无需下一步优化"
 }
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 124
-   - 规则序列: ['AGGREGATE_FILTER_TRANSPOSE', 'AGGREGATE_MERGE']
+   - 规则序列: []
    - 估计代价: 原始=703897.34, 重写=703894.56，相对变化: 0.00%
-✅ 成功存储，记录ID: 4404cb88-7161-49b2-aba1-3763bbd2b8bd
-
-🎲 UCT Math Update: 2 rules, step_sum=+0.0000 (cost=+0.0000, rows=+0.2610, depth=+0.2000, oc=703897.3400, rc=703894.5600)
-   结构分细节: rows 387.0->286.0 (score=+0.261), depth 5.0->4.0 (score=+0.200)
-✅ UCT Update Complete:
-   → AGGREGATE_FILTER_TRANSPOSE: P(s,a)=N/A, reward=+0.000, count=2, avg=-0.012
-   → AGGREGATE_MERGE: P(s,a)=N/A, reward=+0.000, count=4, avg=+0.135
+✅ 成功存储，记录ID: 1e7b7d4b-0aea-4e49-a3b3-35478c9c96cc
 
 ----------------------------------------
 

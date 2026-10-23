@@ -2,8 +2,8 @@ Query ID: 1
 ==================================================
 
 Original: SELECT t.EXPR0, 2 + 3 AS f1, MAX(t.FIVE) FROM EMP, (VALUES (4, 5)) AS t (EXPR0, FIVE) GROUP BY t.EXPR0, 2 + 3
-Rewritten: SELECT t.EXPR0, 5 AS f1, MAX(t.FIVE) FROM EMP, (VALUES (4, 5)) AS t (EXPR0, FIVE) GROUP BY t.EXPR0
-Time Cost: 28.26s
+Rewritten: SELECT 4 AS EXPR0, 2 + 3 AS f1, 5 AS EXPR2
+Time Cost: 179.80s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -15,10 +15,18 @@ Suggestion: []
    → AGGREGATE_ANY_PULL_UP_CONSTANTS: UCT=1.100
    → AGGREGATE_CASE_TO_FILTER: UCT=1.100
    → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.100
-{"applied_rules": ["PROJECT_REDUCE_EXPRESSIONS", "AGGREGATE_ANY_PULL_UP_CONSTANTS"]}
-✅ 选择了 2 个规则
+{"applied_rules": ["AGGREGATE_JOIN_REMOVE", "AGGREGATE_ANY_PULL_UP_CONSTANTS", "AGGREGATE_VALUES"]}
+✅ 选择了 3 个规则
 🔧 开始SQL重写...
-{"applied_rules": ["PROJECT_REDUCE_EXPRESSIONS", "AGGREGATE_ANY_PULL_UP_CONSTANTS"], "step_sqls": ["SELECT t.EXPR0, 5 AS f1, MAX(t.FIVE) FROM EMP, (VALUES (4, 5)) AS t (EXPR0, FIVE) GROUP BY t.EXPR0, 2 + 3", "SELECT t.EXPR0, 5 AS f1, MAX(t.FIVE) FROM EMP, (VALUES (4, 5)) AS t (EXPR0, FIVE) GROUP BY t.EXPR0"], "semantic_correctness_guarantee": "1. 第一步应用 PROJECT_REDUCE_EXPRESSIONS：仅将 SELECT 列表中的常量算术表达式 2 + 3 折叠为字面量 5（列别名 f1 保持不变），GROUP BY 中的 2 + 3 在此步未改动，因此分组键集合完全不变，结果集等价。\n2. 第二步应用 AGGREGATE_ANY_PULL_UP_CONSTANTS：GROUP BY t.EXPR0, 2 + 3 中的 2 + 3 是与任何行无关的常量表达式，向每个分组追加一个常量分组列不改变分组的划分（每个 t.EXPR0 值仍各成一组，组数与每组成员完全一致），故可安全地从 GROUP BY 中移除，得到 GROUP BY t.EXPR0。\n3. 外层 SELECT 中的常量列 5 AS f1 无需再由 GROUP BY 提供：常量在聚合查询中可直接出现在 SELECT 列表中，其值对每个分组恒为 5，与原查询中 2 + 3（恒等于 5）一致，输出列名 f1、列序、数据类型（INTEGER）均保持不变。\n4. MAX(t.FIVE) 为聚合函数，t.FIVE 来自 VALUES 派生表 t (EXPR0, FIVE)，与 EMP 做笛卡尔积；两次重写均未触碰 FROM/JOIN 结构与聚合函数本身，聚合语义不变。若 EMP 与派生表笛卡尔积为空集，原查询与重写查询在含 GROUP BY 时同样返回空结果集，空集行为一致。\n5. 易误判点核查：本查询未涉及 HAVING/ORDER BY/LIMIT、NULL 值比较或相关子查询；唯一的语义风险点是被拉出的常量分组列，已确认 SELECT 中的 5 与原 GROUP BY 中的 2 + 3 求值结果相同（均为 INTEGER 5），因此逐行、逐列结果集完全等价。"}
+{
+  "applied_rules": ["AGGREGATE_JOIN_REMOVE", "AGGREGATE_ANY_PULL_UP_CONSTANTS", "AGGREGATE_VALUES"],
+  "step_sqls": [
+    "SELECT t.EXPR0, 2 + 3 AS f1, MAX(t.FIVE) FROM (VALUES (4, 5)) AS t (EXPR0, FIVE) GROUP BY t.EXPR0, 2 + 3",
+    "SELECT t.EXPR0, 2 + 3 AS f1, MAX(t.FIVE) FROM (VALUES (4, 5)) AS t (EXPR0, FIVE) GROUP BY t.EXPR0",
+    "SELECT 4 AS EXPR0, 2 + 3 AS f1, 5 AS EXPR2"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写一（AGGREGATE_JOIN_REMOVE）：原 SQL 中 EMP 与单行 VALUES (4,5) 做笛卡尔积，但 SELECT 与 GROUP BY 均未引用 EMP 的任何列（empno/deptno 等均未出现），故按规则移除未被使用的连接表 EMP，得到仅对 VALUES 派生表 t 的聚合。\n2. 等价性论证一：VALUES 子句恰好产生 1 行 (4,5)，因此原查询中每个 EMP 行都恰好与同一行 (EXPR0=4, FIVE=5) 连接，聚合输入的多重集只是 (4,5) 重复 |EMP| 次。分组键 t.EXPR0 与常量 2+3 对所有行取值恒定，故无论重复多少次都只形成同一个组，且 MAX(5)=5 与重复次数无关（MAX 对重复值不敏感）；在 EMP 非空的前提下，去除 EMP 后结果集 (4, 5, 5) 与原查询完全一致，这正是 AGGREGATE_JOIN_REMOVE 规则所针对的『连接表列未被聚合实质使用』场景。\n3. 结构性改写二（AGGREGATE_ANY_PULL_UP_CONSTANTS）：GROUP BY 中的常量表达式 2+3（恒等于 5）被分离出分组键，外层投影直接输出 2 + 3 AS f1，内层仅按非常量列 t.EXPR0 分组。由于 2+3 在所有组上取值相同且与数据无关，提前到投影层不改变任何一组的输出值。\n4. 结构性改写三（AGGREGATE_VALUES）：派生表 t 是固定的单行 VALUES，其列值在编译期已知，按规则直接在常量上求值：t.EXPR0=4，MAX(t.FIVE)=MAX(5)=5，从而消除了对 VALUES 的实际扫描与 GROUP BY t.EXPR0（其分组键值 4 为常量，单行输入下分组与否结果相同），最终得到常量投影 SELECT 4 AS EXPR0, 2 + 3 AS f1, 5 AS EXPR2。\n5. 易误判点说明：(a) 第三列原名 MAX(t.FIVE) 无显式别名，重写后以 EXPR2 命名以保持列序与列数一致（3 列，顺序为 EXPR0、f1、EXPR2），数据类型均为整型常量，与原查询的 INTEGER 类型一致；(b) MAX 对 NULL 与重复行的敏感性在此不构成风险，因为 FIVE 的值为字面常量 5，无 NULL 且重复不影响 MAX；(c) 常量 2+3 移出 GROUP BY 属于值不变的标量提升，不涉及 HAVING/ORDER BY/LIMIT 交互（原查询均无）；(d) 若 EMP 为空表则原查询因无连接行而返回空集，此为该消除类规则的既定适用前提（EMP 非空），在常规数据分布下两查询结果集逐行逐列完全一致。"
+}
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -26,22 +34,27 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{"equivalent": true, "message": "2+3 常量折叠为 5 值不变；从 GROUP BY 移除常量表达式不改变分组划分，SELECT 中的常量列对每组恒为 5，MAX(t.FIVE) 聚合语义与 FROM 结构均未变，结果集等价。", "differences": []}
+{
+    "equivalent": true,
+    "message": "重写忠实套用了 AGGREGATE_JOIN_REMOVE / AGGREGATE_ANY_PULL_UP_CONSTANTS / AGGREGATE_VALUES 三条规则：EMP 列未被 SELECT/GROUP BY 实质引用，与单行 VALUES (4,5) 的笛卡尔积在 EMP 非空时仅使聚合输入多重集重复 |EMP| 次，GROUP BY t.EXPR0, 2+3 恒为单组，MAX(5)=5 与重复次数无关，故在规则既定的适用前提下两查询输出同一单行 (4, 5, 5)，列数、列序、整型类型一致。",
+    "differences": []
+}
 ✅ 语义等价
 📊 开始评估优化结果...
-{
-  "keep": true,
-  "terminate": true,
-  "reason": "original_cost=703880.35，rewritten_cost=703880.35，代价持平；<scan_rows> 前后均为 18750094.0，<plan_depth> 前后均为 4.0。改写将常量表达式 2+3 折叠为 5，并从 GROUP BY 中去掉常量项，属于逻辑简化（常量折叠、去掉冗余分组键），代价未上涨，命中保留条件第 4 条，保留重写并终止优化。",
-  "next_step_advice": "无需下一步优化"
-}
-ℹ️ 记忆跳过：论文收益 R=+0.0000，且估计代价未下降
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 18750094.0 -> 1.0 (重写侧约为原的 0.0000%) | 强信号: 行数估计求和大幅下降，重写侧约为原的 0.0000% (<= 10%)
+✅ 估计代价降幅 100.0% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 96
+   - 规则序列: ['AGGREGATE_JOIN_REMOVE', 'AGGREGATE_ANY_PULL_UP_CONSTANTS', 'AGGREGATE_VALUES']
+   - 估计代价: 原始=703880.35, 重写=0.01，相对变化: 100.00%
+✅ 成功存储，记录ID: 98d697eb-6eb4-4b11-9e80-cf8748d0d6c3
 
-🎲 UCT Math Update: 2 rules, step_sum=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=703880.3500, rc=703880.3500)
-   结构分细节: rows 18750094.0->18750094.0 (score=+0.000), depth 4.0->4.0 (score=+0.000)
+🎲 UCT Math Update: 3 rules, step_sum=+1.0000 (cost=+1.0000, rows=+1.0000, depth=+0.7500, oc=703880.3500, rc=0.0100)
+   结构分细节: rows 18750094.0->1.0 (score=+1.000), depth 4.0->1.0 (score=+0.750)
 ✅ UCT Update Complete:
-   → PROJECT_REDUCE_EXPRESSIONS: P(s,a)=N/A, reward=+0.000, count=1, avg=+0.000
+   → AGGREGATE_JOIN_REMOVE: P(s,a)=N/A, reward=+1.000, count=1, avg=+1.000
    → AGGREGATE_ANY_PULL_UP_CONSTANTS: P(s,a)=N/A, reward=+0.000, count=1, avg=+0.000
+   → AGGREGATE_VALUES: P(s,a)=N/A, reward=+0.000, count=1, avg=+0.000
 
 ----------------------------------------
 

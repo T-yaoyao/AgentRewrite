@@ -2,8 +2,8 @@ Query ID: 51
 ==================================================
 
 Original: select dname, ddeptno, c from              (select name dname, deptno ddeptno, count(*) as c              from dept group by grouping sets ((name,deptno),(name))) t               where dname = 'Charlie'
-Rewritten: select name as dname, deptno as ddeptno, c from (select name, deptno, count(*) as c from dept where name = 'Charlie' group by grouping sets ((name,deptno),(name))) t
-Time Cost: 24.46s
+Rewritten: select name as dname, deptno as ddeptno, count(*) as c from dept where name = 'Charlie' group by grouping sets ((name, deptno), (name))
+Time Cost: 372.92s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,13 +12,22 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → SEMI_JOIN_FILTER_TRANSPOSE: UCT=1.247
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.243
-   → JOIN_PUSH_TRANSITIVE_PREDICATES: UCT=1.196
-{"applied_rules": ["PROJECT_FILTER_TRANSPOSE", "FILTER_AGGREGATE_TRANSPOSE"]}
-✅ 选择了 2 个规则
+   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.246
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+{"applied_rules":["FILTER_PROJECT_TRANSPOSE","PROJECT_REMOVE","FILTER_AGGREGATE_TRANSPOSE","PROJECT_AGGREGATE_MERGE"]}
+✅ 选择了 4 个规则
 🔧 开始SQL重写...
-{"applied_rules": ["PROJECT_FILTER_TRANSPOSE", "FILTER_AGGREGATE_TRANSPOSE"], "step_sqls": ["select name as dname, deptno as ddeptno, c from (select name, deptno, count(*) as c from dept group by grouping sets ((name,deptno),(name))) t where name = 'Charlie'", "select name as dname, deptno as ddeptno, c from (select name, deptno, count(*) as c from dept where name = 'Charlie' group by grouping sets ((name,deptno),(name))) t"], "semantic_correctness_guarantee": "1. 结构性改写一（PROJECT_FILTER_TRANSPOSE）：原 SQL 在投影子查询 t 之上用别名 dname 做 WHERE 过滤。第一步把过滤谓词从投影别名 dname 改写为直接引用子查询内部列 name（dname 本就是 name 的别名），即先过滤再投影，输出列名通过外层 as dname / as ddeptno 保持为 dname、ddeptno、c，与原 SQL 输出列名完全一致。\n2. 结构性改写二（FILTER_AGGREGATE_TRANSPOSE）：第二步把只依赖分组键的谓词 name = 'Charlie' 从聚合之上下推到聚合输入（dept 表扫描处），聚合本身（count(*) 与 grouping sets ((name,deptno),(name))）保持不变。\n3. 等价性论证：name 是两个 grouping set（(name,deptno) 与 (name)）共同的分组键。对 (name,deptno) 集，按 (name,deptno) 分组的每个组的 count(*) 只统计该组内行；先过滤 name='Charlie' 只会整体删掉 name≠'Charlie' 的组，不会改变 name='Charlie' 各组的行数。对 (name) 集同理。因此过滤前聚合再过滤 == 过滤后聚合，结果集逐行相同。\n4. 易误判点核验：(a) grouping sets 产生的 NULL（此处两个分组集都不含 grouping() 列，name/deptno 列本身 NOT NULL，不产生聚合 NULL 行）不受影响；(b) 过滤谓词对聚合结果的每一次使用（两个 grouping set）都成立，满足规则前置条件；(c) count(*) 计数语义不受 WHERE 下推影响，因为被过滤掉的行所在组整体不会出现在输出中；(d) 无 ORDER BY/LIMIT，行序无约束。故最终 SQL 与原始 SQL 结果集完全等价。"}
+{
+  "applied_rules": ["FILTER_PROJECT_TRANSPOSE", "PROJECT_REMOVE", "FILTER_AGGREGATE_TRANSPOSE", "PROJECT_AGGREGATE_MERGE"],
+  "step_sqls": [
+    "select name as dname, deptno as ddeptno, c from (select name, deptno, count(*) as c from dept group by grouping sets ((name, deptno), (name))) t where name = 'Charlie'",
+    "select name as dname, deptno as ddeptno, count(*) as c from dept group by grouping sets ((name, deptno), (name)) having name = 'Charlie'",
+    "select name as dname, deptno as ddeptno, count(*) as c from (select * from dept where name = 'Charlie') as s group by grouping sets ((name, deptno), (name))",
+    "select name as dname, deptno as ddeptno, count(*) as c from dept where name = 'Charlie' group by grouping sets ((name, deptno), (name))"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写说明：\n(1) FILTER_PROJECT_TRANSPOSE：原 SQL 中子查询 t 先把 name 重命名为 dname（select name dname ...），外层再对计算/重命名列 dname 做过滤 dname='Charlie'。改写后取消子查询内的重命名投影（子查询只保留 name, deptno, count(*) as c），外层过滤改用原始列 name='Charlie'，重命名移到最外层 select（name as dname, deptno as ddeptno）。由于 name dname 是恒等重命名，谓词 dname='Charlie' 与 name='Charlie' 对同一行取值完全一致。\n(2) PROJECT_REMOVE：第 1 步后外层 select 仅做纯转发/重命名（name→dname, deptno→ddeptno, c→c）并带一个 where。删除这层转发投影：把别名下推进聚合子查询的 select 列表，外层 where 作用于聚合结果行，等价转换为 HAVING name='Charlie'（name 是所有 grouping set 的分组列，可直接在 HAVING 中引用）。\n(3) FILTER_AGGREGATE_TRANSPOSE：HAVING name='Charlie' 只依赖分组键 name，把该过滤从聚合后（HAVING）移到聚合前，形成 (select * from dept where name='Charlie') 作为聚合输入，与规则示例 1 的形式完全对应。\n(4) PROJECT_AGGREGATE_MERGE：(select * from dept where name='Charlie') 仅是对 dept 的纯转发投影，将其与外层聚合合并，得到直接对 dept 做 where + group by grouping sets 的单层查询。\n\n2. 等价性依据（键与相关列）：聚合为 group by grouping sets ((name, deptno), (name))，每个 grouping set 都包含分组列 name；select 列表中的 name、deptno 均为分组列，count(*) 只统计行数，不引用任何被过滤影响的非分组列。过滤谓词 name='Charlie' 是分组列上的等值谓词：同一分组的所有输入行 name 取值相同，因此“先过滤再聚合”与“聚合后按 name 过滤组”对每个分组的成员集合与 count(*) 值完全相同——非 Charlie 的组整组被剔除，Charlie 的组完整保留。故三处过滤位置（外层 where / HAVING / 聚合前 where）结果集一致。\n\n3. 易误判点核验：\n- grouping sets ((name, deptno), (name)) 中第二个集合不含 deptno，对应行 deptno 为 NULL（ddeptno 为 NULL）。所有改写均未触碰 grouping sets 定义与 select 列表，该 NULL 行为在每一步保持不变。\n- 过滤下推未改变 count(*) 的口径：因为谓词只含分组列 name，Charlie 组内没有任何行被额外剔除，计数不变；若谓词含非分组列则不能这样下推，本查询不属此情形。\n- 输出列名与顺序保持为 dname, ddeptno, c，与原 SQL 完全一致；每一步均保留相同别名。\n- PROJECT_REMOVE 中 where→HAVING 的转换：原 where 作用于聚合子查询的输出行（每组一行），HAVING 同样按组过滤，二者逐行等价；且 HAVING 引用的 name 是每个 grouping set 的分组列，语法与语义均合法。\n- 最终 SQL 中 where name='Charlie' 与 group by 的先后由 SQL 语义固定为先 where 后聚合，与第 3 步的子查询形式完全等价，仅消除了纯转发投影层，结果集（含重复行、NULL、列名、隐含顺序）不变。"
+}
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -26,22 +35,24 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{"equivalent": true, "message": "谓词 name='Charlie' 仅依赖两个 grouping set 共同的分组键 name，先过滤后聚合与先聚合后过滤结果集逐行相同，且外层投影列名保持一致，等价。", "differences": []}
+{"equivalent": true, "message": "过滤谓词 name='Charlie' 只作用于分组键 name，将其从聚合后子查询外层下推到聚合前的 WHERE，对每个 grouping set 的组成员集合与 count(*) 均无影响，grouping sets、输出列名与 NULL 语义均保持不变，重写与规则意图一致且无语义偏移。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 1394545.0 -> 50.0 (重写侧约为原的 0.0036%) | 强信号: 行数估计求和大幅下降，重写侧约为原的 0.0036% (<= 10%)
 ✅ 估计代价降幅 90.7% 超过 40%，跳过 LLM 评估，直接终止并保留重写 SQL
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 146
-   - 规则序列: ['PROJECT_FILTER_TRANSPOSE', 'FILTER_AGGREGATE_TRANSPOSE']
+   - 规则序列: ['FILTER_PROJECT_TRANSPOSE', 'PROJECT_REMOVE', 'FILTER_AGGREGATE_TRANSPOSE', 'PROJECT_AGGREGATE_MERGE']
    - 估计代价: 原始=72482.93, 重写=6774.44，相对变化: 90.65%
-✅ 成功存储，记录ID: 23d04897-9b62-4a79-90b1-427ac8c6997a
+✅ 成功存储，记录ID: 07c3a82a-caf4-4096-94b1-c79bb439e9fc
 
-🎲 UCT Math Update: 2 rules, step_sum=+0.9065 (cost=+0.9065, rows=+1.0000, depth=+0.0000, oc=72482.9300, rc=6774.4400)
+🎲 UCT Math Update: 4 rules, step_sum=+0.9065 (cost=+0.9065, rows=+1.0000, depth=+0.0000, oc=72482.9300, rc=6774.4400)
    结构分细节: rows 1394545.0->50.0 (score=+1.000), depth 4.0->4.0 (score=+0.000)
 ✅ UCT Update Complete:
-   → PROJECT_FILTER_TRANSPOSE: P(s,a)=N/A, reward=+0.000, count=1, avg=+0.000
-   → FILTER_AGGREGATE_TRANSPOSE: P(s,a)=N/A, reward=+0.907, count=4, avg=+0.227
+   → FILTER_PROJECT_TRANSPOSE: P(s,a)=N/A, reward=+0.000, count=5, avg=+0.000
+   → PROJECT_REMOVE: P(s,a)=N/A, reward=+0.907, count=8, avg=+0.060
+   → FILTER_AGGREGATE_TRANSPOSE: P(s,a)=N/A, reward=+0.000, count=8, avg=+0.081
+   → PROJECT_AGGREGATE_MERGE: P(s,a)=N/A, reward=+0.000, count=4, avg=+0.000
 
 ----------------------------------------
 

@@ -197,17 +197,17 @@
     },
     {
         "id": "FILTER_INTO_JOIN",
-        "description": "将只依赖某一侧表的 WHERE 条件推入 JOIN 的 ON 或该表的子查询。推入子查询时只投影后续需要的列，不要用 SELECT * 包住大表。",
+        "description": "将只依赖某一侧输入的 WHERE 条件推入该侧：可并入 INNER JOIN 的 ON，或推入该侧子查询/派生表。推入子查询时只投影后续需要的列，不要用 SELECT * 包住大表。本规则只做谓词下推与列裁剪，不改变连接写法与连接条件集合。",
         "examples": [
             {
                 "original_query": "SELECT t1.*, t2.* FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.val > 100",
                 "rewritten_query": "SELECT t1.*, t2.* FROM t1 JOIN t2 ON t1.id = t2.id AND t1.val > 100",
-                "example_description": "覆盖将只依赖左表的WHERE条件并入INNER JOIN的ON条件。"
+                "example_description": "只依赖左表的 WHERE 条件并入 INNER JOIN 的 ON。"
             },
             {
                 "original_query": "SELECT t1.*, t2.name FROM t1 JOIN t2 ON t1.id = t2.id WHERE t2.status = 'ACTIVE'",
                 "rewritten_query": "SELECT t1.*, t2_filtered.name FROM t1 JOIN (SELECT id, name FROM t2 WHERE status = 'ACTIVE') AS t2_filtered ON t1.id = t2_filtered.id",
-                "example_description": "覆盖将只依赖一侧的 WHERE 条件推入该表子查询，并只投影后续需要的列。"
+                "example_description": "只依赖一侧的 WHERE 推入该表子查询，并只投影后续需要的列。"
             }
         ]
     },
@@ -413,11 +413,17 @@
     },
     {
         "id": "JOIN_PUSH_TRANSITIVE_PREDICATES",
-        "description": "利用传递性（如A.x=B.x且B.x=1推出A.x=1）向左右两侧推条件。",
+        "description": "在等值连接上利用传递性，把已有的等值或常量谓词推到对侧（如 A.x=B.x 且 A.x=1 ⇒ B.x=1）。只推导等值链上的等值/常量谓词；不要用不等价关系推导新的列间比较。",
         "examples": [
             {
                 "original_query": "SELECT t1.*, t2.* FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.id = 5",
-                "rewritten_query": "SELECT t1.*, t2.* FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.id = 5 AND t2.id = 5"
+                "rewritten_query": "SELECT t1.*, t2.* FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.id = 5 AND t2.id = 5",
+                "example_description": "等值连接上把常量谓词传到对侧（t1.id=5 ⇒ t2.id=5）。"
+            },
+            {
+                "original_query": "SELECT t1.*, t2.*, t3.* FROM t1 JOIN t2 ON t1.id = t2.id JOIN t3 ON t2.id = t3.id WHERE t1.id = 5",
+                "rewritten_query": "SELECT t1.*, t2.*, t3.* FROM t1 JOIN t2 ON t1.id = t2.id JOIN t3 ON t2.id = t3.id WHERE t1.id = 5 AND t2.id = 5 AND t3.id = 5",
+                "example_description": "沿等值链把常量谓词传到所有可达侧。"
             }
         ]
     },
@@ -549,11 +555,12 @@
     },
     {
         "id": "PROJECT_JOIN_TRANSPOSE",
-        "description": "把投影上提到JOIN之上或下推到左右输入中，只保留后续需要的列。",
+        "description": "把投影上提到JOIN之上或下推到左右输入中，只保留后续需要的列。本规则不改JOIN形态：不把逗号连接改成显式JOIN，不改ON/WHERE中的连接条件与连接顺序；只需列裁剪时才用。",
         "examples": [
             {
                 "original_query": "SELECT t1.id, t2.val FROM t1 JOIN t2 ON t1.id = t2.id",
-                "rewritten_query": "SELECT l.id, r.val FROM (SELECT id FROM t1) AS l JOIN (SELECT id, val FROM t2) AS r ON l.id = r.id"
+                "rewritten_query": "SELECT l.id, r.val FROM (SELECT id FROM t1) AS l JOIN (SELECT id, val FROM t2) AS r ON l.id = r.id",
+                "example_description": "JOIN … ON 保持不变，只裁两侧投影列。"
             }
         ]
     },
@@ -771,32 +778,32 @@
     },
     {
         "id": "STRATEGY_CTE_DECOMPOSITION",
-        "description": "将子查询或过滤逻辑提取为标准 CTE (WITH ... AS ...)。过滤放进 CTE；原来用 IN 子查询过滤时，CTE 按连接键去重，外层直接连接，不要在外面再留一层 IN。同一过滤或同一标量子查询被多处使用时合成一个 CTE。选择性条件在小表上时，先滤成小结果再连接大表。一个过滤对聚合的每一次使用都成立时，可以把该过滤放进这个聚合；不能作用于其他使用处的过滤留在外面，不要复制聚合。",
+        "description": "将可复用的子查询或过滤逻辑提取为标准 CTE (WITH ... AS ...)。过滤放进 CTE；IN 子查询过滤时按连接键去重后外层直接连接，不要在外面再留一层 IN。语义相同的过滤或标量子查询在多处出现时，只定义一次 CTE 并多处引用。选择性条件在小表上时，先滤成小结果再连接大表。过滤对聚合的每一次使用都成立时可放进该聚合；仅部分使用处成立的过滤留在外面，不要复制聚合。",
         "examples": [
             {
                 "original_query": "SELECT l.order_id, p.part_name FROM lineitem AS l JOIN part AS p ON l.part_id = p.part_id WHERE p.type = 'RARE'",
                 "rewritten_query": "WITH p_filtered AS (SELECT part_id, part_name FROM part WHERE type = 'RARE') SELECT l.order_id, p_filtered.part_name FROM lineitem AS l JOIN p_filtered ON l.part_id = p_filtered.part_id",
-                "example_description": "覆盖将JOIN输入侧的过滤逻辑提取为标准CTE。"
+                "example_description": "将 JOIN 输入侧的过滤提取为标准 CTE。"
             },
             {
                 "original_query": "SELECT t1.* FROM t1 WHERE t1.id IN (SELECT t2.id FROM t2 WHERE t2.status = 'ACTIVE')",
                 "rewritten_query": "WITH active_t2 AS (SELECT DISTINCT id FROM t2 WHERE status = 'ACTIVE') SELECT t1.* FROM t1 JOIN active_t2 ON t1.id = active_t2.id",
-                "example_description": "将子查询或过滤逻辑提取为标准CTE (WITH ... AS ...)。过滤放进 CTE 并按连接键去重，外层直接连接这个 CTE，不要在 CTE 外面再留一层 IN 子查询。"
+                "example_description": "IN 过滤抽成 CTE，按连接键去重后外层直接连接。"
             },
             {
                 "original_query": "SELECT COUNT(*) FROM t1, t2, t3 WHERE t1.a = t2.id AND t1.b = t3.id AND t2.flag = 'Y' AND t3.code = 'M'",
                 "rewritten_query": "WITH t2f AS (SELECT id FROM t2 WHERE flag = 'Y'), t3f AS (SELECT id FROM t3 WHERE code = 'M') SELECT COUNT(*) FROM t1 JOIN t2f ON t1.a = t2f.id JOIN t3f ON t1.b = t3f.id",
-                "example_description": "选择性条件在小表上时，抽成只含连接键的 CTE，再连接大表。"
+                "example_description": "小表选择性过滤抽成只含连接键的 CTE，再连接大表。"
             },
             {
                 "original_query": "SELECT t1.v FROM t1 WHERE t1.d IN (SELECT id FROM dim WHERE flag = 'Y') UNION ALL SELECT t2.v FROM t2 WHERE t2.d IN (SELECT id FROM dim WHERE flag = 'Y')",
                 "rewritten_query": "WITH d AS (SELECT DISTINCT id FROM dim WHERE flag = 'Y') SELECT t1.v FROM t1 JOIN d ON t1.d = d.id UNION ALL SELECT t2.v FROM t2 JOIN d ON t2.d = d.id",
-                "example_description": "多处相同的 IN 过滤合成一个 CTE，按连接键去重后再连接，避免重复 id 把外层行乘多。"
+                "example_description": "多处相同过滤只定义一次 CTE 并多处引用。"
             },
             {
                 "original_query": "WITH s AS (SELECT deptno, job, SUM(sal) AS total FROM emp GROUP BY deptno, job) SELECT deptno, total FROM s WHERE deptno = 10 AND job = 'CLERK' AND total > (SELECT AVG(s2.total) FROM s s2 WHERE s2.deptno = s.deptno)",
                 "rewritten_query": "WITH s AS (SELECT deptno, job, SUM(sal) AS total FROM emp WHERE deptno = 10 GROUP BY deptno, job) SELECT deptno, total FROM s WHERE job = 'CLERK' AND total > (SELECT AVG(s2.total) FROM s s2 WHERE s2.deptno = s.deptno)",
-                "example_description": "分组键上的过滤对相关平均值也成立，所以放进这一个聚合。不能作用于平均值的职位过滤留在外面，不要复制聚合。"
+                "example_description": "对所有使用处成立的过滤放进聚合；仅部分成立的过滤留在外面。"
             }
         ]
     },

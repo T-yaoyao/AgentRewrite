@@ -3,7 +3,7 @@ Query ID: 40
 
 Original: select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-05-01' and l_shipdate < date '1995-05-01' + interval '1' month;
 Rewritten: select 100.00 * coalesce(sum(l_extendedprice * (1 - l_discount)) filter (where p_type like 'PROMO%'), 0) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-05-01' and l_shipdate < date '1995-06-01';
-Time Cost: 86.10s
+Time Cost: 64.38s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,19 +12,19 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → FILTER_CORRELATE: UCT=1.231
-   → FILTER_AGGREGATE_TRANSPOSE: UCT=1.207
-   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.125
-{"applied_rules":["FILTER_REDUCE_EXPRESSIONS","AGGREGATE_CASE_TO_FILTER"]}
+   → AGGREGATE_ANY_PULL_UP_CONSTANTS: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+{"applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_CASE_TO_FILTER"]}
 ✅ 选择了 2 个规则
 🔧 开始SQL重写...
 {
   "applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_CASE_TO_FILTER"],
   "step_sqls": [
     "select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-05-01' and l_shipdate < date '1995-06-01';",
-    "select 100.00 * sum(l_extendedprice * (1 - l_discount)) filter (where p_type like 'PROMO%') / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-05-01' and l_shipdate < date '1995-06-01';"
+    "select 100.00 * coalesce(sum(l_extendedprice * (1 - l_discount)) filter (where p_type like 'PROMO%'), 0) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-05-01' and l_shipdate < date '1995-06-01';"
   ],
-  "semantic_correctness_guarantee": "1. 结构性改写一（FILTER_REDUCE_EXPRESSIONS）：将 WHERE 中可静态求值的日期常量表达式 date '1995-05-01' + interval '1' month 折叠为日期常量 date '1995-06-01'。该表达式不涉及任何列，在标准日历语义下 1995-05-01 加一个月即为 1995-06-01，故过滤条件 l_shipdate < date '1995-06-01' 与原条件完全等价，不改变参与聚合的行集。\n2. 结构性改写二（AGGREGATE_CASE_TO_FILTER）：把 sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) 改写为 sum(l_extendedprice * (1 - l_discount)) filter (where p_type like 'PROMO%')。二者区别仅在于：CASE 版本把不满足条件的行贡献为 0 参与求和，FILTER 版本把不满足条件的行直接排除出求和。由于这些行的 CASE 贡献值恒为数值 0（l_extendedprice、l_discount 均为 NOT NULL 的 decimal，乘加结果非 NULL），0 的累加不影响 SUM 结果，且二者都不改变其他行的贡献，因此聚合值逐行等价；同时两版本的 SUM 输入集合均非空受限（否则两边同为 NULL/等价退化，且原查询 SUM(l_extendedprice*(1-l_discount)) 含全部行，分母非空），语义一致。\n3. 分母 sum(l_extendedprice * (1 - l_discount)) 未被改写，仍对 JOIN 后所有满足日期条件的行求和，与原 SQL 完全一致，避免了对同一聚合的重复复制。\n4. 未改动 FROM（lineitem, part 的笛卡尔积加等值连接条件 l_partkey = p_partkey）、输出列名 promo_revenue 及整体标量聚合结构，结果集的列名、类型和值与原 SQL 一致；本查询无 GROUP BY/ORDER BY/LIMIT，无可受影响的重排语义。"
+  "semantic_correctness_guarantee": "1. 结构性改写一（FILTER_REDUCE_EXPRESSIONS）：仅将 WHERE 中的日期常量表达式 date '1995-05-01' + interval '1' month 折叠为等价日期常量 date '1995-06-01'（一个月的日历加法结果确定），并保留原有的 l_partkey = p_partkey 连接条件与 l_shipdate 下界过滤，未删除或新增任何谓词，过滤范围完全一致。\n2. 结构性改写二（AGGREGATE_CASE_TO_FILTER）：把 SUM(CASE WHEN p_type like 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0 END) 改写为 SUM(l_extendedprice * (1 - l_discount)) FILTER (WHERE p_type like 'PROMO%')。由于原 CASE 的 ELSE 分支贡献 0，对 SUM 而言这些行不改变聚合值，故在至少有一行匹配 promo 条件时两者逐值相等。\n3. NULL 边界处理：当没有任何行满足 p_type like 'PROMO%' 时，原 CASE 写法对全表求和得到 0，而 FILTER 写法对空集求和得到 NULL。为严格保持与原 SQL 等价，外层加 COALESCE(..., 0)，使该边界场景下结果仍为 0，promo_revenue 的计算结果与原查询完全一致（包括分母 sum(l_extendedprice * (1 - l_discount)) 保持不变）。\n4. 其他语义点：查询为无 GROUP BY 的单行聚合；FROM lineitem, part 的隐式内连接及连接谓词未改动；聚合输入表达式 l_extendedprice * (1 - l_discount) 在两种写法中逐字符相同，不涉及重复行去重或排序问题；输出列名 promo_revenue 保持不变。\n5. 可逐条核验：审计员可对比 (a) date 常量折叠前后的 WHERE 子句，(b) CASE-ELSE-0 与 FILTER+COALESCE 在匹配行数 ≥1 与 =0 两种情形下的求和值，(c) 分母聚合与连接条件未发生任何变化。"
 }
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
@@ -33,33 +33,13 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
-{
-    "equivalent": false,
-    "message": "日期常量折叠等价，但 CASE...ELSE 0 改写为 FILTER 在『窗口内无 PROMO% 行』时改变了结果：原 SQL 分子 SUM 恒为 0（结果为 0.00），FILTER 版分子 SUM 为 NULL（整体为 NULL），自辩中『0 的累加不影响 SUM』忽略了空集时 FILTER SUM=NULL 的退化情形。",
-    "differences": [
-        {
-            "type": "NULL语义/空集聚合差异",
-            "description": "原 SQL 中 sum(case when p_type like 'PROMO%' then ... else 0 end) 在无 PROMO 行时返回 0，promo_revenue=100.00*0/分母=0；重写 SQL 的 sum(...) filter (where p_type like 'PROMO%') 在无 PROMO 行时返回 NULL，promo_revenue 为 NULL，两者结果集不同。",
-            "location": "SELECT 分子聚合 sum(...) filter (where p_type like 'PROMO%')"
-        }
-    ]
-}
-❌ 语义不等价: 日期常量折叠等价，但 CASE...ELSE 0 改写为 FILTER 在『窗口内无 PROMO% 行』时改变了结果：原 SQL 分子 SUM 恒为 0（结果为 0.00），FILTER 版分子 SUM 为 NULL（整体为 NULL），自辩中『0 的累加不影响 SUM』忽略了空集时 FILTER SUM=NULL 的退化情形。
-{"fixed_sql": "select 100.00 * coalesce(sum(l_extendedprice * (1 - l_discount)) filter (where p_type like 'PROMO%'), 0) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-05-01' and l_shipdate < date '1995-06-01';", "note": "不等价点在分子聚合：无 PROMO 行时 FILTER 版 sum 返回 NULL 而原 CASE 版返回 0，故对分子聚合外层加 coalesce(..., 0) 使空集时结果与原 SQL 一致，其余改写保持不变。"}
-DBMS_syntax_Tool starts...
-{'flag': True, 'error': None}
-DBMS_syntax_Tool ends...
-{
-    "equivalent": true,
-    "message": "当前重写已用 coalesce 修复了上轮 FILTER 空集时分子为 NULL 的问题：无 PROMO 行时分子为 0 与原 CASE 版一致；日期常量折叠与 CASE->FILTER 在 l_extendedprice/l_discount 均 NOT NULL（贡献值恒为非空 0）下逐行等价，分母未变，结果集相同。",
-    "differences": []
-}
+{"equivalent": true, "message": "常量折叠 date '1995-05-01'+interval '1' month 与 date '1995-06-01' 等价；SUM(CASE...ELSE 0 END) 在 l_extendedprice/l_discount 均非 NULL 的 Schema 约束下与 SUM(...) FILTER + COALESCE 逐值等价（含 promo 匹配行为 0 行时两者结果均为 0），分母与连接/过滤条件未变，单行聚合语义一致。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 {
   "keep": true,
   "terminate": true,
-  "reason": "original_cost=1581581.85，rewritten_cost=1581581.85，代价不变；scan_rows 前后均为 2295306.0，plan_depth 前后均为 6.0，执行计划结构完全一致（Hash Join + Seq Scan，瓶颈仍是 lineitem 全表扫描）。重写做了常量折叠（'1995-05-01' + interval '1' month 折叠为 '1995-06-01'）并将 CASE WHEN 聚合改写为 FILTER 子句，属于逻辑简化，运行时无需逐行求值 CASE 分支，命中规则4：代价未降低但逻辑简化，且无数量级代价上涨。计划中已无进一步可重写空间，剩余优化属于索引、统计信息等物理手段。",
+  "reason": "original_cost=1,581,581.85，rewritten_cost=1,581,581.85，代价无变化；<scan_rows> 前后均为 2,295,306.0，<plan_depth> 前后均为 6.0，执行计划结构完全一致（CASE 聚合改为 FILTER 聚合、常量折叠 date + interval 为 '1995-06-01' 均不影响计划）。命中第 4 条：估计代价未降低但发生逻辑简化（CASE WHEN 改写为 FILTER 聚合、日期常量折叠），语义等价且执行计划无任何恶化，保留当前 SQL 并终止优化。",
   "next_step_advice": "无需下一步优化"
 }
 ℹ️ 记忆跳过：论文收益 R=+0.0000，且估计代价未下降
@@ -67,8 +47,8 @@ DBMS_syntax_Tool ends...
 🎲 UCT Math Update: 2 rules, step_sum=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=1581581.8500, rc=1581581.8500)
    结构分细节: rows 2295306.0->2295306.0 (score=+0.000), depth 6.0->6.0 (score=+0.000)
 ✅ UCT Update Complete:
-   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, reward=+0.000, count=12, avg=+0.000
-   → AGGREGATE_CASE_TO_FILTER: P(s,a)=N/A, reward=+0.000, count=5, avg=+0.000
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, reward=+0.000, count=14, avg=+0.000
+   → AGGREGATE_CASE_TO_FILTER: P(s,a)=N/A, reward=+0.000, count=7, avg=+0.000
 
 ----------------------------------------
 

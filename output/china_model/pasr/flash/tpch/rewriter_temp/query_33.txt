@@ -2,8 +2,22 @@ Query ID: 33
 ==================================================
 
 Original: select ps_partkey, sum(ps_supplycost * ps_availqty) as value from partsupp, supplier, nation where ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_name = 'JORDAN' group by ps_partkey having sum(ps_supplycost * ps_availqty) > ( select sum(ps_supplycost * ps_availqty) * 0.0001000000 from partsupp, supplier, nation where ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_name = 'JORDAN' ) order by value desc;
-Rewritten: WITH filtered_supply AS (SELECT ps_partkey, ps_supplycost, ps_availqty FROM partsupp JOIN supplier ON ps_suppkey = s_suppkey JOIN nation ON s_nationkey = n_nationkey AND n_name = 'JORDAN'), total_cost AS (SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000 AS total_threshold FROM filtered_supply) SELECT f.ps_partkey, SUM(f.ps_supplycost * f.ps_availqty) AS value FROM filtered_supply f GROUP BY f.ps_partkey HAVING SUM(f.ps_supplycost * f.ps_availqty) > (SELECT total_threshold FROM total_cost) ORDER BY value DESC;
-Time Cost: 38.61s
+Rewritten: WITH filtered_supply AS (
+  SELECT ps_partkey, ps_supplycost, ps_availqty
+  FROM partsupp
+  JOIN supplier ON ps_suppkey = s_suppkey
+  JOIN (SELECT n_nationkey FROM nation WHERE n_name = 'JORDAN') AS n
+    ON s_nationkey = n.n_nationkey
+)
+SELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value
+FROM filtered_supply
+GROUP BY ps_partkey
+HAVING SUM(ps_supplycost * ps_availqty) > (
+  SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000
+  FROM filtered_supply
+)
+ORDER BY value DESC;
+Time Cost: 46.38s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🔍 计划分析器开始分析...
@@ -11,19 +25,19 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → FILTER_CORRELATE: UCT=1.231
-   → FILTER_AGGREGATE_TRANSPOSE: UCT=1.207
-   → JOIN_SUB_QUERY_TO_CORRELATE: UCT=1.121
+   → AGGREGATE_ANY_PULL_UP_CONSTANTS: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.100
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
 {"applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN"]}
 ✅ 选择了 2 个规则
 🔧 开始SQL重写...
 {
   "applied_rules": ["STRATEGY_CTE_DECOMPOSITION", "FILTER_INTO_JOIN"],
   "step_sqls": [
-    "WITH filtered_supply AS (SELECT ps_partkey, ps_supplycost, ps_availqty FROM partsupp, supplier, nation WHERE ps_suppkey = s_suppkey AND s_nationkey = n_nationkey AND n_name = 'JORDAN'), total_cost AS (SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000 AS total_threshold FROM filtered_supply) SELECT f.ps_partkey, SUM(f.ps_supplycost * f.ps_availqty) AS value FROM filtered_supply f GROUP BY f.ps_partkey HAVING SUM(f.ps_supplycost * f.ps_availqty) > (SELECT total_threshold FROM total_cost) ORDER BY value DESC;",
-    "WITH filtered_supply AS (SELECT ps_partkey, ps_supplycost, ps_availqty FROM partsupp JOIN supplier ON ps_suppkey = s_suppkey JOIN nation ON s_nationkey = n_nationkey AND n_name = 'JORDAN'), total_cost AS (SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000 AS total_threshold FROM filtered_supply) SELECT f.ps_partkey, SUM(f.ps_supplycost * f.ps_availqty) AS value FROM filtered_supply f GROUP BY f.ps_partkey HAVING SUM(f.ps_supplycost * f.ps_availqty) > (SELECT total_threshold FROM total_cost) ORDER BY value DESC;"
+    "WITH filtered_supply AS (\n  SELECT ps_partkey, ps_supplycost, ps_availqty\n  FROM partsupp, supplier, nation\n  WHERE ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'JORDAN'\n)\nSELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value\nFROM filtered_supply\nGROUP BY ps_partkey\nHAVING SUM(ps_supplycost * ps_availqty) > (\n  SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000\n  FROM filtered_supply\n)\nORDER BY value DESC;",
+    "WITH filtered_supply AS (\n  SELECT ps_partkey, ps_supplycost, ps_availqty\n  FROM partsupp\n  JOIN supplier ON ps_suppkey = s_suppkey\n  JOIN (SELECT n_nationkey FROM nation WHERE n_name = 'JORDAN') AS n\n    ON s_nationkey = n.n_nationkey\n)\nSELECT ps_partkey, SUM(ps_supplycost * ps_availqty) AS value\nFROM filtered_supply\nGROUP BY ps_partkey\nHAVING SUM(ps_supplycost * ps_availqty) > (\n  SELECT SUM(ps_supplycost * ps_availqty) * 0.0001000000\n  FROM filtered_supply\n)\nORDER BY value DESC;"
   ],
-  "semantic_correctness_guarantee": "1. 结构性改写一（STRATEGY_CTE_DECOMPOSITION）：原 SQL 中外层查询与 HAVING 里的标量子查询使用了完全相同的三个表连接和同一过滤 n_name = 'JORDAN'，只是聚合方式不同（按 ps_partkey 分组求和 vs 全局求和）。按照规则，将这个被多处使用的共享过滤+连接抽成 CTE filtered_supply，其中只投影后续需要的列 ps_partkey、ps_supplycost、ps_availqty；阈值标量子查询改写为第二个 CTE total_cost，从 filtered_supply 汇总，避免了对 partsupp/supplier/nation 的重复扫描和过滤逻辑的复制。\n2. 结构性改写二（FILTER_INTO_JOIN）：把 CTE 内原来的逗号隐式连接改写为显式 INNER JOIN，并遵循规则将只依赖 nation 表的谓词 n_name = 'JORDAN' 下推进 nation 的 JOIN ON 条件（s_nationkey = n_nationkey AND n_name = 'JORDAN'），连接键条件 ps_suppkey = s_suppkey、s_nationkey = n_nationkey 保持为各自 JOIN 的 ON 条件，连接顺序与原隐式连接等价。\n3. 等价性论证（共享聚合 CTE）：filtered_supply 与原查询中『WHERE ps_suppkey = s_suppkey AND s_nationkey = n_nationkey AND n_name = JORDAN 的 partsupp⋈supplier⋈nation』产生完全相同的行集（同样的内连接与过滤，无 DISTINCT、无去重，行数与重复情况一致）；part_value 类分组聚合 SUM(ps_supplycost * ps_availqty) GROUP BY ps_partkey 与原外层 GROUP BY 逐行对应，分组键 ps_partkey 来自同一行集，故每个分组的聚合值完全相同。\n4. 等价性论证（阈值子查询）：total_threshold = SUM(ps_supplycost * ps_availqty) * 0.0001000000 在 filtered_supply 全行集上计算，与原标量子查询在相同行集上计算的结果一致（数值列均 NOT NULL，乘加无 NULL 语义差异；若行集为空，两侧的 SUM 均为 NULL，HAVING 中 NULL 比较同样导致外层无行返回，行为一致）。\n5. 易误判点核验：HAVING 中的比较对象由相关位置的标量子查询改为对 total_cost 的标量子查询（total_cost 恰好一行一列，标量语义不变）；输出列名保持 ps_partkey 与 value，ORDER BY value DESC 的排序语义不变；过滤 n_name = 'JORDAN' 对外层分组聚合与阈值聚合的每一次使用都成立（两者都限定 JORDAN），因此放进共享 CTE 不改变任何一处聚合的输入范围，未复制聚合，语义等价。"
+  "semantic_correctness_guarantee": "1. 结构性改写一（STRATEGY_CTE_DECOMPOSITION）：原 SQL 中外层查询与 HAVING 中的标量子查询使用了完全相同的三表连接与过滤（ps_suppkey = s_suppkey AND s_nationkey = n_nationkey AND n_name = 'JORDAN'），将其提取为共享 CTE filtered_supply，外层 GROUP BY 聚合和 HAVING 中的标量子查询均从该 CTE 读取。按规则描述『一个过滤对聚合的每一次使用都成立时，可以把该过滤放进这个聚合』，n_name = 'JORDAN' 同时作用于外层求和与子查询总求和，故将其放入 CTE 对两处使用均成立；CTE 是逻辑视图，被引用两次在语义上等价于原 SQL 中重复书写两次相同的 FROM/WHERE，不改变行集。\n2. 结构性改写二（FILTER_INTO_JOIN）：将只依赖 nation 单表的谓词 n_name = 'JORDAN' 从 WHERE 推入 nation 的派生表子查询，并按规则要求只投影后续连接所需的列 n_nationkey；同时把逗号连接改写为显式 INNER JOIN，连接条件 ps_suppkey = s_suppkey 与 s_nationkey = n.n_nationkey 保持不变。\n3. 等价性依据：所有被下推/提取的谓词均不跨表引用（n_name 只依赖 nation），在 INNER JOIN 语义下把单表过滤移到连接输入侧不改变结果；nation 中满足 n_name='JORDAN' 的 n_nationkey 集合不变，因此与 supplier 的连接结果不变，进而 partsupp 的连接与聚合结果不变。\n4. 易误判点核验：(a) 未使用 DISTINCT 去重——本例不是 IN 子查询过滤场景，而是 join + 聚合，n_nationkey 在 nation 中唯一（国家名到主键的映射），且原 SQL 本就是直接连接，无需去重；(b) HAVING 与标量子查询的比较、ORDER BY value DESC 的排序键与方向均原样保留；(c) partsupp/supplier/nation 相关列均 NOT NULL，不存在 NULL 三值逻辑导致的语义差异；(d) 输出列名 ps_partkey、value 与原 SQL 完全一致。\n5. 最终 SQL（step_sqls 最后一项）与原始 SQL 在相同 Schema 下返回相同的结果集（相同的 ps_partkey 分组、相同的 value 值、相同的过滤阈值与排序）。"
 }
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
@@ -32,27 +46,27 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN_TIMEOUT
-{"equivalent": true, "message": "重写将共享的过滤+连接抽为 CTE，并把 n_name 过滤推入 JOIN ON；filtered_supply 与原 FROM-WHERE 行集相同，外层分组聚合与阈值子查询均在同一行集上计算，HAVING/ORDER BY 语义不变，等价。", "differences": []}
+{"equivalent": true, "message": "重写将两处完全相同的三表连接过滤提取为共享 CTE，并把单表谓词 n_name='JORDAN' 推入 nation 派生表，连接条件、HAVING 阈值子查询、ORDER BY 均原样保留，结果集语义等价。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 📐 计划结构: SeqScan reduced by 3 | 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 7727067.0 -> 4703533.0 (重写侧约为原的 60.8709%)
 {
   "keep": true,
   "terminate": true,
-  "reason": "original_cost 523443.29，rewritten_cost 321292.93，代价下降约 38.6%，命中条件 1（估计代价降低）。同时 scan_rows 从 7727067 降至 4703533，plan_depth 从 9 降至 7，且重写将重复扫描的子查询通过 CTE 物化复用，减少了 partsupp 的一次全表扫描相关计算，计划结构更优。未出现数量级代价上涨，无性能恶化。",
+  "reason": "original_cost 523443.29，rewritten_cost 321292.93，代价下降约 38.6%。scan_rows 由 7727067.0 降至 4703533.0，plan_depth 由 9.0 降至 7.0。重写通过 CTE 物化 filtered_supply，使子查询只需对 CTE 一次聚合（InitPlan），消除了原始计划中对 partsupp 的重复扫描（21 节点减为 13 节点），命中条件 1（估计代价降低），同时满足条件 2（扫描行数下降且无数量级代价上涨）与条件 3（树深下降、减少重复扫描，计划结构更优）。",
   "next_step_advice": "无需下一步优化"
 }
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 374
    - 规则序列: ['STRATEGY_CTE_DECOMPOSITION', 'FILTER_INTO_JOIN']
    - 估计代价: 原始=523443.29, 重写=321292.93，相对变化: 38.62%
-✅ 成功存储，记录ID: 05948344-6db4-4f3b-b6ba-c16afe358700
+✅ 成功存储，记录ID: 50cd5b9f-8130-4a89-9292-5ebd262fd7c4
 
 🎲 UCT Math Update: 2 rules, step_sum=+0.3862 (cost=+0.3862, rows=+0.3913, depth=+0.2222, oc=523443.2900, rc=321292.9300)
    结构分细节: rows 7727067.0->4703533.0 (score=+0.391), depth 9.0->7.0 (score=+0.222)
 ✅ UCT Update Complete:
-   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, reward=+0.386, count=9, avg=+0.147
-   → FILTER_INTO_JOIN: P(s,a)=N/A, reward=+0.000, count=14, avg=+0.015
+   → STRATEGY_CTE_DECOMPOSITION: P(s,a)=N/A, reward=+0.386, count=8, avg=+0.280
+   → FILTER_INTO_JOIN: P(s,a)=N/A, reward=+0.000, count=19, avg=+0.001
 
 ----------------------------------------
 

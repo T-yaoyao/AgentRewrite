@@ -2,8 +2,8 @@ Query ID: 43
 ==================================================
 
 Original: SELECT NAME, DDEPTNO, COUNT(*) AS C FROM (SELECT NAME AS NAME, DEPTNO AS DDEPTNO FROM DEPT) AS t3 WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((NAME, DDEPTNO), NAME)
-Rewritten: SELECT NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((NAME, DDEPTNO), NAME)
-Time Cost: 32.34s
+Rewritten: SELECT 'Charlie' AS NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ())
+Time Cost: 357.65s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,13 +12,66 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → JOIN_PUSH_TRANSITIVE_PREDICATES: UCT=1.189
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.187
-   → FILTER_VALUES_MERGE: UCT=1.108
-{"applied_rules":["FILTER_PROJECT_TRANSPOSE","PROJECT_MERGE"]}
-✅ 选择了 2 个规则
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{"applied_rules":["FILTER_PROJECT_TRANSPOSE","AGGREGATE_PROJECT_MERGE","AGGREGATE_ANY_PULL_UP_CONSTANTS"]}
+✅ 选择了 3 个规则
 🔧 开始SQL重写...
-{"applied_rules": ["FILTER_PROJECT_TRANSPOSE", "PROJECT_MERGE"], "step_sqls": ["SELECT NAME, DDEPTNO, COUNT(*) AS C FROM (SELECT NAME AS NAME, DEPTNO AS DDEPTNO FROM DEPT WHERE NAME = 'Charlie') AS t3 GROUP BY GROUPING SETS((NAME, DDEPTNO), NAME)", "SELECT NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((NAME, DDEPTNO), NAME)"], "semantic_correctness_guarantee": "1. FILTER_PROJECT_TRANSPOSE：原 SQL 的过滤谓词 NAME = 'Charlie' 作用于子查询 t3 投影出的列 NAME，而该列直接来自基表 DEPT 的 NAME 列（SELECT NAME AS NAME，无任何表达式变换）。因此把过滤条件下推为对 DEPT.NAME = 'Charlie' 的基表过滤，过滤发生在投影之前，谓词引用的列与原谓词完全同源同值，过滤结果集不变。\n2. PROJECT_MERGE：子查询 t3 仅是纯投影（NAME AS NAME, DEPTNO AS DDEPTNO），不含聚合、DISTINCT、LIMIT 或过滤后复用等禁止合并的情形；外层的 GROUP BY GROUPING SETS 与 COUNT(*) 只依赖这两列。合并后直接在 DEPT 上投影 NAME、DEPTNO AS DDEPTNO 并保留原有的 WHERE 与 GROUP BY 子句，聚合与分组语义完全一致。\n3. 输出列一致性：最终 SQL 输出列为 NAME、DDEPTNO（即 DEPTNO 的别名）、COUNT(*) AS C，与原始 SQL 的输出列名、顺序、数据类型完全一致；GROUP BY GROUPING SETS((NAME, DDEPTNO), NAME) 原样保留，两条 grouping set 产生的行（含 NAME 单独分组时 DDEPTNO 为 NULL 的行）不受影响。\n4. NULL 与重复行：过滤谓词 NAME = 'Charlie' 对 NULL 的处理（不命中）在下推前后一致；子查询为纯投影不引入或消除重复行，因此 COUNT(*) 的计数也与原 SQL 相同。"}
+{"applied_rules": ["FILTER_PROJECT_TRANSPOSE", "AGGREGATE_PROJECT_MERGE", "AGGREGATE_ANY_PULL_UP_CONSTANTS"], "step_sqls": ["SELECT NAME, DDEPTNO, COUNT(*) AS C FROM (SELECT NAME AS NAME, DEPTNO AS DDEPTNO FROM DEPT WHERE NAME = 'Charlie') AS t3 GROUP BY GROUPING SETS((NAME, DDEPTNO), NAME)", "SELECT NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((NAME, DEPTNO), NAME)", "SELECT 'Charlie' AS NAME, DDEPTNO, C FROM (SELECT DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ('Charlie'))) AS t"], "semantic_correctness_guarantee": "1. 结构性改写：第1步（FILTER_PROJECT_TRANSPOSE）把外层对输出列 NAME 的过滤 NAME='Charlie' 前移到子查询 t3 内部、施加在基表 DEPT 的原始列 NAME 上（该投影对 NAME 是恒等重命名，谓词可无变化下推）；第2步（AGGREGATE_PROJECT_MERGE）把紧邻聚合、仅做列重命名的纯投影子查询 t3 合并进聚合查询，GROUP BY 中的 DDEPTNO 同步改写为其源列 DEPTNO；第3步（AGGREGATE_ANY_PULL_UP_CONSTANTS）识别出 WHERE NAME='Charlie' 使分组列 NAME 成为常量列，将其从分组键中分离：分组集 ((NAME, DEPTNO), NAME) 改为 ((DEPTNO), ('Charlie'))，常量列在外层以 'Charlie' AS NAME 补回。\n2. 等价性论证：过滤 NAME='Charlie' 保证参与分组的每一行 NAME 恒等于 'Charlie'，因此分组集 (NAME, DEPTNO) 与 (DEPTNO) 产生的分组划分完全相同（每个 DEPTNO 一组），分组集 (NAME) 与按常量表达式 ('Charlie') 分组产生的分组划分也完全相同（全部行合成一组）；输出中 NAME 列的取值恒为 'Charlie'，与原查询中由过滤条件保证的 NAME 值一致，故三步改写在 DEPT 表结构与常规 SQL 语义下结果集等价。\n3. 易误判点——空输入：若没有行满足 NAME='Charlie'，原查询的所有分组集均不产生任何分组，输出 0 行；因此第2个分组集采用按常量表达式 ('Charlie') 分组，而不是空分组集 ()——GROUP BY () 在空输入上会额外产生一行 COUNT=0 的总计行从而破坏等价性，而按常量表达式分组在空输入上同样输出 0 行，保证空与非空输入下均与原查询逐行一致。\n4. 列名与顺序：最终输出列依次为 NAME、DDEPTNO、C，与原查询的输出列名（NAME, DDEPTNO, COUNT(*) AS C）及顺序完全一致，COUNT(*) 的计数语义未做任何改动。\n5. NULL 与重复行：dept.name 为 NOT NULL 且等值过滤本身排除 NULL，不存在 NULL 被并入 'Charlie' 组的风险；聚合仅在过滤后的行集上进行，未引入或消除任何重复行，GROUPING SETS 的多分组集输出结构（每个分组集各产出若干行）保持不变。"}
+🔍 开始语法检查...
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: non-integer constant in GROUP BY
+LINE 1: ...AME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ('Charlie')...
+                                                             ^
+
+{'flag': False, 'error': "non-integer constant in GROUP BY\nLINE 1: ...AME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ('Charlie')...\n                                                             ^\n"}
+DBMS_syntax_Tool ends...
+DBMS_syntax_Tool starts...
+Error executing EXPLAIN: non-integer constant in GROUP BY
+LINE 1: ...AME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ('Charlie')...
+                                                             ^
+
+{'flag': False, 'error': "non-integer constant in GROUP BY\nLINE 1: ...AME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ('Charlie')...\n                                                             ^\n"}
+DBMS_syntax_Tool ends...
+{"rewritten_sql":"SELECT 'Charlie' AS NAME, DDEPTNO, C FROM (SELECT DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ('Charlie'::text))) AS t","note":"数据库将裸字符串常量 'Charlie' 误判为 GROUP BY 序号引用而报 non-integer constant in GROUP BY；最小修复为给常量加显式类型转换 'Charlie'::text，使其成为普通常量表达式，语义不变（该列已被 WHERE NAME='Charlie' 固定为常量）。"}
+DBMS_syntax_Tool starts...
+{'flag': True, 'error': None}
+DBMS_syntax_Tool ends...
+🧠 开始语义等价检查...
+ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
+{"equivalent": true, "message": "当前重写SQL与原SQL在Schema约束下逐行等价：WHERE NAME='Charlie' 使 NAME 成为常量，分组集 (NAME,DEPTNO) 等价于 (DEPTNO)，(NAME) 等价于按常量 ('Charlie') 分组（空输入时两者均输出0行，未误用空分组集()）；原查询中 (NAME) 分组集不分组 DEPTNO 故 DDEPTNO 为 NULL，重写中常量分组集同样使 DDEPTNO 为 NULL，NAME 列均恒为 'Charlie'，COUNT(*) 语义与列名顺序一致。", "differences": []}
+✅ 语义等价
+📊 开始评估优化结果...
+{
+  "keep": true,
+  "terminate": false,
+  "reason": "original_cost 6774.44，rewritten_cost 6774.27，代价略微下降，未达数量级上涨；scan_rows 由 50.0 降至 41.0，plan_depth 保持 4.0 不变。命中条件 1（估计代价降低）和条件 2（扫描行数下降且代价未数量级上涨）。重写消除了内层子查询的冗余投影并提前常量折叠（NAME 固定为 'Charlie'），逻辑更简化，保留。",
+  "next_step_advice": "继续优化的空间在于 450000 行 DEPT 全表顺序扫描：下一轮可考虑对 WHERE NAME = 'Charlie' 的过滤进行进一步等价改写或消除 GROUPING SETS 中的冗余分组（NAME 恒为 'Charlie'，第二分组 ('Charlie'::text) 与第一分组可能重复），尝试将 GROUPING SETS 简化为单一 GROUP BY，以减少聚合节点数量。"
+}
+ℹ️ 评估建议继续下一轮优化（terminate=false）
+🔍 PlanAnalyzer 分析当前 SQL...
+🧊 历史案例相似度较低，不使用 few-shot
+🔍 计划分析器开始分析...
+✅ 计划分析器完成分析
+✅ 计划分析完成，进入规则选择
+🎯 第2轮规则选择 (UCT-guided)...
+📊 UCT scored 71 rules
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN: UCT=1.100
+   → AGGREGATE_JOIN_JOIN_REMOVE: UCT=1.100
+   → AGGREGATE_REDUCE_FUNCTIONS: UCT=1.100
+{"applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_ANY_PULL_UP_CONSTANTS", "PROJECT_AGGREGATE_MERGE"]}
+✅ 选择了 3 个规则
+🔧 开始SQL重写...
+{
+  "applied_rules": ["FILTER_REDUCE_EXPRESSIONS", "AGGREGATE_ANY_PULL_UP_CONSTANTS", "PROJECT_AGGREGATE_MERGE"],
+  "step_sqls": [
+    "SELECT 'Charlie' AS NAME, DDEPTNO, C FROM (SELECT DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ('Charlie'))) AS t",
+    "SELECT 'Charlie' AS NAME, DDEPTNO, C FROM (SELECT DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ())) AS t",
+    "SELECT 'Charlie' AS NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C FROM DEPT WHERE NAME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ())"
+  ],
+  "semantic_correctness_guarantee": "1. 结构性改写一（FILTER_REDUCE_EXPRESSIONS）：内层 GROUP BY 中的 ('Charlie'::text) 是对字符串字面量施加的常量类型转换（cast），属于可在优化期折算的常量表达式，折叠为 ('Charlie') 后其值与类型（text）完全不变，因此按该常量分组的分组数与各行计数均不变；WHERE NAME = 'Charlie' 是引用列的真实过滤条件，不属于恒真/恒假表达式，予以保留不动。\n2. 结构性改写二（AGGREGATE_ANY_PULL_UP_CONSTANTS）：GROUPING SETS 的第二个分组集 ('Charlie') 是常量分组集，对该分组集而言所有行落入同一组，等价于空分组集 ()（两者的输出都是且仅是一行：DEPTNO 为 NULL、COUNT(*) 为过滤后总行数）。故将第二个分组集改写为 ()，被移出的常量列由外层已存在的常量投影 'Charlie' AS NAME 提供，常量语义不丢失。\n3. 结构性改写三（PROJECT_AGGREGATE_MERGE）：外层 SELECT 'Charlie' AS NAME, DDEPTNO, C 仅做别名转发与常量投影，将其与内层聚合合并，直接得到 SELECT 'Charlie' AS NAME, DEPTNO AS DDEPTNO, COUNT(*) AS C ... GROUP BY GROUPING SETS((DEPTNO), ())，消除了多余的一层 SELECT，输出列名（NAME、DDEPTNO、C）、顺序与类型均与原查询一致。\n4. 易误判点核验：第二个分组集由 ('Charlie') 变为 () 后，该行 DDEPTNO 均为 NULL（两种写法下该分组集都不含 DEPTNO），C 均为 WHERE NAME='Charlie' 过滤后的总行数，逐行完全一致；第一个分组集 (DEPTNO) 未做任何改动，各组 (DEPTNO, COUNT(*)) 结果不变；GROUPING SETS 在无 ORDER BY 时不保证行序，原查询与重写查询均按结果多重集比较，故等价。整条链路未引入或删除任何行，未改变过滤条件与聚合定义，结果集与原始 SQL 完全等价。"
+}
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
 {'flag': True, 'error': None}
@@ -26,22 +79,32 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{"equivalent": true, "message": "重写仅为谓词下推与纯投影子查询合并，GROUP BY GROUPING SETS 与 COUNT(*) 原样保留，输出列名与分组语义一致，结果集相同。", "differences": []}
+{"equivalent": true, "message": "在 WHERE NAME='Charlie' 且 name NOT NULL 的约束下，原 GROUPING SETS((NAME, DDEPTNO), NAME) 与重写的 ((DEPTNO), ()) 逐行结果一致：第一分组集因 NAME 恒为 'Charlie' 而退化为按 DEPTNO 分组，第二分组集均为一行 DDEPTNO=NULL、COUNT=过滤后总行数，常量列 'Charlie' 由外层投影补回，无结果集差异。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
 {
   "keep": true,
   "terminate": true,
-  "reason": "original_cost=6774.44，rewritten_cost=6774.44，代价持平无涨幅；<scan_rows> 前后均为 50.0，<plan_depth> 前后均为 4，执行计划结构完全一致。本轮通过 PROJECT_MERGE/FILTER_PROJECT_TRANSPOSE 去掉了冗余子查询投影（t3 内层投影被合并），属于逻辑简化且代价未上升，命中保留条件第 4 条。剩余优化空间主要是在 name 列上建索引等物理手段，已无有效的查询重写空间。",
+  "reason": "original_cost 6774.44，rewritten_cost 6774.13，代价小幅降低且远未达数量级上涨。<scan_rows> 由 50.0 降至 29.0，<plan_depth> 由 4 降至 3，去掉了多余的 Sort 节点和子查询投影，计划结构更优。命中条件1（代价降低），同时满足条件2、3。",
   "next_step_advice": "无需下一步优化"
 }
-ℹ️ 记忆跳过：论文收益 R=+0.0000，且估计代价未下降
+Error executing EXPLAIN: non-integer constant in GROUP BY
+LINE 1: ...AME = 'Charlie' GROUP BY GROUPING SETS((DEPTNO), ('Charlie')...
+                                                             ^
 
-🎲 UCT Math Update: 2 rules, step_sum=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.0000, oc=6774.4400, rc=6774.4400)
-   结构分细节: rows 50.0->50.0 (score=+0.000), depth 4.0->4.0 (score=+0.000)
+ℹ️ 逐步 EXPLAIN 代价不可用，LinUCB 改为均分 +0.0000 × 3
+💾 正在存储优化案例到向量数据库...
+   - SQL指纹长度: 150
+   - 规则序列: ['FILTER_REDUCE_EXPRESSIONS', 'AGGREGATE_ANY_PULL_UP_CONSTANTS', 'PROJECT_AGGREGATE_MERGE']
+   - 估计代价: 原始=6774.44, 重写=6774.13，相对变化: 0.00%
+✅ 成功存储，记录ID: 1ae3c6e6-2813-4ed8-b3de-cff425ca9920
+
+🎲 UCT Math Update: 3 rules, step_sum=+0.0000 (cost=+0.0000, rows=+0.0000, depth=+0.2500, oc=6774.4400, rc=6774.1300)
+   结构分细节: rows 50.0->29.0 (score=+0.000), depth 4.0->3.0 (score=+0.250)
 ✅ UCT Update Complete:
-   → FILTER_PROJECT_TRANSPOSE: P(s,a)=N/A, reward=+0.000, count=4, avg=+0.000
-   → PROJECT_MERGE: P(s,a)=N/A, reward=+0.000, count=16, avg=+0.074
+   → FILTER_REDUCE_EXPRESSIONS: P(s,a)=N/A, reward=+0.000, count=3, avg=+0.116
+   → AGGREGATE_ANY_PULL_UP_CONSTANTS: P(s,a)=N/A, reward=+0.000, count=3, avg=+0.000
+   → PROJECT_AGGREGATE_MERGE: P(s,a)=N/A, reward=+0.000, count=2, avg=+0.000
 
 ----------------------------------------
 

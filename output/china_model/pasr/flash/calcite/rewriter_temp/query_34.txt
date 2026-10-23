@@ -2,8 +2,8 @@ Query ID: 34
 ==================================================
 
 Original: SELECT NAME, CAST(SUM(CN) FILTER (WHERE g_1) AS BIGINT), CAST(SUM(SM) FILTER (WHERE g_2) AS INTEGER) FROM (SELECT NAME, CN, SM, GROUPING(NAME, CN, SM) = 1 AS g_1, GROUPING(NAME, CN, SM) = 2 AS g_2 FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t3 GROUP BY GROUPING SETS((NAME, CN), (NAME, SM))) AS t5 GROUP BY NAME
-Rewritten: SELECT NAME, CAST(COUNT(*) AS BIGINT), CAST(SUM(DEPTNO) AS INTEGER) FROM DEPT GROUP BY NAME
-Time Cost: 257.36s
+Rewritten: SELECT NAME, CAST(CN AS BIGINT), CAST(SM AS INTEGER) FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t3
+Time Cost: 230.34s
 Suggestion: []
 🔍 PlanAnalyzer 分析当前 SQL...
 🧊 历史案例相似度较低，不使用 few-shot
@@ -12,20 +12,19 @@ Suggestion: []
 ✅ 计划分析完成，进入规则选择
 🎯 第1轮规则选择 (UCT-guided)...
 📊 UCT scored 71 rules
-   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.188
-   → JOIN_PUSH_TRANSITIVE_PREDICATES: UCT=1.141
+   → UNION_REMOVE: UCT=1.198
+   → AGGREGATE_EXPAND_DISTINCT_AGGREGATES: UCT=1.189
    → AGGREGATE_CASE_TO_FILTER: UCT=1.100
-{"applied_rules": ["AGGREGATE_MERGE", "AGGREGATE_REMOVE", "AGGREGATE_PROJECT_MERGE"]}
-✅ 选择了 3 个规则
+{"applied_rules": ["AGGREGATE_MERGE", "AGGREGATE_REMOVE"]}
+✅ 选择了 2 个规则
 🔧 开始SQL重写...
 {
-  "applied_rules": ["AGGREGATE_MERGE", "AGGREGATE_REMOVE", "AGGREGATE_PROJECT_MERGE"],
+  "applied_rules": ["AGGREGATE_MERGE", "AGGREGATE_REMOVE"],
   "step_sqls": [
     "SELECT NAME, CAST(SUM(CN) AS BIGINT), CAST(SUM(SM) AS INTEGER) FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t3 GROUP BY NAME",
-    "SELECT NAME, CAST(CN AS BIGINT), CAST(SM AS INTEGER) FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t3",
-    "SELECT NAME, CAST(COUNT(*) AS BIGINT), CAST(SUM(DEPTNO) AS INTEGER) FROM DEPT GROUP BY NAME"
+    "SELECT NAME, CAST(CN AS BIGINT), CAST(SM AS INTEGER) FROM (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME) AS t3"
   ],
-  "semantic_correctness_guarantee": "1. 结构改写说明：\n① AGGREGATE_MERGE：将最外层 GROUP BY NAME 与其下的 GROUP BY GROUPING SETS((NAME, CN), (NAME, SM)) 这两个嵌套聚合合并为对 t3 的单个聚合（GROUP BY NAME，度量 SUM(CN)、SUM(SM)），消除了 GROUPING SETS 结构与 g_1/g_2 过滤标记。\n② AGGREGATE_REMOVE：t3 本身已是 GROUP BY NAME 的输出（NAME 在 t3 中唯一），其上再套一层 GROUP BY NAME 属于不做真正聚合的冗余分组，去掉该层 GROUP BY，并把 SUM(CN)/SUM(SM) 退化为直接列引用 CN/SM。\n③ AGGREGATE_PROJECT_MERGE：t3 的投影层（NAME, CN, SM）与聚合输出一一对应，去掉多余 SELECT，将 CN≡COUNT(*)、SM≡SUM(DEPTNO) 内联回聚合，得到对 DEPT 的单个 GROUP BY NAME 聚合。\n\n2. 为何结果集等价：t3 = SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME，每个 NAME 恰好一行。中间层在该输入上做 GROUPING SETS((NAME,CN),(NAME,SM))：由于 CN、SM 都是 NAME 的函数（t3 中 NAME 唯一），每个分组集对每个 NAME 各产生恰好一行——set(NAME,CN) 行中 SM 被卷起，GROUPING(NAME,CN,SM)=1（即 g_1=true），携带 CN；set(NAME,SM) 行中 CN 被卷起，GROUPING=2（即 g_2=true），携带 SM。最外层 GROUP BY NAME 将同一 NAME 的两行重新聚合：SUM(CN) FILTER (WHERE g_1) = 该 NAME 唯一的 CN，SUM(SM) FILTER (WHERE g_2) = 该 NAME 唯一的 SM。故「中间 grouping-sets 层 + 最外层」整体等价于对 t3 的恒等投影（仅保留外层的 CAST），三步重写全程以 NAME 为分组键，最终 SELECT NAME, CAST(COUNT(*) AS BIGINT), CAST(SUM(DEPTNO) AS INTEGER) FROM DEPT GROUP BY NAME 与原查询逐行逐列相等。\n\n3. AGGREGATE_REMOVE 的正确性：t3 是 GROUP BY NAME 的输出，NAME 在 t3 中唯一，因此其上 GROUP BY NAME 的每个分组恰含一行，SUM(CN)=CN、SUM(SM)=SM，删除该层 GROUP BY 并以列引用替代 SUM 不改变任何输出值。\n\n4. 易误判点核验：\n• NULL：Schema 中 DEPT.NAME 与 DEPT.DEPTNO 均 NOT NULL；即便存在 NULL NAME，t3 对其恰一行，grouping sets 各产生一行，外层仍归为一行，各层分组一一对应，等价性不受影响。\n• FILTER 求和与取值：SUM(CN) 中 CN=COUNT(*) 永不为 NULL，SUM(SM) 中 SM 因 DEPTNO NOT NULL 也不为 NULL，且每个 NAME 在每个分组集中恰一行，过滤求和与直接取值完全一致。\n• CAST 与列序：外层的 CAST(... AS BIGINT)、CAST(... AS INTEGER) 及输出列顺序（NAME, 第一个 CAST, 第二个 CAST）在每一步均保留，最终列名与数据类型与原查询一致。\n• 无 ORDER BY/LIMIT，不涉及行序与截断语义；无相关子查询，聚合均为同键（NAME）合并，GROUP BY 键与相关列完全对应。"
+  "semantic_correctness_guarantee": "1. 结构性改写一（AGGREGATE_MERGE，第1步）：原 SQL 中间层是 GROUP BY GROUPING SETS((NAME, CN), (NAME, SM)) 的聚合，外层再 GROUP BY NAME 并用 SUM(CN) FILTER (WHERE g_1)、SUM(SM) FILTER (WHERE g_2) 取值。将这两层嵌套聚合合并为对 t3 的单层 GROUP BY NAME 聚合：SELECT NAME, CAST(SUM(CN) AS BIGINT), CAST(SUM(SM) AS INTEGER) ... GROUP BY NAME。合并依据：对每个 NAME，GROUPING SETS 的两个输出行中度量互斥为 NULL——(NAME, CN) 行的 SM 为 NULL、(NAME, SM) 行的 CN 为 NULL（GROUPING(NAME,CN,SM)=1 即 SM 被聚合、=2 即 CN 被聚合），而 SUM 忽略 NULL，因此 SUM(CN) FILTER g_1 = SUM(CN)、SUM(SM) FILTER g_2 = SUM(SM)，GROUPING 标志位与 FILTER 在合并后可安全去除。该等价性对任意 t3 输入均成立，不依赖 NAME 唯一。\n2. 结构性改写二（AGGREGATE_REMOVE，第2步）：t3 = (SELECT NAME, COUNT(*) AS CN, SUM(DEPTNO) AS SM FROM DEPT GROUP BY NAME)，其输出中 NAME 每值恰有一行（DEPT 按 NAME 分组）。因此第1步结果中外层 GROUP BY NAME 的每个分组只含一行，SUM(CN)=CN、SUM(SM)=SM，GROUP BY 未做真正的聚合，按 AGGREGATE_REMOVE 规则去掉该 GROUP BY 及 SUM，改为直接投影 CAST(CN AS BIGINT)、CAST(SM AS INTEGER)。\n3. 结果集等价性：原查询最终每个 NAME 输出一行，值为 (t3.CN, t3.SM)；重写后 t3 每个 NAME 恰一行，直接投影得到相同的 (NAME, CN, SM) 集合。行数、行内容、NAME 分组键完全一致。\n4. 易误判点核验：(a) NAME 在 schema 中为 VARCHAR NOT NULL，不存在 NULL 分组导致的 GROUPING 语义分歧；即使存在 NULL 组，t3 中每个分组键（含 NULL 组）也只产生一行，去除 GROUP BY 仍等价。(b) DEPT 的 DEPTNO 非 NULL 且每个 NAME 组非空，故 CN=COUNT(*)≥1、SM=SUM(DEPTNO) 均非 NULL，CAST 结果与原 FILTER 路径取到的值逐值相同。(c) CAST 类型（BIGINT/INTEGER）与列顺序（NAME 在前）在两步中均保持不变，未命名的 CAST 输出列与原查询一致，排序语义双方均未指定 ORDER BY，不引入排序差异。"
 }
 🔍 开始语法检查...
 DBMS_syntax_Tool starts...
@@ -34,32 +33,27 @@ DBMS_syntax_Tool ends...
 ✅ 语法检查通过
 🧠 开始语义等价检查...
 ℹ️ 确定性等价验证无法判定，转入 LLM 语义检查: UNKNOWN
-{
-    "equivalent": true,
-    "message": "逐层核验：t3 按 NAME 分组后 NAME 唯一，grouping sets ((NAME,CN),(NAME,SM)) 对每个 NAME 各产出恰好一行（SM 卷起时 GROUPING=1 即 g_1，CN 卷起时 GROUPING=2 即 g_2），外层 GROUP BY NAME 重新聚合后 SUM(CN) FILTER g_1=CN、SUM(SM) FILTER g_2=SM，整体等价于对 t3 的恒等投影，最终与 SELECT NAME, CAST(COUNT(*) AS BIGINT), CAST(SUM(DEPTNO) AS INTEGER) FROM DEPT GROUP BY NAME 逐行逐列一致；DEPTNO/NAME 均 NOT NULL，NULL 语义亦无差异。",
-    "differences": []
-}
+{"equivalent": true, "message": "当前重写与原语义一致：原SQL外层经GROUPING SETS与FILTER/SUM取回的正是t3中每个NAME唯一的(CN,SM)；由于t3按NAME分组每值恰一行，外层聚合与GROUPING标志可安全移除，逐行投影得到相同结果集。", "differences": []}
 ✅ 语义等价
 📊 开始评估优化结果...
-📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 576455.0 -> 492085.0 (重写侧约为原的 85.3640%)
+📐 计划结构: 行数估计求和(各节点 Plan Rows 累加，非 EXPLAIN 的 Total Cost): 576455.0 -> 534170.0 (重写侧约为原的 92.6646%)
 {
   "keep": true,
   "terminate": true,
-  "reason": "original_cost=14341.08，rewritten_cost=10865.06，代价下降约24%。scan_rows 由 576455 降至 492085，plan_depth 由 4 降至 2，聚合层数从三层减为一层，消除了 GROUPING SETS 的重复聚合与过滤。命中条件1（代价降低），同时满足条件2和3。",
+  "reason": "估计代价从 14341.08 降至 10865.06（约降 24%）；<scan_rows> 由 576455 降至 534170；<plan_depth> 由 4 降至 3，减少了两层冗余聚合。命中条件 1（代价降低），同时扫描行数与树深均下降，查询逻辑简化正确。",
   "next_step_advice": "无需下一步优化"
 }
 💾 正在存储优化案例到向量数据库...
    - SQL指纹长度: 323
-   - 规则序列: ['AGGREGATE_MERGE', 'AGGREGATE_REMOVE', 'AGGREGATE_PROJECT_MERGE']
+   - 规则序列: ['AGGREGATE_MERGE', 'AGGREGATE_REMOVE']
    - 估计代价: 原始=14341.08, 重写=10865.06，相对变化: 24.24%
-✅ 成功存储，记录ID: 0405ae0f-dce6-44a9-afa7-e0a808bd2232
+✅ 成功存储，记录ID: 8e52f528-5472-4f33-a12e-b0a9e3fb7eb4
 
-🎲 UCT Math Update: 3 rules, step_sum=+0.2424 (cost=+0.2424, rows=+0.1464, depth=+0.5000, oc=14341.0800, rc=10865.0600)
-   结构分细节: rows 576455.0->492085.0 (score=+0.146), depth 4.0->2.0 (score=+0.500)
+🎲 UCT Math Update: 2 rules, step_sum=+0.2424 (cost=+0.2424, rows=+0.0734, depth=+0.2500, oc=14341.0800, rc=10865.0600)
+   结构分细节: rows 576455.0->534170.0 (score=+0.073), depth 4.0->3.0 (score=+0.250)
 ✅ UCT Update Complete:
-   → AGGREGATE_MERGE: P(s,a)=N/A, reward=-0.064, count=5, avg=+0.095
-   → AGGREGATE_REMOVE: P(s,a)=N/A, reward=+0.306, count=6, avg=+0.150
-   → AGGREGATE_PROJECT_MERGE: P(s,a)=N/A, reward=+0.000, count=2, avg=-0.001
+   → AGGREGATE_MERGE: P(s,a)=N/A, reward=-0.064, count=3, avg=-0.355
+   → AGGREGATE_REMOVE: P(s,a)=N/A, reward=+0.306, count=7, avg=+0.192
 
 ----------------------------------------
 
